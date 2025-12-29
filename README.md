@@ -8,7 +8,7 @@ This repository provides Dion optimizer implementations built on top of [NVIDIA 
 
 ## Overview
 
-Megatron-Dion is the **Megatron-Core backend implementation** of [Microsoft Dion](https://github.com/microsoft/dion), a communication-efficient distributed optimizer that uses low-rank gradient compression with error feedback.
+Megatron-Dion is the **Megatron-Core backend implementation** of [Microsoft Dion](https://github.com/microsoft/dion), a communication-efficient distributed optimizer that uses low-rank gradient orthonormalization with error feedback.
 
 Key features:
 - **Distributed optimizer integration**: Built on Megatron's `--use-distributed-optimizer` infrastructure
