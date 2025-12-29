@@ -15,6 +15,47 @@ Key features:
 - **Orthogonal parallelism** (FS x TP) integrated with Megatron's parallelism
 - **Memory-efficient design** with lazy allocation and buffer reuse
 
+## Dion Project Structure
+
+```
+Megatron-Dion/
+├── megatron/
+│   ├── core/
+│   │   ├── optimizer/
+│   │   │   ├── __init__.py                    # Optimizer factory (Dion selection)
+│   │   │   ├── distrib_optimizer_for_dion.py  # DistributedOptimizer for Dion
+│   │   │   ├── megatron_dion.py               # MegatronDion optimizer class (wrapper)
+│   │   │   ├── optimizer_config.py            # Config (Dion hyperparameters)
+│   │   │   ├── clip_grads.py                  # Gradient clipping (FS-aware)
+│   │   │   └── dion/                          # Dion algorithm modules
+│   │   │       ├── __init__.py                # Module exports
+│   │   │       ├── algorithm.py               # DionAlgorithm (core logic)
+│   │   │       ├── ortho.py                   # RCQR orthonormalization
+│   │   │       ├── scalar_opt.py              # 1D param optimizer (AdamW/Lion)
+│   │   │       ├── async_runtime.py           # Async NCCL runtime
+│   │   │       ├── batching.py                # Bucket batching logic
+│   │   │       ├── constants.py               # Constants (DION_NCCL_TAG, etc.)
+│   │   │       ├── types.py                   # Type definitions
+│   │   │       └── utils.py                   # Utility functions
+│   │   ├── distributed/
+│   │   │   ├── distributed_data_parallel.py   # DDP (modified for Dion)
+│   │   │   └── param_and_grad_buffer.py       # Gradient buffers (FS groups)
+│   │   └── tensor_parallel/
+│   │       └── layers.py                      # TP layers (column/row parallel)
+│   └── training/
+│       ├── arguments.py                       # CLI arguments (--optimizer dion)
+│       └── training.py                        # Training loop (optimizer init)
+├── examples/
+│   └── dion/                                  # Ready-to-use training scripts
+│       ├── run_fineweb_dion_fs2_tp2_pp2.sh   # FS=2, TP=2, PP=2
+│       ├── run_fineweb_dion_fs2_tp2_cp2.sh   # FS=2, TP=2, CP=2
+│       ├── run_fineweb_dion_fs2_tp2_ep2.sh   # FS=2, TP=2, EP=2 (MoE)
+│       └── ...
+├── tools/
+│   └── convert_dion_to_megatron.py           # Data format converter
+└── pyproject.toml                             # Dependencies & metadata
+```
+
 ## Supported Parallelism
 
 | Parallelism | Status | Notes |
