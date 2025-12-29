@@ -47,12 +47,12 @@ Megatron-Dion/
 │       └── training.py                        # Training loop (optimizer init)
 ├── examples/
 │   └── dion/                                  # Ready-to-use training scripts
-│       ├── run_fineweb_dion_fs2_tp2_pp2.sh   # FS=2, TP=2, PP=2
-│       ├── run_fineweb_dion_fs2_tp2_cp2.sh   # FS=2, TP=2, CP=2
-│       ├── run_fineweb_dion_fs2_tp2_ep2.sh   # FS=2, TP=2, EP=2 (MoE)
+│       ├── run_fineweb_dion_fs2_tp2_pp2.sh    # FS=2, TP=2, PP=2
+│       ├── run_fineweb_dion_fs2_tp2_cp2.sh    # FS=2, TP=2, CP=2
+│       ├── run_fineweb_dion_fs2_tp2_ep2.sh    # FS=2, TP=2, EP=2 (MoE)
 │       └── ...
 ├── tools/
-│   └── convert_dion_to_megatron.py           # Data format converter
+│   └── convert_dion_to_megatron.py            # Data format converter
 └── pyproject.toml                             # Dependencies & metadata
 ```
 
