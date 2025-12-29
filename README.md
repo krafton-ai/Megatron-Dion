@@ -1,10 +1,8 @@
 # Megatron-Dion
 
-> **Unofficial project. Not affiliated with or endorsed by NVIDIA.**
+> **This project is based on NVIDIA Megatron-LM. It is an unofficial, independent extension and is not affiliated with NVIDIA.**
 
-Welcome to the **KRAFTON-AI/Megatron-Dion** repository!
-
-This repository provides Dion optimizer implementations built on top of [NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM).
+Welcome to the **KRAFTON-AI/Megatron-Dion** repository! This repository contains Dion optimizer ([paper](https://arxiv.org/abs/2504.05295)) implementations built on top of [NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM).
 
 ## Overview
 
