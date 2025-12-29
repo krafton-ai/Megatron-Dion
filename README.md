@@ -148,7 +148,7 @@ USE_VPP=1 NUM_LAYERS_PER_VPP=3 bash examples/dion/run_fineweb_dion_fs2_tp2_pp2.s
 
 ## Architecture
 
-### 2D Data Parallelism (RP x FS)
+### N-Dimensional Parallelism
 
 Dion uses 2D data parallelism where DP (Data Parallel) group is factored into:
 - **RP (Replicate Parallel)**: Replicas holding the same parameter shard (gradient all-reduce group)
@@ -159,7 +159,7 @@ Data Parallel Group (DP = RP x FS)
 +-- Replicate Parallel (RP): Replicas with same shard
 +-- Fully Sharded (FS): Shards within same replica
 
-Example: 8 GPUs with TP=2, PP=2, FS=2
+Example (with Other Parallelism): 8 GPUs with TP=2, PP=2, FS=2
 - World: [0,1,2,3,4,5,6,7]
 - TP groups: [0,1], [2,3], [4,5], [6,7]
 - PP groups: [0,2], [1,3], [4,6], [5,7]
