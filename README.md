@@ -15,7 +15,7 @@ Key features:
 - **Orthogonal parallelism** (FS x TP) integrated with Megatron's parallelism
 - **Memory-efficient design** with lazy allocation and buffer reuse
 
-## Dion Project Structure
+## Megatron-Dion Project Structure
 
 ```
 Megatron-Dion/
