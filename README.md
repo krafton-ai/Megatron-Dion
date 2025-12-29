@@ -189,7 +189,3 @@ This allows efficient gradient communication while maintaining optimal update ru
 
 - [Dion: Communication-Efficient Distributed Optimization](https://github.com/microsoft/dion)
 - [NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM)
-
-## License
-
-This project is licensed under the Apache License 2.0.
