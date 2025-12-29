@@ -19,7 +19,7 @@
 # LR Schedule: WSD (Warmup-Stable-Decay)
 #
 # Usage:
-#   bash examples/dion_gpt/run_fineweb_dion_distributed.sh
+#   bash examples/dion/run_fineweb_dion_fs4_tp2.sh
 #
 # =============================================================================
 
