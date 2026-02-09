@@ -62,6 +62,8 @@ class MegatronDion(Optimizer):
         enable_async: bool = True,  # Enable async execution where possible
         use_compressed_comm: bool = True,  # Enable compressed communication
         scalar_optimizer: str = "adamw",  # Scalar optimizer for non-Dion params ("adamw" or "lion")
+        lr_scaling: str = "dion",  # LR scaling: "dion_ref", "dion", or "moonlight"
+        is_ep_mode: bool = False,  # EP mode: use sync execution to avoid collective desync
     ):
         defaults = dict(
             lr=lr,
@@ -78,16 +80,26 @@ class MegatronDion(Optimizer):
             enable_async=enable_async,
             use_compressed_comm=use_compressed_comm,
             scalar_optimizer=scalar_optimizer,  # "adamw" or "lion"
+            lr_scaling=lr_scaling,  # "dion_ref", "dion", or "moonlight"
             # Reference implementation uses only RCQR and standard scaling
             algorithm="dion",  # Default algorithm, same as original dion.py
             step=0,  # Per-group step counter
         )
         super().__init__(params, defaults)
 
+        # Store lr_scaling type
+        self._lr_scaling = lr_scaling
+
         # Cache global rank for logging (avoid repeated dist.get_rank() calls)
         self._global_rank = dist.get_rank() if dist.is_initialized() else 0
 
         global_rank = self._global_rank
+
+        # EP mode: use sync execution to avoid collective desync across ranks
+        # When EP > 1, different optimizer instances (Dense vs Expert) have different
+        # fs_group compositions, and AsyncRuntime can cause ranks to reach different
+        # yield points, leading to collective hangs.
+        self.is_ep_mode = is_ep_mode
 
         # Store the correct process groups
         self.tp_group = tp_group  # Tensor Parallel
@@ -195,7 +207,10 @@ class MegatronDion(Optimizer):
             dion_tasks_list = list(dion_tasks)
             task_count = len(dion_tasks_list)
             if task_count > 0:
-                runtime = AsyncRuntime((t for t in dion_tasks_list), max_concurrent_tasks=3)
+                # EP mode: sequential execution to avoid collective desync
+                # Non-EP mode: parallel execution for better performance
+                max_tasks = 1 if self.is_ep_mode else 3
+                runtime = AsyncRuntime((t for t in dion_tasks_list), max_concurrent_tasks=max_tasks)
                 runtime.run()
 
                 del runtime
@@ -358,8 +373,14 @@ class MegatronDion(Optimizer):
 
         for p, grad, state, group in adamw_params:
             lr = group.get('lr', self.defaults['lr'])
-            # non-Dion params (embedding, lm_head, norm, bias) use weight_decay=0
-            weight_decay = 0.0
+            # Apply weight decay same as Adam:
+            # - 1D params (bias, norm scale): no weight decay
+            # - 2D+ params (embedding, lm_head): apply weight decay with wd_mult
+            if p.ndim == 1:
+                weight_decay = 0.0
+            else:
+                wd_mult = group.get('wd_mult', 1.0)
+                weight_decay = self.defaults['weight_decay'] * wd_mult
 
             # Choose scalar optimizer
             if scalar_opt == 'lion':
@@ -401,8 +422,14 @@ class MegatronDion(Optimizer):
 
         for p, grad, state in adamw_data:
             lr = group.get('lr', self.defaults['lr'])
-            # non-Dion params use weight_decay=0
-            weight_decay = 0.0
+            # Apply weight decay same as Adam:
+            # - 1D params (bias, norm scale): no weight decay
+            # - 2D+ params (embedding, lm_head): apply weight decay with wd_mult
+            if p.ndim == 1:
+                weight_decay = 0.0
+            else:
+                wd_mult = group.get('wd_mult', 1.0)
+                weight_decay = self.defaults['weight_decay'] * wd_mult
 
             # Choose scalar optimizer
             if scalar_opt == 'lion':
@@ -455,7 +482,35 @@ class MegatronDion(Optimizer):
         # Sort keys for deterministic order across all ranks
         global_param_offset = 0
         ortho_completed_count = 0
-        for shape_key in sorted(shape_groups.keys()):
+
+        # Sync shape_keys across TP group to ensure all TP ranks process same batches
+        # This prevents collective desync when Distributed Optimizer shards params differently across TP ranks
+        local_shape_keys = sorted(shape_groups.keys())
+        if self.tp_group is not None and dist.get_world_size(self.tp_group) > 1:
+            all_shape_keys = self._sync_shape_keys_across_tp_group(local_shape_keys)
+        else:
+            all_shape_keys = local_shape_keys
+
+        for shape_key in all_shape_keys:
+            # Check if this rank has params for this shape_key
+            if shape_key not in shape_groups:
+                # This rank doesn't have params for this shape_key
+                # If has_tp_axis=True, we still need to participate in TP collectives with dummy data
+                has_tp_axis = shape_key[2]
+                if has_tp_axis and self.tp_group is not None and dist.get_world_size(self.tp_group) > 1:
+                    local_num_params = 0
+                    num_params_tensor = torch.tensor([local_num_params], device=torch.cuda.current_device(), dtype=torch.int64)
+                    dist.all_reduce(num_params_tensor, op=dist.ReduceOp.MAX, group=self.tp_group)
+                    max_num_params = int(num_params_tensor.item())
+
+                    if max_num_params > 0:
+                        shard_world_size = dist.get_world_size(self.tp_group)
+                        batch_size = shard_world_size
+                        num_batches = (max_num_params + batch_size - 1) // batch_size
+                        for _ in range(num_batches):
+                            yield from self._batch_dion_dummy_collective(shape_key, batch_size)
+                continue
+
             group_data = shape_groups[shape_key]
             local_shape = shape_key[0]
             m, n = local_shape
@@ -464,18 +519,29 @@ class MegatronDion(Optimizer):
             has_fs_axis = shape_key[1]
 
             if has_tp_axis and self.tp_group:
-                # inner_sharded: batch_size = TP world size
                 shard_world_size = dist.get_world_size(self.tp_group)
             elif has_fs_axis and self.fs_group:
-                # outer_sharded only: batch_size = FS world size
                 shard_world_size = dist.get_world_size(self.fs_group)
             else:
-                # non_sharded: use RP world size or default
                 shard_world_size = dist.get_world_size(self.rp_group) if self.rp_group else 1
 
             batch_size = shard_world_size
 
-            for i in range(0, len(group_data['params']), batch_size):
+            # Sync number of params for this shape_key across TP group
+            local_num_params = len(group_data['params'])
+            if has_tp_axis and self.tp_group is not None and dist.get_world_size(self.tp_group) > 1:
+                num_params_tensor = torch.tensor([local_num_params], device=torch.cuda.current_device(), dtype=torch.int64)
+                dist.all_reduce(num_params_tensor, op=dist.ReduceOp.MAX, group=self.tp_group)
+                max_num_params = int(num_params_tensor.item())
+            else:
+                max_num_params = local_num_params
+
+            for i in range(0, max_num_params, batch_size):
+                # Check if this rank has params for this batch iteration
+                if i >= len(group_data['params']):
+                    if has_tp_axis and self.tp_group is not None and dist.get_world_size(self.tp_group) > 1:
+                        yield from self._batch_dion_dummy_collective(shape_key, batch_size)
+                    continue
                 batch_end = min(i + batch_size, len(group_data['params']))
 
                 # Extract batch components - Store ORIGINAL params directly (not views)
@@ -996,18 +1062,10 @@ class MegatronDion(Optimizer):
 
             m_global, n_global = self._get_global_shape(meta, m, n)
 
-            # Restore TP dimension for true global shape
-            if config.has_tp_axis and self.tp_world_size > 1:
-                if config.inner_shard_tensor_dim == 0:
-                    m_true_global = m_global * self.tp_world_size
-                    n_true_global = n_global
-                elif config.inner_shard_tensor_dim == 1:
-                    m_true_global = m_global
-                    n_true_global = n_global * self.tp_world_size
-                else:
-                    m_true_global, n_true_global = m_global, n_global
-            else:
-                m_true_global, n_true_global = m_global, n_global
+            # NOTE: meta.global_shape is already TP restored in distrib_optimizer_for_dion.py
+            # (_build_gbuf_range_map applies: global_n = n * tp_world_size for tp_split_dim=1)
+            # Do NOT restore TP again here - it was causing double application bug!
+            m_true_global, n_true_global = m_global, n_global
 
             r_global = rank_fraction * min(m_true_global, n_true_global)
             r_global = rank_multiple_of * math.ceil(r_global / rank_multiple_of)
@@ -1017,7 +1075,11 @@ class MegatronDion(Optimizer):
             q_base_local = m if config.is_transposed else n
 
             if config.has_tp_axis and self.tp_group is not None and self.tp_world_size > 1:
-                assert r_global % self.tp_world_size == 0
+                # Ensure r_global is divisible by tp_world_size to avoid r_local=0
+                if r_global < self.tp_world_size:
+                    r_global = self.tp_world_size
+                elif r_global % self.tp_world_size != 0:
+                    r_global = self.tp_world_size * math.ceil(r_global / self.tp_world_size)
                 r_local = r_global // self.tp_world_size
             else:
                 r_local = r_global
@@ -1107,6 +1169,155 @@ class MegatronDion(Optimizer):
 
         return S
 
+    # TP Sync methods for Option C
+
+    def _sync_shape_keys_across_tp_group(self, local_shape_keys: List[Tuple]) -> List[Tuple]:
+        """
+        Sync shape_keys across TP group to ensure all TP ranks process same batches.
+
+        When Distributed Optimizer shards params across DP group (which includes TP),
+        different TP ranks may end up with different param sets. This causes TP collective
+        desync because some ranks have has_tp_axis=True params while others don't.
+
+        Solution: Gather all shape_keys from all TP ranks and return the union.
+        """
+        if self.tp_group is None:
+            return local_shape_keys
+
+        tp_world_size = dist.get_world_size(self.tp_group)
+        if tp_world_size <= 1:
+            return local_shape_keys
+
+        local_keys_serialized = []
+        for sk in local_shape_keys:
+            local_shape = tuple(sk[0]) if isinstance(sk[0], (tuple, list)) else sk[0]
+            key_data = (
+                local_shape,
+                bool(sk[1]),  # has_fs_axis
+                bool(sk[2]),  # has_tp_axis
+                bool(sk[3]),  # is_transposed
+                bool(sk[4]),  # compressed_all_reduce
+                int(sk[5]) if sk[5] is not None else -1,  # inner_shard_tensor_dim
+                int(sk[6]) if sk[6] is not None else -1,  # outer_shard_tensor_dim
+            )
+            local_keys_serialized.append(key_data)
+
+        gathered_keys_list = [None] * tp_world_size
+        dist.all_gather_object(gathered_keys_list, local_keys_serialized, group=self.tp_group)
+
+        all_keys_set = set()
+        for rank_keys in gathered_keys_list:
+            for key_data in rank_keys:
+                all_keys_set.add(key_data)
+
+        all_keys_sorted = sorted(all_keys_set)
+        return all_keys_sorted
+
+    def _batch_dion_dummy_collective(self, shape_key: Tuple, batch_size: int) -> Generator[None, None, None]:
+        """
+        Participate in TP collectives with dummy tensors when this rank has no params for a batch.
+
+        When Distributed Optimizer shards params differently across TP ranks,
+        some ranks may not have params for certain shape_keys. This function ensures those
+        ranks still participate in TP collectives to prevent hangs.
+        """
+        if self.tp_group is None:
+            return
+
+        tp_world_size = dist.get_world_size(self.tp_group)
+        if tp_world_size <= 1:
+            return
+
+        local_shape = shape_key[0]
+        m, n = local_shape
+        has_tp_axis = shape_key[2]
+        is_transposed = shape_key[3]
+        inner_shard_dim = shape_key[5] if shape_key[5] != -1 else None
+
+        rank_fraction = self.defaults.get('rank_fraction', 1.0)
+        rank_multiple_of = self.defaults.get('rank_multiple_of', 1)
+        q_base_local = m if is_transposed else n
+
+        # Compute r_global and r_local (matching _init_state logic)
+        if inner_shard_dim == 0:
+            m_true_global = m * tp_world_size
+            n_true_global = n
+        elif inner_shard_dim == 1:
+            m_true_global = m
+            n_true_global = n * tp_world_size
+        else:
+            m_true_global = m
+            n_true_global = n
+
+        r_global = int(rank_fraction * min(m_true_global, n_true_global))
+        r_global = rank_multiple_of * math.ceil(r_global / rank_multiple_of)
+        r_global = min(r_global, m_true_global, n_true_global)
+        r_global = max(1, r_global)
+
+        if r_global < tp_world_size:
+            r_global = tp_world_size
+        elif r_global % tp_world_size != 0:
+            r_global = tp_world_size * math.ceil(r_global / tp_world_size)
+
+        r_local = r_global // tp_world_size
+        r_local = max(1, r_local)
+        r_full = r_global
+
+        device = torch.cuda.current_device()
+        dtype = torch.float32
+
+        # STEP 2: Q unshard via all_gather
+        q_local = torch.zeros(q_base_local, r_local, device=device, dtype=dtype)
+        gathered_list = [torch.zeros(q_base_local, r_local, device=device, dtype=dtype) for _ in range(tp_world_size)]
+
+        for _ in range(batch_size):
+            handle = dist.all_gather(gathered_list, q_local.contiguous(), group=self.tp_group, async_op=True)
+            handle.wait()
+
+        yield
+
+        # STEP 4: _distributed_orthogonalize collectives
+        p_dim = m if not is_transposed else n
+        oversample = self.defaults.get('rcqr_oversample', 1.25)
+        k = math.ceil(oversample * r_full / 128) * 128
+        if k == 0:
+            k = 128
+        m_global = p_dim * tp_world_size
+
+        S_full = torch.zeros(batch_size, k, m_global, device=device, dtype=dtype)
+        tp_group_ranks = dist.get_process_group_ranks(self.tp_group)
+        broadcast_src = tp_group_ranks[0]
+        dist.broadcast(S_full, src=broadcast_src, group=self.tp_group)
+
+        SP_batch = torch.zeros(batch_size, k, r_full, device=device, dtype=dtype)
+        SP_slice = funcol.reduce_scatter_tensor(SP_batch, reduceOp="sum", scatter_dim=0, group=self.tp_group)
+        slice_batch_size = SP_slice.size(0)
+
+        R_slice = torch.zeros(slice_batch_size, r_full, r_full, device=device, dtype=dtype)
+        R_full = funcol.all_gather_tensor(R_slice.contiguous(), gather_dim=0, group=self.tp_group)
+
+        PP_local = torch.zeros(batch_size, r_full, r_full, device=device, dtype=dtype)
+        PP_slice = funcol.reduce_scatter_tensor(PP_local, reduceOp="sum", scatter_dim=0, group=self.tp_group)
+
+        R_slice2 = torch.zeros(PP_slice.size(0), r_full, r_full, device=device, dtype=dtype)
+        R_full2 = funcol.all_gather_tensor(R_slice2.contiguous(), gather_dim=0, group=self.tp_group)
+
+        yield
+
+        # STEP 5: R all_reduce (conditional)
+        R_batch = torch.zeros(batch_size, r_full, r_full, device=device, dtype=dtype)
+        need_tp_R = has_tp_axis and (
+            (not is_transposed and inner_shard_dim == 0) or
+            (is_transposed and inner_shard_dim == 1)
+        )
+        if need_tp_R:
+            tensors = [R_batch[i] for i in range(batch_size)]
+            reduced = funcol.all_reduce_coalesced(tensors, reduceOp="sum", group=self.tp_group)
+            yield
+
+        del q_local, gathered_list, S_full, SP_batch, SP_slice
+        del R_slice, R_full, PP_local, PP_slice, R_slice2, R_full2, R_batch
+
     def _orthogonalize(self, P: torch.Tensor, rcqr_oversample: float = 1.25) -> torch.Tensor:
         """Local orthogonalization with Randomized Cholesky QR."""
         # Use pure function with sketch_fn callback
@@ -1151,6 +1362,9 @@ class MegatronDion(Optimizer):
         P_batch_fp32 = P_batch.float()
 
         k = math.ceil(oversample * r / 128) * 128
+        if k == 0:
+            # Fallback: minimum k=128 when r is very small
+            k = 128
         std = math.sqrt(1.0 / k)
 
         if self._ortho_generator is not None and self._ortho_generator.device == device:
@@ -1289,19 +1503,40 @@ class MegatronDion(Optimizer):
 
         P_batch = M_batch @ Q_batch
 
-        # STEP 3.5: All-Reduce for P
-        if self.fs_group and dist.get_world_size(self.fs_group) > 1:
+        # STEP 3.5: All-Reduce for P (only if FS collectives are enabled)
+        # NOTE: Expert params use different shard_group (EP-internal), so we group by shard_group
+        if self.use_fs_collectives:
             need_fs = [i for i, c in enumerate(configs) if c.has_fs_axis and (
                 (not c.is_transposed and getattr(c, 'outer_shard_tensor_dim', None) == 1) or
                 (c.is_transposed and getattr(c, 'outer_shard_tensor_dim', None) == 0))]
 
             if need_fs:
-                tensors = [P_batch[i] for i in need_fs]
-                reduced = funcol.all_reduce_coalesced(tensors, reduceOp="sum", group=self.fs_group)
-                yield
-                for i, t in zip(need_fs, reduced):
-                    P_batch[i].copy_(t)
-                del tensors, reduced
+                # Group params by their shard_group (expert vs dense use different groups)
+                group_to_indices = {}
+                for i in need_fs:
+                    meta = metas[i] if i < len(metas) else None
+                    shard_group = getattr(meta, 'shard_group', None) if meta else None
+                    if shard_group is None:
+                        shard_group = self.fs_group
+                    group_id = id(shard_group) if shard_group else 0
+                    if group_id not in group_to_indices:
+                        group_to_indices[group_id] = (shard_group, [])
+                    group_to_indices[group_id][1].append(i)
+
+                # All-reduce for each group separately
+                did_yield = False
+                for group_id, (group, indices) in group_to_indices.items():
+                    if group and dist.get_world_size(group) > 1:
+                        tensors = [P_batch[idx] for idx in indices]
+                        reduced = funcol.all_reduce_coalesced(tensors, reduceOp="sum", group=group)
+                        if not did_yield:
+                            yield
+                            did_yield = True
+                        for idx, t in zip(indices, reduced):
+                            P_batch[idx].copy_(t)
+                        del tensors, reduced
+                if not did_yield and need_fs:
+                    yield  # Ensure we yield at least once if there were params to process
 
         # STEP 4: Orthogonalize P
         if use_compressed:
@@ -1357,7 +1592,18 @@ class MegatronDion(Optimizer):
             else:
                 m_local, n_local = param_shapes[i]
                 m_global, n_global = self._get_global_shape(metas[i], m_local, n_local)
-            scaled_lr = ((m_global / n_global) ** 0.5) * lr
+            # LR scaling based on scaling type:
+            # - "dion_ref": sqrt(m/n) * lr (original Dion reference implementation)
+            # - "dion": 0.2 / sqrt(rank_fraction) * sqrt(max(m,n)) * lr (RMS-matched for low-rank)
+            # - "moonlight": 0.2 * sqrt(max(m,n)) * lr (original Muon/Moonlight for full-rank)
+            if self._lr_scaling == "dion_ref":
+                scaled_lr = ((m_global / n_global) ** 0.5) * lr
+            elif self._lr_scaling == "dion":
+                rank_fraction = self.defaults.get('rank_fraction', 0.25)
+                base_scale = 0.2 / (rank_fraction ** 0.5)
+                scaled_lr = base_scale * (max(m_global, n_global) ** 0.5) * lr
+            else:  # "moonlight"
+                scaled_lr = 0.2 * (max(m_global, n_global) ** 0.5) * lr
 
             Q32 = Q_new_batch[i].float()
             delta = Q32 @ P_batch[i].t() if c.is_transposed else P_batch[i] @ Q32.t()
@@ -1640,25 +1886,25 @@ class MegatronDion(Optimizer):
     def _batch_error_feedback(self, momentums: List[Tensor], P_batch: Tensor,
                              R_batch: Tensor, configs: List[DionParamConfig],
                              groups: List[dict]):
-        """Apply error feedback to momentum."""
+        """Apply error feedback to momentum: M = M - (1-mu) * (P @ R^T)."""
+        # Get mu value (same for all params in this batch)
+        mu = groups[0].get('mu', self.defaults['mu'])
+
         is_transposed = configs[0].is_transposed
         if all(c.is_transposed == is_transposed for c in configs):
-            mu = groups[0].get('mu', self.defaults['mu'])
             self._foreach_baddbmm_(
                 momentums, P_batch, R_batch,
-                alpha=-(1 - mu), beta=1.0,
+                alpha=-(1.0 - mu), beta=1.0,
                 transpose=is_transposed
             )
         else:
             for i, momentum in enumerate(momentums):
-                mu = groups[i].get('mu', self.defaults['mu'])
-
                 if configs[i].is_transposed:
                     update = R_batch[i] @ P_batch[i].t()
                 else:
                     update = P_batch[i] @ R_batch[i].t()
 
-                momentum.add_(update, alpha=-(1 - mu))
+                momentum.add_(update, alpha=-(1.0 - mu))
                 del update
 
     def _batch_column_normalize_async(self, R_batch: Tensor, configs: List[DionParamConfig],
@@ -1679,7 +1925,7 @@ class MegatronDion(Optimizer):
 
             col_sum_sq = (R * R).sum(dim=0, keepdim=True)
 
-            fs_world_ok = (self.fs_group is not None and dist.get_world_size(self.fs_group) > 1)
+            fs_world_ok = (self.use_fs_collectives and self.fs_group is not None and dist.get_world_size(self.fs_group) > 1)
             need_allreduce = (config.has_fs_axis and fs_world_ok)
 
             if need_allreduce:
@@ -1688,7 +1934,7 @@ class MegatronDion(Optimizer):
 
             col_sum_sq_list.append(col_sum_sq)
 
-        if self.fs_group is not None and dist.get_world_size(self.fs_group) > 1:
+        if self.use_fs_collectives and self.fs_group is not None and dist.get_world_size(self.fs_group) > 1:
             num_to_reduce = torch.tensor([len(to_reduce_tensors)], device=R_batch.device, dtype=torch.int64)
             dist.all_reduce(num_to_reduce, op=dist.ReduceOp.MAX, group=self.fs_group)
             max_to_reduce = int(num_to_reduce.item())

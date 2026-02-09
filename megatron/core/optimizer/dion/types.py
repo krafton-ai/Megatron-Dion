@@ -44,6 +44,8 @@ class MegatronDionDistMeta:
     is_transposed: bool = False
     param_uid: Tuple = None  # (buffer_idx, bucket_idx, start) for unique identification
     is_dion_param: bool = False
+    is_expert: bool = False  # True if this is an expert parameter (MoE)
+    param_name: str = ""  # Full parameter name for debugging
 
     # Clear 2D parallelism groups
     replica_group: Optional[torch.distributed.ProcessGroup] = None  # RP group (across replicas)
@@ -61,7 +63,7 @@ class MegatronDionDistMeta:
                  global_range: Tuple[int, int] = None, tp_split_dim: int = -1,
                  rank_fraction: float = 0.25, global_shape: torch.Size = None,
                  param_uid: Tuple = None, is_dion_param: bool = False,
-                 fs_split_dim: int = -1):
+                 fs_split_dim: int = -1, is_expert: bool = False, param_name: str = ""):
         self.buffer_idx = buffer_idx
         self.bucket_idx = bucket_idx
         self.shape = shape
@@ -71,6 +73,8 @@ class MegatronDionDistMeta:
         self.rank_fraction = rank_fraction
         self.param_uid = param_uid
         self.is_dion_param = is_dion_param
+        self.is_expert = is_expert
+        self.param_name = param_name
 
         if global_shape is None:
             self.global_shape = shape if tp_split_dim == -1 else shape

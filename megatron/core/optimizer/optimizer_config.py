@@ -355,6 +355,9 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_Q_dtype: Optional[torch.dtype] = torch.float32
     """Dtype for Q basis matrices. Recommended: float32 for stability."""
 
+    dion_lr_scaling: str = "dion"
+    """LR scaling type: "dion_ref" (sqrt(m/n)), "dion" (RMS-matched), or "moonlight" (Muon-style)."""
+
     # 2D Parallelism for Dion
     fully_shard_model_parallel_size: int = 1
     """Fully Sharded (FS) size for 2D parallelism."""

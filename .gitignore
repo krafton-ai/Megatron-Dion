@@ -13,6 +13,7 @@ wandb/
 onelogger.log
 onelogger.err
 .venv
+venv/
 runs/
 /test_cases/
 **/dist/
@@ -20,3 +21,10 @@ runs/
 # Sphinx documentation
 docs/_build
 docs/apidocs
+uv.lock
+data/
+tensorboard/
+checkpoints/
+.claude/
+dion_test/
+megatron/core/datasets/Makefile

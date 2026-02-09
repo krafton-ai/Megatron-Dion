@@ -548,7 +548,13 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             # Get TP info
             tp_split_dim = get_tp_split_dim(param)
             has_tp = is_tp_enabled(param)
-            tp_world_size = get_tensor_model_parallel_world_size() if has_tp else 1
+            # CRITICAL: Expert params use Expert TP world size, not Dense TP world size
+            is_expert = not getattr(param, 'allreduce', True)
+            if is_expert and has_tp:
+                from megatron.core import parallel_state
+                tp_world_size = parallel_state.get_expert_tensor_parallel_world_size()
+            else:
+                tp_world_size = get_tensor_model_parallel_world_size() if has_tp else 1
 
             # FS split dimension is orthogonal to TP split dimension
             fs_split_dim = get_fs_split_dim(tp_split_dim)
@@ -1964,13 +1970,19 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             bucket_idx: Bucket index within buffer
         """
         from ..parallel_state import get_tensor_model_parallel_world_size
+        from megatron.core import parallel_state
 
         m, n = param.shape
 
         # Get TP info
         tp_split_dim = get_tp_split_dim(param)
         has_tp = is_tp_enabled(param)
-        tp_world_size = get_tensor_model_parallel_world_size() if has_tp else 1
+        # Expert params use Expert TP world size
+        is_expert = not getattr(param, 'allreduce', True)
+        if is_expert and has_tp:
+            tp_world_size = parallel_state.get_expert_tensor_parallel_world_size()
+        else:
+            tp_world_size = get_tensor_model_parallel_world_size() if has_tp else 1
 
         # FS split dimension is orthogonal to TP
         fs_split_dim = get_fs_split_dim(tp_split_dim)
@@ -2786,9 +2798,26 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 param_range_info["gbuf_world"].end
             )
 
-            # All Dion params on this rank use the same RP/FS groups
+            # Get param name and is_expert for shard_group selection
+            param_name = ""
+            if hasattr(self, 'param_to_name'):
+                param_name = self.param_to_name.get(model_param, "")
+            is_expert = not getattr(model_param, 'allreduce', True)
+
+            # Use different shard_group for expert vs dense params
+            # Expert params use expert_data_parallel_group (EP-internal FS)
+            # Dense params use global fs_group
             replica_group = self.my_rp_group
-            shard_group = self.my_fs_group
+            if is_expert:
+                from megatron.core import parallel_state
+                try:
+                    shard_group = parallel_state.get_expert_data_parallel_group(
+                        partial_expert_data_parallel=True
+                    )
+                except Exception:
+                    shard_group = self.my_fs_group
+            else:
+                shard_group = self.my_fs_group
 
             # Get group info from actual groups
             if replica_group is not None:
@@ -2818,6 +2847,8 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 fs_split_dim=fs_split_dim,  # Pass FS split dimension for correct axis detection
                 rank_fraction=self.optimizer.defaults.get('rank_fraction', 0.25),
                 is_dion_param=getattr(model_param, 'is_dion_param', True),
+                is_expert=is_expert,
+                param_name=param_name,
                 # Use tuple (buffer_idx, bucket_idx, start) for unique param_uid
                 # gbuf_world.start alone can collide across different buffers
                 param_uid=(shard_info.gbuf_index, shard_info.bucket_index, param_range_info["gbuf_world"].start),

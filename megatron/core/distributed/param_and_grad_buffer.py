@@ -663,7 +663,11 @@ class _ParamAndGradBucketGroup:
                         m, n = grad.numel(), 1
 
                 grad_2d = grad.view(m, n)
-                scale = 1.0 / fs_size
+                # Apply gradient_scaling_factor for averaging (same as Adam).
+                # RS SUM combines gradients from all DP ranks:
+                #   result = scale * sum(G_i) = gsf * sum(G_i) = (1/dp_size) * sum(G_i) = avg(G_i)
+                # NOTE: Do NOT divide by fs_size - each rank contributes different gradient.
+                scale = bucket.gradient_scaling_factor
 
                 for rank_i in range(fs_size):
                     start_idx = rank_i * size_per_rank

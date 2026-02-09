@@ -247,6 +247,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     data_parallel_group_idx: Optional[int] = None,
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
+    is_expert_parallel: bool = False,
 ) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
 
@@ -388,74 +389,110 @@ def _get_megatron_optimizer_based_on_param_groups(
             )
 
             # Create RP/FS groups for Dion 2D parallelism
-            fs_world_size = getattr(config, 'fully_shard_model_parallel_size', 1) or 1
-            rp_size = getattr(config, 'replicate_model_parallel_size', 1) or 1
+            # Option A: Auto-scale FS to match data_parallel_group size (for EP/MoE support)
+            user_fs_world_size = getattr(config, 'fully_shard_model_parallel_size', 1) or 1
+            rp_size = 1  # RP=1 is enforced for DO overlap compatibility
 
             rp_process_group = None
             fs_process_group = None
 
-            if data_parallel_group is not None and (fs_world_size > 1 or rp_size > 1):
+            if data_parallel_group is not None:
                 world_rank = dist.get_rank()
                 world_size = dist.get_world_size()
 
-                # CP > 1: FS group is based on pure DP (without CP)
-                # After RS on pure DP, an additional all-reduce across CP ranks is needed
+                # Auto-scale FS to data_parallel_group size (Option A)
+                # For EP: Dense uses full DP (size 4), Expert uses expert DP (size 2)
+                dp_world_ranks_local = dist.get_process_group_ranks(data_parallel_group)
+                fs_world_size = len(dp_world_ranks_local)
+
+                # Handle CP > 1: FS group should be based on pure DP (without CP)
+                # But only for the main DP group, not for expert DP groups
                 cp_size = parallel_state.get_context_parallel_world_size()
                 if cp_size > 1:
-                    dp_group_for_fs = parallel_state.get_data_parallel_group(with_context_parallel=False)
-                    dp_world_ranks_local = dist.get_process_group_ranks(dp_group_for_fs)
-                else:
-                    dp_world_ranks_local = dist.get_process_group_ranks(data_parallel_group)
+                    main_dp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+                    main_dp_ranks = dist.get_process_group_ranks(main_dp_group)
+                    if set(dp_world_ranks_local) == set(main_dp_ranks):
+                        dp_group_for_fs = parallel_state.get_data_parallel_group(with_context_parallel=False)
+                        dp_world_ranks_local = dist.get_process_group_ranks(dp_group_for_fs)
+                        fs_world_size = len(dp_world_ranks_local)
 
-                all_dp_groups_list = [None] * world_size
-                dist.all_gather_object(all_dp_groups_list, dp_world_ranks_local)
-
-                unique_dp_groups = []
-                seen = set()
-                for dp_group in all_dp_groups_list:
-                    dp_tuple = tuple(sorted(dp_group))
-                    if dp_tuple not in seen:
-                        seen.add(dp_tuple)
-                        unique_dp_groups.append(list(dp_tuple))
-                unique_dp_groups.sort()
-
-                my_rp_group = None
-                my_fs_group = None
-
-                for dp_group_ranks in unique_dp_groups:
-                    for fs_idx in range(fs_world_size):
-                        rp_ranks = [
-                            dp_group_ranks[rp_idx * fs_world_size + fs_idx]
-                            for rp_idx in range(rp_size)
-                        ]
-                        group = dist.new_group(ranks=rp_ranks)
-                        if world_rank in rp_ranks:
-                            my_rp_group = group
-
-                    for rp_idx in range(rp_size):
-                        fs_ranks = [
-                            dp_group_ranks[rp_idx * fs_world_size + fs_idx]
-                            for fs_idx in range(fs_world_size)
-                        ]
-                        group = dist.new_group(ranks=fs_ranks)
-                        if world_rank in fs_ranks:
-                            my_fs_group = group
-
-                if my_rp_group is None or my_fs_group is None:
-                    raise RuntimeError(
-                        f"World rank {world_rank}: Failed to find RP/FS groups!"
+                if fs_world_size != user_fs_world_size:
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        f"Dion: Auto-scaled FS from {user_fs_world_size} to {fs_world_size} "
+                        f"to match data_parallel_group size (EP/MoE support)",
                     )
 
-                rp_process_group = my_rp_group
-                fs_process_group = my_fs_group
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"Dion 2D parallelism: RP={rp_size}, FS={fs_world_size}",
-                )
+                if fs_world_size > 1:
+                    all_dp_groups_list = [None] * world_size
+                    dist.all_gather_object(all_dp_groups_list, dp_world_ranks_local)
+
+                    unique_dp_groups = []
+                    seen = set()
+                    for dp_group in all_dp_groups_list:
+                        dp_tuple = tuple(sorted(dp_group))
+                        if dp_tuple not in seen:
+                            seen.add(dp_tuple)
+                            unique_dp_groups.append(list(dp_tuple))
+                    unique_dp_groups.sort()
+
+                    my_rp_group = None
+                    my_fs_group = None
+
+                    for dp_group_ranks in unique_dp_groups:
+                        for fs_idx in range(fs_world_size):
+                            rp_ranks = [
+                                dp_group_ranks[rp_idx * fs_world_size + fs_idx]
+                                for rp_idx in range(rp_size)
+                            ]
+                            group = dist.new_group(ranks=rp_ranks)
+                            if world_rank in rp_ranks:
+                                my_rp_group = group
+
+                        for rp_idx in range(rp_size):
+                            fs_ranks = [
+                                dp_group_ranks[rp_idx * fs_world_size + fs_idx]
+                                for fs_idx in range(fs_world_size)
+                            ]
+                            group = dist.new_group(ranks=fs_ranks)
+                            if world_rank in fs_ranks:
+                                my_fs_group = group
+
+                    if my_rp_group is None or my_fs_group is None:
+                        raise RuntimeError(
+                            f"World rank {world_rank}: Failed to find RP/FS groups! "
+                            f"FS={fs_world_size}, RP={rp_size}, DP_ranks={dp_world_ranks_local}"
+                        )
+
+                    rp_process_group = my_rp_group
+                    fs_process_group = my_fs_group
+
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        f"Dion 2D parallelism: RP={rp_size}, FS={fs_world_size}",
+                    )
+                else:
+                    rp_process_group = data_parallel_group
+                    fs_process_group = data_parallel_group
             else:
                 rp_process_group = data_parallel_group
                 fs_process_group = data_parallel_group
+
+            # Select TP group: expert params use expert_tensor_parallel_group
+            use_fs_collectives = config.dion_use_fs_collectives
+            tp_group_to_use = (
+                parallel_state.get_expert_tensor_parallel_group()
+                if is_expert_parallel and parallel_state.get_expert_tensor_parallel_group(check_initialized=False) is not None
+                else parallel_state.get_tensor_model_parallel_group()
+            )
+
+            # Get EP size for is_ep_mode flag
+            try:
+                ep_size = parallel_state.get_expert_model_parallel_world_size()
+            except Exception:
+                ep_size = 1
 
             optimizer = MegatronDion(
                 param_groups,
@@ -470,12 +507,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                 eps=config.dion_eps,
                 scalar_optimizer=config.dion_scalar_optimizer,
                 mixed_precision_config=mixed_precision_config,
-                use_fs_collectives=config.dion_use_fs_collectives,
+                use_fs_collectives=use_fs_collectives,
                 use_compressed_comm=config.dion_use_compressed_comm,
                 rp_group=rp_process_group,
                 fs_group=fs_process_group,
-                tp_group=parallel_state.get_tensor_model_parallel_group(),
+                tp_group=tp_group_to_use,
                 enable_async=True,
+                lr_scaling=config.dion_lr_scaling,
+                is_ep_mode=(ep_size > 1),
             )
             init_state_fn = None
         else:
@@ -522,8 +561,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                     DistributedOptimizerForDion,
                 )
 
-                fs_size = getattr(config, 'fully_shard_model_parallel_size', None) or 1
-                rp_size = getattr(config, 'replicate_model_parallel_size', None) or 1
+                import torch.distributed as dist
+                # Auto-scale FS to data_parallel_group size (Option A for EP support)
+                if data_parallel_group is not None:
+                    dp_world_ranks = dist.get_process_group_ranks(data_parallel_group)
+                    fs_size = len(dp_world_ranks)
+                else:
+                    fs_size = getattr(config, 'fully_shard_model_parallel_size', None) or 1
+                rp_size = 1  # RP=1 enforced for DO overlap compatibility
 
                 optimizer = DistributedOptimizerForDion(
                     *optimizer_args,
@@ -746,6 +791,7 @@ def get_megatron_optimizer(
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                is_expert_parallel=True,
             )
         )
 
