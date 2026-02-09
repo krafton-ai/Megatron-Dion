@@ -1,6 +1,6 @@
 #!/bin/bash
 # Megatron-LM training script matching nanoMoE configuration (Dion optimizer)
-# Reference: /wbl/optimization/nanoMoE/config/train_nano_moe.py
+# Reference: nanoMoE config/train_nano_moe.py
 #
 # Parallelism: FS=2, TP=2, EP=2 (8 GPUs)
 #
@@ -9,7 +9,10 @@
 #   - MoE: 8 experts, top-2, every other layer (stride=2)
 #   - Training: lr=6e-4, weight_decay=0.1, warmup=2000, max_iters=50000
 #   - Batch: ~491,520 tokens per step
-#   - Dataset: OpenWebText (~9B tokens)
+#   - Dataset: Fineweb 10B tokens
+#
+# Usage:
+#   bash examples/dion/run_nanomoe_dion.sh
 
 set -e
 export CUDA_DEVICE_MAX_CONNECTIONS=1
