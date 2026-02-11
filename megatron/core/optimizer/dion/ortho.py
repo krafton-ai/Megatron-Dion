@@ -1,6 +1,7 @@
 """Orthogonalization functions for Dion optimizer."""
 
 import logging
+import math
 from typing import Callable, Optional
 
 import torch
@@ -88,8 +89,6 @@ def _default_sketch_matrix(P: Tensor, oversample: float) -> Tensor:
     Returns:
         Sketch matrix S of shape (..., k, m)
     """
-    import math
-
     batch_shape = P.shape[:-2]
     m = P.size(-2)
     r = P.size(-1)

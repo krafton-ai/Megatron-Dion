@@ -1,7 +1,8 @@
 """Dion optimizer main class for Megatron-LM."""
 
 import logging
-import os
+import math
+import hashlib
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import torch
@@ -167,10 +168,6 @@ class MegatronDion(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-
-        # Test mode: Apply Adam update using Dion gradients (DION_TEST_ADAM=1)
-        if os.getenv("DION_TEST_ADAM", "0") == "1":
-            return self._step_test_adam(loss)
 
         # Reset counters at the beginning of each step
         self._dion_update_count = 0
@@ -786,79 +783,6 @@ class MegatronDion(Optimizer):
             for meta in self.dist_metas.values() if meta.is_dion_param
         )
 
-    # Test mode: Adam update using Dion gradients (DION_TEST_ADAM=1)
-    @torch.no_grad()
-    def _step_test_adam(self, loss=None):
-        """Test mode: Apply Adam update using Dion gradients."""
-        self._step_count += 1
-        global_rank = self._global_rank
-
-        total_updated = 0
-        total_zero_grad = 0
-
-        for group in self.param_groups:
-            lr = group.get('lr', self.defaults['lr'])
-            # Apply per-group weight decay multiplier (wd_mult)
-            wd_mult = group.get('wd_mult', 1.0)
-            weight_decay = self.defaults['weight_decay'] * wd_mult
-            beta1 = 0.9
-            beta2 = 0.999
-            eps = 1e-8
-
-            for p in group['params']:
-                if not getattr(p, 'is_dion_param', False):
-                    continue
-
-                # Get gradient (same path as Dion update)
-                grad = self._get_gradient(p)
-                if grad is None:
-                    total_zero_grad += 1
-                    continue
-
-                # Ensure gradient is float32 for numerical stability
-                if grad.dtype != torch.float32:
-                    grad = grad.float()
-
-                # Check for zero gradient
-                grad_norm = grad.norm().item()
-                if grad_norm < 1e-12:
-                    total_zero_grad += 1
-                    continue
-
-                # Get or initialize Adam states
-                state = self.state[p]
-                if 'test_exp_avg' not in state:
-                    state['test_exp_avg'] = torch.zeros_like(grad, dtype=torch.float32)
-                    state['test_exp_avg_sq'] = torch.zeros_like(grad, dtype=torch.float32)
-                    state['test_step'] = 0
-
-                state['test_step'] += 1
-                step = state['test_step']
-
-                exp_avg = state['test_exp_avg']
-                exp_avg_sq = state['test_exp_avg_sq']
-
-                # Adam update
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-
-                bias_correction1 = 1 - beta1 ** step
-                bias_correction2 = 1 - beta2 ** step
-
-                step_size = lr / bias_correction1
-                denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(eps)
-
-                # Weight decay (decoupled, AdamW style)
-                if weight_decay > 0:
-                    p.data.add_(p.data, alpha=-lr * weight_decay)
-
-                # Apply update
-                p.data.addcdiv_(exp_avg, denom, value=-step_size)
-
-                total_updated += 1
-
-        return loss
-
     # Scalar optimizer methods (AdamW, Lion)
 
     def _adamw_update(self, p: Tensor, grad: Tensor, state: Dict, group: Dict,
@@ -994,7 +918,7 @@ class MegatronDion(Optimizer):
 
     def _get_or_initialize_state(self, param: Tensor, group: dict) -> dict:
         """Get existing state or lazy-initialize it."""
-        import hashlib
+
 
         param_uid = getattr(param, "_dion_param_uid", None)
         meta = self.dist_metas.get(param, None)
@@ -1023,8 +947,8 @@ class MegatronDion(Optimizer):
 
     def _init_state(self, param: Tensor, state: Dict[str, Any], group: dict):
         """Initialize optimizer state with proper configuration."""
-        import hashlib
-        import math
+
+
 
         # Initialize momentum
         momentum_dtype = self._str_to_dtype(self._mixed_precision_config.momentum_dtype)
@@ -1137,8 +1061,8 @@ class MegatronDion(Optimizer):
 
     def _generate_random_sketch_matrix(self, P: torch.Tensor, oversample: float = 1.25) -> torch.Tensor:
         """Generate random sketch matrix for Randomized Cholesky QR."""
-        import hashlib
-        import math
+
+
 
         assert P.ndim >= 2
         batch_shape = P.shape[:-2]
@@ -1342,7 +1266,7 @@ class MegatronDion(Optimizer):
         oversample: float = 1.25,
     ) -> torch.Tensor:
         """Distributed orthogonalization matching Algorithm 2."""
-        import math
+
 
         batch_size = P_batch.size(0)
         m_shard_local = P_batch.size(1)
