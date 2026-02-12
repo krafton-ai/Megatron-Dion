@@ -33,6 +33,8 @@ def adamw_update(
         state['exp_avg'] = torch.zeros_like(grad, dtype=torch.float32)
         state['exp_avg_sq'] = torch.zeros_like(grad, dtype=torch.float32)
         state['step'] = 0
+    if 'step' not in state:
+        state['step'] = 0
 
     exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
 

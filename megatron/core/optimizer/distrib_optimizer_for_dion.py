@@ -2462,6 +2462,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                         shard_main_param = model_param.float().view(-1)[
                             param_range.start : param_range.end
                         ]
+                    shard_main_param._model_param = model_param
                 else:
                     shard_main_param = shard_model_param.clone().float()
                     shard_main_param._model_param = model_param
@@ -4021,6 +4022,157 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         self.start_param_gather_after_step()
 
         return ok
+
+    def sharded_state_dict(
+        self,
+        model_sharded_state_dict=None,
+        is_loading: bool = False,
+        sharding_type=None,
+        metadata=None,
+    ):
+        """Override to handle Dion's 2D FS sharding for checkpoint save/load.
+
+        Dion uses 2D FS sharding (row/col split) instead of standard DO's flat sharding.
+        The parent DO's dp_reshardable format assumes flat sharding and fails with
+        negative tensor dimensions for Dion params.
+
+        Solution: Use non-reshardable format (ShardedObject) which saves each DP rank's
+        state as-is. Requires same parallelism config (FS, TP, EP) for save and load.
+
+        Saves two parts:
+        1. Common state (step, param_groups) - same format as parent DO
+        2. MegatronDion's inner parameter state (momentum, Q, exp_avg, etc.)
+           as a single ShardedObject per DP rank
+        """
+        from ..dist_checkpointing.mapping import ShardedObject
+
+        if model_sharded_state_dict is None:
+            model_sharded_state_dict = {}
+
+        dp_rank = self.data_parallel_group.rank()
+        base_key = f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}'
+        replica_id = (self.distributed_optimizer_instance_id, 0, dp_rank)
+
+        # Part 1: Common state (step, param_groups) - same format as parent
+        common_state = self.state_dict()
+        state_dict = {
+            k: ShardedObject(f'{base_key}.{k}', v, (1,), (0,), replica_id=replica_id)
+            for k, v in common_state.items()
+        }
+
+        # Part 2: MegatronDion's inner parameter state (momentum, Q, exp_avg, etc.)
+        # Use model param NAME as key (deterministic across runs) instead of integer
+        # index (param ordering in param_groups can differ between save and load runs)
+        name_to_state = {}
+        for p, s in self.optimizer.state.items():
+            name = self._get_shard_param_name(p)
+            if name is not None:
+                name_to_state[name] = s
+        state_dict['param_state'] = ShardedObject(
+            f'{base_key}.dion_param_state', name_to_state, (1,), (0,),
+            replica_id=replica_id,
+        )
+        state_dict['param_state_sharding_type'] = 'dion_non_reshardable'
+
+        # NOTE: Do NOT call self.load_state_dict() during is_loading.
+        # The parent's load_state_dict allocates dummy flat 1D tensors (exp_avg, exp_avg_sq)
+        # that overwrite MegatronDion's proper state (momentum, Q, etc.) and cause shape
+        # mismatches. Our load_state_dict override below handles restoration correctly.
+
+        return state_dict
+
+    def load_state_dict(self, state_dict):
+        """Override to handle Dion-specific checkpoint loading.
+
+        When param_state_sharding_type is 'dion_non_reshardable':
+        - Restores MegatronDion's full state (momentum, Q, exp_avg, etc.)
+        - Restores param_groups hyperparameters (lr, step, mu, etc.)
+        - Restores grad_scaler if present
+
+        Otherwise falls back to parent DO's load_state_dict.
+        """
+        if state_dict.get('param_state_sharding_type') != 'dion_non_reshardable':
+            super().load_state_dict(state_dict)
+            return
+
+        # Restore MegatronDion's parameter state from checkpoint
+        # State is keyed by model param name (deterministic across runs)
+        name_to_state = state_dict.get('param_state')
+        if name_to_state and isinstance(name_to_state, dict) and len(name_to_state) > 0:
+            restored = 0
+            missing = 0
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    name = self._get_shard_param_name(p)
+                    if name is None:
+                        missing += 1
+                        continue
+                    if name in name_to_state:
+                        saved = name_to_state[name]
+                        # Validate momentum shape matches param (topology must be same)
+                        saved_momentum = saved.get('momentum')
+                        if (isinstance(saved_momentum, torch.Tensor)
+                                and saved_momentum.shape != p.shape):
+                            logger.warning(
+                                f'[Dion] Shape mismatch for {name}: '
+                                f'saved momentum={tuple(saved_momentum.shape)}, '
+                                f'current param={tuple(p.shape)}. '
+                                f'Skipping restore (will re-init).'
+                            )
+                            missing += 1
+                            continue
+                        # Cast tensors to match param device
+                        restored_state = {}
+                        for k, v in saved.items():
+                            if isinstance(v, torch.Tensor):
+                                restored_state[k] = v.to(device=p.device)
+                            else:
+                                restored_state[k] = v
+                        self.optimizer.state[p] = restored_state
+                        restored += 1
+                    else:
+                        missing += 1
+            logger.info(
+                f'[Dion] Restored {restored} param states from checkpoint '
+                f'({missing} missing, will re-init on first step)'
+            )
+        else:
+            logger.info('[Dion] No param state in checkpoint, will re-initialize on first step')
+
+        # Restore param_groups hyperparameters (lr, step, mu, etc.)
+        if 'optimizer' in state_dict:
+            saved_opt = state_dict['optimizer']
+            if isinstance(saved_opt, dict) and 'param_groups' in saved_opt:
+                for current_pg, saved_pg in zip(
+                    self.optimizer.param_groups, saved_opt['param_groups']
+                ):
+                    for key, value in saved_pg.items():
+                        if key != 'params':
+                            current_pg[key] = value
+
+        # Restore grad_scaler
+        if 'grad_scaler' in state_dict and self.grad_scaler:
+            self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
+
+        # Sync fp32 main params from bf16 model params.
+        # The fp32 copies still hold stale values from __init__ (cloned before checkpoint
+        # loading). Without this, the first optimizer step would corrupt model params.
+        # bf16->fp32 cast has ~1e-3 precision loss, acceptable for training resumption.
+        self._copy_model_params_to_main_params()
+
+    def _get_shard_param_name(self, shard_param):
+        """Get deterministic model param name for a shard param.
+
+        Traces shard_param -> model_param -> param_to_name mapping.
+        Returns None if name cannot be found.
+        """
+        model_param = getattr(shard_param, '_model_param', None)
+        if model_param is None:
+            return None
+        for buffer in self.buffers:
+            if hasattr(buffer, 'param_to_name') and model_param in buffer.param_to_name:
+                return buffer.param_to_name[model_param]
+        return None
 
     def offload_to_cpu(self):
         """Clean up Dion-specific buffers during offload.
