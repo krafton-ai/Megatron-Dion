@@ -2285,18 +2285,15 @@ def _add_training_args(parser):
                        help='Beta2 for Dion scalar optimizer.')
     group.add_argument('--dion-eps', type=float, default=1e-8,
                        help='Epsilon for Dion scalar optimizer.')
-    group.add_argument('--dion-lr-scaling', type=str, default='dion',
-                       choices=['dion_ref', 'dion', 'moonlight'],
-                       help='LR scaling type for Dion. '
-                            'dion_ref: sqrt(m/n)*lr, '
-                            'dion: 0.2/sqrt(rank_fraction)*sqrt(max(m,n))*lr, '
-                            'moonlight: 0.2*sqrt(max(m,n))*lr.')
     group.add_argument('--dion-momentum-dtype', type=str, default='float32',
                        choices=['float32', 'bfloat16'],
                        help='Dion momentum state dtype.')
     group.add_argument('--dion-Q-dtype', type=str, default='float32',
                        choices=['float32', 'bfloat16'],
                        help='Dion Q matrix dtype.')
+    group.add_argument('--dion-lr-scaling', type=str, default='dion',
+                       choices=['dion_ref', 'dion', 'moonlight'],
+                       help='Dion LR scaling: dion_ref (sqrt(m/n)), dion (RMS-matched), moonlight (Muon-style).')
     # 2D Parallelism for Dion
     group.add_argument('--fully-shard-model-parallel-size', type=int, default=1,
                        help='Fully Sharded (FS) size for Dion 2D parallelism.')

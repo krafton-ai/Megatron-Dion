@@ -65,10 +65,11 @@ def orthogonalize(
         # Step 5: Cholesky QR for better orthogonalization
         PP = P.mT @ P  # Always do float32 matrix multiply
 
-        # No regularization (matches dion_reference.py)
         R, info = torch.linalg.cholesky_ex(PP, upper=True)
-        if info > 0:
-            logger.warning(f"[Dion] Cholesky failed at position {info.item()}, using fallback QR")
+        if (info > 0).any():
+            # Cholesky failed (near-singular PP) — QR fallback for numerical stability
+            Q, _ = torch.linalg.qr(P)
+            return Q.to(original_dtype).contiguous()
 
         P = torch.linalg.solve_triangular(
             R, P, upper=True, left=False
@@ -89,6 +90,7 @@ def _default_sketch_matrix(P: Tensor, oversample: float) -> Tensor:
     Returns:
         Sketch matrix S of shape (..., k, m)
     """
+
     batch_shape = P.shape[:-2]
     m = P.size(-2)
     r = P.size(-1)

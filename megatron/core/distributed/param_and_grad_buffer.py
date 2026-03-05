@@ -40,8 +40,6 @@ except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
-import megatron.core.nccl_allocator as nccl_allocator
-
 
 class BufferType(Enum):
     """
@@ -583,6 +581,10 @@ class _ParamAndGradBucketGroup:
             if dion_shard_size <= 0 or pack_total <= 0:
                 continue
 
+            # Pack FS-size chunks. CP averaging is now done separately before RS.
+            packing_size = fs_size
+            use_dp_cp_rs = False
+
             # Build lookup maps
             dion_ptr_to_entry = {}
             dion_name_to_entry = {}
@@ -593,9 +595,6 @@ class _ParamAndGradBucketGroup:
                     if hasattr(e_param, '_param_name'):
                         dion_name_to_entry[e_param._param_name] = e
 
-            # Separate row-split and col-split entries for stats
-            row_split_entries = []
-            col_split_entries = []
             all_entries = []
 
             for bucket_param in bucket.params:
@@ -609,36 +608,20 @@ class _ParamAndGradBucketGroup:
                     continue
 
                 entry['_bucket_param'] = bucket_param
-                fs_split_dim = entry.get('fs_split_dim', 0)
-
-                if fs_split_dim == 0:
-                    row_split_entries.append(entry)
-                else:
-                    col_split_entries.append(entry)
                 all_entries.append(entry)
 
-            # Calculate buffer size
-            non_dion_shard_size = getattr(bucket, 'non_dion_shard_size', 0)
-            rs_output_size = dion_shard_size + non_dion_shard_size
-            bucket_total = bucket.grad_data.numel()
-            total_buffer_size = pack_total * fs_size
-
-            # When CP > 1, all-reduce gradients before RS to average across CP ranks
-            cp_group = getattr(bucket, 'cp_group', None)
-            if cp_group is not None and cp_group.size() > 1:
-                cp_size = cp_group.size()
-                torch.distributed.all_reduce(
-                    bucket.grad_data,
-                    op=torch.distributed.ReduceOp.AVG,
-                    group=cp_group,
-                )
-
-            # Two-pass packing: read all segments first, then write (avoids overlap corruption)
-            can_reuse_grad_data = bucket_total >= total_buffer_size
-
-            # Pass 1: Read all segments before any write
-            segments_to_write = []
-            packed_count = 0
+            total_buffer_size = pack_total * packing_size
+            # IMPORTANT: Always allocate separate buffer.
+            # Reusing grad_data causes overlap between RS input and output
+            # (dion_grad_buffer = grad_data[:N*pack_total], RS output = grad_data[:pack_total]),
+            # which corrupts NCCL reduce_scatter results.
+            dion_grad_buffer = torch.zeros(
+                total_buffer_size,
+                dtype=bucket.grad_data.dtype,
+                device=bucket.grad_data.device,
+            )
+            bucket._memory_reused = False
+            bucket.dion_grad_buffer = dion_grad_buffer
 
             for entry in all_entries:
                 bucket_param = entry['_bucket_param']
@@ -663,55 +646,44 @@ class _ParamAndGradBucketGroup:
                         m, n = grad.numel(), 1
 
                 grad_2d = grad.view(m, n)
-                # Apply gradient_scaling_factor for averaging (same as Adam).
-                # RS SUM combines gradients from all DP ranks:
-                #   result = scale * sum(G_i) = gsf * sum(G_i) = (1/dp_size) * sum(G_i) = avg(G_i)
-                # NOTE: Do NOT divide by fs_size - each rank contributes different gradient.
-                scale = bucket.gradient_scaling_factor
+                # Scale for Dion packing before reduce-scatter.
+                # Dion buckets do CP aggregation separately (cp_group below) and then RS over FS.
+                # - average_in_collective=True: RS uses AVG, so no pre-scaling is needed.
+                # - average_in_collective=False: RS uses SUM. Since we do CP AVG separately,
+                #   pre-scale by (gradient_scaling_factor * cp_size) so that the final scaling
+                #   matches standard dp-cp reduction semantics.
+                is_expert_bucket = not getattr(bucket_param, 'allreduce', True)
+                if is_expert_bucket:
+                    # Expert buckets do not use CP, so gradient_scaling_factor is sufficient.
+                    scale = bucket.gradient_scaling_factor
+                else:
+                    if self.ddp_config.average_in_collective:
+                        scale = 1.0
+                    else:
+                        cp_group = getattr(bucket, 'cp_group', None)
+                        cp_size = cp_group.size() if cp_group is not None else 1
+                        scale = bucket.gradient_scaling_factor * cp_size
 
-                for rank_i in range(fs_size):
-                    start_idx = rank_i * size_per_rank
+                for rank_j in range(packing_size):
+                    fs_pos = dp_cp_to_fs[rank_j] if use_dp_cp_rs else rank_j
+                    start_idx = fs_pos * size_per_rank
                     end_idx = min(start_idx + size_per_rank, m if fs_split_dim == 0 else n)
 
                     if fs_split_dim == 0:
-                        segment = grad_2d[start_idx:end_idx, :].contiguous().view(-1)
+                        seg_2d = grad_2d[start_idx:end_idx, :]
                     else:
-                        segment = grad_2d[:, start_idx:end_idx].contiguous().view(-1)
+                        seg_2d = grad_2d[:, start_idx:end_idx]
 
-                    # Compute scaled value NOW (before any write to grad_data)
-                    # segment * scale creates a NEW tensor - safe from corruption
-                    scaled_segment = segment * scale
-                    buf_offset = rank_i * pack_total + pack_offset
+                    if seg_2d.numel() == 0:
+                        continue
 
-                    # Store for later write
-                    segments_to_write.append((buf_offset, scaled_segment))
+                    buf_offset = rank_j * pack_total + pack_offset
+                    out = dion_grad_buffer[buf_offset:buf_offset + seg_2d.numel()].view_as(seg_2d)
+                    out.copy_(seg_2d)
+                    if scale != 1.0:
+                        out.mul_(scale)
 
-                packed_count += 1
                 del entry['_bucket_param']
-
-            # Pass 2: Write all segments to dion_grad_buffer
-            if can_reuse_grad_data:
-                # Use grad_data directly as dion_grad_buffer (VIEW - no allocation!)
-                dion_grad_buffer = bucket.grad_data[:total_buffer_size]
-                bucket._memory_reused = True
-            else:
-                # Fallback: allocate separate buffer (should not happen in practice)
-                dion_grad_buffer = torch.zeros(
-                    total_buffer_size,
-                    dtype=bucket.grad_data.dtype,
-                    device=bucket.grad_data.device,
-                )
-                bucket._memory_reused = False
-
-            bucket.dion_grad_buffer = dion_grad_buffer
-
-            # Write all stored segments to dion_grad_buffer
-            for buf_offset, scaled_segment in segments_to_write:
-                segment_numel = scaled_segment.numel()
-                dion_grad_buffer[buf_offset:buf_offset + segment_numel].copy_(scaled_segment)
-
-            # Cleanup: help GC reclaim memory from segments_to_write
-            del segments_to_write
 
         # Handle non-Dion params in mixed buckets for GRAD_FUSION=1
         for bucket in self.buckets:
@@ -737,7 +709,12 @@ class _ParamAndGradBucketGroup:
 
             # Get DP group info
             dp_group = bucket.non_dion_dp_group if hasattr(bucket, 'non_dion_dp_group') and bucket.non_dion_dp_group else None
-            dp_size = dp_group.size() if dp_group else 4
+            if dp_group is None:
+                raise RuntimeError(
+                    "[Dion] non_dion_dp_group is missing for a mixed bucket; "
+                    "cannot safely compute dp_size for non-Dion GRAD_FUSION packing."
+                )
+            dp_size = dp_group.size()
             non_dion_pack_total = getattr(bucket, 'non_dion_pack_total', 0)
 
             # Build name-to-entry map for non-Dion params
@@ -786,7 +763,14 @@ class _ParamAndGradBucketGroup:
                 shard_size = entry['segment_size']
                 grad_flat = grad_source.view(-1)
                 param_numel = grad_flat.numel()
-                scale = 1.0 / dp_size  # Pre-scale for SUM reduction
+                # Pre-scale for RS. Non-Dion mixed-bucket path does CP aggregation separately
+                # and then RS over DP/FS.
+                if self.ddp_config.average_in_collective:
+                    scale = 1.0
+                else:
+                    cp_group = getattr(bucket, 'cp_group', None)
+                    cp_size = cp_group.size() if cp_group is not None else 1
+                    scale = bucket.gradient_scaling_factor * cp_size
 
                 # Write each shard to the corresponding section
                 for rank_i in range(dp_size):
@@ -798,7 +782,8 @@ class _ParamAndGradBucketGroup:
                         buf_start = rank_i * non_dion_pack_total + pack_offset
                         buf_end = buf_start + actual_shard_size
                         bucket.non_dion_full_grad_buffer[buf_start:buf_end].add_(
-                            grad_flat[shard_start:shard_end] * scale
+                            grad_flat[shard_start:shard_end],
+                            alpha=scale,
                         )
 
         # gradient_scaling_factor already takes into account whether we are computing
@@ -806,7 +791,8 @@ class _ParamAndGradBucketGroup:
         for bucket in self.buckets:
             if bucket.gradient_scaling_factor != 1.0:
                 # Skip gradient_scaling_factor for Dion buckets
-                # Dion packing already pre-scaled by 1/fs_size, and scratch is a view of grad_data.
+                # Dion packing already pre-scaled (gradient_scaling_factor or 1/fs_size),
+                # and scratch is a view of grad_data.
                 # If we scale grad_data, scratch (RS input) would be incorrectly scaled.
                 has_dion = (hasattr(bucket, 'dion_param_layout') and bucket.dion_param_layout and
                            len(bucket.dion_param_layout) > 0)
@@ -871,22 +857,36 @@ class _ParamAndGradBucketGroup:
                     fs_param_ids = {id(e['param']) for e in (bucket.dion_param_layout if hasattr(bucket, 'dion_param_layout') and bucket.dion_param_layout else [])}
                     has_non_dion = any(id(p) not in fs_param_ids for p in bucket.params)
 
-                    # Get communication group (FS group = DP group when RP=1)
-                    # Note: dion_comm_group is set by distrib_optimizer_for_dion.py
-                    comm_group = getattr(bucket, "dion_comm_group", None) or communication_group
-                    world_size = comm_group.size()
+                    # RS group: always use FS group for Dion RS.
+                    # CP AVG is done separately before RS (line 893-899),
+                    # so RS should only scatter across FS ranks (not dp_cp).
+                    # Using dp_cp group would cause CP-rank duplicates in the SUM.
+                    dion_rs_group = getattr(bucket, "dion_comm_group", None) or communication_group
 
-                    # ------- Dion params: Single RS -------
-                    # dion_grad_buffer → grad_data[:dion_shard_size]
+                    # ------- Dion params: CP AVG then FS RS -------
+                    # CP>1: average partial gradients across CP ranks first,
+                    # then reduce-scatter over FS group (same as non-Dion path).
                     if has_dion:
                         dion_shard_size = bucket.dion_shard_size
                         dion_grad_buffer = bucket.dion_grad_buffer
+
+                        # CP averaging for Dion gradients (dense params only)
+                        cp_group = getattr(bucket, 'cp_group', None)
+                        if cp_group is not None and cp_group.size() > 1:
+                            torch.distributed.all_reduce(
+                                dion_grad_buffer,
+                                op=torch.distributed.ReduceOp.AVG,
+                                group=cp_group,
+                            )
+
+                        # RS over FS group (not dp_cp)
+                        fs_rs_group = getattr(bucket, "dion_comm_group", None) or communication_group
 
                         h = dist_reduce_scatter_func(
                             bucket.grad_data[:dion_shard_size],
                             dion_grad_buffer,
                             op=reduce_op,
-                            group=comm_group,
+                            group=fs_rs_group,
                             async_op=async_op,
                         )
                         if async_op and h is not None:

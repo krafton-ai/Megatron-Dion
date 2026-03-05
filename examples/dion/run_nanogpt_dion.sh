@@ -1,25 +1,19 @@
 #!/bin/bash
 # =============================================================================
-# Fineweb 10B GPT Training with DION + Distributed Optimizer
+# nanoGPT 124M Dense + Dion
 # =============================================================================
-#
-# Configuration: 8 GPUs = TP(2) × FS(4) × RP(1)
-#   - Tensor Parallel: 2
-#   - Fully Shard (FS): 4 (DION's 2D parallelism)
-#   - Replicate Parallel (RP): 1
-#   - overlap_grad_reduce: enabled
-#   - overlap_param_gather: enabled
-#
-# This script matches the parallelism configuration for Adam distributed
-# experiments to enable fair comparison.
 #
 # Model: 124M GPT (12 layers, 768 hidden, 6 heads)
 # Data: Fineweb 10B tokens (GPT-2 tokenized)
 # Optimizer: DION (low-rank orthonormalized updates)
 # LR Schedule: WSD (Warmup-Stable-Decay)
 #
+# Default: TP=2, FS=4, PP=1, CP=1 (8 GPUs)
+#
 # Usage:
-#   bash examples/dion/run_fineweb_dion_fs4_tp2.sh
+#   bash examples/dion/run_nanogpt_dion.sh
+#   TP_SIZE=4 FS_SIZE=2 bash examples/dion/run_nanogpt_dion.sh
+#   CP_SIZE=2 bash examples/dion/run_nanogpt_dion.sh  # auto-enables TE
 #
 # =============================================================================
 
@@ -32,6 +26,15 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 NGPUS=${NGPUS:-8}
 MASTER_PORT=${MASTER_PORT:-29500}
 
+# =============================================================================
+# Parallelism Configuration
+# =============================================================================
+TP_SIZE=${TP_SIZE:-2}
+FS_SIZE=${FS_SIZE:-4}
+RP_SIZE=${RP_SIZE:-1}
+PP_SIZE=${PP_SIZE:-1}
+CP_SIZE=${CP_SIZE:-1}
+
 # TransformerEngine option (USE_TE=1 for TE, default is local)
 USE_TE=${USE_TE:-0}
 # Gradient accumulation fusion option (GRAD_FUSION=1 to enable, default is disabled for Dion)
@@ -42,6 +45,11 @@ PERSIST_LN=${PERSIST_LN:-0}
 SEQ_PARALLEL=${SEQ_PARALLEL:-0}
 # TP communication overlap option (TP_COMM_OVERLAP=1 to enable, requires SEQ_PARALLEL=1)
 TP_COMM_OVERLAP=${TP_COMM_OVERLAP:-0}
+
+# CP requires TE
+if [ "$CP_SIZE" -gt 1 ]; then
+    USE_TE=1
+fi
 
 if [ "$USE_TE" = "1" ]; then
     TRANSFORMER_IMPL="transformer_engine"
@@ -87,21 +95,7 @@ else
 fi
 
 # =============================================================================
-# Parallelism Configuration
-# =============================================================================
-# Default: 8 GPUs = TP(2) × FS(4) × RP(1)
-# - TP=2: Model split across 2 GPUs (tensor parallelism)
-# - FS=4: 4-way fully sharded (DION's distributed optimizer)
-# - RP=1: No replication
-#
-# Override via environment: TP_SIZE=4 FS_SIZE=2 bash script.sh
-# =============================================================================
-TP_SIZE=${TP_SIZE:-2}
-FS_SIZE=${FS_SIZE:-4}
-RP_SIZE=${RP_SIZE:-1}
-
-# =============================================================================
-# DION-specific hyperparameters (defined early for use in paths)
+# DION-specific hyperparameters
 # =============================================================================
 DION_MOMENTUM=0.95        # Error feedback momentum (mu)
 DION_RANK_FRACTION=${DION_RANK_FRACTION:-0.25}  # Low-rank fraction r/d
@@ -113,13 +107,13 @@ DION_BETA2=0.95           # Beta2 for scalar optimizer
 # Data Configuration
 # =============================================================================
 DATA_PATH="data/fineweb10B/fineweb_train"
-CHECKPOINT_DIR="checkpoints/fineweb_dion_distributed_rank${DION_RANK_FRACTION}"
-TENSORBOARD_DIR="tensorboard/fineweb_dion_distributed_rank${DION_RANK_FRACTION}"
+CHECKPOINT_DIR="checkpoints/nanogpt_dion_rank${DION_RANK_FRACTION}"
+TENSORBOARD_DIR="tensorboard/nanogpt_dion_rank${DION_RANK_FRACTION}"
 
 # =============================================================================
-# Model Configuration (124M GPT, matching Adam baseline)
+# Model Configuration (124M GPT)
 # =============================================================================
-NUM_LAYERS=12
+NUM_LAYERS=16
 HIDDEN_SIZE=768
 NUM_ATTENTION_HEADS=6
 SEQ_LENGTH=1024
@@ -153,22 +147,22 @@ mkdir -p ${CHECKPOINT_DIR}
 mkdir -p ${TENSORBOARD_DIR}
 
 echo "============================================"
-echo "Fineweb 10B GPT Training with DION"
-echo "  + DistributedOptimizerForDion"
+echo "nanoGPT 124M Dense + Dion"
 echo "============================================"
 echo "GPUs: ${NGPUS}"
-echo "Parallelism: TP=${TP_SIZE}, FS=${FS_SIZE}, RP=${RP_SIZE}"
+echo "Parallelism: TP=${TP_SIZE}, FS=${FS_SIZE}, RP=${RP_SIZE}, PP=${PP_SIZE}, CP=${CP_SIZE}"
 echo "Model: ${NUM_LAYERS}L-${HIDDEN_SIZE}H-${NUM_ATTENTION_HEADS}A (124M)"
 echo "Batch: ${GLOBAL_BATCH_SIZE} global, ${MICRO_BATCH_SIZE} micro"
 echo "LR: ${LR}, WD: ${WEIGHT_DECAY}"
 echo "DION: mu=${DION_MOMENTUM}, rank_frac=${DION_RANK_FRACTION}"
 echo "Iterations: ${TRAIN_ITERS}"
 echo "Transformer: ${TRANSFORMER_IMPL}"
-echo "Features: distributed-optimizer, overlap-grad-reduce, overlap-param-gather, seq-parallel=${SEQ_PARALLEL}, tp-comm-overlap=${TP_COMM_OVERLAP}"
 echo "============================================"
 
 torchrun --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} pretrain_gpt.py \
     --tensor-model-parallel-size ${TP_SIZE} \
+    --pipeline-model-parallel-size ${PP_SIZE} \
+    --context-parallel-size ${CP_SIZE} \
     --num-layers ${NUM_LAYERS} \
     --hidden-size ${HIDDEN_SIZE} \
     --num-attention-heads ${NUM_ATTENTION_HEADS} \
@@ -202,12 +196,15 @@ torchrun --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} pretrain_gpt.py 
     --squared-relu \
     --qk-layernorm \
     --disable-bias-linear \
+    --hidden-dropout 0.0 \
+    --attention-dropout 0.0 \
     --use-flash-attn \
     --transformer-impl ${TRANSFORMER_IMPL} \
     ${PERSIST_LN_FLAG} \
     ${GRAD_ACC_FUSION_FLAG} \
     ${SEQ_PARALLEL_FLAG} \
     ${TP_COMM_OVERLAP_FLAG} \
+    --no-data-sharding \
     --data-path ${DATA_PATH} \
     --split 100,0,0 \
     --tokenizer-type HuggingFaceTokenizer \

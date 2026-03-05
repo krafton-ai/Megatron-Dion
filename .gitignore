@@ -28,3 +28,6 @@ checkpoints/
 .claude/
 dion_test/
 megatron/core/datasets/Makefile
+# Local backup artifacts
+*.bak_*
+*.bak

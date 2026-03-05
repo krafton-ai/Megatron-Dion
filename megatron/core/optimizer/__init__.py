@@ -274,6 +274,9 @@ def _get_megatron_optimizer_based_on_param_groups(
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
     # for the purposes of grad stats reductions.
+
+    effective_optimizer = config.optimizer
+
     if param_groups:
         if config.optimizer_cpu_offload:
             if torch.__version__ < '2.3.0':
@@ -284,11 +287,11 @@ def _get_megatron_optimizer_based_on_param_groups(
             assert (
                 config.decoupled_weight_decay
             ), "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
-            gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
-            cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
+            gpu_optimizer_cls = Adam if effective_optimizer == 'adam' else SGD
+            cpu_optimizer_cls = CPUAdam if effective_optimizer == 'adam' else CPUSGD
             if config.use_torch_optimizer_for_cpu_offload:
                 gpu_optimizer_cls = cpu_optimizer_cls
-            if config.optimizer == 'adam':
+            if effective_optimizer == 'adam':
                 gpu_optimizer_cls = Adam
                 cpu_optimizer_cls = CPUAdam
                 optimizer_defaults = dict(
@@ -317,7 +320,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 **optimizer_defaults,
             )
             init_state_fn = None
-        elif config.optimizer == 'adam':
+        elif effective_optimizer == 'adam':
             kwargs = {
                 "params": param_groups,
                 "lr": config.lr,
@@ -370,7 +373,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                             else:
                                 opt.initialize_state(p)
 
-        elif config.optimizer == 'sgd':
+        elif effective_optimizer == 'sgd':
             optimizer = SGD(
                 param_groups,
                 lr=config.lr,
@@ -378,7 +381,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 momentum=config.sgd_momentum,
             )
             init_state_fn = None
-        elif config.optimizer == 'dion':
+        elif effective_optimizer == 'dion':
             from megatron.core.optimizer.dion import MegatronDion, DionMixedPrecisionConfig
             from megatron.core import parallel_state
             import torch.distributed as dist
@@ -389,7 +392,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             )
 
             # Create RP/FS groups for Dion 2D parallelism
-            # Option A: Auto-scale FS to match data_parallel_group size (for EP/MoE support)
+            # Auto-scale FS to match data_parallel_group size (FS × RP = DP_size)
             user_fs_world_size = getattr(config, 'fully_shard_model_parallel_size', 1) or 1
             rp_size = 1  # RP=1 is enforced for DO overlap compatibility
 
@@ -400,18 +403,18 @@ def _get_megatron_optimizer_based_on_param_groups(
                 world_rank = dist.get_rank()
                 world_size = dist.get_world_size()
 
-                # Auto-scale FS to data_parallel_group size (Option A)
-                # For EP: Dense uses full DP (size 4), Expert uses expert DP (size 2)
                 dp_world_ranks_local = dist.get_process_group_ranks(data_parallel_group)
                 fs_world_size = len(dp_world_ranks_local)
 
-                # Handle CP > 1: FS group should be based on pure DP (without CP)
-                # But only for the main DP group, not for expert DP groups
+                # CP > 1: FS group should use pure DP (without CP)
                 cp_size = parallel_state.get_context_parallel_world_size()
+                dp_group_for_fs = None
                 if cp_size > 1:
+                    # Check if this is the main DP group by comparing sizes
                     main_dp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
                     main_dp_ranks = dist.get_process_group_ranks(main_dp_group)
                     if set(dp_world_ranks_local) == set(main_dp_ranks):
+                        # This is the main DP group, use pure DP for FS
                         dp_group_for_fs = parallel_state.get_data_parallel_group(with_context_parallel=False)
                         dp_world_ranks_local = dist.get_process_group_ranks(dp_group_for_fs)
                         fs_world_size = len(dp_world_ranks_local)
@@ -474,13 +477,20 @@ def _get_megatron_optimizer_based_on_param_groups(
                         f"Dion 2D parallelism: RP={rp_size}, FS={fs_world_size}",
                     )
                 else:
-                    rp_process_group = data_parallel_group
-                    fs_process_group = data_parallel_group
+                    # No FS sharding. Use pure DP group (without CP) if available.
+                    if dp_group_for_fs is not None:
+                        rp_process_group = dp_group_for_fs
+                        fs_process_group = dp_group_for_fs
+                    else:
+                        rp_process_group = data_parallel_group
+                        fs_process_group = data_parallel_group
             else:
                 rp_process_group = data_parallel_group
                 fs_process_group = data_parallel_group
 
-            # Select TP group: expert params use expert_tensor_parallel_group
+            # Disable FS and TP collectives when EP causes incompatibility
+            # EP splits DP group such that tp_group members end up in different DP groups,
+            # causing collective hangs since they run different optimizer instances
             use_fs_collectives = config.dion_use_fs_collectives
             tp_group_to_use = (
                 parallel_state.get_expert_tensor_parallel_group()
@@ -493,6 +503,10 @@ def _get_megatron_optimizer_based_on_param_groups(
                 ep_size = parallel_state.get_expert_model_parallel_world_size()
             except Exception:
                 ep_size = 1
+
+            # Note: With EP mode sync execution (max_concurrent_tasks=1), we keep TP/FS
+            # collectives enabled. The sync execution ensures all ranks execute collectives
+            # in the same order, preventing async desync hangs.
 
             optimizer = MegatronDion(
                 param_groups,
@@ -513,8 +527,8 @@ def _get_megatron_optimizer_based_on_param_groups(
                 fs_group=fs_process_group,
                 tp_group=tp_group_to_use,
                 enable_async=True,
-                lr_scaling=config.dion_lr_scaling,
-                is_ep_mode=(ep_size > 1),
+                is_ep_mode=(ep_size > 1),  # EP mode: sync execution to avoid collective desync
+                lr_scaling=config.dion_lr_scaling,  # "dion_ref", "dion", or "moonlight"
             )
             init_state_fn = None
         else:
@@ -556,15 +570,26 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
             # Use DistributedOptimizerForDion for Dion optimizer
-            if config.optimizer == 'dion':
+            if effective_optimizer == 'dion':
                 from megatron.core.optimizer.distrib_optimizer_for_dion import (
                     DistributedOptimizerForDion,
                 )
-
                 import torch.distributed as dist
+
                 # Auto-scale FS to data_parallel_group size (Option A for EP support)
+                # This must match the fs_world_size used in FS/RP group creation above
+                # When CP > 1, use pure DP group (without CP) to match FS group creation logic
                 if data_parallel_group is not None:
-                    dp_world_ranks = dist.get_process_group_ranks(data_parallel_group)
+                    cp_size = parallel_state.get_context_parallel_world_size()
+                    if cp_size > 1:
+                        main_dp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+                        main_dp_ranks = dist.get_process_group_ranks(main_dp_group)
+                        dp_world_ranks = dist.get_process_group_ranks(data_parallel_group)
+                        if set(dp_world_ranks) == set(main_dp_ranks):
+                            dp_group_for_fs = parallel_state.get_data_parallel_group(with_context_parallel=False)
+                            dp_world_ranks = dist.get_process_group_ranks(dp_group_for_fs)
+                    else:
+                        dp_world_ranks = dist.get_process_group_ranks(data_parallel_group)
                     fs_size = len(dp_world_ranks)
                 else:
                     fs_size = getattr(config, 'fully_shard_model_parallel_size', None) or 1

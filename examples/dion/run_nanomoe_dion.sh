@@ -1,6 +1,6 @@
 #!/bin/bash
 # Megatron-LM training script matching nanoMoE configuration (Dion optimizer)
-# Reference: nanoMoE config/train_nano_moe.py
+# Reference: /wbl/optimization/nanoMoE/config/train_nano_moe.py
 #
 # Parallelism: FS=2, TP=2, EP=2 (8 GPUs)
 #
@@ -9,10 +9,7 @@
 #   - MoE: 8 experts, top-2, every other layer (stride=2)
 #   - Training: lr=6e-4, weight_decay=0.1, warmup=2000, max_iters=50000
 #   - Batch: ~491,520 tokens per step
-#   - Dataset: Fineweb 10B tokens
-#
-# Usage:
-#   bash examples/dion/run_nanomoe_dion.sh
+#   - Dataset: OpenWebText (~9B tokens)
 
 set -e
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -28,7 +25,7 @@ EP_SIZE=${EP_SIZE:-2}
 # ============================================
 # nanoMoE Model Configuration
 # ============================================
-NUM_LAYERS=6
+NUM_LAYERS=8
 HIDDEN_SIZE=384
 FFN_HIDDEN_SIZE=1536  # 4 * hidden_size
 NUM_ATTENTION_HEADS=6
@@ -63,8 +60,8 @@ MOE_AUX_LOSS_COEFF=0.01
 MOE_Z_LOSS_COEFF=0.001
 
 # Data path
-DATA_PATH=${DATA_PATH:-"data/fineweb10B/fineweb_train"}
-VALID_PATH=${VALID_PATH:-"data/fineweb10B/fineweb_train"}
+DATA_PATH=${DATA_PATH:-"data/openwebtext/openwebtext_train_text_document"}
+VALID_PATH=${VALID_PATH:-"data/openwebtext/openwebtext_val_text_document"}
 
 # Tensorboard
 TENSORBOARD_DIR=${TENSORBOARD_DIR:-"tensorboard/nanomoe_dion_ep${EP_SIZE}"}
@@ -129,6 +126,7 @@ torchrun --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} pretrain_gpt.py 
     --transformer-impl transformer_engine \
     --sequence-parallel \
     --bf16 \
+    --no-data-sharding \
     --train-data-path ${DATA_PATH} \
     --valid-data-path ${VALID_PATH} \
     --tokenizer-type HuggingFaceTokenizer \
