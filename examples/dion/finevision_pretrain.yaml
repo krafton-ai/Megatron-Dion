@@ -1,0 +1,17 @@
+__module__: megatron.energon
+__class__: Metadataset
+splits:
+  train:
+    datasets:
+      - weight: 1.
+        path: /wbl-fast/usrs/jihuny/Megatron-LM/data/finevision_wds
+        subflavors:
+          is_llava_training: true
+          augmentation: false
+  val:
+    datasets:
+      - weight: 1.
+        path: /wbl-fast/usrs/jihuny/Megatron-LM/data/finevision_wds
+        subflavors:
+          is_llava_training: true
+          augmentation: false

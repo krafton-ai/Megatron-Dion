@@ -1,18 +1,25 @@
 #!/bin/bash
-# nanoVLM (Qwen-style, small): SigLIP2-base + Qwen-style tiny decoder + Dion optimizer.
+# nanoVLM: SmolLM2-360M + SigLIP2-base + Dion Optimizer
 #
-# Goal: fast multi-parallel consistency checks on 8 GPUs.
-# Qwen-style choices:
-#   - num_attention_heads=16
-#   - num_query_groups=8 (GQA)
-#   - add_qkv_bias enabled
-# Also set encoder-num-attention-heads=16 so TP=8 is valid for vision side too.
+# Reference: https://github.com/huggingface/nanoVLM
+#   - models/config.py: VLMConfig, TrainConfig
+#   - train.py: AdamW, cosine schedule, 3% warmup, min_lr=10% of max
+#
+# Architecture:
+#   Vision:  SigLIP2-base (12L, 768H, 12heads, patch=16, img=512)
+#   Language: SmolLM2-360M (32L, 960H, 15heads, 5kv, tie_weights=True)
+#   Pixel shuffle factor=4 → 64 image tokens
+#
+# Note: nanoVLM uses per-group LR (MP=0.00512, ViT=5e-5, LM=5e-5).
+#   Megatron uses single LR=5e-5 for all parameters.
+#
+# GBS=16 matches nanoVLM's batch_size=2 * grad_accum=8 on 1 GPU
 
 export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 SOURCE=$(cd "$(dirname "$0")/../.." && pwd)
-MODEL_NAME="nanovlm-qwen-siglip2"
+MODEL_NAME="nanovlm-siglip2base-smollm2"
 
 OUTPUT="${SOURCE}/output/${MODEL_NAME}"
 FINETUNE_DIR="${OUTPUT}/checkpoints"
@@ -26,8 +33,8 @@ GBS=${GBS:-16}
 MBS=${MBS:-2}
 TRAIN_ITERS=${TRAIN_ITERS:-40000}
 LR=${LR:-5e-5}
-MIN_LR=${MIN_LR:-5e-6}
-WARMUP_ITERS=${WARMUP_ITERS:-1200}
+MIN_LR=${MIN_LR:-5e-6}              # 10% of max LR (nanoVLM default)
+WARMUP_ITERS=${WARMUP_ITERS:-1200}   # 3% of 40000 (nanoVLM default)
 FREEZE_VIT=${FREEZE_VIT:-0}
 FREEZE_LM=${FREEZE_LM:-0}
 
@@ -48,10 +55,10 @@ export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NVTE_ALLOW_NONDETERMINISTIC_ALGO:-1}
 
 torchrun --nproc_per_node ${NUM_GPUS} \
     ${SOURCE}/pretrain_vlm.py \
-    --num-layers 16 --decoder-num-layers 16 \
-    --hidden-size 1024 --ffn-hidden-size 2816 \
-    --num-attention-heads 16 --group-query-attention --num-query-groups 8 --add-qkv-bias \
-    --encoder-hidden-size 768 --encoder-ffn-hidden-size 3072 --encoder-num-attention-heads 16 \
+    --num-layers 12 --decoder-num-layers 32 \
+    --hidden-size 960 --ffn-hidden-size 2560 \
+    --num-attention-heads 15 --group-query-attention --num-query-groups 5 \
+    --encoder-hidden-size 768 --encoder-ffn-hidden-size 3072 --encoder-num-attention-heads 12 \
     --seq-length 64 --dataloader-seq-length 4096 --max-position-embeddings 8192 \
     --img-h 512 --img-w 512 --patch-dim 16 \
     --vision-model-type siglip2_base \
@@ -76,7 +83,7 @@ torchrun --nproc_per_node ${NUM_GPUS} \
     --tokenizer-model HuggingFaceTB/SmolLM2-360M-Instruct \
     --tokenizer-prompt-format chatml --language-model-type smollm2_360m \
     --distributed-timeout-minutes 60 --ckpt-format torch \
-    --optimizer dion --dion-lr-scaling dion \
+    --optimizer dion \
     --use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather \
     ${FREEZE_ARGS} ${CKPT_ARGS} \
     --dataloader-type external \

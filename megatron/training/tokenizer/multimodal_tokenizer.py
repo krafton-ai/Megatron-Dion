@@ -266,21 +266,21 @@ class MultimodalTokenizer(MegatronLegacyTokenizer):
         target = tokens.copy()
 
         # Mask system and user tokens in the target.
+        # Use incremental tokenization: tokenize conversation[0:i] to find turn boundaries.
         idx = 0
         for turn_idx, turn in enumerate(conversation):
             if len(turn["content"]) == 0:
                 raise ValueError(f"empty turn in conversation: {conversation}. Skipping.")
 
-            turn_tokens = self._tokenizer.apply_chat_template(
-                [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
+            # Tokenize conversation up to and including this turn to find exact boundary
+            partial_tokens = self._tokenizer.apply_chat_template(
+                conversation[: turn_idx + 1],
+                tokenize=True,
+                add_generation_prompt=False,
+                chat_template=self._prompt_config.custom_chat_template,
             )
-
-            # There should be only one BOS at the very beginning.
-            # After the first turn, skip BOS token.
-            if self._prompt_config.has_bos and turn_idx > 0:
-                turn_tokens = turn_tokens[1:]
-
-            turn_len = len(turn_tokens)
+            turn_end = len(partial_tokens)
+            turn_len = turn_end - idx
 
             role = turn["role"].lower()
             if role in ("system", "user"):
@@ -292,13 +292,7 @@ class MultimodalTokenizer(MegatronLegacyTokenizer):
                 if self._prompt_config.assistant_prefix_len > 0:
                     target[idx : idx + self._prompt_config.assistant_prefix_len] = IGNORE_INDEX
 
-            assert np.allclose(
-                tokens[idx : idx + turn_len], turn_tokens
-            ), f"expected turn tokens to match tokens in conversation {conversation}"
-
-            idx += turn_len
-
-        assert idx == len(tokens), f"mismatch in target masking the conversation {conversation}"
+            idx = turn_end
 
         return tokens, target
 

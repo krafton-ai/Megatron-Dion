@@ -158,6 +158,14 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         grad_group = self.get_grad_stats_parallel_group()
         state_group = getattr(self, "state_replica_group", None)
 
+        def _normalize_diag_name(name: Optional[str]) -> Optional[str]:
+            if not name:
+                return name
+            normalized = name
+            while normalized.startswith("module.module."):
+                normalized = normalized[len("module.") :]
+            return normalized
+
         def _fingerprint(tensor: Optional[torch.Tensor]):
             if tensor is None:
                 return None
@@ -192,6 +200,12 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 pack_expected_fp = None
                 pack_diff = None
                 pack_group_ranks = None
+                entry_param = None
+                entry_param_name = None
+                entry_param_same = None
+                entry_model_fp = None
+                pack_lookup_via_model_id = False
+                pack_lookup_via_entry_id = False
                 if getattr(model_param, "is_dion_param", False):
                     dion_info = self._param_dion_info(model_param)
                     buffer_idx = dion_info.get("buffer_idx")
@@ -199,7 +213,35 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     if buffer_idx is not None and bucket_idx is not None:
                         bucket = self.buffers[buffer_idx].buckets[bucket_idx]
                         pack_debug_inputs = getattr(bucket, "dion_pack_debug_inputs", None) or {}
+                        normalized_param_name = _normalize_diag_name(param_name)
+                        buffer_param_to_name = getattr(self.buffers[buffer_idx], "param_to_name", None)
+                        for entry in getattr(bucket, "dion_param_layout", []) or []:
+                            candidate_param = entry.get("param")
+                            if candidate_param is None:
+                                continue
+                            if candidate_param is model_param:
+                                entry_param = candidate_param
+                                break
+                            candidate_name = None
+                            if buffer_param_to_name:
+                                candidate_name = buffer_param_to_name.get(candidate_param)
+                            if _normalize_diag_name(candidate_name) == normalized_param_name:
+                                entry_param = candidate_param
+                                entry_param_name = candidate_name
+                                break
+                        if entry_param is not None:
+                            if entry_param_name is None and buffer_param_to_name:
+                                entry_param_name = buffer_param_to_name.get(entry_param)
+                            entry_param_same = bool(entry_param is model_param)
+                            entry_model_fp = _fingerprint(getattr(entry_param, "main_grad", None))
+
                         local_pack_info = pack_debug_inputs.get(id(model_param))
+                        pack_lookup_via_model_id = bool(local_pack_info is not None)
+                        if entry_param is not None:
+                            entry_pack_info = pack_debug_inputs.get(id(entry_param))
+                            pack_lookup_via_entry_id = bool(entry_pack_info is not None)
+                            if local_pack_info is None and entry_pack_info is not None:
+                                local_pack_info = entry_pack_info
                         pack_group = getattr(bucket, "dion_pack_debug_group", None)
                         pack_is_avg = bool(
                             getattr(bucket, "dion_pack_debug_is_avg", False)
@@ -302,6 +344,23 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     gathered_model_state,
                     gathered_opt_state,
                 )
+                if getattr(model_param, "is_dion_param", False):
+                    logger.info(
+                        "[DION_PARAM_GRAD_FP_ENTRY] step=%s rank=%s param=%s model_id=%s entry_id=%s entry_same=%s "
+                        "model_name=%s entry_name=%s pack_by_model_id=%s pack_by_entry_id=%s model_state=%s entry_state=%s",
+                        call_idx,
+                        self._global_rank,
+                        param_name,
+                        id(model_param),
+                        id(entry_param) if entry_param is not None else None,
+                        entry_param_same,
+                        _normalize_diag_name(param_name),
+                        _normalize_diag_name(entry_param_name),
+                        pack_lookup_via_model_id,
+                        pack_lookup_via_entry_id,
+                        gathered_model_state,
+                        entry_model_fp,
+                    )
 
         self._dion_param_grad_fp_logged = int(
             getattr(self, "_dion_param_grad_fp_logged", 0)
@@ -3325,6 +3384,9 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         grad_group_pairs = grad_copy_ctx["grad_group_pairs"]
         copy_step = int(getattr(self, "_debug_grad_copy_call_idx", 0)) + 1
         self._debug_grad_copy_call_idx = copy_step
+
+        if os.getenv("DION_PARAM_GRAD_FP_NAMES", "").strip():
+            self._maybe_log_target_grad_fingerprints()
 
         for model_groups, shard_groups in grad_group_pairs:
             copy_stock_non_dion_grads_(

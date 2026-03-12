@@ -56,9 +56,9 @@ class CLIPViTModel(VisionModule):
     ) -> None:
 
         error_msg = f"CLIPViTModel model subtype {model_subtype} is not supported."
-        assert model_subtype in ["clip", "siglip", "internvit", "internvit300M"], error_msg
+        assert model_subtype in ["clip", "siglip", "siglip2_base", "internvit", "internvit300M"], error_msg
 
-        if model_subtype == "siglip":
+        if model_subtype in ("siglip", "siglip2_base"):
             assert class_token_len == 0, "SigLIP does not support class tokens."
             assert not add_class_token, "SigLIP does not support class tokens."
 
@@ -97,7 +97,7 @@ class CLIPViTModel(VisionModule):
             )
             conv_bias = False
             padding = 0
-        elif model_subtype == "siglip":
+        elif model_subtype in ("siglip", "siglip2_base"):
             self.ln_post = build_module(
                 ln_post_impl,
                 config=transformer_config,
@@ -215,7 +215,7 @@ def get_num_image_embeddings(
     tokenizer_type=None,
 ):
     """Get the number of image embeddings per image tile."""
-    if vision_model_type == "siglip":
+    if vision_model_type in ("siglip", "siglip2_base"):
         keep_class_token = False
     elif vision_model_type in ("clip", "internvit", "internvit300M"):
         keep_class_token = not disable_vision_class_token
@@ -242,7 +242,10 @@ def get_num_image_embeddings(
     num_image_embeddings_per_tile = num_patches + (class_token_len if keep_class_token else 0)
 
     if pixel_shuffle:
-        num_image_embeddings_per_tile = int(num_image_embeddings_per_tile * (0.5**2))
+        # pixel_shuffle can be True (factor=2) or an int (explicit factor)
+        ps_factor = pixel_shuffle if isinstance(pixel_shuffle, int) and pixel_shuffle > 1 else 2
+        scale = 1.0 / (ps_factor ** 2)
+        num_image_embeddings_per_tile = int(num_image_embeddings_per_tile * scale)
 
     if use_tile_tags:
         if tokenizer_type in ("llama3p1", "chatml", "qwen2p0", "qwen2p5"):

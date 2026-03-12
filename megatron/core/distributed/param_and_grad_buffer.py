@@ -74,6 +74,121 @@ def _dion_pack_debug_enabled(param_name: Optional[str]) -> bool:
     return any(token and token in param_name for token in spec.split(","))
 
 
+def _log_dion_target_main_grad_phase_(bucket, *, phase: str, param_to_name=None) -> None:
+    """Env-gated target-param phase trace for canonical model_param.main_grad."""
+    targets_raw = os.getenv("DION_PARAM_GRAD_FP_NAMES", "").strip()
+    if not targets_raw or bucket is None:
+        return
+
+    targets = [token.strip() for token in targets_raw.split(",") if token.strip()]
+    if not targets:
+        return
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    bucket_id = getattr(bucket, "bucket_id", None)
+
+    for param in getattr(bucket, "params", []) or []:
+        param_name = None
+        if param_to_name:
+            param_name = param_to_name.get(param)
+        if not param_name:
+            param_name = getattr(param, "_param_name", None)
+        if not param_name or not any(target in param_name for target in targets):
+            continue
+
+        key = (phase, rank, bucket_id, param_name)
+        if key in _DION_PACK_DEBUG_SEEN:
+            continue
+        _DION_PACK_DEBUG_SEEN.add(key)
+
+        grad = getattr(param, "main_grad", None)
+        if grad is None:
+            logger.info(
+                "[DION_MAIN_GRAD_PHASE] phase=%s rank=%s bucket=%s param=%s grad=None",
+                phase,
+                rank,
+                bucket_id,
+                param_name,
+            )
+            continue
+
+        grad_fp32 = grad.detach().float()
+        flat = grad_fp32.view(-1)
+        logger.info(
+            "[DION_MAIN_GRAD_PHASE] phase=%s rank=%s bucket=%s param=%s ptr=%s norm=%.6f sum=%.6f abs_sum=%.6f amax=%.6f sample=%s",
+            phase,
+            rank,
+            bucket_id,
+            param_name,
+            int(grad_fp32.data_ptr()),
+            float(grad_fp32.norm().item()),
+            float(grad_fp32.sum().item()),
+            float(grad_fp32.abs().sum().item()),
+            float(grad_fp32.abs().max().item()) if flat.numel() > 0 else 0.0,
+            flat[: min(8, flat.numel())].cpu().tolist(),
+        )
+
+
+def _log_dion_target_mixed_mask_phase_(bucket, *, phase: str, param_to_name=None) -> None:
+    """Env-gated trace for mixed-bucket masking on target canonical main_grad tensors."""
+    targets_raw = os.getenv("DION_PARAM_GRAD_FP_NAMES", "").strip()
+    if not targets_raw or bucket is None:
+        return
+
+    targets = [token.strip() for token in targets_raw.split(",") if token.strip()]
+    if not targets:
+        return
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    bucket_id = getattr(bucket, "bucket_id", None)
+    full_ranges = tuple(getattr(bucket, "mixed_dion_full_bucket_ranges", ()) or ())
+
+    for param in getattr(bucket, "params", []) or []:
+        param_name = None
+        if param_to_name:
+            param_name = param_to_name.get(param)
+        if not param_name:
+            param_name = getattr(param, "_param_name", None)
+        if not param_name or not any(target in param_name for target in targets):
+            continue
+
+        key = ("mixed-mask", phase, rank, bucket_id, param_name)
+        if key in _DION_PACK_DEBUG_SEEN:
+            continue
+        _DION_PACK_DEBUG_SEEN.add(key)
+
+        grad = getattr(param, "main_grad", None)
+        if grad is None:
+            logger.info(
+                "[DION_MIXED_MASK_PHASE] phase=%s rank=%s bucket=%s mixed=%s full_ranges=%s param=%s grad=None",
+                phase,
+                rank,
+                bucket_id,
+                bool(getattr(bucket, "has_non_dion_params", False)),
+                full_ranges,
+                param_name,
+            )
+            continue
+
+        grad_fp32 = grad.detach().float()
+        flat = grad_fp32.view(-1)
+        logger.info(
+            "[DION_MIXED_MASK_PHASE] phase=%s rank=%s bucket=%s mixed=%s full_ranges=%s param=%s ptr=%s norm=%.6f sum=%.6f abs_sum=%.6f amax=%.6f sample=%s",
+            phase,
+            rank,
+            bucket_id,
+            bool(getattr(bucket, "has_non_dion_params", False)),
+            full_ranges,
+            param_name,
+            int(grad_fp32.data_ptr()),
+            float(grad_fp32.norm().item()),
+            float(grad_fp32.sum().item()),
+            float(grad_fp32.abs().sum().item()),
+            float(grad_fp32.abs().max().item()) if flat.numel() > 0 else 0.0,
+            flat[: min(8, flat.numel())].cpu().tolist(),
+        )
+
+
 def lookup_mixed_non_dion_entry(bucket, param: torch.nn.Parameter, param_name: Optional[str] = None):
     """Return the canonical mixed non-Dion pack-plan entry for `param`."""
     if bucket is None:
@@ -114,11 +229,21 @@ def mask_mixed_dion_full_bucket_ranges_(bucket) -> None:
     grad_data = getattr(bucket, "grad_data", None)
     if grad_data is None:
         raise RuntimeError("[Dion] mixed bucket is missing canonical bucket.grad_data.")
+    _log_dion_target_mixed_mask_phase_(
+        bucket,
+        phase="before_mask_mixed_dion_ranges",
+        param_to_name=getattr(bucket, "param_to_name", None),
+    )
     grad_flat = grad_data.view(-1)
     for start, end in full_ranges:
         if end <= start:
             continue
         grad_flat[start:end].zero_()
+    _log_dion_target_mixed_mask_phase_(
+        bucket,
+        phase="after_mask_mixed_dion_ranges",
+        param_to_name=getattr(bucket, "param_to_name", None),
+    )
 
 
 def scale_mixed_non_dion_full_bucket_ranges_(bucket, scale: float) -> None:
@@ -154,6 +279,37 @@ def scale_mixed_non_dion_full_bucket_ranges_(bucket, scale: float) -> None:
             continue
         seen.add(key)
         grad_flat[full_start:full_end].mul_(scale)
+
+
+def build_mixed_non_dion_rs_input_(bucket, scale: float) -> torch.Tensor:
+    """Build mixed non-Dion RS input without mutating canonical bucket.grad_data."""
+    grad_data = getattr(bucket, "grad_data", None)
+    if grad_data is None:
+        raise RuntimeError(
+            f"[Dion] mixed bucket {getattr(bucket, 'bucket_id', -1)} missing canonical bucket.grad_data."
+        )
+
+    mixed_input = grad_data.detach().clone()
+    tmp_bucket = type(
+        "_MixedNonDionTmpBucket",
+        (),
+        {
+            "bucket_id": getattr(bucket, "bucket_id", -1),
+            "grad_data": mixed_input,
+            "non_dion_pack_plan": getattr(bucket, "non_dion_pack_plan", None),
+            "mixed_dion_full_bucket_ranges": getattr(bucket, "mixed_dion_full_bucket_ranges", None),
+        },
+    )()
+    scale_mixed_non_dion_full_bucket_ranges_(tmp_bucket, scale)
+    full_ranges = getattr(tmp_bucket, "mixed_dion_full_bucket_ranges", None)
+    if full_ranges:
+        grad_flat = mixed_input.view(-1)
+        for start, end in full_ranges:
+            if end <= start:
+                continue
+            grad_flat[start:end].zero_()
+    bucket.non_dion_grad_buffer = mixed_input
+    return mixed_input
 
 
 class _ParamAndGradBucket:
@@ -489,17 +645,19 @@ class _ParamAndGradBucketGroup:
                     f"stock_local={stock_local_data_view.numel()}"
                 )
             # Follow the stock DO contract as closely as possible:
-            # - bucket.grad_data is the canonical full-bucket grad buffer
-            # - mixed non-Dion takes the stock local-shard RS path on that same buffer
-            # - Dion-owned full-bucket spans are zeroed because Dion grads have already been
-            #   packed into `bucket.dion_grad_buffer` above and must not participate here
-            mask_mixed_dion_full_bucket_ranges_(bucket)
+            # - bucket.grad_data remains the canonical full-bucket grad buffer
+            # - mixed non-Dion takes the stock local-shard RS path on a dedicated
+            #   stock-equivalent input buffer so canonical model_param.main_grad is preserved
+            mixed_non_dion_input = build_mixed_non_dion_rs_input_(
+                bucket,
+                bucket.gradient_scaling_factor,
+            )
             if non_dion_group.size() <= 1:
-                stock_local_data_view.copy_(bucket.grad_data[:non_dion_local_shard_size])
+                stock_local_data_view.copy_(mixed_non_dion_input[:non_dion_local_shard_size])
                 return
             handle = dist_reduce_scatter_func(
                 stock_local_data_view,
-                bucket.grad_data,
+                mixed_non_dion_input,
                 op=reduce_op,
                 group=non_dion_group,
                 async_op=async_op,
@@ -1118,11 +1276,10 @@ class _ParamAndGradBucketGroup:
                 if has_dion and has_non_dion:
                     # Mixed bucket:
                     # - Dion spans are packed separately below and already pre-scaled there
-                    # - non-Dion spans still need the stock DO full-buffer scaling before
-                    #   the stock local-shard RS path runs on bucket.grad_data
-                    scale_mixed_non_dion_full_bucket_ranges_(
-                        bucket, bucket.gradient_scaling_factor
-                    )
+                    # - non-Dion spans still need stock DO full-buffer scaling, but
+                    #   mixed non-Dion RS now uses a dedicated input buffer so the
+                    #   canonical bucket.grad_data / model_param.main_grad stay intact.
+                    pass
                 elif has_dion and not has_non_dion:
                     # Pure Dion bucket: skip, Dion packing already pre-scaled.
                     pass
@@ -1194,6 +1351,11 @@ class _ParamAndGradBucketGroup:
                         async_op=async_op,
                         handles=handles,
                         communication_group=communication_group,
+                    )
+                    _log_dion_target_main_grad_phase_(
+                        bucket,
+                        phase="start_grad_sync_after_rs_launch",
+                        param_to_name=getattr(self, "param_to_name", None),
                     )
                     continue
 
@@ -1338,6 +1500,8 @@ class _ParamAndGradBucketGroup:
                 bucket.dion_grad_local_view = None
             if hasattr(bucket, 'non_dion_grad_local_view'):
                 bucket.non_dion_grad_local_view = None
+            if hasattr(bucket, 'non_dion_grad_buffer'):
+                bucket.non_dion_grad_buffer = None
             if hasattr(bucket, '_memory_reused'):
                 bucket._memory_reused = False
 
@@ -1365,6 +1529,12 @@ class _ParamAndGradBucketGroup:
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
             self._flush_mixed_non_dion_rs_buffers()
+            for bucket in self.buckets:
+                _log_dion_target_main_grad_phase_(
+                    bucket,
+                    phase="finish_grad_sync_sync_exit",
+                    param_to_name=getattr(self, "param_to_name", None),
+                )
             if pp_world_size > 1:
                 logger.info("[DION_PP_DEBUG] rank=%s finish_grad_sync exit sync", rank)
             return
@@ -1376,6 +1546,12 @@ class _ParamAndGradBucketGroup:
             if os.getenv("DION_POST_INTER_LOCAL_DIAG", "0") == "1":
                 self._log_post_inter_local_views()
             self._flush_mixed_non_dion_rs_buffers()
+            for bucket in self.buckets:
+                _log_dion_target_main_grad_phase_(
+                    bucket,
+                    phase="finish_grad_sync_inter_exit",
+                    param_to_name=getattr(self, "param_to_name", None),
+                )
             if pp_world_size > 1:
                 logger.info("[DION_PP_DEBUG] rank=%s finish_grad_sync exit inter-instance", rank)
             return
@@ -1386,6 +1562,12 @@ class _ParamAndGradBucketGroup:
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
         self._flush_mixed_non_dion_rs_buffers()
+        for bucket in self.buckets:
+            _log_dion_target_main_grad_phase_(
+                bucket,
+                phase="finish_grad_sync_async_exit",
+                param_to_name=getattr(self, "param_to_name", None),
+            )
         if pp_world_size > 1:
             logger.info("[DION_PP_DEBUG] rank=%s finish_grad_sync exit async", rank)
 
@@ -1798,6 +1980,10 @@ class _ParamAndGradBuffer:
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
         self.grad_data *= scaling_factor
+        for bucket in self.buckets:
+            dion_local_view = getattr(bucket, "dion_grad_local_view", None)
+            if dion_local_view is not None:
+                dion_local_view.mul_(scaling_factor)
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """

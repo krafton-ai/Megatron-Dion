@@ -72,9 +72,15 @@ def broadcast_data(keys, data, datatype, tp_group=None):
                   with keys.
         tp_group: the tensor model parallel group to broadcast to.
     """
-    # Build (key, size) and (key, number of elements) dictionaries along
-    # with the total number of elements on all ranks.
-    key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(keys, data)
+    # Build (key, size) and (key, number of elements) dictionaries along with the
+    # total number of elements on all ranks.
+    #
+    # IMPORTANT: Use the same communication group for both size broadcast and
+    # payload broadcast. Otherwise, callers that pass a non-default tp_group
+    # (e.g., TP×CP) can hit mismatched "rank 0" semantics and crash/hang.
+    key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(
+        keys, data, tp_group=tp_group
+    )
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
     # Pack on rank zero.
     if tp_group.rank() == 0:

@@ -183,9 +183,9 @@ class LLaVAModel(MegatronModule):
                 from megatron.core.models.huggingface.module import build_hf_model
 
                 self.language_model = build_hf_model(
-                    language_transformer_config, language_transformer_config.language_model_type
+                    language_transformer_config,
+                    language_transformer_config.language_model_type,
                 )
-                self.language_model = build_hf_model(language_transformer_config)
             elif language_model_type.startswith('nemotron5-hybrid'):
                 self.language_model = MambaModel(
                     config=language_transformer_config,
@@ -243,7 +243,7 @@ class LLaVAModel(MegatronModule):
             if vision_transformer_config.vision_model_type.startswith(
                 ("clip", "siglip", "internvit")
             ):
-                if vision_transformer_config.vision_model_type == "siglip":
+                if vision_transformer_config.vision_model_type in ("siglip", "siglip2_base"):
                     class_token_len = 0
                     add_class_token = False
                     error_msg = (
@@ -334,7 +334,10 @@ class LLaVAModel(MegatronModule):
             )
 
             vision_projection_input_size = vision_transformer_config.hidden_size
-            vision_projection_input_size *= 4 if pixel_shuffle else 1
+            if pixel_shuffle:
+                ps_factor = pixel_shuffle if isinstance(pixel_shuffle, int) else 2
+                vision_projection_input_size *= ps_factor ** 2
+
 
             # Map (intermediate) vision model outputs to the language model input dimension.
             self.vision_projection = MultimodalProjector(
@@ -515,9 +518,9 @@ class LLaVAModel(MegatronModule):
             # plus text sequence length.
             seq_lens = num_image_tiles_batch * img_seq_len - num_images_per_sample + text_seq_len
             max_seq_len = seq_lens.max()
-            # Pipeline parallel expects fixed input size. Check if we need to pad.
+            # Pipeline parallel and context parallel expect fixed input size. Pad if needed.
             if (
-                self._language_is_pipeline_parallel
+                (self._language_is_pipeline_parallel or self.context_parallel_lm > 1)
                 and max_seq_len < self._language_max_sequence_length
                 and inference_context is None
             ):
@@ -845,18 +848,25 @@ class LLaVAModel(MegatronModule):
         if use_inference_kv_cache:
             image_embeddings = None
         elif self.add_encoder and not has_images:
-            # If no images provided, use an empty image embeddings tensor.
-            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device).reshape(
-                0, 0, 0
-            )
+            # PP text-only microbatches can pass images=None on encoder stages.
+            # Build an empty tensor on the local model device to avoid None dereference.
+            if images is not None:
+                empty_device = images.device
+                empty_dtype = images.dtype
+            else:
+                param = next(iter(self.parameters()), None)
+                empty_device = param.device if param is not None else input_ids.device
+                empty_dtype = param.dtype if param is not None else torch.float32
+            image_embeddings = torch.empty((0, 0, 0), dtype=empty_dtype, device=empty_device)
         elif self.add_encoder and has_images:
             image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
             if self._drop_vision_class_token:
                 image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
 
             if self._pixel_shuffle:
+                ps_factor = self._pixel_shuffle if isinstance(self._pixel_shuffle, int) else 2
                 image_embeddings = pixel_shuffle(
-                    image_embeddings
+                    image_embeddings, scale_factor=1.0/ps_factor
                 )  # [num_tiles, img_seq_len_shuffled, h_vision_shuffled]
 
             # contiguous() required as `permute` can sparsify the tensor and this breaks pipelining
