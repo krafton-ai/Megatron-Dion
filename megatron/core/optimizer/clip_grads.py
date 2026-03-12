@@ -130,6 +130,7 @@ def get_grad_norm_fp32(
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
+
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
     return total_norm
@@ -159,15 +160,16 @@ def clip_grad_by_total_norm_fp32(
     for param in parameters:
         if use_decoupled_grad:
             if hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
+                if param.decoupled_grad.numel() == 0:
+                    continue
                 assert param.decoupled_grad.dtype in [torch.float32, torch.bfloat16]
                 params.append(param)
                 grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
         else:
-            # Check main_grad first (for Dion optimizer), then fall back to grad
-            grad = getattr(param, 'main_grad', None)
-            if grad is None:
-                grad = param.grad
+            grad = param.grad
             if grad is not None:
+                if grad.numel() == 0:
+                    continue
                 assert grad.type() == 'torch.cuda.FloatTensor'
                 params.append(param)
                 grads.append(to_local_if_dtensor(grad).detach())
@@ -227,6 +229,8 @@ def count_zeros_fp32(
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
             grad = to_local_if_dtensor(grad_obj).detach()
+            if grad.numel() == 0:
+                continue
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros = num_zeros + total_num_zeros
 

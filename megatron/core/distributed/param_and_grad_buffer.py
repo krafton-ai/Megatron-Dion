@@ -3,6 +3,7 @@
 import functools
 import logging
 import math
+import os
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -28,6 +29,8 @@ from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
+
+_DION_PACK_DEBUG_SEEN = set()
 
 try:
     if is_torch_min_version("1.13.0"):
@@ -60,6 +63,97 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
         buffer[(r * shard_size) : ((r + 1) * shard_size)] for r in range(data_parallel_world_size)
     ]
     return sharded_buffer
+
+
+def _dion_pack_debug_enabled(param_name: Optional[str]) -> bool:
+    spec = os.getenv("DION_PARAM_GRAD_FP_NAMES", "").strip()
+    if not spec or not param_name:
+        return False
+    if spec == "1":
+        return True
+    return any(token and token in param_name for token in spec.split(","))
+
+
+def lookup_mixed_non_dion_entry(bucket, param: torch.nn.Parameter, param_name: Optional[str] = None):
+    """Return the canonical mixed non-Dion pack-plan entry for `param`."""
+    if bucket is None:
+        return None
+
+    entry = None
+    id_to_entry = getattr(bucket, "non_dion_param_id_to_entry", None)
+    if id_to_entry:
+        entry = id_to_entry.get(id(param))
+        if entry is not None:
+            return entry
+
+    name_to_entry = getattr(bucket, "non_dion_param_name_to_entry", None)
+    if name_to_entry:
+        if param_name is None:
+            param_name = getattr(param, "_param_name", None)
+        if param_name:
+            entry = name_to_entry.get(param_name)
+            if entry is not None:
+                return entry
+
+    return None
+
+
+def mask_mixed_dion_full_bucket_ranges_(bucket) -> None:
+    """Zero Dion-owned full-bucket spans before stock mixed non-Dion RS.
+
+    Mixed buckets should follow the stock DO local-shard contract for non-Dion params:
+    - input is the canonical full `bucket.grad_data`
+    - output is one local shard view of that same buffer
+
+    Dion params are packed separately into `bucket.dion_grad_buffer`, so their full-bucket
+    grad spans must be zeroed before the stock RS path runs for mixed non-Dion params.
+    """
+    full_ranges = getattr(bucket, "mixed_dion_full_bucket_ranges", None)
+    if not full_ranges:
+        return
+    grad_data = getattr(bucket, "grad_data", None)
+    if grad_data is None:
+        raise RuntimeError("[Dion] mixed bucket is missing canonical bucket.grad_data.")
+    grad_flat = grad_data.view(-1)
+    for start, end in full_ranges:
+        if end <= start:
+            continue
+        grad_flat[start:end].zero_()
+
+
+def scale_mixed_non_dion_full_bucket_ranges_(bucket, scale: float) -> None:
+    """Apply stock DO grad scaling to the non-Dion spans of a mixed bucket.
+
+    Stock Megatron-Core scales the full canonical `bucket.grad_data` before reduce-scatter.
+    Mixed Dion buckets split that buffer into:
+    - Dion-owned spans: packed separately and already scaled during Dion packing
+    - non-Dion spans: must still receive the stock `gradient_scaling_factor` on
+      `bucket.grad_data` before the stock local-shard RS path runs
+    """
+    if scale == 1.0:
+        return
+    pack_plan = getattr(bucket, "non_dion_pack_plan", None)
+    if not pack_plan:
+        raise RuntimeError(
+            f"[Dion] mixed bucket {getattr(bucket, 'bucket_id', -1)} missing canonical non-Dion pack plan."
+        )
+    grad_data = getattr(bucket, "grad_data", None)
+    if grad_data is None:
+        raise RuntimeError(
+            f"[Dion] mixed bucket {getattr(bucket, 'bucket_id', -1)} missing canonical bucket.grad_data."
+        )
+    grad_flat = grad_data.view(-1)
+    seen = set()
+    for entry in pack_plan:
+        full_start = int(entry.get("full_start", 0))
+        full_end = int(entry.get("full_end", full_start))
+        if full_end <= full_start:
+            continue
+        key = (full_start, full_end)
+        if key in seen:
+            continue
+        seen.add(key)
+        grad_flat[full_start:full_end].mul_(scale)
 
 
 class _ParamAndGradBucket:
@@ -129,7 +223,9 @@ class _ParamAndGradBucket:
 
         # Full grad buffers for accumulation
         self.dion_grad_buffer = None
+        self.dion_grad_local_view = None
         self.non_dion_grad_buffer = None
+        self.non_dion_grad_local_view = None
         self.dion_shard_size = 0
         self.non_dion_shard_size = 0
         self.dion_param_layout = []
@@ -144,6 +240,9 @@ class _ParamAndGradBucket:
 
         # Cached computed properties
         self._cached_dion_param_ids = None
+        self.dion_param_ptr_to_entry = None
+        self.dion_param_name_to_entry = None
+        self._dion_param_layout_cache_len = None
 
     # Helper Properties
 
@@ -186,6 +285,9 @@ class _ParamAndGradBucket:
     def invalidate_dion_cache(self):
         """Invalidate Dion param cache (call when layout changes)."""
         self._cached_dion_param_ids = None
+        self.dion_param_ptr_to_entry = None
+        self.dion_param_name_to_entry = None
+        self._dion_param_layout_cache_len = None
 
 
 class _ParamAndGradBucketGroup:
@@ -257,6 +359,209 @@ class _ParamAndGradBucketGroup:
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
+    def _mark_dion_param_sync_ready(self, ready: bool):
+        """Update forward-readiness state for custom Dion param-gather buckets."""
+        for bucket in self.buckets:
+            if hasattr(bucket, "_dion_full_param_ready"):
+                bucket._dion_full_param_ready = ready
+
+    def _check_dion_param_sync_ready(self):
+        """Verify bucket.param_data remains the forward-visible canonical storage."""
+        for bucket in self.buckets:
+            if not getattr(bucket, "_dion_requires_param_sync_check", False):
+                continue
+            optimizer = getattr(bucket, "dion_optimizer", None)
+            if optimizer is None:
+                continue
+            optimizer._check_bucket_param_views(bucket, context="finish_param_sync")
+            bucket._dion_full_param_ready = True
+
+    def _get_stock_local_grad_view(self, idx: int, bucket: _ParamAndGradBucket) -> torch.Tensor:
+        """Return the canonical stock local optimizer shard for one bucket."""
+        if self.cached_grad_buffer_shard_list[idx] is None:
+            self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                bucket.grad_data, self.intra_distributed_optimizer_instance_size
+            )
+        return self.cached_grad_buffer_shard_list[idx][
+            self.intra_distributed_optimizer_instance_rank
+        ]
+
+    def _has_dion_runtime(self, bucket: _ParamAndGradBucket) -> bool:
+        """Whether a bucket has active Dion grad runtime state for this step."""
+        return (
+            bool(getattr(bucket, "dion_param_layout", None))
+            and getattr(bucket, "dion_grad_buffer", None) is not None
+        )
+
+    def _has_non_dion(self, bucket: _ParamAndGradBucket) -> bool:
+        """Whether a bucket owns any non-Dion params."""
+        return bucket.has_non_dion_params
+
+    def _is_pure_non_dion(self, bucket: _ParamAndGradBucket) -> bool:
+        """Whether a bucket should follow the stock DO RS path without Dion helpers."""
+        return self._has_non_dion(bucket) and not bool(getattr(bucket, "dion_param_layout", None))
+
+    def _start_dion_bucket_rs(
+        self,
+        *,
+        bucket: _ParamAndGradBucket,
+        reduce_op,
+        async_op: bool,
+        handles: list,
+        communication_group,
+    ) -> None:
+        """Launch the Dion-only logical local-shard RS path for one bucket."""
+        has_dion = self._has_dion_runtime(bucket)
+        if not has_dion:
+            bucket.dion_grad_local_view = None
+            return
+
+        dion_rs_group = getattr(bucket, "dion_comm_group", None) or communication_group
+        dion_shard_size = int(getattr(bucket, "dion_shard_size", 0))
+        dion_grad_buffer = bucket.dion_grad_buffer
+        expected_input = dion_shard_size * dion_rs_group.size()
+        if dion_grad_buffer is None or dion_grad_buffer.numel() != expected_input:
+            raise RuntimeError(
+                f"[Dion] Invalid Dion RS buffer size: bucket={bucket.bucket_id} "
+                f"input={0 if dion_grad_buffer is None else dion_grad_buffer.numel()} "
+                f"expected={expected_input} shard={dion_shard_size} group={dion_rs_group.size()}"
+            )
+
+        dion_shards = getattr(bucket, "cached_dion_grad_buffer_shard_list", None)
+        if (
+            dion_shards is None
+            or len(dion_shards) != dion_rs_group.size()
+            or dion_shards[0].numel() * dion_rs_group.size() != dion_grad_buffer.numel()
+        ):
+            dion_shards = shard_buffer(dion_grad_buffer, dion_rs_group.size())
+            bucket.cached_dion_grad_buffer_shard_list = dion_shards
+        dion_rs_output = dion_shards[dion_rs_group.rank()]
+        bucket.dion_grad_local_view = dion_rs_output
+
+        if dion_rs_group.size() <= 1:
+            dion_rs_output.copy_(dion_grad_buffer[:dion_shard_size])
+            return
+
+        handle = dist_reduce_scatter_func(
+            dion_rs_output,
+            dion_grad_buffer,
+            op=reduce_op,
+            group=dion_rs_group,
+            async_op=async_op,
+        )
+        if async_op and handle is not None:
+            handles.append(handle)
+
+    def _start_non_dion_bucket_rs(
+        self,
+        *,
+        idx: int,
+        bucket: _ParamAndGradBucket,
+        reduce_op,
+        async_op: bool,
+        handles: list,
+        communication_group,
+    ) -> None:
+        """Launch the canonical stock local-shard RS path for pure/mixed non-Dion grads."""
+        has_non_dion = self._has_non_dion(bucket)
+        has_dion = self._has_dion_runtime(bucket)
+        stock_local_data_view = self._get_stock_local_grad_view(idx, bucket)
+
+        if not has_non_dion:
+            bucket.non_dion_grad_local_view = None
+            if has_dion:
+                stock_local_data_view.zero_()
+            return
+
+        bucket.non_dion_grad_local_view = stock_local_data_view
+
+        if has_dion:
+            non_dion_group = getattr(bucket, "non_dion_dp_group", None)
+            if non_dion_group is None:
+                raise RuntimeError(
+                    f"[Dion] Mixed bucket {bucket.bucket_id} missing canonical non-Dion group."
+                )
+            non_dion_local_shard_size = int(getattr(bucket, "non_dion_pack_total", 0))
+            if non_dion_local_shard_size != stock_local_data_view.numel():
+                raise RuntimeError(
+                    "[Dion] Mixed non-Dion local shard size mismatch "
+                    f"bucket={bucket.bucket_id} local={non_dion_local_shard_size} "
+                    f"stock_local={stock_local_data_view.numel()}"
+                )
+            # Follow the stock DO contract as closely as possible:
+            # - bucket.grad_data is the canonical full-bucket grad buffer
+            # - mixed non-Dion takes the stock local-shard RS path on that same buffer
+            # - Dion-owned full-bucket spans are zeroed because Dion grads have already been
+            #   packed into `bucket.dion_grad_buffer` above and must not participate here
+            mask_mixed_dion_full_bucket_ranges_(bucket)
+            if non_dion_group.size() <= 1:
+                stock_local_data_view.copy_(bucket.grad_data[:non_dion_local_shard_size])
+                return
+            handle = dist_reduce_scatter_func(
+                stock_local_data_view,
+                bucket.grad_data,
+                op=reduce_op,
+                group=non_dion_group,
+                async_op=async_op,
+            )
+            if async_op and handle is not None:
+                handles.append(handle)
+            return
+
+        expected_bucket_input = stock_local_data_view.numel() * communication_group.size()
+        if bucket.grad_data.numel() != expected_bucket_input:
+            raise RuntimeError(
+                f"[Dion] Invalid stock RS buffer size: bucket={bucket.bucket_id} "
+                f"input={bucket.grad_data.numel()} expected={expected_bucket_input} "
+                f"local={stock_local_data_view.numel()} group={communication_group.size()}"
+            )
+        handle = dist_reduce_scatter_func(
+            stock_local_data_view,
+            bucket.grad_data,
+            op=reduce_op,
+            group=communication_group,
+            async_op=async_op,
+        )
+        if async_op and handle is not None:
+            handles.append(handle)
+
+    def _all_reduce_inter_instance_local_views(
+        self,
+        *,
+        idx: int,
+        bucket: _ParamAndGradBucket,
+        reduce_op,
+        async_op: bool,
+    ) -> None:
+        """All-reduce the already-materialized optimizer local views across instances."""
+        dion_local_view = getattr(bucket, "dion_grad_local_view", None)
+        has_non_dion = self._has_non_dion(bucket)
+        non_dion_local_view = getattr(bucket, "non_dion_grad_local_view", None)
+
+        if dion_local_view is not None and dion_local_view.numel() > 0:
+            torch.distributed.all_reduce(
+                dion_local_view,
+                op=reduce_op,
+                group=self.inter_distributed_optimizer_instance_group,
+                async_op=async_op,
+            )
+
+        if not has_non_dion:
+            bucket.non_dion_grad_local_view = None
+            return
+
+        if non_dion_local_view is None:
+            non_dion_local_view = self._get_stock_local_grad_view(idx, bucket)
+            bucket.non_dion_grad_local_view = non_dion_local_view
+
+        if non_dion_local_view is not None and non_dion_local_view.numel() > 0:
+            torch.distributed.all_reduce(
+                non_dion_local_view,
+                op=reduce_op,
+                group=self.inter_distributed_optimizer_instance_group,
+                async_op=async_op,
+            )
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
@@ -326,51 +631,33 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+            self._mark_dion_param_sync_ready(False)
 
             # For Dion params: perform fresh all-gather after optimizer.step()
             if has_any_dion:
+                pure_non_dion_indices = []
                 for bucket in self.buckets:
-                    if (hasattr(bucket, 'fs_all_gather_fn') and
-                        bucket.fs_all_gather_fn is not None and
-                        hasattr(bucket, 'dion_param_layout') and
-                        bucket.dion_param_layout and len(bucket.dion_param_layout) > 0):
+                    has_dion = (
+                        hasattr(bucket, 'dion_param_layout')
+                        and bucket.dion_param_layout
+                        and len(bucket.dion_param_layout) > 0
+                    )
+                    has_non_dion = bucket.has_non_dion_params
+
+                    if has_dion and hasattr(bucket, 'fs_all_gather_fn') and bucket.fs_all_gather_fn is not None:
                         bucket.fs_all_gather_fn(async_op=False)
-            return
-        else:
-            assert self.param_gather_handle is None
+                        if has_non_dion and hasattr(bucket, 'non_dion_all_gather_fn') and bucket.non_dion_all_gather_fn is not None:
+                            bucket.non_dion_all_gather_fn(async_op=False)
+                    elif has_non_dion:
+                        pure_non_dion_indices.append(bucket)
 
-        async_op = self.ddp_config.overlap_param_gather and not force_sync
-
-        if has_any_dion:
-            # Mixed bucket param all-gather
-            all_handles = []
-
-            for idx, bucket in enumerate(self.buckets):
-                has_dion = (
-                    hasattr(bucket, 'dion_param_layout')
-                    and bucket.dion_param_layout
-                    and len(bucket.dion_param_layout) > 0
-                )
-                fs_param_ids = {
-                    id(e['param']) for e in (bucket.dion_param_layout if has_dion else [])
-                }
-                has_non_dion = any(id(p) not in fs_param_ids for p in bucket.params)
-
-                # Dion params: FS all-gather (via callback)
-                if has_dion and hasattr(bucket, 'fs_all_gather_fn') and bucket.fs_all_gather_fn is not None:
-                    fs_handles = bucket.fs_all_gather_fn(async_op=async_op)
-                    if fs_handles:
-                        bucket.fs_param_gather_handles = fs_handles
-
-                # Non-Dion params: AG for MIXED and PURE buckets
-                if has_non_dion:
-                    if has_dion:
-                        if hasattr(bucket, 'non_dion_all_gather_fn') and bucket.non_dion_all_gather_fn is not None:
-                            non_dion_handles = bucket.non_dion_all_gather_fn(async_op=async_op)
-                            if non_dion_handles:
-                                bucket.non_dion_param_gather_handles = non_dion_handles
-                    else:
-                        if bucket.param_data is not None:
+                if pure_non_dion_indices:
+                    with _coalescing_manager(
+                        self.intra_distributed_optimizer_instance_group, async_ops=False
+                    ):
+                        for idx, bucket in enumerate(self.buckets):
+                            if bucket not in pure_non_dion_indices:
+                                continue
                             if self.cached_param_buffer_shard_list[idx] is None:
                                 self.cached_param_buffer_shard_list[idx] = shard_buffer(
                                     bucket.param_data, self.intra_distributed_optimizer_instance_size
@@ -378,26 +665,86 @@ class _ParamAndGradBucketGroup:
                             local_data_view = self.cached_param_buffer_shard_list[idx][
                                 self.intra_distributed_optimizer_instance_rank
                             ]
-                            h = dist_all_gather_func(
+                            dist_all_gather_func(
                                 bucket.param_data,
                                 local_data_view,
                                 group=self.intra_distributed_optimizer_instance_group,
-                                async_op=async_op,
+                                async_op=False,
                             )
-                            if async_op and h is not None:
-                                all_handles.append(h)
+                self._check_dion_param_sync_ready()
+            return
+        else:
+            assert self.param_gather_handle is None
 
-            if async_op and all_handles:
+        async_op = self.ddp_config.overlap_param_gather and not force_sync
+        self._mark_dion_param_sync_ready(False)
+
+        if has_any_dion:
+            # Keep pure non-Dion buckets on the stock DO coalesced all-gather path even when
+            # other buckets in the same bucket-group contain Dion params.
+            pure_non_dion_indices = []
+            custom_handles = []
+
+            for idx, bucket in enumerate(self.buckets):
+                has_dion = (
+                    hasattr(bucket, 'dion_param_layout')
+                    and bucket.dion_param_layout
+                    and len(bucket.dion_param_layout) > 0
+                )
+                has_non_dion = bucket.has_non_dion_params
+
+                if has_dion and hasattr(bucket, 'fs_all_gather_fn') and bucket.fs_all_gather_fn is not None:
+                    fs_handles = bucket.fs_all_gather_fn(async_op=async_op)
+                    if fs_handles:
+                        bucket.fs_param_gather_handles = fs_handles
+
+                if not has_non_dion:
+                    continue
+
+                if has_dion:
+                    if hasattr(bucket, 'non_dion_all_gather_fn') and bucket.non_dion_all_gather_fn is not None:
+                        non_dion_handles = bucket.non_dion_all_gather_fn(async_op=async_op)
+                        if non_dion_handles:
+                            bucket.non_dion_param_gather_handles = non_dion_handles
+                else:
+                    pure_non_dion_indices.append(idx)
+
+            stock_cm = None
+            if pure_non_dion_indices:
+                with _coalescing_manager(
+                    self.intra_distributed_optimizer_instance_group, async_ops=async_op
+                ) as stock_cm:
+                    for idx in pure_non_dion_indices:
+                        bucket = self.buckets[idx]
+                        if self.cached_param_buffer_shard_list[idx] is None:
+                            self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                                bucket.param_data, self.intra_distributed_optimizer_instance_size
+                            )
+                        local_data_view = self.cached_param_buffer_shard_list[idx][
+                            self.intra_distributed_optimizer_instance_rank
+                        ]
+                        dist_all_gather_func(
+                            bucket.param_data,
+                            local_data_view,
+                            group=self.intra_distributed_optimizer_instance_group,
+                            async_op=async_op,
+                        )
+
+            if async_op:
                 class _HandleList:
                     def __init__(self, hs):
                         self.hs = [h for h in hs if h is not None]
+
                     def wait(self):
                         for h in self.hs:
                             if hasattr(h, "wait"):
                                 h.wait()
-                self.param_gather_handle = _HandleList(all_handles)
+
+                stock_handle = stock_cm if pure_non_dion_indices else None
+                self.param_gather_handle = _HandleList([stock_handle, *custom_handles])
             else:
                 self.param_gather_handle = None
+                self._check_dion_param_sync_ready()
             self.param_gather_dispatched = True
             return
 
@@ -424,6 +771,7 @@ class _ParamAndGradBucketGroup:
             self.param_gather_handle = cm
         else:
             self.param_gather_handle = None
+            self._check_dion_param_sync_ready()
         self.param_gather_dispatched = True
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -498,6 +846,7 @@ class _ParamAndGradBucketGroup:
                             )
                     bucket.non_dion_param_gather_handles = None
 
+            self._check_dion_param_sync_ready()
 
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
@@ -516,6 +865,7 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                self._check_dion_param_sync_ready()
                 # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
                 if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
                     if self.next_param_gather_bucket_group.param_gather_dispatched:
@@ -581,34 +931,26 @@ class _ParamAndGradBucketGroup:
             if dion_shard_size <= 0 or pack_total <= 0:
                 continue
 
-            # Pack FS-size chunks. CP averaging is now done separately before RS.
             packing_size = fs_size
-            use_dp_cp_rs = False
-
-            # Build lookup maps
-            dion_ptr_to_entry = {}
-            dion_name_to_entry = {}
-            for e in bucket.dion_param_layout:
-                e_param = e.get('param')
-                if e_param is not None:
-                    dion_ptr_to_entry[e_param.data.data_ptr()] = e
-                    if hasattr(e_param, '_param_name'):
-                        dion_name_to_entry[e_param._param_name] = e
 
             all_entries = []
-
-            for bucket_param in bucket.params:
-                bp_ptr = bucket_param.data.data_ptr()
-                entry = dion_ptr_to_entry.get(bp_ptr)
-                if entry is None and hasattr(bucket_param, '_param_name'):
-                    entry = dion_name_to_entry.get(bucket_param._param_name)
-                if entry is None:
+            missing_main_grad = 0
+            for entry in bucket.dion_param_layout:
+                entry_param = entry.get("param")
+                if entry_param is None:
                     continue
-                if not hasattr(bucket_param, 'main_grad') or bucket_param.main_grad is None:
+                if not hasattr(entry_param, "main_grad") or entry_param.main_grad is None:
+                    missing_main_grad += 1
                     continue
-
-                entry['_bucket_param'] = bucket_param
+                entry["_bucket_param"] = entry_param
                 all_entries.append(entry)
+
+            if missing_main_grad > 0:
+                logger.warning(
+                    "[Dion] bucket %s skipped %s Dion layout entries with missing main_grad during RS packing",
+                    bucket.bucket_id,
+                    missing_main_grad,
+                )
 
             total_buffer_size = pack_total * packing_size
             # IMPORTANT: Always allocate separate buffer.
@@ -622,15 +964,23 @@ class _ParamAndGradBucketGroup:
             )
             bucket._memory_reused = False
             bucket.dion_grad_buffer = dion_grad_buffer
+            bucket.dion_rs_local_buffer = None
+            bucket.dion_grad_local_view = None
+            bucket.dion_pack_debug_inputs = {}
+            bucket.dion_pack_debug_is_avg = bool(self.ddp_config.average_in_collective)
+            bucket.dion_pack_debug_group = fs_group
 
             for entry in all_entries:
                 bucket_param = entry['_bucket_param']
+                param_name = getattr(bucket_param, "_param_name", None)
                 grad = bucket_param.main_grad.data
                 pack_offset = entry['pack_offset']
                 size_per_rank = entry.get('size_per_rank', 0)
                 fs_split_dim = entry.get('fs_split_dim', 0)
                 global_shape = entry.get('global_shape', grad.shape)
                 local_shape = entry.get('local_shape', grad.shape)
+                local_start_idx = int(entry.get('start_idx', 0))
+                local_end_idx = int(entry.get('end_idx', 0))
 
                 if fs_split_dim == 0:
                     m = global_shape[0]
@@ -646,26 +996,95 @@ class _ParamAndGradBucketGroup:
                         m, n = grad.numel(), 1
 
                 grad_2d = grad.view(m, n)
+                if os.environ.get("DION_DIAG_FS_PACK_COMPARE"):
+                    try:
+                        fs_group_rank = int(torch.distributed.get_rank(group=fs_group)) if fs_group else 0
+                        pack_start_idx = fs_group_rank * size_per_rank
+                        pack_end_idx = min(
+                            pack_start_idx + size_per_rank,
+                            m if fs_split_dim == 0 else n,
+                        )
+                        if fs_split_dim == 0:
+                            pack_local = grad_2d[pack_start_idx:pack_end_idx, :]
+                            direct_local = grad_2d[local_start_idx:local_end_idx, :]
+                        else:
+                            pack_local = grad_2d[:, pack_start_idx:pack_end_idx]
+                            direct_local = grad_2d[:, local_start_idx:local_end_idx]
+                        pack_local_max = (
+                            float(pack_local.abs().amax()) if pack_local.numel() > 0 else 0.0
+                        )
+                        direct_local_max = (
+                            float(direct_local.abs().amax()) if direct_local.numel() > 0 else 0.0
+                        )
+                        if (
+                            pack_start_idx != local_start_idx
+                            or pack_end_idx != local_end_idx
+                            or (pack_local_max == 0.0) != (direct_local_max == 0.0)
+                        ):
+                            param_name = getattr(bucket_param, "_param_name", f"id_{id(bucket_param)}")
+                            logger.error(
+                                "[DION_FS_PACK_COMPARE] param=%s bucket=%s fs_rank=%s fs_split_dim=%s "
+                                "pack=[%s:%s] direct=[%s:%s] grad_shape=%s local_shape=%s global_shape=%s "
+                                "pack_local_max=%.3e direct_local_max=%.3e",
+                                param_name,
+                                getattr(bucket, "bucket_id", None),
+                                fs_group_rank,
+                                fs_split_dim,
+                                pack_start_idx,
+                                pack_end_idx,
+                                local_start_idx,
+                                local_end_idx,
+                                tuple(grad_2d.shape),
+                                tuple(local_shape),
+                                tuple(global_shape),
+                                pack_local_max,
+                                direct_local_max,
+                            )
+                    except Exception as error:
+                        logger.error("[DION_FS_PACK_COMPARE_FAILED] err=%r", error)
                 # Scale for Dion packing before reduce-scatter.
-                # Dion buckets do CP aggregation separately (cp_group below) and then RS over FS.
-                # - average_in_collective=True: RS uses AVG, so no pre-scaling is needed.
-                # - average_in_collective=False: RS uses SUM. Since we do CP AVG separately,
-                #   pre-scale by (gradient_scaling_factor * cp_size) so that the final scaling
-                #   matches standard dp-cp reduction semantics.
                 is_expert_bucket = not getattr(bucket_param, 'allreduce', True)
                 if is_expert_bucket:
-                    # Expert buckets do not use CP, so gradient_scaling_factor is sufficient.
                     scale = bucket.gradient_scaling_factor
                 else:
                     if self.ddp_config.average_in_collective:
                         scale = 1.0
                     else:
-                        cp_group = getattr(bucket, 'cp_group', None)
-                        cp_size = cp_group.size() if cp_group is not None else 1
-                        scale = bucket.gradient_scaling_factor * cp_size
+                        scale = bucket.gradient_scaling_factor
+
+                fs_group_rank = int(torch.distributed.get_rank(group=fs_group)) if fs_group else 0
+                if _dion_pack_debug_enabled(param_name):
+                    all_pack_scaled = []
+                    for target_rank in range(packing_size):
+                        target_start_idx = target_rank * size_per_rank
+                        target_end_idx = min(
+                            target_start_idx + size_per_rank,
+                            m if fs_split_dim == 0 else n,
+                        )
+                        if fs_split_dim == 0:
+                            target_pack_seg = grad_2d[target_start_idx:target_end_idx, :]
+                        else:
+                            target_pack_seg = grad_2d[:, target_start_idx:target_end_idx]
+                        target_pack_scaled = target_pack_seg.detach().float().clone()
+                        if scale != 1.0:
+                            target_pack_scaled.mul_(scale)
+                        all_pack_scaled.append(target_pack_scaled.cpu())
+                    bucket.dion_pack_debug_inputs[id(bucket_param)] = {
+                        "param_name": param_name,
+                        "buffer_idx": getattr(bucket, "global_buffer_idx", None),
+                        "bucket_id": getattr(bucket, "bucket_id", None),
+                        "pack_offset": int(pack_offset),
+                        "local_shape": tuple(int(x) for x in local_shape),
+                        "fs_split_dim": int(fs_split_dim),
+                        "size_per_rank": int(size_per_rank),
+                        "start_idx": int(local_start_idx),
+                        "end_idx": int(local_end_idx),
+                        "scale": float(scale),
+                        "all_scaled": all_pack_scaled,
+                    }
 
                 for rank_j in range(packing_size):
-                    fs_pos = dp_cp_to_fs[rank_j] if use_dp_cp_rs else rank_j
+                    fs_pos = rank_j
                     start_idx = fs_pos * size_per_rank
                     end_idx = min(start_idx + size_per_rank, m if fs_split_dim == 0 else n)
 
@@ -685,122 +1104,30 @@ class _ParamAndGradBucketGroup:
 
                 del entry['_bucket_param']
 
-        # Handle non-Dion params in mixed buckets for GRAD_FUSION=1
-        for bucket in self.buckets:
-            # Check if this is a mixed bucket with non-Dion params
-            has_dion = (hasattr(bucket, 'dion_param_layout') and bucket.dion_param_layout and
-                       len(bucket.dion_param_layout) > 0)
-            has_non_dion_buffer = (hasattr(bucket, 'non_dion_full_grad_buffer') and
-                                  bucket.non_dion_full_grad_buffer is not None)
-            has_non_dion_plan = (hasattr(bucket, 'non_dion_pack_plan') and
-                                bucket.non_dion_pack_plan and len(bucket.non_dion_pack_plan) > 0)
-
-            if not (has_dion and has_non_dion_buffer and has_non_dion_plan):
-                continue  # Not a mixed bucket or no non-Dion plan
-
-            # Check if GRAD_FUSION=1 (any bucket param has grad_added_to_main_grad=True)
-            # NOTE: Check on bucket.params (DDP params), NOT on optimizer's pack_plan params
-            need_grad_fusion_copy = any(
-                getattr(bp, 'grad_added_to_main_grad', False)
-                for bp in bucket.params if not getattr(bp, 'is_dion_param', False)
-            )
-            if not need_grad_fusion_copy:
-                continue  # GRAD_FUSION=0: DDP hook already handled it
-
-            # Get DP group info
-            dp_group = bucket.non_dion_dp_group if hasattr(bucket, 'non_dion_dp_group') and bucket.non_dion_dp_group else None
-            if dp_group is None:
-                raise RuntimeError(
-                    "[Dion] non_dion_dp_group is missing for a mixed bucket; "
-                    "cannot safely compute dp_size for non-Dion GRAD_FUSION packing."
-                )
-            dp_size = dp_group.size()
-            non_dion_pack_total = getattr(bucket, 'non_dion_pack_total', 0)
-
-            # Build name-to-entry map for non-Dion params
-            if hasattr(bucket, 'non_dion_param_name_to_entry') and bucket.non_dion_param_name_to_entry:
-                name_to_entry = bucket.non_dion_param_name_to_entry
-            else:
-                name_to_entry = {}
-                for e in bucket.non_dion_pack_plan:
-                    p = e.get('param')
-                    if p is not None and hasattr(p, '_param_name'):
-                        name_to_entry[p._param_name] = e
-
-            for bucket_param in bucket.params:
-                # Check if this is a non-Dion param that needs GRAD_FUSION copy
-                if not getattr(bucket_param, 'grad_added_to_main_grad', False):
-                    continue  # Not GRAD_FUSION=1
-
-                # Skip Dion params (already handled above)
-                is_dion = getattr(bucket_param, 'is_dion_param', False)
-                if is_dion:
-                    continue
-
-                # Get gradient from main_grad
-                if not hasattr(bucket_param, 'main_grad') or bucket_param.main_grad is None:
-                    continue
-
-                grad_source = bucket_param.main_grad.data
-
-                # Find entry in non_dion_pack_plan
-                entry = None
-                param_name = getattr(bucket_param, '_param_name', None)
-                if param_name and param_name in name_to_entry:
-                    entry = name_to_entry[param_name]
-                else:
-                    bucket_param_ptr = bucket_param.data.data_ptr()
-                    for e in bucket.non_dion_pack_plan:
-                        e_param = e.get('param')
-                        if e_param is not None and e_param.data.data_ptr() == bucket_param_ptr:
-                            entry = e
-                            break
-
-                if entry is None:
-                    continue  # Not found in non-Dion pack plan
-
-                pack_offset = entry['pack_offset']
-                shard_size = entry['segment_size']
-                grad_flat = grad_source.view(-1)
-                param_numel = grad_flat.numel()
-                # Pre-scale for RS. Non-Dion mixed-bucket path does CP aggregation separately
-                # and then RS over DP/FS.
-                if self.ddp_config.average_in_collective:
-                    scale = 1.0
-                else:
-                    cp_group = getattr(bucket, 'cp_group', None)
-                    cp_size = cp_group.size() if cp_group is not None else 1
-                    scale = bucket.gradient_scaling_factor * cp_size
-
-                # Write each shard to the corresponding section
-                for rank_i in range(dp_size):
-                    shard_start = rank_i * shard_size
-                    shard_end = min(shard_start + shard_size, param_numel)
-
-                    if shard_start < param_numel:
-                        actual_shard_size = shard_end - shard_start
-                        buf_start = rank_i * non_dion_pack_total + pack_offset
-                        buf_end = buf_start + actual_shard_size
-                        bucket.non_dion_full_grad_buffer[buf_start:buf_end].add_(
-                            grad_flat[shard_start:shard_end],
-                            alpha=scale,
-                        )
+        # For mixed buckets, non-Dion params follow the stock Megatron-Core DO path:
+        # TE/backward hook accumulates into canonical `param.main_grad`, and the bucket
+        # participates in the standard bucket.grad_data RS/AR lifecycle below. No custom
+        # mixed non-Dion packing is performed here.
 
         # gradient_scaling_factor already takes into account whether we are computing
         # an average or sum in the data-parallel collective.
         for bucket in self.buckets:
             if bucket.gradient_scaling_factor != 1.0:
-                # Skip gradient_scaling_factor for Dion buckets
-                # Dion packing already pre-scaled (gradient_scaling_factor or 1/fs_size),
-                # and scratch is a view of grad_data.
-                # If we scale grad_data, scratch (RS input) would be incorrectly scaled.
-                has_dion = (hasattr(bucket, 'dion_param_layout') and bucket.dion_param_layout and
-                           len(bucket.dion_param_layout) > 0)
-                if has_dion:
-                    # Dion bucket: skip (already pre-scaled in packing)
+                has_dion = bool(getattr(bucket, 'dion_param_layout', None))
+                has_non_dion = self._has_non_dion(bucket)
+                if has_dion and has_non_dion:
+                    # Mixed bucket:
+                    # - Dion spans are packed separately below and already pre-scaled there
+                    # - non-Dion spans still need the stock DO full-buffer scaling before
+                    #   the stock local-shard RS path runs on bucket.grad_data
+                    scale_mixed_non_dion_full_bucket_ranges_(
+                        bucket, bucket.gradient_scaling_factor
+                    )
+                elif has_dion and not has_non_dion:
+                    # Pure Dion bucket: skip, Dion packing already pre-scaled.
                     pass
                 else:
-                    # Pure non-Dion bucket: apply normally
+                    # Pure non-Dion buckets follow stock bucket.grad_data scaling.
                     bucket.grad_data *= bucket.gradient_scaling_factor
 
         # Decide reduce_op.
@@ -842,127 +1169,68 @@ class _ParamAndGradBucketGroup:
             else self.data_parallel_group
         )
 
-        # Manually collect handles to avoid _coalescing_manager receiving None from FS reduce-scatter.
+        # Keep pure non-Dion buckets on the stock DO reduce-scatter path and use
+        # custom helpers only for mixed/Dion buckets.
         handles = []
+        pure_non_dion_indices = []
 
         with stream_context:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer:
-                    # Mixed bucket: separate reduce-scatter for Dion and non-Dion params
-                    # Check for Dion params
-                    has_dion = (hasattr(bucket, 'dion_grad_buffer') and
-                               bucket.dion_grad_buffer is not None)
+                    if self._is_pure_non_dion(bucket):
+                        pure_non_dion_indices.append(idx)
+                        continue
+                    self._start_dion_bucket_rs(
+                        bucket=bucket,
+                        reduce_op=reduce_op,
+                        async_op=async_op,
+                        handles=handles,
+                        communication_group=communication_group,
+                    )
+                    self._start_non_dion_bucket_rs(
+                        idx=idx,
+                        bucket=bucket,
+                        reduce_op=reduce_op,
+                        async_op=async_op,
+                        handles=handles,
+                        communication_group=communication_group,
+                    )
+                    continue
 
-                    # Non-Dion: params not in dion_param_layout
-                    fs_param_ids = {id(e['param']) for e in (bucket.dion_param_layout if hasattr(bucket, 'dion_param_layout') and bucket.dion_param_layout else [])}
-                    has_non_dion = any(id(p) not in fs_param_ids for p in bucket.params)
+                handle = torch.distributed.all_reduce(
+                    bucket.grad_data,
+                    op=reduce_op,
+                    group=communication_group,
+                    async_op=async_op,
+                )
+                if async_op and handle is not None:
+                    handles.append(handle)
 
-                    # RS group: always use FS group for Dion RS.
-                    # CP AVG is done separately before RS (line 893-899),
-                    # so RS should only scatter across FS ranks (not dp_cp).
-                    # Using dp_cp group would cause CP-rank duplicates in the SUM.
-                    dion_rs_group = getattr(bucket, "dion_comm_group", None) or communication_group
-
-                    # ------- Dion params: CP AVG then FS RS -------
-                    # CP>1: average partial gradients across CP ranks first,
-                    # then reduce-scatter over FS group (same as non-Dion path).
-                    if has_dion:
-                        dion_shard_size = bucket.dion_shard_size
-                        dion_grad_buffer = bucket.dion_grad_buffer
-
-                        # CP averaging for Dion gradients (dense params only)
-                        cp_group = getattr(bucket, 'cp_group', None)
-                        if cp_group is not None and cp_group.size() > 1:
-                            torch.distributed.all_reduce(
-                                dion_grad_buffer,
-                                op=torch.distributed.ReduceOp.AVG,
-                                group=cp_group,
-                            )
-
-                        # RS over FS group (not dp_cp)
-                        fs_rs_group = getattr(bucket, "dion_comm_group", None) or communication_group
-
-                        h = dist_reduce_scatter_func(
-                            bucket.grad_data[:dion_shard_size],
-                            dion_grad_buffer,
-                            op=reduce_op,
-                            group=fs_rs_group,
-                            async_op=async_op,
+        if pure_non_dion_indices:
+            with stream_context, _coalescing_manager(
+                communication_group, async_ops=async_op
+            ) as pure_cm:
+                for idx in pure_non_dion_indices:
+                    bucket = self.buckets[idx]
+                    local_data_view = self._get_stock_local_grad_view(idx, bucket)
+                    bucket.non_dion_grad_local_view = local_data_view
+                    expected_bucket_input = local_data_view.numel() * communication_group.size()
+                    if bucket.grad_data.numel() != expected_bucket_input:
+                        raise RuntimeError(
+                            "[Dion] Invalid pure non-Dion stock RS buffer size: "
+                            f"bucket={bucket.bucket_id} input={bucket.grad_data.numel()} "
+                            f"expected={expected_bucket_input} local={local_data_view.numel()} "
+                            f"group={communication_group.size()}"
                         )
-                        if async_op and h is not None:
-                            handles.append(h)
-
-                    # ------- Non-Dion params: RS for MIXED and PURE buckets -------
-                    # Non-Dion params handling:
-                    # - MIXED bucket: RS from non_dion_full_grad_buffer → bucket.grad_data[dion_shard_size:]
-                    # - PURE non-Dion bucket: Standard bucket-level RS
-                    if has_non_dion:
-                        if has_dion:
-                            # MIXED bucket: RS from non_dion_full_grad_buffer
-                            has_buffer = hasattr(bucket, 'non_dion_full_grad_buffer') and bucket.non_dion_full_grad_buffer is not None
-                            has_shard_size = hasattr(bucket, 'non_dion_shard_size')
-                            shard_size_val = getattr(bucket, 'non_dion_shard_size', 0)
-                            if has_buffer and has_shard_size and shard_size_val > 0:
-                                dion_shard_size = bucket.dion_shard_size
-                                non_dion_shard_size = bucket.non_dion_shard_size
-                                dp_group = getattr(bucket, 'non_dion_dp_group', None) or communication_group
-
-                                cp_group = getattr(bucket, 'cp_group', None)
-                                if cp_group is not None and cp_group.size() > 1:
-                                    torch.distributed.all_reduce(
-                                        bucket.non_dion_full_grad_buffer,
-                                        op=torch.distributed.ReduceOp.AVG,
-                                        group=cp_group,
-                                    )
-
-                                h = dist_reduce_scatter_func(
-                                    bucket.grad_data[dion_shard_size:dion_shard_size + non_dion_shard_size],
-                                    bucket.non_dion_full_grad_buffer,
-                                    op=reduce_op,
-                                    group=dp_group,
-                                    async_op=async_op,
-                                )
-                                if async_op and h is not None:
-                                    handles.append(h)
-                        else:
-                            # PURE non-Dion bucket: use standard bucket-level RS
-                            # CP all-reduce for pure non-Dion bucket when CP > 1
-                            # This bucket has no Dion params, so CP all-reduce was not done above.
-                            cp_group = getattr(bucket, 'cp_group', None)
-                            if cp_group is not None and cp_group.size() > 1:
-                                torch.distributed.all_reduce(
-                                    bucket.grad_data,
-                                    op=torch.distributed.ReduceOp.AVG,
-                                    group=cp_group,
-                                )
-
-                            if self.cached_grad_buffer_shard_list[idx] is None:
-                                self.cached_grad_buffer_shard_list[idx] = shard_buffer(
-                                    bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                                )
-                            local_data_view = self.cached_grad_buffer_shard_list[idx][
-                                self.intra_distributed_optimizer_instance_rank
-                            ]
-                            h = dist_reduce_scatter_func(
-                                local_data_view,
-                                bucket.grad_data,
-                                op=reduce_op,
-                                group=communication_group,
-                                async_op=async_op,
-                            )
-                            if async_op and h is not None:
-                                handles.append(h)
-
-                else:
-                    # Non-distributed optimizer: standard all-reduce
-                    h = torch.distributed.all_reduce(
+                    dist_reduce_scatter_func(
+                        local_data_view,
                         bucket.grad_data,
                         op=reduce_op,
                         group=communication_group,
                         async_op=async_op,
                     )
-                    if async_op and h is not None:
-                        handles.append(h)
+            if async_op:
+                handles.append(pure_cm)
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
@@ -978,20 +1246,58 @@ class _ParamAndGradBucketGroup:
                 ) as cm,
             ):
                 for idx, bucket in enumerate(self.buckets):
-                    if self.cached_grad_buffer_shard_list[idx] is None:
-                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
-                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                        )
-                    local_data_view = self.cached_grad_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-
-                    torch.distributed.all_reduce(
-                        local_data_view,
-                        op=reduce_op,
-                        group=self.inter_distributed_optimizer_instance_group,
+                    dion_local_view = getattr(bucket, "dion_grad_local_view", None)
+                    non_dion_local_view = getattr(bucket, "non_dion_grad_local_view", None)
+                    self._all_reduce_inter_instance_local_views(
+                        idx=idx,
+                        bucket=bucket,
+                        reduce_op=reduce_op,
                         async_op=async_op,
                     )
+
+                    if (
+                        not async_op
+                        and os.getenv("DION_INTER_DIAG", "0") == "1"
+                        and not getattr(bucket, "_dion_inter_diag_logged", False)
+                    ):
+                        fp = []
+                        if dion_local_view is not None and dion_local_view.numel() > 0:
+                            torch.cuda.synchronize(dion_local_view.device)
+                            fp.append(
+                                (
+                                    "dion",
+                                    tuple(dion_local_view.shape),
+                                    float(dion_local_view.float().sum().item()),
+                                    float(dion_local_view.float().abs().sum().item()),
+                                    float((dion_local_view.float() ** 2).sum().item()),
+                                    float(dion_local_view.float().abs().max().item()),
+                                )
+                            )
+                        if non_dion_local_view is not None and non_dion_local_view.numel() > 0:
+                            torch.cuda.synchronize(non_dion_local_view.device)
+                            fp.append(
+                                (
+                                    "non_dion",
+                                    tuple(non_dion_local_view.shape),
+                                    float(non_dion_local_view.float().sum().item()),
+                                    float(non_dion_local_view.float().abs().sum().item()),
+                                    float((non_dion_local_view.float() ** 2).sum().item()),
+                                    float(non_dion_local_view.float().abs().max().item()),
+                                )
+                            )
+                        gathered = [None] * self.inter_distributed_optimizer_instance_group.size()
+                        torch.distributed.all_gather_object(
+                            gathered, fp, group=self.inter_distributed_optimizer_instance_group
+                        )
+                        logger.info(
+                            "[DION_INTER_INSTANCE_DIAG] bucket=%s group=%s gathered=%s",
+                            getattr(bucket, "bucket_id", -1),
+                            torch.distributed.get_process_group_ranks(
+                                self.inter_distributed_optimizer_instance_group
+                            ),
+                            gathered,
+                        )
+                        bucket._dion_inter_diag_logged = True
             # Add coalescing manager handle to the list
             if async_op and cm is not None:
                 handles.append(cm)
@@ -1011,22 +1317,29 @@ class _ParamAndGradBucketGroup:
         else:
             self.grad_reduce_handle = None
 
+    def _flush_mixed_non_dion_rs_buffers(self):
+        """Mixed non-Dion now follows stock DO local-shard contract; no flush is required."""
+        return
+
     def _release_dion_grad_buffers(self):
         """
         Clean up Dion RS buffers after reduce-scatter completes.
 
         - dion_grad_buffer: Release reference (view of grad_data or separate allocation)
-        - non_dion_full_grad_buffer: Zero for next iteration (persistent buffer)
+        - mixed non-Dion follows stock `bucket.grad_data` local-shard contract
         """
         for bucket in self.buckets:
             # Release dion_grad_buffer reference
             if hasattr(bucket, 'dion_grad_buffer'):
                 bucket.dion_grad_buffer = None
+            if hasattr(bucket, 'dion_rs_local_buffer'):
+                bucket.dion_rs_local_buffer = None
+            if hasattr(bucket, 'dion_grad_local_view'):
+                bucket.dion_grad_local_view = None
+            if hasattr(bucket, 'non_dion_grad_local_view'):
+                bucket.non_dion_grad_local_view = None
             if hasattr(bucket, '_memory_reused'):
                 bucket._memory_reused = False
-            # Zero non_dion_full_grad_buffer for next iteration
-            if hasattr(bucket, 'non_dion_full_grad_buffer') and bucket.non_dion_full_grad_buffer is not None:
-                bucket.non_dion_full_grad_buffer.zero_()
 
     def finish_grad_sync(self):
         """
@@ -1038,16 +1351,33 @@ class _ParamAndGradBucketGroup:
         makes synchronous call.
         """
         self.param_gather_dispatched = False
+        pp_world_size = parallel_state.get_pipeline_model_parallel_world_size()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if pp_world_size > 1:
+            logger.info(
+                "[DION_PP_DEBUG] rank=%s finish_grad_sync enter buckets=%s overlap=%s handle=%s",
+                rank,
+                [getattr(bucket, 'bucket_id', -1) for bucket in self.buckets],
+                self.ddp_config.overlap_grad_reduce,
+                self.grad_reduce_handle is not None,
+            )
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
-            self._release_dion_grad_buffers()
+            self._flush_mixed_non_dion_rs_buffers()
+            if pp_world_size > 1:
+                logger.info("[DION_PP_DEBUG] rank=%s finish_grad_sync exit sync", rank)
             return
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
-            torch.cuda.default_stream().wait_stream(self.communication_stream)
-            self._release_dion_grad_buffers()
+            if self.communication_stream is not None:
+                torch.cuda.default_stream().wait_stream(self.communication_stream)
+            if os.getenv("DION_POST_INTER_LOCAL_DIAG", "0") == "1":
+                self._log_post_inter_local_views()
+            self._flush_mixed_non_dion_rs_buffers()
+            if pp_world_size > 1:
+                logger.info("[DION_PP_DEBUG] rank=%s finish_grad_sync exit inter-instance", rank)
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -1055,7 +1385,72 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
-        self._release_dion_grad_buffers()
+        self._flush_mixed_non_dion_rs_buffers()
+        if pp_world_size > 1:
+            logger.info("[DION_PP_DEBUG] rank=%s finish_grad_sync exit async", rank)
+
+    def _log_post_inter_local_views(self):
+        """Best-effort exact post-inter-instance local-view fingerprint check.
+
+        This is a focused debug tool for multi-instance DO integration. It runs only
+        after the default stream has waited on the communication stream, so the local
+        optimizer shard views should already reflect the final stock-DO-equivalent RS/AR
+        result for this step.
+        """
+        if not torch.distributed.is_initialized():
+            return
+        inter_group = getattr(self, "inter_distributed_optimizer_instance_group", None)
+        if inter_group is None or inter_group.size() <= 1:
+            return
+
+        try:
+            group_ranks = torch.distributed.get_process_group_ranks(inter_group)
+        except Exception:
+            group_ranks = None
+
+        for bucket in self.buckets:
+            dion_view = getattr(bucket, "dion_grad_local_view", None)
+            if dion_view is not None and dion_view.numel() > 0:
+                tensor = dion_view.detach().float()
+                fp = (
+                    "dion",
+                    int(getattr(bucket, "bucket_id", -1)),
+                    tuple(tensor.shape),
+                    float(tensor.sum().item()),
+                    float(tensor.abs().sum().item()),
+                    float((tensor * tensor).sum().item()),
+                    float(tensor.abs().max().item()),
+                )
+                gathered = [None] * inter_group.size()
+                torch.distributed.all_gather_object(gathered, fp, group=inter_group)
+                if any(item != fp for item in gathered):
+                    logger.error(
+                        "[DION_POST_INTER_LOCAL_MISMATCH] kind=dion bucket=%s group_ranks=%s gathered=%s",
+                        getattr(bucket, "bucket_id", -1),
+                        group_ranks,
+                        gathered,
+                    )
+            non_dion_view = getattr(bucket, "non_dion_grad_local_view", None)
+            if non_dion_view is not None and non_dion_view.numel() > 0:
+                tensor = non_dion_view.detach().float()
+                fp = (
+                    "non_dion",
+                    int(getattr(bucket, "bucket_id", -1)),
+                    tuple(tensor.shape),
+                    float(tensor.sum().item()),
+                    float(tensor.abs().sum().item()),
+                    float((tensor * tensor).sum().item()),
+                    float(tensor.abs().max().item()),
+                )
+                gathered = [None] * inter_group.size()
+                torch.distributed.all_gather_object(gathered, fp, group=inter_group)
+                if any(item != fp for item in gathered):
+                    logger.error(
+                        "[DION_POST_INTER_LOCAL_MISMATCH] kind=non_dion bucket=%s group_ranks=%s gathered=%s",
+                        getattr(bucket, "bucket_id", -1),
+                        group_ranks,
+                        gathered,
+                    )
 
     def register_grad_ready(self, param: torch.nn.Parameter):
         """

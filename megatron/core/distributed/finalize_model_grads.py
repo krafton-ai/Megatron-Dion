@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
+import os
 from functools import partial
 from typing import Callable, List, Optional, Union
 
@@ -29,6 +31,72 @@ from ..utils import (
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
 )
+
+logger = logging.getLogger(__name__)
+
+_FINALIZE_CALL_IDX = 0
+
+
+def _maybe_log_finalize_target_grads(
+    model: List[torch.nn.Module],
+    *,
+    stage: str,
+    step: int,
+    pp_group: Optional[torch.distributed.ProcessGroup],
+):
+    if os.getenv("DION_FINALIZE_GRAD_DIAG", "0") != "1":
+        return
+    target_step = int(os.getenv("DION_FINALIZE_GRAD_STEP", "10"))
+    if step != target_step:
+        return
+    target_env = os.getenv("DION_FINALIZE_GRAD_NAMES", "")
+    targets = [item.strip() for item in target_env.split(",") if item.strip()]
+    if not targets:
+        targets = ["word_embeddings.weight", "output_layer.weight"]
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    pp_group_ranks = None
+    if pp_group is not None and torch.distributed.is_initialized():
+        try:
+            pp_group_ranks = torch.distributed.get_process_group_ranks(pp_group)
+        except Exception:
+            pp_group_ranks = None
+
+    for chunk_idx, model_chunk in enumerate(model):
+        named_parameters = get_attr_wrapped_model(model_chunk, 'named_parameters')()
+        for name, param in named_parameters:
+            if not any(target in name for target in targets):
+                continue
+            grad_attr = _get_main_grad_attr(param)
+            grad = getattr(param, grad_attr, None)
+            if grad is None:
+                logger.info(
+                    "[DION_FINALIZE_GRAD] step=%s stage=%s rank=%s chunk=%s name=%s grad=None",
+                    step,
+                    stage,
+                    rank,
+                    chunk_idx,
+                    name,
+                )
+                continue
+            local_grad = grad._local_tensor if hasattr(grad, "_local_tensor") else grad
+            flat = local_grad.detach().float().view(-1)
+            ptr = int(local_grad.untyped_storage().data_ptr()) if local_grad.numel() > 0 else 0
+            logger.info(
+                "[DION_FINALIZE_GRAD] step=%s stage=%s rank=%s pp_group=%s chunk=%s "
+                "name=%s shape=%s numel=%s sq_sum=%.9f amax=%.9f ptr=%s",
+                step,
+                stage,
+                rank,
+                pp_group_ranks,
+                chunk_idx,
+                name,
+                tuple(local_grad.shape),
+                local_grad.numel(),
+                float((flat * flat).sum().item()) if flat.numel() > 0 else 0.0,
+                float(flat.abs().max().item()) if flat.numel() > 0 else 0.0,
+                ptr,
+            )
 
 
 def _get_main_grad_attr(param: torch.nn.Parameter):
@@ -396,6 +464,10 @@ def finalize_model_grads(
     scale gradients by `num_tokens`.
     """
 
+    global _FINALIZE_CALL_IDX
+    _FINALIZE_CALL_IDX += 1
+    finalize_step = _FINALIZE_CALL_IDX
+
     config = get_model_config(model[0])
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')
@@ -430,8 +502,25 @@ def finalize_model_grads(
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
-    for model_chunk in model:
+    pp_world_size = get_pg_size(pp_group)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    for chunk_idx, model_chunk in enumerate(model):
+        if pp_world_size > 1:
+            logger.info(
+                "[DION_PP_DEBUG] rank=%s before finish_grad_sync chunk=%s",
+                rank,
+                chunk_idx,
+            )
         model_chunk.finish_grad_sync()
+        if pp_world_size > 1:
+            logger.info(
+                "[DION_PP_DEBUG] rank=%s after finish_grad_sync chunk=%s",
+                rank,
+                chunk_idx,
+            )
+    _maybe_log_finalize_target_grads(
+        model, stage="post_finish_grad_sync", step=finalize_step, pp_group=pp_group
+    )
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
 
@@ -440,7 +529,11 @@ def finalize_model_grads(
         config.timers('conditional-embedder-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
+    if pp_world_size > 1:
+        logger.info("[DION_PP_DEBUG] rank=%s before conditional_embedding_allreduce", rank)
     _allreduce_conditional_embedding_grads(model, config, pp_group)
+    if pp_world_size > 1:
+        logger.info("[DION_PP_DEBUG] rank=%s after conditional_embedding_allreduce", rank)
     if config.timers is not None:
         config.timers('conditional-embedder-grads-all-reduce').stop()
 
@@ -458,8 +551,21 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
+    if pp_world_size > 1:
+        logger.info("[DION_PP_DEBUG] rank=%s before word_embedding_allreduce", rank)
     _allreduce_word_embedding_grads(model, config, embd_group, pp_group)
+    _maybe_log_finalize_target_grads(
+        model, stage="post_word_embedding_allreduce", step=finalize_step, pp_group=pp_group
+    )
+    if pp_world_size > 1:
+        logger.info("[DION_PP_DEBUG] rank=%s after word_embedding_allreduce", rank)
+        logger.info("[DION_PP_DEBUG] rank=%s before position_embedding_allreduce", rank)
     _allreduce_position_embedding_grads(model, config, pos_emb_group, pp_group)
+    _maybe_log_finalize_target_grads(
+        model, stage="post_position_embedding_allreduce", step=finalize_step, pp_group=pp_group
+    )
+    if pp_world_size > 1:
+        logger.info("[DION_PP_DEBUG] rank=%s after position_embedding_allreduce", rank)
 
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()

@@ -2291,9 +2291,6 @@ def _add_training_args(parser):
     group.add_argument('--dion-Q-dtype', type=str, default='float32',
                        choices=['float32', 'bfloat16'],
                        help='Dion Q matrix dtype.')
-    group.add_argument('--dion-lr-scaling', type=str, default='dion',
-                       choices=['dion_ref', 'dion', 'moonlight'],
-                       help='Dion LR scaling: dion_ref (sqrt(m/n)), dion (RMS-matched), moonlight (Muon-style).')
     # 2D Parallelism for Dion
     group.add_argument('--fully-shard-model-parallel-size', type=int, default=1,
                        help='Fully Sharded (FS) size for Dion 2D parallelism.')

@@ -1267,7 +1267,10 @@ class ChainedOptimizer(MegatronOptimizer):
     def get_grad_norm(self):
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].get_grad_norm()
-        if self.grads_states_parallel_group_is_shared():
+
+        is_shared = self.grads_states_parallel_group_is_shared()
+
+        if is_shared:
             grads_for_norm = []
             for optimizer in self.chained_optimizers:
                 grads_for_norm += optimizer.get_main_grads_for_grad_norm()

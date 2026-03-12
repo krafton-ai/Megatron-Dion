@@ -5,6 +5,7 @@
 
 import gc
 import itertools
+import os
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -59,6 +60,56 @@ from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_g
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
+
+
+def _std_grad_contract_diag_enabled(param_name: str) -> bool:
+    spec = os.getenv("DION_STD_GRAD_CONTRACT_DIAG", "")
+    if not spec:
+        return False
+    if spec == "1":
+        return True
+    if not param_name:
+        return False
+    return any(token and token in param_name for token in spec.split(","))
+
+
+def _maybe_log_std_grad_contract_(
+    *,
+    model_param: torch.nn.Parameter,
+    shard_param: torch.nn.Parameter,
+    model_grad: torch.Tensor,
+    shard_grad: torch.Tensor,
+    param_range,
+) -> None:
+    param_name = (
+        getattr(model_param, "_param_name", "")
+        or getattr(shard_param, "_param_name", "")
+        or f"id_{id(model_param)}"
+    )
+    if not _std_grad_contract_diag_enabled(param_name):
+        return
+
+    def _fp(t: torch.Tensor):
+        tf = t.float()
+        return (
+            tuple(t.shape),
+            float(tf.sum().item()),
+            float(tf.abs().sum().item()),
+            float((tf**2).sum().item()),
+            float(tf.abs().max().item()) if t.numel() > 0 else 0.0,
+        )
+
+    logger.info(
+        "[DION_STD_GRAD_CONTRACT] rank=%s param=%s shared=%s shared_embedding=%s range=(%s,%s) model=%s shard=%s",
+        torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+        param_name,
+        bool(getattr(model_param, "shared", False)),
+        bool(getattr(model_param, "shared_embedding", False)),
+        int(param_range.start),
+        int(param_range.end),
+        _fp(model_grad),
+        _fp(shard_grad),
+    )
 
 
 class Range:
@@ -2395,6 +2446,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     model_grad = model_param.main_grad
                     shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
+                    _maybe_log_std_grad_contract_(
+                        model_param=model_param,
+                        shard_param=shard_main_param,
+                        model_grad=model_grad,
+                        shard_grad=shard_model_grad,
+                        param_range=param_range,
+                    )
                     if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # Pytorch requires a param and its' grad to be the same dtype, but we want
                         # their types to be different in precision-aware optimizer. So we use

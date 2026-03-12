@@ -1,15 +1,8 @@
 #!/bin/bash
-# Megatron-LM training script matching nanoMoE configuration (Dion optimizer)
-# Reference: /wbl/optimization/nanoMoE/config/train_nano_moe.py
+# Megatron-LM training script for a smaller picoMoE validation model (Dion optimizer)
 #
-# Parallelism: FS=2, TP=2, EP=2, PP=1, CP=1 (8 GPUs)
-#
-# nanoMoE config:
-#   - Model: 8 layers, 8 heads, 384 hidden (small GPT)
-#   - MoE: 8 experts, top-2, every other layer (stride=2)
-#   - Training: lr=6e-4, weight_decay=0.1, warmup=2000, max_iters=50000
-#   - Batch: ~491,520 tokens per step
-#   - Dataset: OpenWebText (~9B tokens)
+# Parallelism defaults remain overridable via env vars. The topology legality is the
+# same as nanoMoE on 8 GPUs, but the model is much smaller for faster validation.
 
 set -e
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -17,63 +10,60 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 NGPUS=${NGPUS:-8}
 MASTER_PORT=${MASTER_PORT:-29500}
 
-# Parallelism: FS=2, TP=2, EP=2, PP=1, CP=1 (overridable via env vars)
+# Parallelism (overridable via env vars)
 FS_SIZE=${FS_SIZE:-2}
 RP_SIZE=${RP_SIZE:-1}
 TP_SIZE=${TP_SIZE:-2}
 EP_SIZE=${EP_SIZE:-2}
 PP_SIZE=${PP_SIZE:-1}
 CP_SIZE=${CP_SIZE:-1}
+ENABLE_SP=${ENABLE_SP:-1}
 
 # ============================================
-# nanoMoE Model Configuration
+# picoMoE Model Configuration
 # ============================================
 NUM_LAYERS=${NUM_LAYERS:-8}
-HIDDEN_SIZE=384
-FFN_HIDDEN_SIZE=1536  # 4 * hidden_size
+HIDDEN_SIZE=128
+FFN_HIDDEN_SIZE=512
 NUM_ATTENTION_HEADS=8
 SEQ_LENGTH=1024
 
 # MoE config
 NUM_EXPERTS=8
 MOE_ROUTER_TOPK=2
-MOE_LAYER_FREQ=2  # stride=2 (every other layer is MoE)
-MOE_CAPACITY_FACTOR=1.25  # nanoMoE: train_capacity=1.25
+MOE_LAYER_FREQ=2
+MOE_CAPACITY_FACTOR=1.25
 
 # ============================================
 # Training Configuration
 # ============================================
-MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-12}  # nanoMoE: batch_size=12
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-12}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-480}
 
-# Learning rate (nanoMoE: 6e-4)
 LR=${LR:-0.0006}
 MIN_LR=${MIN_LR:-0.00006}
 
-# Training iterations
 TRAIN_ITERS=${TRAIN_ITERS:-50000}
-LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-500}      # 1% warmup
-LR_WSD_DECAY_ITERS=${LR_WSD_DECAY_ITERS:-10000}  # 20% decay
+LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-500}
+LR_WSD_DECAY_ITERS=${LR_WSD_DECAY_ITERS:-10000}
 
-# Weight decay (nanoMoE: 0.1)
 WEIGHT_DECAY=0.1
-
-# Auxiliary loss (nanoMoE: aux_loss_weight=0.01, router_z_loss_weight=0.001)
 MOE_AUX_LOSS_COEFF=0.01
 MOE_Z_LOSS_COEFF=0.001
 
-# Data path
 DATA_PATH=${DATA_PATH:-"data/openwebtext/openwebtext_train_text_document"}
 VALID_PATH=${VALID_PATH:-"data/openwebtext/openwebtext_val_text_document"}
-
-# Tensorboard
-TENSORBOARD_DIR=${TENSORBOARD_DIR:-"tensorboard/nanomoe_dion_ep${EP_SIZE}"}
+TENSORBOARD_DIR=${TENSORBOARD_DIR:-"tensorboard/picomoe_dion_ep${EP_SIZE}"}
+LOG_INTERVAL=${LOG_INTERVAL:-10}
+EVAL_INTERVAL=${EVAL_INTERVAL:-500}
+EVAL_ITERS=${EVAL_ITERS:-200}
 
 echo "============================================"
-echo "nanoMoE Config - Dion Optimizer"
+echo "picoMoE Config - Dion Optimizer"
 echo "============================================"
 echo "GPUs: ${NGPUS}"
 echo "Parallelism: FS=${FS_SIZE}, RP=${RP_SIZE}, TP=${TP_SIZE}, EP=${EP_SIZE}, PP=${PP_SIZE}, CP=${CP_SIZE}"
+echo "Sequence Parallel: ${ENABLE_SP}"
 echo "Model: ${NUM_LAYERS}L-${HIDDEN_SIZE}H-${NUM_ATTENTION_HEADS}A"
 echo "MoE: ${NUM_EXPERTS} experts, top-${MOE_ROUTER_TOPK}, freq=${MOE_LAYER_FREQ}"
 echo "Optimizer: Dion (lr=${LR})"
@@ -89,6 +79,11 @@ fi
 if [ $(( NUM_LAYERS % PP_SIZE )) -ne 0 ]; then
     echo "ERROR: invalid NUM_LAYERS=${NUM_LAYERS} for PP=${PP_SIZE}; NUM_LAYERS must be divisible by PP"
     exit 1
+fi
+
+SEQ_PARALLEL_ARG=""
+if [ "${ENABLE_SP}" = "1" ]; then
+    SEQ_PARALLEL_ARG="--sequence-parallel"
 fi
 
 torchrun --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} pretrain_gpt.py \
@@ -139,16 +134,16 @@ torchrun --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} pretrain_gpt.py 
     --normalization LayerNorm \
     --use-flash-attn \
     --transformer-impl transformer_engine \
-    --sequence-parallel \
+    ${SEQ_PARALLEL_ARG} \
     --bf16 \
     --no-data-sharding \
     --train-data-path ${DATA_PATH} \
     --valid-data-path ${VALID_PATH} \
     --tokenizer-type HuggingFaceTokenizer \
     --tokenizer-model gpt2 \
-    --log-interval 10 \
-    --eval-interval 500 \
-    --eval-iters 200 \
+    --log-interval ${LOG_INTERVAL} \
+    --eval-interval ${EVAL_INTERVAL} \
+    --eval-iters ${EVAL_ITERS} \
     --tensorboard-dir ${TENSORBOARD_DIR} \
     --log-timers-to-tensorboard \
     --log-memory-to-tensorboard \

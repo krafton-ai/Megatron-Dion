@@ -25,9 +25,18 @@ def get_global_shape(
     Returns:
         Tuple of (global_m, global_n)
     """
-    if meta is not None and getattr(meta, 'global_shape', None) is not None:
-        return tuple(meta.global_shape)
-    # Fallback: use local shape (no sharding)
+    if meta is not None:
+        if getattr(meta, 'global_shape', None) is not None:
+            return tuple(meta.global_shape)
+        if getattr(meta, 'is_dion_param', False):
+            raise RuntimeError(
+                "Dion distributed param is missing global_shape required for "
+                f"LR/rank scaling: local_shape=({local_m}, {local_n}) "
+                f"buffer={getattr(meta, 'buffer_idx', 'NA')} "
+                f"bucket={getattr(meta, 'bucket_idx', 'NA')} "
+                f"param={getattr(meta, 'param_name', '')}"
+            )
+    # Local non-distributed fallback.
     return (local_m, local_n)
 
 

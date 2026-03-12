@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Optional
 
@@ -15,7 +16,10 @@ from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from .param_and_grad_buffer import (
+    _ParamAndGradBuffer,
+    partition_buckets,
+)
 
 # Import is_dion_param for Dion parameter classification
 try:
@@ -288,6 +292,19 @@ class DistributedDataParallel(_BaseDataParallel):
             # Create map from param to bucket group, used in pre_hook.
             for bucket_group in bucket_groups:
                 for bucket in bucket_group.buckets:
+                    if self.ddp_config.use_distributed_optimizer:
+                        bucket.intra_distributed_optimizer_instance_group = (
+                            bucket_group.intra_distributed_optimizer_instance_group
+                        )
+                        bucket.intra_distributed_optimizer_instance_size = (
+                            bucket_group.intra_distributed_optimizer_instance_size
+                        )
+                        bucket.intra_distributed_optimizer_instance_rank = (
+                            bucket_group.intra_distributed_optimizer_instance_rank
+                        )
+                        bucket.inter_distributed_optimizer_instance_group = getattr(
+                            bucket_group, "inter_distributed_optimizer_instance_group", None
+                        )
                     for param in bucket.params_list:
                         self.param_to_bucket_group[param] = bucket_group
 
@@ -453,9 +470,74 @@ class DistributedDataParallel(_BaseDataParallel):
                     self.ddp_config.align_param_gather
                     or self.overlap_param_gather_with_optimizer_step
                 )
-                self.param_to_bucket_group[param].finish_param_sync(
+                bucket_group = self.param_to_bucket_group[param]
+                bucket_group.finish_param_sync(
                     skip_next_bucket_dispatch=skip_next_bucket_dispatch
                 )
+                bucket = bucket_group.param_to_bucket.get(param)
+                if (
+                    bucket is not None
+                    and getattr(bucket, "_dion_requires_param_sync_check", False)
+                    and not getattr(bucket, "_dion_full_param_ready", True)
+                ):
+                    raise RuntimeError(
+                        f"[Dion] forward pre-hook observed stale full params for bucket "
+                        f"{getattr(bucket, 'bucket_id', -1)} param shape={tuple(param.shape)}"
+                    )
+
+                if (
+                    os.getenv("DION_FULL_PARAM_REPLICA_DIAG", "0") == "1"
+                    and getattr(self, "dp_cp_group", None) is not None
+                    and torch.distributed.get_world_size(self.dp_cp_group) > 1
+                ):
+                    target = os.getenv("DION_FULL_PARAM_REPLICA_NAME", "")
+                    param_name = self.param_to_name.get(param, "")
+                    if target and target in param_name:
+                        tol = float(os.getenv("DION_FULL_PARAM_REPLICA_TOL", "1e-6"))
+                        warn_cap = int(os.getenv("DION_FULL_PARAM_REPLICA_MAX_LOGS", "16"))
+                        warn_count = getattr(self, "_dion_full_param_diag_warn_count", 0)
+                        if warn_count < warn_cap:
+                            tensor = param.data.detach().float()
+                            flat = tensor.view(-1)
+                            sample = flat[: min(16, flat.numel())].cpu().tolist()
+                            fp = {
+                                "name": param_name,
+                                "shape": tuple(tensor.shape),
+                                "norm": float(tensor.norm().item()),
+                                "sum": float(tensor.sum().item()),
+                                "amax": float(tensor.abs().max().item()) if flat.numel() > 0 else 0.0,
+                                "sample": sample,
+                            }
+                            gathered = [None] * torch.distributed.get_world_size(self.dp_cp_group)
+                            torch.distributed.all_gather_object(gathered, fp, group=self.dp_cp_group)
+                            ref = gathered[0]
+                            mismatch_ranks = []
+                            for idx, entry in enumerate(gathered[1:], start=1):
+                                same = (
+                                    entry["shape"] == ref["shape"]
+                                    and abs(entry["norm"] - ref["norm"]) <= tol
+                                    and abs(entry["sum"] - ref["sum"]) <= tol
+                                    and abs(entry["amax"] - ref["amax"]) <= tol
+                                    and len(entry["sample"]) == len(ref["sample"])
+                                )
+                                if same:
+                                    for lhs, rhs in zip(ref["sample"], entry["sample"]):
+                                        if abs(lhs - rhs) > tol:
+                                            same = False
+                                            break
+                                if not same:
+                                    mismatch_ranks.append(idx)
+                            if mismatch_ranks:
+                                setattr(self, "_dion_full_param_diag_warn_count", warn_count + 1)
+                                logger.error(
+                                    "[DION_FULL_PARAM_REPLICA_MISMATCH] rank=%s group_ranks=%s param=%s "
+                                    "mismatch_local_ranks=%s gathered=%s",
+                                    torch.distributed.get_rank(),
+                                    torch.distributed.get_process_group_ranks(self.dp_cp_group),
+                                    param_name,
+                                    mismatch_ranks,
+                                    gathered,
+                                )
 
         return hook
 
@@ -490,72 +572,14 @@ class DistributedDataParallel(_BaseDataParallel):
                 )
 
                 if should_process_grad:
-                    bucket_group = self.param_to_bucket_group[param]
-                    bucket = bucket_group.param_to_bucket.get(param)
-
                     if is_dion:
                         # Dion params: accumulate to main_grad, packing in start_grad_sync
                         param.main_grad.add_(param.grad.data)
                     else:
-                        # non-Dion params handling
-                        if (bucket is not None and
-                            hasattr(bucket, 'non_dion_full_grad_buffer') and
-                            bucket.non_dion_full_grad_buffer is not None and
-                            hasattr(bucket, 'non_dion_pack_plan') and
-                            bucket.non_dion_pack_plan):
-                            # MIXED bucket: use strided layout for RS
-                            _found_in_pack_plan = False
-                            entry = None
-
-                            # Primary: Name-based lookup
-                            if hasattr(bucket, 'non_dion_param_name_to_entry') and bucket.non_dion_param_name_to_entry:
-                                param_name = self.param_to_name.get(param)
-                                if param_name:
-                                    entry = bucket.non_dion_param_name_to_entry.get(param_name)
-
-                            # Fallback: Object identity or data_ptr match
-                            if entry is None:
-                                param_data_ptr = param.data.data_ptr()
-                                for e in bucket.non_dion_pack_plan:
-                                    entry_param = e['param']
-                                    if entry_param is param or entry_param.data.data_ptr() == param_data_ptr:
-                                        entry = e
-                                        break
-
-                            if entry is not None:
-                                # Strided layout for RS
-                                # RS with SUM: output = sum(section across ranks) = section * dp_size
-                                # Pre-scale by 1/dp_size so output = section * dp_size / dp_size = section
-                                pack_offset = entry['pack_offset']
-                                shard_size = entry['segment_size']
-                                pack_total = bucket.non_dion_pack_total
-                                dp_group = bucket.non_dion_dp_group if hasattr(bucket, 'non_dion_dp_group') and bucket.non_dion_dp_group else None
-                                dp_size = dp_group.size() if dp_group else 4
-
-                                grad_flat = param.grad.data.view(-1)
-                                param_numel = grad_flat.numel()
-                                scale = 1.0 / dp_size  # Pre-scale for SUM reduction
-
-                                # Write each shard to the corresponding section
-                                for rank_i in range(dp_size):
-                                    shard_start = rank_i * shard_size
-                                    shard_end = min(shard_start + shard_size, param_numel)
-
-                                    if shard_start < param_numel:
-                                        actual_shard_size = shard_end - shard_start
-                                        buf_start = rank_i * pack_total + pack_offset
-                                        buf_end = buf_start + actual_shard_size
-                                        bucket.non_dion_full_grad_buffer[buf_start:buf_end].add_(
-                                            grad_flat[shard_start:shard_end] * scale
-                                        )
-
-                                _found_in_pack_plan = True
-
-                            if not _found_in_pack_plan:
-                                param.main_grad.add_(param.grad.data)
-                        else:
-                            # PURE non-Dion bucket: use main_grad
-                            param.main_grad.add_(param.grad.data)
+                        # Stock Megatron-Core DO contract: always accumulate non-Dion grads
+                        # directly into canonical model-side main_grad, regardless of whether
+                        # the bucket is pure non-Dion or mixed with Dion params.
+                        param.main_grad.add_(param.grad.data)
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:

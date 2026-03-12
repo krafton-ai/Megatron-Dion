@@ -4,6 +4,7 @@
 import logging
 import os
 import random
+import sys
 import time
 import warnings
 from datetime import timedelta
@@ -33,6 +34,69 @@ from megatron.training.global_vars import set_global_variables
 from megatron.training.yaml_arguments import validate_yaml
 
 logger = logging.getLogger(__name__)
+
+
+def _has_cli_flag(flag_name):
+    for arg in sys.argv[1:]:
+        if arg == flag_name or arg.startswith(f"{flag_name}="):
+            return True
+    return False
+
+
+def _resolve_dion_fs_rp_topology(args):
+    requested_fs = getattr(args, "fully_shard_model_parallel_size", 1) or 1
+    requested_rp = getattr(args, "replicate_model_parallel_size", 1) or 1
+    dense_dp_cp_domain = args.world_size // (
+        args.tensor_model_parallel_size * args.pipeline_model_parallel_size
+    )
+
+    fs_explicit = _has_cli_flag("--fully-shard-model-parallel-size")
+    rp_explicit = _has_cli_flag("--replicate-model-parallel-size")
+
+    if fs_explicit and rp_explicit:
+        resolved_fs = requested_fs
+        resolved_rp = requested_rp
+    elif fs_explicit:
+        resolved_fs = requested_fs
+        if dense_dp_cp_domain % resolved_fs != 0:
+            raise RuntimeError(
+                "Dion FS topology is incompatible with the stock Megatron-Core "
+                "distributed-optimizer shard domain. "
+                f"dense_dp_cp_domain={dense_dp_cp_domain} requested_fs={resolved_fs}"
+            )
+        resolved_rp = dense_dp_cp_domain // resolved_fs
+    elif rp_explicit:
+        resolved_rp = requested_rp
+        if dense_dp_cp_domain % resolved_rp != 0:
+            raise RuntimeError(
+                "Dion RP topology is incompatible with the stock Megatron-Core "
+                "distributed-optimizer shard domain. "
+                f"dense_dp_cp_domain={dense_dp_cp_domain} requested_rp={resolved_rp}"
+            )
+        resolved_fs = dense_dp_cp_domain // resolved_rp
+    else:
+        # Match stock Megatron-Core DO defaults: use the full dense dp*cp domain
+        # as the local shard domain, with no replica axis.
+        resolved_fs = dense_dp_cp_domain
+        resolved_rp = 1
+
+    if dense_dp_cp_domain % resolved_fs != 0:
+        raise RuntimeError(
+            "Dion FS topology is incompatible with the stock Megatron-Core "
+            "distributed-optimizer shard domain. "
+            f"dense_dp_cp_domain={dense_dp_cp_domain} requested_fs={resolved_fs}"
+        )
+
+    expected_rp = dense_dp_cp_domain // resolved_fs
+    if resolved_rp != expected_rp:
+        raise RuntimeError(
+            "Dion RP/FS topology is incompatible with the stock Megatron-Core "
+            "distributed-optimizer instance topology. "
+            f"dense_dp_cp_domain={dense_dp_cp_domain} requested_fs={resolved_fs} "
+            f"requested_rp={resolved_rp} expected_rp={expected_rp}"
+        )
+
+    return resolved_fs, resolved_rp, expected_rp, fs_explicit, rp_explicit, dense_dp_cp_domain
 
 
 def initialize_megatron(
@@ -360,6 +424,60 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     if device_count > 0:
+        if args.optimizer == "dion" and args.use_distributed_optimizer:
+            (
+                resolved_fs,
+                resolved_rp,
+                required_num_dist_opt_instances,
+                fs_explicit,
+                rp_explicit,
+                dense_dp_cp_domain,
+            ) = _resolve_dion_fs_rp_topology(args)
+            if (
+                args.fully_shard_model_parallel_size != resolved_fs
+                or args.replicate_model_parallel_size != resolved_rp
+            ):
+                if args.rank == 0:
+                    if not fs_explicit and not rp_explicit:
+                        print(
+                            "Auto-configuring Dion FS/RP to match stock Megatron-Core "
+                            "distributed-optimizer defaults: "
+                            f"fs {args.fully_shard_model_parallel_size} -> {resolved_fs}, "
+                            f"rp {args.replicate_model_parallel_size} -> {resolved_rp} "
+                            f"(dense_dp_cp_domain={dense_dp_cp_domain})",
+                            flush=True,
+                        )
+                    elif not fs_explicit:
+                        print(
+                            "Auto-configuring Dion FS from the stock Megatron-Core "
+                            "distributed-optimizer shard domain: "
+                            f"rp {args.replicate_model_parallel_size} -> {resolved_rp}, "
+                            f"fs {args.fully_shard_model_parallel_size} -> {resolved_fs} "
+                            f"(dense_dp_cp_domain={dense_dp_cp_domain})",
+                            flush=True,
+                        )
+                    elif not rp_explicit:
+                        print(
+                            "Auto-configuring Dion RP from the stock Megatron-Core "
+                            "distributed-optimizer shard domain: "
+                            f"fs {args.fully_shard_model_parallel_size} -> {resolved_fs}, "
+                            f"rp {args.replicate_model_parallel_size} -> {resolved_rp} "
+                            f"(dense_dp_cp_domain={dense_dp_cp_domain})",
+                            flush=True,
+                        )
+                args.fully_shard_model_parallel_size = resolved_fs
+                args.replicate_model_parallel_size = resolved_rp
+            if args.num_distributed_optimizer_instances != required_num_dist_opt_instances:
+                if args.rank == 0:
+                    print(
+                        "Overriding --num-distributed-optimizer-instances for Dion to match "
+                        "the stock Megatron-Core distributed-optimizer shard domain: "
+                        f"{args.num_distributed_optimizer_instances} -> "
+                        f"{required_num_dist_opt_instances}",
+                        flush=True,
+                    )
+                args.num_distributed_optimizer_instances = required_num_dist_opt_instances
+
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
@@ -412,8 +530,13 @@ def _set_random_seed(
 ):
     """Set random seed for reproducability."""
     if seed_ is not None and seed_ > 0:
-        # Ensure that different pipeline MP stages get different seeds.
-        seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
+        # Default behavior: different PP stages get different seeds.
+        # For PP-consistency debug sweeps we can opt out via env var.
+        if os.getenv("MEGATRON_PP_SEED_INVARIANT", "0") == "1":
+            pp_seed_offset = 0
+        else:
+            pp_seed_offset = 100 * mpu.get_pipeline_model_parallel_rank()
+        seed = seed_ + pp_seed_offset
         # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
             seed = seed + (10 * mpu.get_data_parallel_rank())

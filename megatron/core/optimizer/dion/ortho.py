@@ -34,14 +34,12 @@ def orthogonalize(
     """
     assert P.ndim >= 2
     original_dtype = P.dtype
-    P = P.to(torch.float32)
-
     m, r = P.shape[-2:]
 
     # Case 1: Square or wide matrix - use standard QR
     if m <= r:
-        Q, _ = torch.linalg.qr(P)
-        return Q.to(original_dtype)
+        Q, _ = torch.linalg.qr(P.to(dtype=torch.float32))
+        return Q.to(original_dtype).contiguous()
 
     # Case 2: Tall matrix - use Randomized Cholesky QR
     else:
@@ -55,11 +53,11 @@ def orthogonalize(
         SP = S @ P
 
         # Step 3: QR decomposition of sketch
-        _, R = torch.linalg.qr(SP, mode='r')
+        _, R = torch.linalg.qr(SP.to(dtype=torch.float32), mode='r')
 
         # Step 4: Solve for orthogonal factor
         P = torch.linalg.solve_triangular(
-            R, P, upper=True, left=False
+            R, P.to(dtype=torch.float32), upper=True, left=False
         )
 
         # Step 5: Cholesky QR for better orthogonalization
@@ -100,7 +98,7 @@ def _default_sketch_matrix(P: Tensor, oversample: float) -> Tensor:
 
     std = math.sqrt(1.0 / k)
 
-    S = torch.empty((*batch_shape, k, m), device=P.device, dtype=torch.float32)
+    S = torch.empty((*batch_shape, k, m), device=P.device, dtype=P.dtype)
     S.normal_(std=std)
 
     return S

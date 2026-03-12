@@ -42,7 +42,7 @@ class MegatronDionDistMeta:
     local_range: Tuple[int, int] = None
     rank_fraction: float = 0.25
     is_transposed: bool = False
-    param_uid: Tuple = None  # (buffer_idx, bucket_idx, start) for unique identification
+    param_uid: Tuple = None  # topology-independent logical param identity for optimizer state
     is_dion_param: bool = False
     is_expert: bool = False  # True if this is an expert parameter (MoE)
     param_name: str = ""  # Full parameter name for debugging
