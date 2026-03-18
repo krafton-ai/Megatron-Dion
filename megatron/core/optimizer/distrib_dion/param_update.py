@@ -53,7 +53,7 @@ def check_shard_identity_(
                 mismatch_count += 1
             elif opt_param is not shard_param:
                 if mismatch_count < 5:
-                    logger.warning(
+                    logger.error(
                         "[Dion] main_shard_groups[%s][%s] object mismatch: same data_ptr=%s but different object. id(shard)=%s, id(opt)=%s",
                         group_index,
                         param_index,
@@ -66,8 +66,7 @@ def check_shard_identity_(
                 match_count += 1
 
     if mismatch_count > 0:
-        logger.error(
-            "[Dion] %s params in main_shard_groups not in optimizer.param_groups (%s matched). Dion updates may be overwritten.",
-            mismatch_count,
-            match_count,
+        raise RuntimeError(
+            "[Dion] main_shard_groups identity mismatch with optimizer.param_groups: "
+            f"mismatches={mismatch_count} matched={match_count}"
         )

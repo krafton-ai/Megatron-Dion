@@ -5,7 +5,6 @@ from .batching import BatchProcessor, pad_batch
 from .constants import (
     DEFAULT_EPSILON,
     DEFAULT_LR,
-    DEFAULT_MAX_BATCH_SIZE,
     DEFAULT_MU,
     DEFAULT_RANK_FRACTION,
     DEFAULT_RCQR_OVERSAMPLE,
@@ -36,7 +35,6 @@ __all__ = [
     "DEFAULT_RANK_FRACTION",
     "DEFAULT_EPSILON",
     "DEFAULT_RCQR_OVERSAMPLE",
-    "DEFAULT_MAX_BATCH_SIZE",
     "SCALAR_OPT_ADAMW",
     "SCALAR_OPT_LION",
 ]

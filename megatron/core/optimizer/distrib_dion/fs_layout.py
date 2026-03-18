@@ -72,3 +72,34 @@ def write_fs_shard_2d_(
     else:
         dst2d[:, start_idx:end_idx].copy_(src2d)
 
+
+def compute_fs_flat_segments(
+    *,
+    full_start: int,
+    m: int,
+    n: int,
+    fs_split_dim: int,
+    start_idx: int,
+    end_idx: int,
+) -> Tuple[Tuple[int, int], ...]:
+    """Return canonical flat-buffer segments for one FS shard of a 2D parameter.
+
+    The returned `(start, end)` ranges are offsets inside the bucket-level flat
+    `bucket.param_data` coordinate system.
+
+    For row FS sharding (`fs_split_dim == 0`) the local shard is one contiguous
+    flat range. For column FS sharding (`fs_split_dim == 1`) the local shard is
+    strided in the flattened row-major layout, so we represent it as one segment
+    per row.
+    """
+    if start_idx < 0 or end_idx < start_idx:
+        raise ValueError(f"invalid FS shard range: start_idx={start_idx} end_idx={end_idx}")
+    if fs_split_dim == 0:
+        return ((full_start + start_idx * n, full_start + end_idx * n),)
+
+    width = end_idx - start_idx
+    segments = []
+    for row_idx in range(m):
+        row_base = full_start + row_idx * n
+        segments.append((row_base + start_idx, row_base + start_idx + width))
+    return tuple(segments)

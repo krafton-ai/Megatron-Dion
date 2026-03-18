@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import logging
+import math
+import os
 import warnings
 from dataclasses import astuple
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -41,6 +43,7 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
+from .distrib_dion.param_selection import annotate_dion_candidates
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import (
@@ -50,7 +53,13 @@ from .optimizer import (
     MegatronOptimizer,
     param_group_identifier_keys,
 )
-from .optimizer_config import AdamOptimizerConfig, DionOptimizerConfig, OptimizerConfig, ParamKey, SGDOptimizerConfig
+from .optimizer_config import (
+    AdamOptimizerConfig,
+    DionOptimizerConfig,
+    OptimizerConfig,
+    ParamKey,
+    SGDOptimizerConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +97,46 @@ def _matches(param: torch.nn.Parameter, param_name: str, param_key: ParamKey) ->
     return False
 
 
+def get_standard_config_overrides(
+    config: OptimizerConfig,
+) -> Optional[Dict[ParamKey, OptimizerConfig]]:
+    """Get standard stock-MCore optimizer config overrides.
+
+    The active stock behavior we need here is decoupled LR for embedding/output
+    parameters. Common weight-decay skipping continues to be handled by the
+    existing wd_mult path in `_get_param_groups()`.
+    """
+    config_overrides: Dict[ParamKey, OptimizerConfig] = {}
+
+    if config.decoupled_lr is not None:
+        decoupled_config = copy.deepcopy(config)
+        decoupled_config.lr = config.decoupled_lr
+        if config.decoupled_min_lr is not None:
+            decoupled_config.min_lr = config.decoupled_min_lr
+        config_overrides[ParamKey(attr="is_embedding_or_output_parameter")] = decoupled_config
+
+    if not config_overrides:
+        return None
+    return config_overrides
+
+
+def _apply_dion_scalar_param_rules(
+    param: torch.nn.Parameter, config_for_param: OptimizerConfig
+) -> tuple[OptimizerConfig, bool]:
+    """Apply Dion scalar-param rules using parameter-local metadata.
+
+    Current parity rule:
+    - no scalar-path LR overrides
+
+    Weight decay follows the normal Adam/MCore param-group rule so that
+    scalar-path embeddings and lm heads behave like the baseline optimizer.
+    """
+    if not isinstance(config_for_param, DionOptimizerConfig):
+        return config_for_param, False
+
+    return config_for_param, False
+
+
 def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
@@ -110,17 +159,16 @@ def _get_param_groups(
     # Map (wd_mult, is_expert_parallel, param_group_hyperparameters_config) to params.
     params_map = {}
     configs_map = {}
+    decoupled_lr_enabled = config.decoupled_lr is not None
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
 
-            uses_default_config = False
             # Get optimizer config for this parameter.
             if config_overrides is None:
                 config_for_param = config
-                uses_default_config = True
             else:
                 config_for_param = None
                 for param_key in config_overrides:
@@ -130,9 +178,18 @@ def _get_param_groups(
                 # Fall back to default config.
                 if config_for_param is None:
                     config_for_param = config
-                    uses_default_config = True
+
+            config_for_param, has_dion_scalar_override = _apply_dion_scalar_param_rules(
+                param, config_for_param
+            )
+            uses_default_config = (
+                config_for_param.lr == config.lr and config_for_param.min_lr == config.min_lr
+            )
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_decoupled_lr = decoupled_lr_enabled and getattr(
+                param, 'is_embedding_or_output_parameter', False
+            )
 
             # TODO: Make sure there is a way to support old no_weight_decay_func functionality
             # and default_skip_embedding_weight_decay:
@@ -148,14 +205,12 @@ def _get_param_groups(
             config_for_param_copy = copy.deepcopy(config_for_param)
             config_for_param_copy.timers = None
             config_tuple = astuple(config_for_param_copy)
-            key = (wd_mult, is_expert_parallel, config_tuple)
+            key = (wd_mult, is_expert_parallel, is_decoupled_lr, config_tuple)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
 
-            if key in configs_map:
-                assert (config_for_param, uses_default_config) == configs_map[key]
-            else:
+            if key not in configs_map:
                 configs_map[key] = (config_for_param, uses_default_config)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
@@ -169,16 +224,17 @@ def _get_param_groups(
             if key not in params_key:
                 params_key.append(key)
 
+    default_optimizer_config = config
     param_groups = []
     for key in params_key:
-        wd_mult, is_expert_parallel, _ = key
+        wd_mult, is_expert_parallel, is_decoupled_lr, _ = key
         params = params_map[key] if key in params_map else []
-        config, uses_default_config = None, True
+        group_config, uses_default_config = None, True
         if key not in configs_map:
             assert params == []
         else:
-            config, uses_default_config = configs_map[key]
-            assert config is not None
+            group_config, uses_default_config = configs_map[key]
+            assert group_config is not None
 
         # TODO: Remove "backwards compatible" fields below eventually.
         param_group = {
@@ -186,16 +242,20 @@ def _get_param_groups(
             'wd_mult': wd_mult,  # For backwards compatibility.
             'lr_mult': 1.0,  # For backwards compatibility.
             'is_expert_parallel': is_expert_parallel,
-            'is_decoupled_lr': False,  # For backwards compatibility.
+            'is_decoupled_lr': is_decoupled_lr,
             'default_config': uses_default_config,
         }
 
         # Stick relevant fields into param_group from config object.
-        if config is not None:
-            param_group['max_lr'] = config.lr
-            param_group['min_lr'] = config.min_lr
-            # TODO: Add other relevant arguments (e.g., weight decay, optimizer)
-            # here as well.
+        if group_config is not None:
+            param_group['max_lr'] = group_config.lr
+            param_group['min_lr'] = group_config.min_lr
+            if (
+                not uses_default_config
+                and group_config.weight_decay != default_optimizer_config.weight_decay
+            ):
+                param_group['start_wd'] = group_config.weight_decay
+                param_group['end_wd'] = group_config.weight_decay
         param_groups.append(param_group)
 
     return param_groups
@@ -236,6 +296,52 @@ def _get_param_groups_and_buffers(
     return param_groups, buffers
 
 
+def _maybe_log_dion_scalar_param_groups(
+    model_chunks: List[MegatronModule], param_groups: List[Dict], config: OptimizerConfig
+) -> None:
+    """Log Dion scalar-param group overrides once when explicitly requested."""
+    if not isinstance(config, DionOptimizerConfig):
+        return
+    if os.environ.get("DION_LOG_SCALAR_PARAM_GROUPS", "0") != "1":
+        return
+
+    for param_group in param_groups:
+        tagged_params = []
+        for param in param_group["params"]:
+            is_lm_head = bool(getattr(param, "is_lm_head_parameter", False))
+            is_text_embedding = bool(getattr(param, "is_text_embedding_parameter", False))
+            if not is_lm_head and not is_text_embedding:
+                continue
+
+            param_name = get_global_unique_param_name(model_chunks, param)
+            fan_in = int(param.shape[1]) if param.ndim >= 2 else None
+            tagged_params.append(
+                {
+                    "name": param_name,
+                    "is_lm_head": is_lm_head,
+                    "is_text_embedding": is_text_embedding,
+                    "shape": tuple(param.shape),
+                    "fan_in": fan_in,
+                }
+            )
+
+        if not tagged_params:
+            continue
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "[DION_SCALAR_GROUP] "
+            f"max_lr={param_group.get('max_lr')} "
+            f"min_lr={param_group.get('min_lr')} "
+            f"start_wd={param_group.get('start_wd', config.weight_decay)} "
+            f"end_wd={param_group.get('end_wd', config.weight_decay)} "
+            f"default_config={param_group.get('default_config')} "
+            f"is_decoupled_lr={param_group.get('is_decoupled_lr')} "
+            f"params={tagged_params}",
+        )
+
+
 def _get_megatron_optimizer_based_on_param_groups(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -259,7 +365,7 @@ def _get_megatron_optimizer_based_on_param_groups(
         per_model_buffers (dict, optional): buffers for distributed optimizer. Defaults to None.
         data_parallel_group (torch.distributed.ProcessGroup, optional): data-parallel group for
             distributed optimizer. Defaults to None.
-        full_data_parallel_group (torch.distributed.ProcessGroup, optional): full stock
+        full_data_parallel_group (torch.distributed.ProcessGroup, optional): full standard
             Megatron-Core dense/expert gradient-construction group (e.g. dp_cp or expt_dp).
         data_parallel_group_gloo (torch.distributed.ProcessGroup, optional): gloo data-parallel
             group for distributed optimizer. Defaults to None.
@@ -395,9 +501,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             )
 
             # Create RP/FS groups for Dion 2D parallelism.
-            # Current runtime contract is RP=1.
-            #
-            # Dense/expert Dion params must follow the stock Megatron-Core distributed-optimizer
+            # Dense/expert Dion params must follow the standard Megatron-Core distributed-optimizer
             # local shard domain exactly. RP, when enabled, is the inter-instance replica domain
             # over those same local shards.
             user_fs_world_size = getattr(config, 'fully_shard_model_parallel_size', 1) or 1
@@ -419,7 +523,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                         "Dion FS topology mismatch while constructing MegatronDion. "
                         f"requested_fs={user_fs_world_size} actual_fs_group_size={fs_world_size} "
                         f"(fs_group_ranks={fs_world_ranks_local}). "
-                        "Dion FS must match the stock Megatron-Core distributed-optimizer "
+                        "Dion FS must match the standard Megatron-Core distributed-optimizer "
                         "local shard domain."
                     )
             else:
@@ -460,25 +564,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                         f"(rp_group_ranks={rp_world_ranks_local})."
                     )
 
-            # Disable FS and TP collectives when EP causes incompatibility
-            # EP splits DP group such that tp_group members end up in different DP groups,
-            # causing collective hangs since they run different optimizer instances
+            # Expert params must use the expert TP group when it exists; dense params stay on
+            # the standard TP group.
             use_fs_collectives = config.dion_use_fs_collectives
             tp_group_to_use = (
                 parallel_state.get_expert_tensor_parallel_group()
                 if is_expert_parallel and parallel_state.get_expert_tensor_parallel_group(check_initialized=False) is not None
                 else parallel_state.get_tensor_model_parallel_group()
             )
-
-            # Get EP size for is_ep_mode flag
-            try:
-                ep_size = parallel_state.get_expert_model_parallel_world_size()
-            except Exception:
-                ep_size = 1
-
-            # Note: With EP mode sync execution (max_concurrent_tasks=1), we keep TP/FS
-            # collectives enabled. The sync execution ensures all ranks execute collectives
-            # in the same order, preventing async desync hangs.
 
             optimizer = MegatronDion(
                 param_groups,
@@ -492,6 +585,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 betas=(config.dion_beta1, config.dion_beta2),
                 eps=config.dion_eps,
                 scalar_optimizer=config.dion_scalar_optimizer,
+                lr_scaling_rule=config.dion_lr_scaling,
                 mixed_precision_config=mixed_precision_config,
                 use_fs_collectives=use_fs_collectives,
                 use_compressed_comm=config.dion_use_compressed_comm,
@@ -499,7 +593,8 @@ def _get_megatron_optimizer_based_on_param_groups(
                 fs_group=fs_process_group,
                 tp_group=tp_group_to_use,
                 enable_async=True,
-                is_ep_mode=(ep_size > 1),  # EP mode: sync execution to avoid collective desync
+                local_batch_size=config.dion_local_batch_size,
+                max_concurrent_tasks=config.dion_max_concurrent_tasks,
             )
             init_state_fn = None
         else:
@@ -558,7 +653,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                             "DistributedOptimizerForDion. "
                             f"requested_fs={requested_fs_size} actual_fs_group_size={fs_size} "
                             f"(fs_group_ranks={fs_world_ranks}). "
-                            "Dion FS must match the stock Megatron-Core distributed-optimizer "
+                            "Dion FS must match the standard Megatron-Core distributed-optimizer "
                             "local shard domain."
                         )
                 else:
@@ -630,6 +725,10 @@ def get_megatron_optimizer(
     """
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
+
+    if getattr(config, 'optimizer', None) == 'dion':
+        for model_chunk in model_chunks:
+            annotate_dion_candidates(model_chunk)
 
     # TODO: Remove `optimizer` from this eventually (e.g., if we use Muon for some layers and
     # Adam for other layers). This would need some more refactoring to work though (param_groups
@@ -727,6 +826,7 @@ def get_megatron_optimizer(
             filter_fn=lambda g: not g['is_expert_parallel'],
             buffer_name='buffers',
         )
+        _maybe_log_dion_scalar_param_groups(dense_model_chunks, param_groups, config)
         for model_chunk in dense_model_chunks:
             model_chunk.overlap_param_gather_with_optimizer_step = (
                 overlap_param_gather_with_optimizer_step
@@ -764,6 +864,7 @@ def get_megatron_optimizer(
         filter_fn=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
     )
+    _maybe_log_dion_scalar_param_groups(model_chunks, moe_param_groups, config)
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:
             for param in param_group["params"]:

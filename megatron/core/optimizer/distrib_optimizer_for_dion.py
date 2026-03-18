@@ -7,59 +7,37 @@ Supports orthogonal TP × FS sharding:
 """
 
 import logging
-import math
 import os
 import traceback
 import torch
 import torch.distributed as dist
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 from .distrib_optimizer import DistributedOptimizer, Range
 from .megatron_dion import MegatronDion, MegatronDionDistMeta
-from .distrib_dion.bucket_order import reorder_bucket_params_
-from .distrib_dion.bucket_plan import (
-    DionParamLayout,
-    build_dion_bucket_layout_,
-    build_stock_bucket_non_dion_plan_,
-    check_bucket_dion_flags_,
-    check_local_dion_bucket_,
-    check_mixed_bucket_ranges_,
-    check_shared_dion_layout_,
+from .distrib_dion.bucket_layout import (
+    DionBucketEntry,
+    DionBucketLayout,
+    build_dion_entries_,
+    bucket_rank_range_,
+    param_rank_range_,
     select_non_dion_bucket_params_,
 )
 from .distrib_dion.checkpoint_io import (
-    apply_stock_non_dion_shards_,
+    apply_non_dion_shards_,
     apply_group_shards_to_model_params_,
-    build_named_dion_param_state,
+    build_persistent_dion_param_state,
     copy_group_params_to_main_shards_,
-    restore_group_params_,
-    restore_named_dion_param_state_,
-)
-from .distrib_dion.fs_all_gather import (
-    pack_fs_shards_,
-    unpack_fs_shards_,
+    restore_persistent_dion_param_state_,
 )
 from .distrib_dion.grad_wiring import (
-    copy_stock_non_dion_grads_,
-    copy_grad_groups_,
-    fix_zero_dion_grads_,
-)
-from .distrib_dion.grad_diag import GradIssueLogger
-from .distrib_dion.grad_norm import (
-    append_precomputed_norm_grads_,
-    build_grad_norm_entries_,
-    clip_precomputed_grad_groups_,
-    debug_validate_precomputed_norm_grads_,
-    get_optimizer_grad_,
-    log_grad_norm_contributors_,
-    log_zero_global_grad_norm_,
+    copy_dion_grads_,
+    copy_non_dion_grads_,
 )
 from .distrib_dion.fs_layout import (
-    compute_fs_shard_range,
-    compute_local_shape,
     get_fs_split_dim,
     slice_fs_shard_2d,
-    write_fs_shard_2d_,
 )
 from .distrib_dion.overlap_sync import (
     finish_bucket_group_grad_sync_,
@@ -68,36 +46,53 @@ from .distrib_dion.overlap_sync import (
 from .distrib_dion.param_selection import is_dion_param, is_moe_expert_param
 from .distrib_dion.param_update import check_shard_identity_
 from .distrib_dion.param_utils import get_tp_split_dim, is_tp_enabled
-from .distrib_dion.shard_info import DionShardInfo
+from .distrib_dion.shard_info import DionShardLayout, DionShardBinding
 from .. import parallel_state, tensor_parallel
 from ..fp8_utils import is_float8tensor
 
 logger = logging.getLogger(__name__)
 
 
-def _slice_expected_dion_shard_from_main_grad(model_param, opt_grad) -> Optional[torch.Tensor]:
-    """Derive the expected Dion logical local shard directly from canonical model_param.main_grad."""
-    dion_info = getattr(model_param, "dion_info", None)
-    model_grad = getattr(model_param, "main_grad", None)
-    if dion_info is None or model_grad is None or model_grad.ndim != 2:
-        return None
-
-    start_idx = dion_info.get("start_idx")
-    end_idx = dion_info.get("end_idx")
-    fs_split_dim = dion_info.get("fs_split_dim")
-    if start_idx is None or end_idx is None or fs_split_dim not in (0, 1):
-        return None
-
-    if fs_split_dim == 0:
-        expected = model_grad[start_idx:end_idx, :]
-    else:
-        expected = model_grad[:, start_idx:end_idx]
-
-    if opt_grad is not None and tuple(expected.shape) != tuple(opt_grad.shape):
-        return None
-    return expected
+def _debug_target_params() -> set[str]:
+    targets = os.getenv("DION_DEBUG_HOOK_PARAMS", "")
+    return {name for name in targets.split(",") if name}
 
 
+class _DeferredHandle:
+    """Waitable handle that runs a local callback after the collective completes."""
+
+    def __init__(self, work, callback=None):
+        self._work = work
+        self._callback = callback
+
+    def wait(self):
+        if self._work is not None:
+            self._work.wait()
+        if self._callback is not None:
+            self._callback()
+        self._work = None
+        self._callback = None
+
+
+class _HandleGroup:
+    """Aggregate multiple waitable handles behind one `.wait()` call."""
+
+    def __init__(self, handles):
+        self._handles = [handle for handle in handles if handle is not None]
+
+    def wait(self):
+        for handle in self._handles:
+            handle.wait()
+        self._handles = []
+
+
+@dataclass
+class _PreparedDionGatherEntry:
+    """Prepacked Dion local shard input for one canonical bucket gather."""
+
+    entry: DionBucketEntry
+    full_view_2d: torch.Tensor
+    shard_buffer: torch.Tensor
 class DistributedOptimizerForDion(DistributedOptimizer):
     """
     Distributed optimizer for MegatronDion with true parameter sharding.
@@ -116,301 +111,51 @@ class DistributedOptimizerForDion(DistributedOptimizer):
     Provides automatic configuration of 2D process groups and FS-aware annotation.
     """
 
-    # Class variable for _build_model_gbuf_range (classmethod workaround)
-    _current_init_fs_config = None
+    @staticmethod
+    def _group_size(group) -> int:
+        return group.size() if hasattr(group, "size") else dist.get_world_size(group)
 
-    def _maybe_log_target_grad_fingerprints(self) -> None:
-        """Env-gated focused grad fingerprint for one or more target params.
-
-        This is for proving exact contract mismatches, not for normal logging.
-        It logs:
-        - model-side canonical grad (`model_param.main_grad`) gathered over `dp_cp_group`
-        - optimizer-side canonical grad (`shard_param.grad/decoupled_grad`) gathered over
-          `grad_stats_parallel_group`
-        - both tensors gathered over `state_replica_group` when available
-        """
-        targets_raw = os.getenv("DION_PARAM_GRAD_FP_NAMES", "").strip()
-        if not targets_raw:
-            return
-
-        try:
-            every_n = int(os.getenv("DION_PARAM_GRAD_FP_EVERY", "1"))
-        except ValueError:
-            every_n = 1
-        try:
-            max_logs = int(os.getenv("DION_PARAM_GRAD_FP_MAX_LOGS", "8"))
-        except ValueError:
-            max_logs = 8
-
-        call_idx = int(getattr(self, "_dion_param_grad_fp_call_idx", 0)) + 1
-        self._dion_param_grad_fp_call_idx = call_idx
-        if every_n > 1 and call_idx % every_n != 0:
-            return
-        if int(getattr(self, "_dion_param_grad_fp_logged", 0)) >= max_logs:
-            return
-
-        targets = [token.strip() for token in targets_raw.split(",") if token.strip()]
-        if not targets:
-            return
-
-        model_groups, shard_groups, _, _ = self._grad_norm_maps()
-        dp_cp_group = getattr(self, "dp_cp_group", None)
-        grad_group = self.get_grad_stats_parallel_group()
-        state_group = getattr(self, "state_replica_group", None)
-
-        def _normalize_diag_name(name: Optional[str]) -> Optional[str]:
-            if not name:
-                return name
-            normalized = name
-            while normalized.startswith("module.module."):
-                normalized = normalized[len("module.") :]
-            return normalized
-
-        def _fingerprint(tensor: Optional[torch.Tensor]):
-            if tensor is None:
-                return None
-            data = tensor.detach().float()
-            flat = data.view(-1)
-            return {
-                "shape": tuple(data.shape),
-                "norm": float(data.norm().item()),
-                "sum": float(data.sum().item()),
-                "amax": float(data.abs().max().item()) if flat.numel() > 0 else 0.0,
-                "sample": flat[: min(8, flat.numel())].cpu().tolist(),
-                "ptr": int(data.data_ptr()),
-            }
-
-        for model_group, shard_group in zip(model_groups, shard_groups):
-            for model_param, shard_param in zip(model_group, shard_group):
-                if shard_param is None:
-                    continue
-                param_name = self._find_param_name(model_param) or getattr(
-                    model_param, "_param_name", ""
-                )
-                if not param_name:
-                    continue
-                if not any(target in param_name for target in targets):
-                    continue
-
-                model_grad = getattr(model_param, "main_grad", None)
-                opt_grad = get_optimizer_grad_(shard_param)
-                model_fp = _fingerprint(model_grad)
-                opt_fp = _fingerprint(opt_grad)
-                pack_pre_inter_fp = None
-                pack_expected_fp = None
-                pack_diff = None
-                pack_group_ranks = None
-                entry_param = None
-                entry_param_name = None
-                entry_param_same = None
-                entry_model_fp = None
-                pack_lookup_via_model_id = False
-                pack_lookup_via_entry_id = False
-                if getattr(model_param, "is_dion_param", False):
-                    dion_info = self._param_dion_info(model_param)
-                    buffer_idx = dion_info.get("buffer_idx")
-                    bucket_idx = dion_info.get("bucket_idx")
-                    if buffer_idx is not None and bucket_idx is not None:
-                        bucket = self.buffers[buffer_idx].buckets[bucket_idx]
-                        pack_debug_inputs = getattr(bucket, "dion_pack_debug_inputs", None) or {}
-                        normalized_param_name = _normalize_diag_name(param_name)
-                        buffer_param_to_name = getattr(self.buffers[buffer_idx], "param_to_name", None)
-                        for entry in getattr(bucket, "dion_param_layout", []) or []:
-                            candidate_param = entry.get("param")
-                            if candidate_param is None:
-                                continue
-                            if candidate_param is model_param:
-                                entry_param = candidate_param
-                                break
-                            candidate_name = None
-                            if buffer_param_to_name:
-                                candidate_name = buffer_param_to_name.get(candidate_param)
-                            if _normalize_diag_name(candidate_name) == normalized_param_name:
-                                entry_param = candidate_param
-                                entry_param_name = candidate_name
-                                break
-                        if entry_param is not None:
-                            if entry_param_name is None and buffer_param_to_name:
-                                entry_param_name = buffer_param_to_name.get(entry_param)
-                            entry_param_same = bool(entry_param is model_param)
-                            entry_model_fp = _fingerprint(getattr(entry_param, "main_grad", None))
-
-                        local_pack_info = pack_debug_inputs.get(id(model_param))
-                        pack_lookup_via_model_id = bool(local_pack_info is not None)
-                        if entry_param is not None:
-                            entry_pack_info = pack_debug_inputs.get(id(entry_param))
-                            pack_lookup_via_entry_id = bool(entry_pack_info is not None)
-                            if local_pack_info is None and entry_pack_info is not None:
-                                local_pack_info = entry_pack_info
-                        pack_group = getattr(bucket, "dion_pack_debug_group", None)
-                        pack_is_avg = bool(
-                            getattr(bucket, "dion_pack_debug_is_avg", False)
-                        )
-                        if local_pack_info is not None:
-                            if pack_group is not None and dist.get_world_size(pack_group) > 1:
-                                gathered_pack_inputs = [None] * dist.get_world_size(pack_group)
-                                dist.all_gather_object(
-                                    gathered_pack_inputs, local_pack_info, group=pack_group
-                                )
-                                pack_group_ranks = dist.get_process_group_ranks(pack_group)
-                            else:
-                                gathered_pack_inputs = [local_pack_info]
-                                pack_group_ranks = None
-
-                            pack_target_rank = (
-                                dist.get_rank(group=pack_group)
-                                if pack_group is not None and dist.get_world_size(pack_group) > 1
-                                else 0
-                            )
-                            pack_tensors = []
-                            for item in gathered_pack_inputs:
-                                if item is None:
-                                    continue
-                                all_scaled = item.get("all_scaled", None)
-                                if all_scaled is None:
-                                    continue
-                                if not (0 <= pack_target_rank < len(all_scaled)):
-                                    continue
-                                pack_tensors.append(all_scaled[pack_target_rank].float())
-                            if pack_tensors:
-                                pack_expected = pack_tensors[0].clone()
-                                for item in pack_tensors[1:]:
-                                    pack_expected.add_(item)
-                                if pack_is_avg:
-                                    pack_expected.div_(len(pack_tensors))
-                                pack_pre_inter_fp = _fingerprint(pack_expected)
-                                final_expected = pack_expected
-                                if (
-                                    state_group is not None
-                                    and dist.get_world_size(state_group) > 1
-                                ):
-                                    gathered_expected = [None] * dist.get_world_size(state_group)
-                                    dist.all_gather_object(
-                                        gathered_expected,
-                                        pack_expected.cpu(),
-                                        group=state_group,
-                                    )
-                                    state_tensors = [
-                                        item.float() for item in gathered_expected if item is not None
-                                    ]
-                                    if state_tensors:
-                                        final_expected = state_tensors[0].clone()
-                                        for item in state_tensors[1:]:
-                                            final_expected.add_(item)
-                                        if pack_is_avg:
-                                            final_expected.div_(len(state_tensors))
-                                pack_expected_fp = _fingerprint(final_expected)
-                                if opt_grad is not None and tuple(final_expected.shape) == tuple(opt_grad.shape):
-                                    diff = (final_expected - opt_grad.detach().float().cpu()).abs()
-                                    pack_diff = {
-                                        "amax": float(diff.max().item()) if diff.numel() > 0 else 0.0,
-                                        "sum": float(diff.sum().item()),
-                                        "sq_sum": float((diff ** 2).sum().item()),
-                                    }
-
-                if dp_cp_group is not None and dist.get_world_size(dp_cp_group) > 1:
-                    gathered_model = [None] * dist.get_world_size(dp_cp_group)
-                    dist.all_gather_object(gathered_model, model_fp, group=dp_cp_group)
-                else:
-                    gathered_model = [model_fp]
-
-                if grad_group is not None and dist.get_world_size(grad_group) > 1:
-                    gathered_opt = [None] * dist.get_world_size(grad_group)
-                    dist.all_gather_object(gathered_opt, opt_fp, group=grad_group)
-                else:
-                    gathered_opt = [opt_fp]
-
-                if state_group is not None and dist.get_world_size(state_group) > 1:
-                    gathered_model_state = [None] * dist.get_world_size(state_group)
-                    gathered_opt_state = [None] * dist.get_world_size(state_group)
-                    dist.all_gather_object(gathered_model_state, model_fp, group=state_group)
-                    dist.all_gather_object(gathered_opt_state, opt_fp, group=state_group)
-                else:
-                    gathered_model_state = [model_fp]
-                    gathered_opt_state = [opt_fp]
-
-                logger.info(
-                    "[DION_PARAM_GRAD_FP] step=%s rank=%s param=%s state_group=%s pack_group=%s model_gather=%s opt_gather=%s pack_pre_inter=%s pack_expected=%s pack_diff=%s model_state=%s opt_state=%s",
-                    call_idx,
-                    self._global_rank,
-                    param_name,
-                    dist.get_process_group_ranks(state_group) if state_group is not None else None,
-                    pack_group_ranks,
-                    gathered_model,
-                    gathered_opt,
-                    pack_pre_inter_fp,
-                    pack_expected_fp,
-                    pack_diff,
-                    gathered_model_state,
-                    gathered_opt_state,
-                )
-                if getattr(model_param, "is_dion_param", False):
-                    logger.info(
-                        "[DION_PARAM_GRAD_FP_ENTRY] step=%s rank=%s param=%s model_id=%s entry_id=%s entry_same=%s "
-                        "model_name=%s entry_name=%s pack_by_model_id=%s pack_by_entry_id=%s model_state=%s entry_state=%s",
-                        call_idx,
-                        self._global_rank,
-                        param_name,
-                        id(model_param),
-                        id(entry_param) if entry_param is not None else None,
-                        entry_param_same,
-                        _normalize_diag_name(param_name),
-                        _normalize_diag_name(entry_param_name),
-                        pack_lookup_via_model_id,
-                        pack_lookup_via_entry_id,
-                        gathered_model_state,
-                        entry_model_fp,
-                    )
-
-        self._dion_param_grad_fp_logged = int(
-            getattr(self, "_dion_param_grad_fp_logged", 0)
-        ) + 1
+    @staticmethod
+    def _group_rank(group) -> int:
+        return group.rank() if hasattr(group, "rank") else dist.get_rank(group)
 
     @classmethod
-    def _resolve_fs_rank(cls, dp_group, dp_rank: int) -> Tuple[int, int]:
-        """Resolve FS shard rank from the actual fs_group captured before parent init."""
-        fs_config = cls._current_init_fs_config or {}
-        fs_size = fs_config.get('fs_size', 1)
-        fs_group = fs_config.get('fs_group', None)
-
-        def _group_size(pg):
-            return pg.size() if hasattr(pg, "size") else dist.get_world_size(pg)
-
-        def _group_rank(pg):
-            return pg.rank() if hasattr(pg, "rank") else dist.get_rank(pg)
-
-        if fs_group is not None:
-            fs_size_pg = _group_size(fs_group)
-            fs_rank = _group_rank(fs_group)
-            if fs_size_pg != fs_size:
-                logger.warning(
-                    f"[Dion] FS size mismatch between init config and optimizer.fs_group: "
-                    f"config_fs_size={fs_size} fs_group.size={fs_size_pg}. "
-                    f"Using fs_group.size for layout computation."
+    def _bucket_shard_group(cls, param_and_grad_buffer, bucket):
+        """Return the standard local-shard group that owns this bucket."""
+        expert_flags = [not getattr(param, "allreduce", True) for param in bucket.params]
+        if any(expert_flags):
+            if not all(expert_flags):
+                raise RuntimeError(
+                    f"[Dion][EP] mixed dense/expert bucket is invalid: bucket_id={bucket.bucket_id}"
                 )
-            return fs_size_pg, fs_rank
-
-        if fs_size > 1:
-            raise RuntimeError(
-                "Dion requires a concrete fs_group when fs_size > 1. "
-                "Refusing to infer fs_rank from dp_rank because that is not robust "
-                "for multi-node or CP>1 topologies."
+            group = parallel_state.get_expert_data_parallel_group(
+                check_initialized=False,
+                partial_expert_data_parallel=True,
             )
+            if group is None:
+                raise RuntimeError(
+                    f"[Dion][EP] missing expert local-shard group for bucket {bucket.bucket_id}"
+                )
+            return group
 
-        return fs_size, 0
+        group = getattr(param_and_grad_buffer, "data_parallel_group", None)
+        if group is None:
+            raise RuntimeError(
+                f"[Dion] missing standard local-shard group for bucket {bucket.bucket_id}"
+            )
+        return group
 
-    def _stash_fs_init(self, opt) -> None:
-        """Stash init-time FS topology for `_build_model_gbuf_range()`."""
-        fs_group = getattr(opt, "fs_group", None) if opt is not None else None
-        DistributedOptimizerForDion._current_init_fs_config = {
-            'fs_size': self._fs_size if self._fs_size else 1,
-            'rp_size': self._rp_size if self._rp_size else 1,
-            'fs_group': fs_group,
-        }
-
-    def _clear_fs_init(self) -> None:
-        """Clear the class-level init FS topology stash."""
-        DistributedOptimizerForDion._current_init_fs_config = None
+    @classmethod
+    def _bucket_shard_topology(cls, param_and_grad_buffer, bucket) -> Tuple[object, int, int]:
+        """Return the standard bucket shard group and this rank's position in it."""
+        shard_group = cls._bucket_shard_group(param_and_grad_buffer, bucket)
+        shard_size = cls._group_size(shard_group)
+        shard_rank = cls._group_rank(shard_group)
+        if shard_size <= 0:
+            raise RuntimeError(
+                f"[Dion] invalid shard group size for bucket {bucket.bucket_id}: {shard_size}"
+            )
+        return shard_group, shard_size, shard_rank
 
     @classmethod
     def _build_bucket_param_map(
@@ -449,21 +194,6 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             bucket_offset,
         )
 
-        parent_param_summary = {
-            "bucket_idx": bucket_index,
-            "dp_rank": dp_rank,
-            "param_count": len(parent_param_map),
-        }
-        all_param_summaries = [None] * dp_group.size()
-        dist.all_gather_object(all_param_summaries, parent_param_summary, group=dp_group)
-        param_counts = [summary["param_count"] for summary in all_param_summaries]
-        if len(set(param_counts)) > 1 and bucket_index == 0 and dp_rank == 0:
-            logger.info(
-                f"[Dion] Bucket {bucket_index}: param_map sizes differ under optim_grads_params; "
-                "canonical runtime order follows bucket.params, and missing local entries are "
-                "represented as zero-length standard-DO shard ranges."
-            )
-
         canonical_param_map = OrderedDict()
         for param in ordered_params:
             canonical_param_map[param] = (
@@ -484,10 +214,11 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
     @classmethod
     def _mark_bucket_dion_params(cls, param_map, param_to_name, fs_size):
-        """Classify bucket params and attach Dion metadata once."""
+        """Classify bucket params and build static Dion metadata once."""
         from ..parallel_state import get_tensor_model_parallel_world_size
 
         dion_param_count = 0
+        dion_static_info_by_param = {}
 
         for param in param_map.keys():
             param_name = None
@@ -509,7 +240,6 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 tp_world_size = get_tensor_model_parallel_world_size() if has_tp else 1
 
             if not param.is_dion_param:
-                param_map[param]["dion_info"] = {"is_dion": False}
                 continue
 
             dion_param_count += 1
@@ -537,7 +267,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             else:
                 per_expert_global_shape = None
 
-            param_map[param]["dion_info"] = {
+            dion_static_info_by_param[param] = {
                 "is_dion": True,
                 "global_shape": (global_m, global_n),
                 "fs_split_dim": fs_split_dim,
@@ -552,77 +282,53 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     f"tp_world_size={tp_world_size}, is_expert={is_expert}"
                 )
 
-        return dion_param_count
+        return dion_param_count, dion_static_info_by_param
 
-    def _resolve_fs_group(self) -> None:
-        """Resolve runtime FS group/size/rank after parent init."""
-        use_optimizer_fs_group = (
-            hasattr(self, 'optimizer') and
-            hasattr(self.optimizer, 'fs_group') and
-            self.optimizer.fs_group is not None
-        )
-
-        if use_optimizer_fs_group:
-            self.fs_group = self.optimizer.fs_group
-            self.fs_size = self.fs_group.size()
-            self.fs_rank = self.fs_group.rank()
-            if hasattr(self, '_fs_size') and self._fs_size is not None and self._fs_size != self.fs_size:
-                logger.warning(
-                    f"[Dion] Global rank {self._global_rank}: "
-                    f"FS size mismatch! configured={self._fs_size}, optimizer.fs_group.size()={self.fs_size}"
-                )
+    def _init_runtime_groups(self) -> None:
+        """Resolve the standard runtime groups that Dion math consumes."""
+        optimizer_fs_group = getattr(self.optimizer, "fs_group", None) if hasattr(self, "optimizer") else None
+        if optimizer_fs_group is not None:
+            self.fs_group = optimizer_fs_group
+            self.fs_size = self._group_size(optimizer_fs_group)
+            self.fs_rank = self._group_rank(optimizer_fs_group)
         else:
             self.fs_group = self.data_parallel_group
-            self.fs_size = self.data_parallel_group.size()
-            self.fs_rank = self.data_parallel_group.rank()
+            self.fs_size = self._group_size(self.data_parallel_group)
+            self.fs_rank = self._group_rank(self.data_parallel_group)
 
-    def _resolve_rp_group(self) -> None:
-        """Resolve runtime RP group/size/rank after parent init."""
+        configured_fs_size = int(self._fs_size) if self._fs_size is not None else 1
+        if self.fs_size != configured_fs_size:
+            raise RuntimeError(
+                f"[Dion] Global rank {self._global_rank}: "
+                f"FS size mismatch configured={configured_fs_size} actual={self.fs_size}"
+            )
+
         configured_rp_size = int(self._rp_size) if self._rp_size is not None else 1
-        optimizer_rp_group = (
-            getattr(self.optimizer, 'rp_group', None)
-            if hasattr(self, 'optimizer')
-            else None
-        )
-
+        optimizer_rp_group = getattr(self.optimizer, "rp_group", None) if hasattr(self, "optimizer") else None
         if configured_rp_size <= 1:
             self.rp_group = None
-            return
-
-        if optimizer_rp_group is None:
-            raise RuntimeError(
-                "[Dion] RP>1 requires optimizer.rp_group to be initialized "
-                f"(configured_rp_size={configured_rp_size})"
-            )
-
-        rp_size = dist.get_world_size(optimizer_rp_group)
-        if rp_size != configured_rp_size:
-            group_ranks = dist.get_process_group_ranks(optimizer_rp_group)
-            raise RuntimeError(
-                "[Dion] RP topology mismatch after parent init: "
-                f"configured_rp_size={configured_rp_size} actual_rp_group_size={rp_size} "
-                f"rp_group_ranks={group_ranks}"
-            )
-
-        self.rp_group = optimizer_rp_group
-
-    def _resolve_state_replica_group(self) -> None:
-        """Resolve the stock partial-DO optimizer-state replica group.
-
-        CP is not a Dion compressed replicate mesh, but with multiple distributed
-        optimizer instances the same local shard exists in multiple optimizer
-        instances. Those replicas must keep optimizer state and task ordering
-        identical.
-        """
-        from megatron.core import parallel_state
+        else:
+            if optimizer_rp_group is None:
+                raise RuntimeError(
+                    "[Dion] RP>1 requires optimizer.rp_group to be initialized "
+                    f"(configured_rp_size={configured_rp_size})"
+                )
+            rp_size = self._group_size(optimizer_rp_group)
+            if rp_size != configured_rp_size:
+                group_ranks = dist.get_process_group_ranks(optimizer_rp_group)
+                raise RuntimeError(
+                    "[Dion] RP topology mismatch after parent init: "
+                    f"configured_rp_size={configured_rp_size} actual_rp_group_size={rp_size} "
+                    f"rp_group_ranks={group_ranks}"
+                )
+            self.rp_group = optimizer_rp_group
 
         try:
-            state_group = parallel_state.get_inter_distributed_optimizer_instance_group(
+            self.state_replica_group = parallel_state.get_inter_distributed_optimizer_instance_group(
                 check_initialized=False
             )
         except Exception:
-            state_group = None
-        self.state_replica_group = state_group
+            self.state_replica_group = None
 
     @staticmethod
     def _param_name(name_map, param) -> Optional[str]:
@@ -656,22 +362,50 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     return name
         return None
 
-    def _build_name_map(self) -> Dict[int, str]:
-        """Build id(param) -> name mapping for the current runtime module params."""
-        runtime_name_map: Dict[int, str] = {}
-        if hasattr(self, "model_chunks"):
-            for model_idx, model in enumerate(self.model_chunks):
-                try:
-                    for name, param in model.named_parameters():
-                        runtime_name_map[id(param)] = name
-                except Exception as error:
-                    logger.warning(
-                        f"[Dion] model_chunks[{model_idx}] named_parameters() failed: {error}"
-                    )
-        elif hasattr(self, "module") and isinstance(self.module, torch.nn.Module):
-            for name, param in self.module.named_parameters():
-                runtime_name_map[id(param)] = name
-        return runtime_name_map
+    def _canonical_param_name(self, param) -> Optional[str]:
+        """Return the most direct stable name available for a model or shard param."""
+        if param is None:
+            return None
+
+        name = self._param_name(getattr(self, "param_to_name", None), param)
+        if name is not None:
+            return name
+
+        model_param = getattr(param, "_model_param", None)
+        if model_param is not None:
+            name = self._param_name(getattr(self, "param_to_name", None), model_param)
+            if name is not None:
+                return name
+            name = getattr(model_param, "_param_name", None)
+            if name is not None:
+                return name
+
+        name = getattr(param, "_param_name", None)
+        if name is not None:
+            return name
+
+        return self._find_param_name(model_param if model_param is not None else param)
+
+    def _shard_param_name(self, shard_param) -> str:
+        """Return a deterministic checkpoint/log name for one optimizer shard param."""
+        name = self._canonical_param_name(shard_param)
+        if name is not None:
+            return name
+        return f"id_{id(shard_param)}"
+
+    def _shard_param_uid(self, shard_param):
+        """Return the logical checkpoint/state identity for one optimizer shard."""
+        param_uid = getattr(shard_param, "_dion_param_uid", None)
+        if param_uid is not None:
+            return param_uid
+        meta = getattr(self, "dist_metas", {}).get(shard_param)
+        if meta is not None and getattr(meta, "param_uid", None) is not None:
+            return meta.param_uid
+        raise RuntimeError(
+            "[Dion] missing param_uid for optimizer shard "
+            f"name={self._canonical_param_name(shard_param) or f'id_{id(shard_param)}'} "
+            f"shape={tuple(shard_param.shape)}"
+        )
 
     @staticmethod
     def _bucket_param_view(bucket, param) -> Optional[torch.Tensor]:
@@ -683,10 +417,50 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         start, end = bucket.param_to_index[param]
         return bucket.param_data.view(-1)[start:end].view(param.data.shape)
 
+    @staticmethod
+    def _bucket_full_param_view_2d(bucket, param, entry) -> Optional[torch.Tensor]:
+        """Return the canonical full 2D bucket view for one Dion param."""
+        if bucket is None or getattr(bucket, "param_data", None) is None:
+            return None
+        if not hasattr(bucket, "param_to_index") or param not in bucket.param_to_index:
+            return None
+        start, end = bucket.param_to_index[param]
+        full_flat = bucket.param_data.view(-1)[start:end]
+        global_shape = entry.global_shape
+        fs_split_dim = int(entry.fs_split_dim)
+        if fs_split_dim == 0:
+            full_shape = (int(global_shape[0]), int(param.shape[1]))
+        else:
+            full_shape = (int(param.shape[0]), int(global_shape[1]))
+        expected_numel = int(full_shape[0]) * int(full_shape[1])
+        if full_flat.numel() != expected_numel:
+            raise RuntimeError(
+                "[Dion] canonical full-param view size mismatch "
+                f"for param={getattr(param, 'shape', None)} bucket={getattr(bucket, 'bucket_id', -1)} "
+                f"slice_numel={int(full_flat.numel())} expected_numel={expected_numel} "
+                f"full_shape={full_shape}"
+            )
+        return full_flat.view(full_shape)
+
     def _bind_bucket_param_views(self, bucket, *, copy_data: bool) -> None:
         """Ensure each param in `bucket` aliases the bucket's canonical param buffer."""
         if bucket is None or getattr(bucket, "param_data", None) is None:
             return
+        debug_targets = _debug_target_params()
+        source_copies = {}
+        if copy_data:
+            for param in bucket.params:
+                expected_view = self._bucket_param_view(bucket, param)
+                if expected_view is None:
+                    continue
+                if (
+                    param.data.shape == expected_view.shape
+                    and param.data.data_ptr() == expected_view.data_ptr()
+                ):
+                    continue
+                if param.data.numel() != expected_view.numel():
+                    continue
+                source_copies[param] = param.data.view(expected_view.shape).clone()
         for param in bucket.params:
             expected_view = self._bucket_param_view(bucket, param)
             if expected_view is None:
@@ -696,8 +470,20 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 and param.data.data_ptr() == expected_view.data_ptr()
             ):
                 continue
-            if copy_data and param.data.numel() == expected_view.numel():
-                expected_view.copy_(param.data.view(expected_view.shape))
+            if copy_data and param in source_copies:
+                source_view = source_copies[param]
+                expected_view.copy_(source_view)
+                param_name = self._canonical_param_name(param)
+                if param_name in debug_targets:
+                    logger.warning(
+                        "[DION_BIND_VIEW] param=%s bucket=%s source_norm=%s target_norm=%s source_ptr=%s target_ptr=%s",
+                        param_name,
+                        getattr(bucket, "bucket_id", -1),
+                        float(source_view.detach().float().norm().item()),
+                        float(expected_view.detach().float().norm().item()),
+                        int(source_view.data_ptr()),
+                        int(expected_view.data_ptr()),
+                    )
             param.data = expected_view
 
     def _check_bucket_param_views(self, bucket, *, context: str) -> None:
@@ -740,96 +526,10 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 if hasattr(bucket, "_dion_full_param_ready"):
                     bucket._dion_full_param_ready = ready
 
-    def _build_fs_bucket_plans(self, gbuf_idx, buffer, gbuf_range_maps) -> None:
-        """Populate buffer-level bucket plan metadata from `gbuf_ranges`."""
-        buffer.dion_param_layouts_by_bucket = []
-        buffer.fs_bucket_plan_map = {}
-        cumulative_bucket_id = 0
+    def _init_bucket_comm(self, bucket, fs_group) -> None:
+        """Attach the Dion shard group to a bucket."""
+        bucket.dion_shard_group = fs_group
 
-        for dtype, bucket_list in gbuf_range_maps.items():
-            for gbuf_range_map in bucket_list:
-                global_bucket_id = cumulative_bucket_id
-                dion_shard_range = gbuf_range_map.get("dion_param_shard_range", None)
-                buffer.fs_bucket_plan_map[global_bucket_id] = {
-                    "dtype": dtype,
-                    "local_total": gbuf_range_map.get("local_total", 0),
-                    "dion_param_layout": gbuf_range_map.get("dion_param_layout", []),
-                    "dion_param_shard_range": dion_shard_range,
-                }
-                if gbuf_range_map.get("dion_param_layout"):
-                    buffer.dion_param_layouts_by_bucket.append(
-                        {
-                            "bucket_idx": global_bucket_id,
-                            "dtype": dtype,
-                            "dion_param_layout": gbuf_range_map["dion_param_layout"],
-                        }
-                    )
-                cumulative_bucket_id += 1
-
-        expected_bucket_ids = {bucket.bucket_id for bucket in buffer.buckets}
-        if set(buffer.fs_bucket_plan_map.keys()) != expected_bucket_ids:
-            raise RuntimeError(
-                f"[DDP/OPT BUCKET MISMATCH] buffer={gbuf_idx} expected bucket_ids={sorted(expected_bucket_ids)} "
-                f"but gbuf_ranges provided {sorted(buffer.fs_bucket_plan_map.keys())}"
-            )
-
-        buffer.dion_param_layout = DionParamLayout()
-        for bucket_info in buffer.dion_param_layouts_by_bucket:
-            buffer.dion_param_layout.extend(bucket_info["dion_param_layout"])
-
-    def _index_buffer_params(self, gbuf_idx, buffer) -> None:
-        """Refresh param_index_map after the Dion shard/non-shard layout rewrite."""
-        for bucket in buffer.buckets:
-            bucket_plan = buffer.fs_bucket_plan_map.get(bucket.bucket_id)
-            if bucket_plan is None:
-                continue
-
-            dtype_key = bucket_plan["dtype"]
-            gbuf_range_map = self.gbuf_ranges[gbuf_idx][dtype_key][bucket.bucket_id]
-            param_map = gbuf_range_map.get("param_map", {})
-            for param, range_info in param_map.items():
-                local_range = range_info["param"]
-                global_start = bucket.offset + local_range.start
-                global_end = bucket.offset + local_range.end
-                buffer.param_index_map[param] = (global_start, global_end, bucket.bucket_id)
-
-    def _bucket_range_map(self, gbuf_idx, buffer, bucket):
-        """Resolve the `gbuf_range_map` matching one runtime bucket."""
-        bucket_plan = buffer.fs_bucket_plan_map.get(bucket.bucket_id, None)
-        dtype_key = (buffer.param_dtype, buffer.grad_dtype)
-        if bucket_plan is None:
-            raise RuntimeError(
-                f"[DDP/OPT BUCKET MISMATCH] buffer={gbuf_idx} missing plan for bucket_id={bucket.bucket_id}"
-            )
-        if bucket_plan["dtype"] != dtype_key:
-            raise RuntimeError(
-                f"[DDP/OPT BUCKET MISMATCH] buffer={gbuf_idx} bucket={bucket.bucket_id} dtype mismatch: "
-                f"DDP bucket dtype_key={dtype_key} vs plan dtype_key={bucket_plan['dtype']}"
-            )
-        return bucket_plan, self.gbuf_ranges[gbuf_idx][bucket_plan["dtype"]][bucket.bucket_id]
-
-    def _fs_positions(self, fs_group, fs_size: int):
-        """Build full dp_cp-rank -> FS-shard-position mapping used by bucket packing."""
-        dp_cp_group = self._original_dp_group if self._original_dp_group is not None else self.data_parallel_group
-        dp_cp_size = dp_cp_group.size()
-        if dp_cp_size > fs_size:
-            my_fs_rank_val = fs_group.rank()
-            all_fs_ranks = [None] * dp_cp_size
-            dist.all_gather_object(all_fs_ranks, my_fs_rank_val, group=dp_cp_group)
-            return all_fs_ranks
-        return list(range(fs_size))
-
-    def _init_bucket_comm(self, bucket, fs_group, fs_size: int) -> None:
-        """Attach common FS/DP/CP communication metadata to a bucket."""
-        dp_cp_group = self._original_dp_group if self._original_dp_group is not None else self.data_parallel_group
-        bucket.dion_comm_group = fs_group
-        bucket.dion_dp_cp_group = dp_cp_group
-        bucket.dp_cp_size = dp_cp_group.size()
-        bucket.dp_cp_to_fs_position = self._fs_positions(fs_group, fs_size)
-
-        from megatron.core import parallel_state as ps
-
-        cp_size = ps.get_context_parallel_world_size()
         expert_flags = [not getattr(p, "allreduce", True) for p in bucket.params]
         is_expert_bucket = any(expert_flags)
         if is_expert_bucket and not all(expert_flags):
@@ -845,135 +545,35 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 expected_group=expert_group,
                 extra="Megatron-Core EP local-shard ownership must stay on intra_expt_dp_group.",
             )
-        bucket.cp_group = ps.get_context_parallel_group() if (cp_size > 1 and not is_expert_bucket) else None
 
-    def _build_bucket_name_map(
-        self,
-        *,
-        bucket,
-        bucket_dion_param_layout,
-        active_name_map,
-        stale_name_map,
-        gbuf_idx: int,
-    ) -> Dict[str, torch.nn.Parameter]:
-        """Resolve current runtime bucket params by canonical name."""
-        bucket_param_by_name: Dict[str, torch.nn.Parameter] = {}
-
-        for param in bucket.params:
-            param_name = self._param_name(active_name_map, param)
-            if param_name and param_name not in bucket_param_by_name:
-                bucket_param_by_name[param_name] = param
-
-        for param in bucket.params:
-            if any(id(param) == id(found) for found in bucket_param_by_name.values()):
-                continue
-            param_name = self._param_name(stale_name_map, param)
-            if param_name and param_name not in bucket_param_by_name:
-                bucket_param_by_name[param_name] = param
-
-        for param in bucket.params:
-            if any(id(param) == id(found) for found in bucket_param_by_name.values()):
-                continue
-            found_name = self._find_param_name(param)
-            if found_name and found_name not in bucket_param_by_name:
-                bucket_param_by_name[found_name] = param
-
-        for param in bucket.params:
-            if any(id(param) == id(found) for found in bucket_param_by_name.values()):
-                continue
-            candidates = [
-                entry for entry in bucket_dion_param_layout if tuple(param.shape) == tuple(entry["param"].shape)
-            ]
-            if len(candidates) == 1:
-                entry = candidates[0]
-                param_name = (
-                    self._param_name(active_name_map, entry["param"])
-                    or self._param_name(stale_name_map, entry["param"])
-                )
-                if param_name and param_name not in bucket_param_by_name:
-                    bucket_param_by_name[param_name] = param
-            elif len(candidates) > 1:
-                logger.warning(
-                    f"[Dion] buffer={gbuf_idx} bucket={bucket.bucket_id} "
-                    f"param shape={tuple(param.shape)} has multiple dion_param_layout matches; skipping fallback"
-                )
-
-        return bucket_param_by_name
-
-    def _rebind_bucket_layout(
+    def _attach_dion_bucket_layout(
         self,
         *,
         gbuf_idx: int,
         buffer,
         bucket,
-        bucket_dion_param_layout,
-        stale_name_map,
-        active_name_map,
+        dion_bucket_layout: DionBucketLayout,
     ) -> None:
-        """Rebind persisted Dion layout entries onto current runtime param objects."""
-        if not active_name_map:
+        """Validate that planned Dion entries already target the current runtime bucket."""
+        if not hasattr(bucket, "param_to_index") or bucket.param_to_index is None:
             raise RuntimeError(
-                f"[Dion] buffer={gbuf_idx} bucket={bucket.bucket_id} "
-                f"no active name map (model_chunks/module missing or empty)"
+                f"[Dion] buffer={gbuf_idx} bucket={bucket.bucket_id} missing bucket.param_to_index"
             )
 
-        bucket_param_by_name = self._build_bucket_name_map(
-            bucket=bucket,
-            bucket_dion_param_layout=bucket_dion_param_layout,
-            active_name_map=active_name_map,
-            stale_name_map=stale_name_map,
-            gbuf_idx=gbuf_idx,
-        )
-
-        rebuilt_entries = []
-        rebuilt_dion_param_shard_range = {}
-        bucket.fs_param_id_to_full_offset = {}
-        offset = 0
-
-        for entry in bucket_dion_param_layout:
-            param_name = (
-                self._param_name(active_name_map, entry["param"])
-                or self._param_name(stale_name_map, entry["param"])
-            )
-            target_param = bucket_param_by_name.get(param_name, None)
-            if target_param is None:
+        for entry in dion_bucket_layout.entries:
+            entry_param = entry.param
+            if entry_param not in bucket.param_to_index:
+                buffer_name_map = getattr(buffer, "param_to_name", None)
+                param_name = self._param_name(buffer_name_map, entry_param)
                 raise RuntimeError(
-                    f"[Dion] buffer={gbuf_idx} bucket={bucket.bucket_id} "
-                    f"name={param_name} shape={entry['param'].shape} not found in current bucket params"
+                    f"[Dion] buffer={gbuf_idx} bucket={bucket.bucket_id} planned param "
+                    f"{param_name or f'id_{id(entry_param)}'} "
+                    "is not present in the current runtime bucket"
                 )
-
-            new_entry = entry.copy()
-            new_entry["param"] = target_param
-            rebuilt_entries.append(new_entry)
-
-            seg_size = entry["segment_size"]
-            bucket.fs_param_id_to_full_offset[id(target_param)] = offset
-
-            pack_offset = entry.get("pack_offset", 0)
-            local_size = entry["local_shape"][0] * entry["local_shape"][1]
-            rebuilt_dion_param_shard_range[target_param] = (pack_offset, pack_offset + local_size)
-            offset += seg_size
-
-        bucket.dion_param_layout = rebuilt_entries
-        bucket.dion_param_shard_range = rebuilt_dion_param_shard_range
-        bucket.dion_shard_size = sum(entry["segment_size"] for entry in rebuilt_entries)
-
-        dion_param_name_to_entry = {}
-        for entry in rebuilt_entries:
-            entry_param = entry.get("param")
-            if entry_param is None:
-                continue
-            param_name = None
-            if hasattr(buffer, "param_to_name"):
-                param_name = self._param_name(buffer.param_to_name, entry_param)
-            if param_name is None:
-                param_name = (
-                    self._param_name(active_name_map, entry_param)
-                    or self._param_name(stale_name_map, entry_param)
-                )
-            if param_name:
-                dion_param_name_to_entry[param_name] = entry
-        bucket.dion_param_name_to_entry = dion_param_name_to_entry
+        bucket.dion_layout = dion_bucket_layout
+        for entry in dion_bucket_layout.entries:
+            self._dion_buckets_by_param[entry.param] = bucket
+            self._dion_entries_by_param[entry.param] = entry
 
     def _init_dion_bucket(
         self,
@@ -981,48 +581,25 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         gbuf_idx: int,
         buffer,
         bucket,
-        bucket_dion_param_layout,
-        dion_param_shard_range_map,
+        dion_bucket_layout: DionBucketLayout,
         fs_group,
-        fs_size: int,
-        stale_name_map,
-        active_name_map,
     ) -> None:
         """Configure one bucket that contains at least one Dion param."""
-        bucket.dion_param_layout = bucket_dion_param_layout
-        if dion_param_shard_range_map:
-            bucket.dion_param_shard_range = dion_param_shard_range_map
-        bucket.dion_grad_buffer = None
-        bucket.dion_grad_local_view = None
-        bucket.dion_rs_local_buffer = None
-
-        self._rebind_bucket_layout(
+        self._attach_dion_bucket_layout(
             gbuf_idx=gbuf_idx,
             buffer=buffer,
             bucket=bucket,
-            bucket_dion_param_layout=bucket_dion_param_layout,
-            stale_name_map=stale_name_map,
-            active_name_map=active_name_map,
+            dion_bucket_layout=dion_bucket_layout,
         )
-        self._init_bucket_comm(bucket, fs_group, fs_size)
+        self._init_bucket_comm(bucket, fs_group)
 
-        bucket.fs_full_grad_total = bucket.dion_shard_size * fs_size
-        bucket.fs_pack_total = max(
-            entry["pack_offset"] + entry["segment_size"] for entry in bucket_dion_param_layout
-        )
-        bucket.fs_pack_buffer = None
-        bucket.fs_gathered_buffer = None
-        bucket.fs_all_gather_fn = (
-            lambda async_op=False, b=buffer, bkt=bucket, plan=bucket.dion_param_layout:
-            self._all_gather_params_bucket(b, bkt, plan, async_op=async_op)
-        )
         bucket.dion_optimizer = self
         bucket._dion_requires_param_sync_check = True
         bucket._dion_full_param_ready = True
-        self._bind_bucket_param_views(bucket, copy_data=False)
+        self._bind_bucket_param_views(bucket, copy_data=True)
 
-    def _init_non_dion_bucket(self, *, gbuf_idx: int, buffer, bucket, fs_group, fs_size: int) -> None:
-        """Configure one bucket that has no Dion layout entries."""
+    def _init_non_dion_bucket(self, *, gbuf_idx: int, buffer, bucket, fs_group) -> None:
+        """Configure one bucket that has no Dion layout."""
         has_dion = any(getattr(param, "is_dion_param", False) for param in bucket.params)
         if has_dion:
             name_map = getattr(self, "param_to_name", {}) or getattr(buffer, "param_to_name", {})
@@ -1032,238 +609,45 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     param_name = self._param_name(name_map, param)
                     dion_params.append((id(param), param_name or f"id_{id(param)}", tuple(param.shape)))
             logger.error(
-                f"[Dion] Buffer {gbuf_idx} Bucket {bucket.bucket_id} has Dion params but no dion_param_layout. params={dion_params}"
+                f"[Dion] Buffer {gbuf_idx} Bucket {bucket.bucket_id} has Dion params but no dion_bucket_layout. params={dion_params}"
             )
             raise RuntimeError(
-                f"[Dion] Buffer {gbuf_idx} Bucket {bucket.bucket_id} has Dion params but no dion_param_layout"
+                f"[Dion] Buffer {gbuf_idx} Bucket {bucket.bucket_id} has Dion params but no dion_bucket_layout"
             )
 
-        bucket.dion_param_layout = DionParamLayout()
-        bucket.dion_grad_buffer = None
-        bucket.dion_grad_local_view = None
-        bucket.dion_rs_local_buffer = None
-        bucket.fs_full_grad_total = 0
-        bucket.fs_param_id_to_full_offset = {}
-        bucket.dion_shard_size = 0
-        self._init_bucket_comm(bucket, fs_group, fs_size)
-        bucket.fs_pack_total = 0
-        bucket.fs_pack_buffer = None
-        bucket.fs_gathered_buffer = None
-        bucket.fs_all_gather_fn = None
-        bucket.is_pure_non_dion_bucket = True
+        bucket.dion_layout = None
+        self._init_bucket_comm(bucket, fs_group)
         bucket.dion_optimizer = self
         bucket._dion_requires_param_sync_check = False
         bucket._dion_full_param_ready = True
 
-    def _init_mixed_non_dion(
-        self,
-        *,
-        gbuf_idx: int,
-        buffer,
-        bucket,
-        active_name_map,
-        stale_name_map,
-    ) -> None:
-        """Configure the non-Dion section for one mixed bucket."""
-        has_dion = bool(getattr(bucket, "dion_param_layout", None))
-        if has_dion:
-            _, gbuf_range_map = self._bucket_range_map(gbuf_idx, buffer, bucket)
-            param_map = gbuf_range_map.get("param_map", {})
-        else:
-            param_map = None
-
-        non_dion_params_in_bucket = select_non_dion_bucket_params_(
-            bucket_params=bucket.params,
-            dion_param_layout=bucket.dion_param_layout if has_dion else None,
-            param_map=param_map,
-        )
-
-        if has_dion and non_dion_params_in_bucket:
-            # Match stock Megatron-Core DO: _ParamAndGradBuffer.data_parallel_group is the
-            # full DPxCP group used for canonical bucket ownership, while the actual stock
-            # local optimizer shard contract is defined by the bucket group's intra
-            # distributed-optimizer-instance group.
-            dp_group = getattr(bucket, "intra_distributed_optimizer_instance_group", None)
-            if dp_group is None:
-                raise RuntimeError(
-                    "[Dion] mixed non-Dion path requires "
-                    "bucket.intra_distributed_optimizer_instance_group to match "
-                    "stock Megatron-Core DO local-shard semantics."
-                )
-            (
-                non_dion_pack_plan,
-                non_dion_param_ranges,
-                non_dion_shard_size,
-                non_dion_full_grad_total,
-            ) = build_stock_bucket_non_dion_plan_(
-                bucket=bucket,
-                params=non_dion_params_in_bucket,
-                dp_size=dp_group.size(),
-                dp_rank=dp_group.rank(),
-            )
-
-            bucket.non_dion_pack_plan = non_dion_pack_plan
-            bucket.non_dion_param_ranges = non_dion_param_ranges
-            bucket.non_dion_pack_total = non_dion_shard_size
-            bucket.non_dion_shard_size = non_dion_shard_size
-            bucket.non_dion_full_grad_total = non_dion_full_grad_total
-
-            bucket.non_dion_dp_group = dp_group
-            bucket.non_dion_all_gather_fn = (
-                lambda async_op=False, b=buffer, bkt=bucket: self._all_gather_non_dion(bkt, b, async_op)
-            )
-            bucket.dion_optimizer = self
-            bucket._dion_requires_param_sync_check = True
-            bucket._dion_full_param_ready = True
-
-            non_dion_param_name_to_entry = {}
-            non_dion_param_id_to_entry = {}
-            for entry in non_dion_pack_plan:
-                entry_param = entry.get("param")
-                if entry_param is None:
-                    continue
-                non_dion_param_id_to_entry[id(entry_param)] = entry
-                param_name = None
-                if hasattr(buffer, "param_to_name"):
-                    param_name = self._param_name(buffer.param_to_name, entry_param)
-                if param_name is None:
-                    param_name = (
-                        self._param_name(active_name_map, entry_param)
-                        or self._param_name(stale_name_map, entry_param)
-                    )
-                if param_name:
-                    non_dion_param_name_to_entry[param_name] = entry
-            bucket.non_dion_param_id_to_entry = non_dion_param_id_to_entry
-            bucket.non_dion_param_name_to_entry = non_dion_param_name_to_entry
-            mixed_dion_full_bucket_ranges = []
-            if hasattr(bucket, "param_to_index") and bucket.param_to_index is not None:
-                for dion_entry in bucket.dion_param_layout:
-                    dion_param = dion_entry.get("param")
-                    if dion_param is None or dion_param not in bucket.param_to_index:
-                        continue
-                    start, end = bucket.param_to_index[dion_param]
-                    mixed_dion_full_bucket_ranges.append((int(start), int(end)))
-            bucket.mixed_dion_full_bucket_ranges = tuple(mixed_dion_full_bucket_ranges)
-
-            if dist.is_initialized() and dp_group is not None and dp_group.size() > 1:
-                def _entry_name(_entry):
-                    _param = _entry["param"]
-                    _name = self._param_name(buffer.param_to_name, _param)
-                    return _name if _name is not None else f"id_{id(_param)}"
-
-                # Mixed non-Dion stock plan contains both:
-                # - rank-invariant metadata (`full_*`, `rank_*_ranges`)
-                # - rank-local views (`local_*`, `local_bucket_*`)
-                # Only the rank-invariant part should match across DP ranks.
-                local_signature = (
-                    int(bucket.bucket_id),
-                    int(bucket.non_dion_pack_total),
-                    int(bucket.non_dion_full_grad_total),
-                    tuple(
-                        (
-                            _entry_name(entry),
-                            int(entry["full_start"]),
-                            int(entry["full_end"]),
-                            tuple(entry.get("rank_bucket_ranges", ())),
-                            tuple(entry.get("rank_param_ranges", ())),
-                        )
-                        for entry in non_dion_pack_plan
-                    ),
-                )
-                for entry in non_dion_pack_plan:
-                    rank_bucket_ranges = entry.get("rank_bucket_ranges", ())
-                    rank_param_ranges = entry.get("rank_param_ranges", ())
-                    if len(rank_bucket_ranges) != dp_group.size() or len(rank_param_ranges) != dp_group.size():
-                        raise RuntimeError(
-                            "[Dion] mixed non-Dion stock plan has invalid per-rank range metadata: "
-                            f"bucket={bucket.bucket_id} param={_entry_name(entry)} "
-                            f"bucket_ranges={len(rank_bucket_ranges)} param_ranges={len(rank_param_ranges)} "
-                            f"dp_size={dp_group.size()}"
-                        )
-                    expected_bucket_start, expected_bucket_end = rank_bucket_ranges[dp_group.rank()]
-                    expected_param_start, expected_param_end = rank_param_ranges[dp_group.rank()]
-                    if (
-                        int(entry["local_bucket_start"]) != int(expected_bucket_start)
-                        or int(entry["local_bucket_end"]) != int(expected_bucket_end)
-                        or int(entry["local_start"]) != int(expected_param_start)
-                        or int(entry["local_end"]) != int(expected_param_end)
-                    ):
-                        raise RuntimeError(
-                            "[Dion] mixed non-Dion stock plan local-range mismatch: "
-                            f"bucket={bucket.bucket_id} param={_entry_name(entry)} "
-                            f"local_bucket=({int(entry['local_bucket_start'])},{int(entry['local_bucket_end'])}) "
-                            f"expected_bucket=({int(expected_bucket_start)},{int(expected_bucket_end)}) "
-                            f"local_param=({int(entry['local_start'])},{int(entry['local_end'])}) "
-                            f"expected_param=({int(expected_param_start)},{int(expected_param_end)})"
-                        )
-                gathered_signatures = [None] * dp_group.size()
-                dist.all_gather_object(gathered_signatures, local_signature, group=dp_group)
-                if any(sig != local_signature for sig in gathered_signatures):
-                    raise RuntimeError(
-                        "[Dion] mixed non-Dion pack plan differs across DP ranks: "
-                        f"bucket={bucket.bucket_id} local={local_signature} gathered={gathered_signatures}"
-                    )
-
-            for entry in non_dion_pack_plan:
-                param = entry["param"]
-                local_start = int(entry.get("local_start", 0))
-                local_end = int(entry.get("local_end", local_start))
-                expected_numel = max(0, local_end - local_start)
-                model_grad = getattr(param, "main_grad", None)
-                if model_grad is not None and model_grad.numel() < local_end:
-                    logger.error(
-                        "[NON_DION_MAIN_GRAD_RANGE_MISMATCH] Bucket %s param %s local_range=(%s,%s) "
-                        "entry_numel=%s main_grad_numel=%s",
-                        bucket.bucket_id,
-                        tuple(param.shape),
-                        local_start,
-                        local_end,
-                        expected_numel,
-                        model_grad.numel(),
-                    )
-        else:
-            bucket.non_dion_pack_plan = []
-            bucket.non_dion_full_grad_total = 0
-            bucket.non_dion_shard_size = 0
-            bucket.non_dion_pack_total = 0
-            bucket.non_dion_all_gather_fn = None
-            bucket.non_dion_dp_group = None
-            bucket.non_dion_param_id_to_entry = {}
-            bucket.non_dion_param_name_to_entry = {}
-            bucket.mixed_dion_full_bucket_ranges = ()
-
     def _init_dion_buffers(self) -> None:
-        """Configure buffer-level Dion bucket plans after parent optimizer init."""
+        """Configure buffer-level Dion bucket layouts after parent optimizer init."""
         if not hasattr(self, "gbuf_ranges") or not hasattr(self, "buffers"):
             return
 
-        fs_group, fs_size = self.fs_group, self.fs_size
-        runtime_name_map = self._build_name_map()
+        fs_group = self.fs_group
 
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             buffer = self.buffers[gbuf_idx]
-            stale_name_map = getattr(self, "param_to_name", {}) or getattr(buffer, "param_to_name", {})
-            active_name_map = runtime_name_map or stale_name_map or {}
-
-            self._build_fs_bucket_plans(gbuf_idx, buffer, gbuf_range_maps)
-            self._index_buffer_params(gbuf_idx, buffer)
+            dtype_key = (buffer.param_dtype, buffer.grad_dtype)
+            if dtype_key not in gbuf_range_maps:
+                raise RuntimeError(
+                    f"[Dion] missing gbuf_ranges entry for buffer={gbuf_idx} dtype={dtype_key}"
+                )
+            bucket_range_maps = gbuf_range_maps[dtype_key]
 
             for bucket in buffer.buckets:
-                bucket_plan, _ = self._bucket_range_map(gbuf_idx, buffer, bucket)
-                bucket_dion_param_layout = bucket_plan.get("dion_param_layout", None)
-                dion_param_shard_range_map = bucket_plan.get("dion_param_shard_range", None)
+                bucket_range_map = bucket_range_maps[bucket.bucket_id]
+                dion_bucket_layout = bucket_range_map.pop("dion_bucket_layout", None)
 
-                if bucket_dion_param_layout:
+                if dion_bucket_layout is not None and dion_bucket_layout.has_params:
                     self._init_dion_bucket(
                         gbuf_idx=gbuf_idx,
                         buffer=buffer,
                         bucket=bucket,
-                        bucket_dion_param_layout=bucket_dion_param_layout,
-                        dion_param_shard_range_map=dion_param_shard_range_map,
+                        dion_bucket_layout=dion_bucket_layout,
                         fs_group=fs_group,
-                        fs_size=fs_size,
-                        stale_name_map=stale_name_map,
-                        active_name_map=active_name_map,
                     )
                 else:
                     self._init_non_dion_bucket(
@@ -1271,20 +655,10 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                         buffer=buffer,
                         bucket=bucket,
                         fs_group=fs_group,
-                        fs_size=fs_size,
                     )
 
-            for bucket in buffer.buckets:
-                self._init_mixed_non_dion(
-                    gbuf_idx=gbuf_idx,
-                    buffer=buffer,
-                    bucket=bucket,
-                    active_name_map=active_name_map,
-                    stale_name_map=stale_name_map,
-                )
-
     def _log_unmapped_main_grads(self, model_groups, label: str) -> None:
-        """Log params that are truly missing from Dion bookkeeping.
+        """Fail fast if any params are missing from Dion bookkeeping.
 
         Pure non-Dion buckets are handled by the parent DO path and should not be
         flagged as uncategorized.
@@ -1292,10 +666,15 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         missing_gbuf_map = 0
         missing_param_map = 0
         uncategorized = 0
+        examples = []
         for group in model_groups:
             for model_param in group:
                 if model_param not in self.model_param_gbuf_map:
                     missing_gbuf_map += 1
+                    if len(examples) < 5:
+                        examples.append(
+                            f"missing_model_param_gbuf_map:{self._find_param_name(model_param) or getattr(model_param, '_param_name', f'id_{id(model_param)}')}"
+                        )
                     continue
 
                 gbuf_idx, dtype, bucket_idx = self.model_param_gbuf_map[model_param]
@@ -1303,29 +682,28 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 gbuf_range_map = self.gbuf_ranges[gbuf_idx][dtype][bucket_idx]
                 if model_param not in gbuf_range_map["param_map"]:
                     missing_param_map += 1
+                    if len(examples) < 5:
+                        examples.append(
+                            f"missing_bucket_param_map:{self._find_param_name(model_param) or getattr(model_param, '_param_name', f'id_{id(model_param)}')}"
+                        )
                     continue
 
                 bucket = buffer.buckets[bucket_idx]
-                if getattr(bucket, "is_pure_non_dion_bucket", False) and model_param in bucket.params:
-                    continue
-                is_dion_param = hasattr(bucket, "dion_param_shard_range") and model_param in bucket.dion_param_shard_range
-                is_non_dion_param = hasattr(bucket, "non_dion_param_ranges") and model_param in bucket.non_dion_param_ranges
+                is_dion_param = id(model_param) in getattr(bucket, "dion_param_ids", frozenset())
+                is_non_dion_param = model_param in bucket.params and not is_dion_param
                 if not (is_dion_param or is_non_dion_param):
-                    if uncategorized < 5:
-                        logger.warning(f"[Dion] Uncategorized param {model_param.shape}, skipping rebind")
                     uncategorized += 1
+                    if len(examples) < 5:
+                        examples.append(
+                            f"uncategorized:{self._find_param_name(model_param) or getattr(model_param, '_param_name', f'id_{id(model_param)}')}"
+                        )
 
-        if missing_gbuf_map > 0:
-            logger.warning(
-                f"[Dion] {missing_gbuf_map} params in {label} are missing from model_param_gbuf_map"
-            )
-        if missing_param_map > 0:
-            logger.warning(
-                f"[Dion] {missing_param_map} params in {label} are missing from bucket param_map"
-            )
-        if uncategorized > 0:
-            logger.warning(
-                f"[Dion] {uncategorized} params in {label} are not categorized by Dion bucket bookkeeping"
+        if missing_gbuf_map > 0 or missing_param_map > 0 or uncategorized > 0:
+            raise RuntimeError(
+                "[Dion] params missing from canonical bucket bookkeeping "
+                f"(label={label} missing_model_param_gbuf_map={missing_gbuf_map} "
+                f"missing_bucket_param_map={missing_param_map} uncategorized={uncategorized} "
+                f"examples={examples})"
             )
 
     def _rebind_dion_shards(self) -> None:
@@ -1351,16 +729,16 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     if shard_param is not None:
                         self._update_opt_shard(model_param, shard_param)
 
-        self.optimizer._distrib_dion_shard_info = self._dion_shard_info
         self._log_unmapped_main_grads(self.model_float16_groups, "model_float16_groups")
         self._log_unmapped_main_grads(self.model_fp32_groups, "model_fp32_groups")
 
     def _setup_dion_after_init(self) -> None:
         """Run Dion-specific setup after parent DistributedOptimizer init."""
-        self.use_fs_shard_alloc = True
-        self._dion_shard_info = {}
+        self._shard_bindings_by_param = {}
+        self._dion_buckets_by_param = {}
+        self._dion_entries_by_param = {}
 
-        if self.use_fs_shard_alloc and hasattr(self, 'buffers'):
+        if hasattr(self, 'buffers'):
             self._init_dion_buffers()
 
         if hasattr(self, 'optimizer') and isinstance(self.optimizer, (MegatronDion,)):
@@ -1407,7 +785,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         - Adds Dion metadata only for 2D weight matrices
         - Non-Dion params follow standard DO path entirely
 
-        Returns: Parent DO structure + optional "dion_info" per param
+        Returns: Parent DO structure + optional typed Dion shard layout per param
         """
         # STEP 1: Call parent to get DO standard bucket structure
         from .distrib_optimizer import DistributedOptimizer
@@ -1420,22 +798,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         dp_group = param_and_grad_buffer.data_parallel_group
         dp_rank = dp_group.rank()
         dp_world_size = dp_group.size()
-        ordering_group = getattr(param_and_grad_buffer, "dp_cp_group", None)
-        if ordering_group is None:
-            ordering_group = dp_group
-        ordering_rank = ordering_group.rank()
-
-        # Cache param names for fallback
-        if not hasattr(cls, "_param_name_bank"):
-            cls._param_name_bank = dict(param_and_grad_buffer.param_to_name) if hasattr(param_and_grad_buffer, 'param_to_name') else {}
-
-        ordered_params = reorder_bucket_params_(
-            param_and_grad_buffer=param_and_grad_buffer,
-            bucket=bucket,
-            dp_group=ordering_group,
-            dp_rank=ordering_rank,
-            name_bank=cls._param_name_bank,
-        )
+        ordered_params = tuple(bucket.params_list)
 
         param_map = cls._build_bucket_param_map(
             parent_result=parent_result,
@@ -1448,124 +811,116 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             bucket_size=bucket.grad_data.numel(),
         )
 
-        fs_size, fs_rank = cls._resolve_fs_rank(dp_group, dp_rank)
-        dion_param_count = cls._mark_bucket_dion_params(
+        _, fs_size, fs_rank = cls._bucket_shard_topology(param_and_grad_buffer, bucket)
+        dion_param_count, dion_static_info_by_param = cls._mark_bucket_dion_params(
             param_map=param_map,
             param_to_name=getattr(param_and_grad_buffer, "param_to_name", None),
             fs_size=fs_size,
         )
-        check_bucket_dion_flags_(
-            bucket_index=bucket_index,
-            dp_group=dp_group,
-            param_map=param_map,
-            param_to_name=getattr(param_and_grad_buffer, "param_to_name", None),
-        )
+        canonical_param_map_snapshot = {}
+        for param, range_info in param_map.items():
+            canonical_param_map_snapshot[param] = {
+                "param": (int(range_info["param"].start), int(range_info["param"].end)),
+                "gbuf_local": (
+                    int(range_info["gbuf_local"].start),
+                    int(range_info["gbuf_local"].end),
+                ),
+                "gbuf_world": (
+                    int(range_info["gbuf_world"].start),
+                    int(range_info["gbuf_world"].end),
+                ),
+                "gbuf_world_in_bucket": (
+                    int(range_info["gbuf_world_in_bucket"].start),
+                    int(range_info["gbuf_world_in_bucket"].end),
+                ),
+            }
 
         # STEP 3: Recalculate buffer ranges for FS × TP hybrid sharding
         # Dion params use FS shard, non-Dion params use DP shard
 
-        dion_param_layout, dion_param_shard_range, dion_section_size, dion_param_count = (
-            build_dion_bucket_layout_(
+        (
+            dion_bucket_layout,
+            dion_shard_layout_by_param,
+            dion_param_count,
+        ) = (
+            build_dion_entries_(
+                bucket=bucket,
                 param_map=param_map,
-                param_to_name=getattr(param_and_grad_buffer, "param_to_name", None),
+                dion_static_info_by_param=dion_static_info_by_param,
                 fs_size=fs_size,
                 fs_rank=fs_rank,
-                bucket_index=bucket_index,
             )
         )
-        # `local_total` is the Dion-owned local section size. Mixed non-Dion params now follow
-        # stock DO full-bucket local-shard layout and use separate runtime buffers, so they must
-        # not inflate the Dion-local section metadata here.
-        local_offset = dion_section_size
-
-        # Second pass: Non-Dion params in MIXED buckets.
-        # Keep parent standard-DO `param_map[param]["param"]` intact for optimizer shards.
-        # Only build a mixed-bucket communication plan for the extra Dion-managed section.
-        if dion_param_count > 0:
-            non_dion_params_in_bucket = select_non_dion_bucket_params_(
-                bucket_params=ordered_params,
-                dion_param_layout=dion_param_layout,
-                param_map=param_map,
-            )
-            if non_dion_params_in_bucket:
-                (
-                    non_dion_pack_plan,
-                    non_dion_param_ranges,
-                    non_dion_shard_size,
-                    non_dion_full_grad_total,
-                ) = build_stock_bucket_non_dion_plan_(
-                    bucket=bucket,
-                    params=non_dion_params_in_bucket,
-                    dp_size=dp_world_size,
-                    dp_rank=dp_rank,
+        for param, snapshot in canonical_param_map_snapshot.items():
+            range_info = param_map[param]
+            current = {
+                "param": (int(range_info["param"].start), int(range_info["param"].end)),
+                "gbuf_local": (
+                    int(range_info["gbuf_local"].start),
+                    int(range_info["gbuf_local"].end),
+                ),
+                "gbuf_world": (
+                    int(range_info["gbuf_world"].start),
+                    int(range_info["gbuf_world"].end),
+                ),
+                "gbuf_world_in_bucket": (
+                    int(range_info["gbuf_world_in_bucket"].start),
+                    int(range_info["gbuf_world_in_bucket"].end),
+                ),
+            }
+            if current != snapshot:
+                param_name = ""
+                if hasattr(param_and_grad_buffer, "param_to_name"):
+                    param_name = param_and_grad_buffer.param_to_name.get(param, "")
+                raise RuntimeError(
+                    "[Dion] build_dion_entries_ mutated canonical standard DO param_map "
+                    f"for param={param_name or f'id_{id(param)}'} before={snapshot} after={current}"
                 )
-                parent_result["non_dion_pack_plan"] = non_dion_pack_plan
-                parent_result["non_dion_param_ranges"] = non_dion_param_ranges
-                parent_result["non_dion_shard_size"] = non_dion_shard_size
-                parent_result["non_dion_full_grad_total"] = non_dion_full_grad_total
-            else:
-                parent_result["non_dion_pack_plan"] = []
-                parent_result["non_dion_param_ranges"] = {}
-                parent_result["non_dion_shard_size"] = 0
-                parent_result["non_dion_full_grad_total"] = 0
 
-            # Update local_total for buffer resize (used by Dion-only paths).
-            parent_result["local_total"] = local_offset
+        for param, range_info in param_map.items():
+            range_info["dion_shard_layout"] = dion_shard_layout_by_param.get(param)
+        parent_result["local_total"] = 0 if dion_bucket_layout is None else dion_bucket_layout.shard_size
 
         # Calculate param counts for summary
         total_params = len(param_map)
         non_dion_count = total_params - dion_param_count
 
-        # Add dion_param_layout and dion_param_shard_range to result
-        parent_result["dion_param_layout"] = dion_param_layout
-        parent_result["dion_param_shard_range"] = dion_param_shard_range
-
-        # Get TP rank for this rank
-        from ..parallel_state import get_tensor_model_parallel_rank
-        tp_rank = get_tensor_model_parallel_rank()
-
-        check_local_dion_bucket_(
-            parent_result=parent_result,
-            buckets=param_and_grad_buffer.buckets,
-            dion_param_layout=dion_param_layout,
-            fs_size=fs_size,
-        )
-        from .. import parallel_state
-
-        check_shared_dion_layout_(
-            dp_group=param_and_grad_buffer.data_parallel_group,
-            replica_group=parallel_state.get_inter_distributed_optimizer_instance_group(
-                check_initialized=False
-            ),
-            bucket_index=bucket_index,
-            dp_rank=dp_rank,
-            tp_rank=tp_rank,
-            fs_rank=fs_rank,
-            dion_param_layout=dion_param_layout,
-            dion_param_count=dion_param_count,
-            non_dion_count=non_dion_count,
-            local_total=local_offset,
-            param_to_name=(
-                param_and_grad_buffer.param_to_name
-                if hasattr(param_and_grad_buffer, "param_to_name")
-                else None
-            ),
-        )
+        # Add Dion communication layout to the parent result.
+        parent_result["dion_bucket_layout"] = dion_bucket_layout
+        parent_result["non_dion_count"] = non_dion_count
 
         # Return hybrid sharding structure (parent ranges + Dion metadata)
         return parent_result
 
     @classmethod
+    def _has_local_dion_shard(cls, range_info: Dict) -> bool:
+        """Return whether this rank owns a real Dion local shard for the param."""
+        shard_layout = range_info.get("dion_shard_layout", None)
+        if shard_layout is None:
+            return False
+
+        for dim in shard_layout.local_shape:
+            if int(dim) <= 0:
+                raise RuntimeError(
+                    "[Dion] invalid empty Dion local shard in optimizer ownership map "
+                    f"shape={tuple(int(x) for x in shard_layout.local_shape)}"
+                )
+        return shard_layout.local_numel > 0
+
+    @classmethod
     def _build_model_param_gbuf_map(
         cls, gbuf_ranges: List[Dict]
     ) -> Dict[torch.nn.Parameter, Tuple]:
-        """Create the reverse mapping for locally owned shards only.
+        """Create the reverse mapping for locally owned optimizer params.
 
         Dion rebuilds each bucket param map in canonical bucket order and inserts
         zero-length placeholder entries for params that are not locally owned on this
         rank. Those placeholders are useful for stable bucket bookkeeping, but they
-        must never participate in optimizer ownership. Parent DO only maps params with
-        a non-empty local `param` range; Dion must preserve that contract.
+        must never participate in optimizer ownership.
+
+        Ownership rule:
+        - non-Dion params: standard DO local `param` range
+        - Dion params: local FS shard described by canonical `dion_shard_layout`
         """
         param_gbuf_map = {}
         for gbuf_index, gbuf_range_map in enumerate(gbuf_ranges):
@@ -1573,23 +928,31 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 for bucket_index, bucket_range_map in enumerate(gbuf_range_map_for_all_buckets):
                     for param, range_info in bucket_range_map["param_map"].items():
                         param_range = range_info.get("param", None)
-                        if param_range is None or param_range.size <= 0:
+                        has_standard_local_range = (
+                            param_range is not None and param_range.size > 0
+                        )
+                        has_local_dion_shard = cls._has_local_dion_shard(range_info)
+                        if not has_standard_local_range and not has_local_dion_shard:
                             continue
                         assert param not in param_gbuf_map, (
                             "Param should not appear in model_param_gbuf_map more than once; "
-                            "only locally owned optimizer shards belong in the map."
+                            "only locally owned optimizer params belong in the map."
                         )
                         param_gbuf_map[param] = (gbuf_index, dtype, bucket_index)
         return param_gbuf_map
 
     @classmethod
     def _build_optimizer_group_ranges(cls, param_groups: List[Dict], gbuf_ranges: List[Dict]):
-        """Build optimizer groups from locally owned shard ranges only.
+        """Build optimizer groups from locally owned optimizer params only.
 
         Canonical zero-length placeholder entries exist only to stabilize bucket param
         ordering. They must not leak into optimizer param groups, otherwise the optimizer
         starts owning params whose local shard is empty and later violates the parent DO
         local-shard write-back contract.
+
+        Ownership rule:
+        - non-Dion params: standard DO local `param` range
+        - Dion params: local FS shard described by canonical `dion_shard_layout`
         """
         world_param_group_map = {}
         for group_index, group in enumerate(param_groups):
@@ -1604,7 +967,11 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 for bucket_range_map in bucket_range_maps:
                     for param, range_info in bucket_range_map["param_map"].items():
                         param_range = range_info.get("param", None)
-                        if param_range is None or param_range.size <= 0:
+                        has_standard_local_range = (
+                            param_range is not None and param_range.size > 0
+                        )
+                        has_local_dion_shard = cls._has_local_dion_shard(range_info)
+                        if not has_standard_local_range and not has_local_dion_shard:
                             continue
                         group_index = world_param_group_map[param]
                         group_range = group_ranges[group_index]
@@ -1623,11 +990,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
     def __init__(self, *args, **kwargs):
         """Initialize with improved Dion support."""
         # Initialize Dion param info before parent init
-        self._dion_param_info = {}
-        self._global_owner_tuples = set()
-
-        # Batch processing configuration
-        self._batch_size = kwargs.pop('dion_batch_size', 8)
+        self._shard_layouts_by_param = {}
         self._original_dp_group = kwargs.pop('full_data_parallel_group', None)
 
         # 2D parallelism configuration
@@ -1639,407 +1002,407 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         if self._rp_size is None:
             self._rp_size = 1
 
-        # Set class variable for _build_model_gbuf_range (accessed during super().__init__()).
-        #
-        # NOTE: _build_model_gbuf_range is a classmethod invoked inside the parent
-        # DistributedOptimizer.__init__(). We stash any FS topology we can infer here
-        # (especially the actual fs_group) so range/layout calculations are robust in
-        # multi-node and CP>1 settings where dp_rank % fs_size can be wrong.
-        opt = args[0] if len(args) > 0 else kwargs.get("optimizer", None)
-        self._stash_fs_init(opt)
-
         # Call parent initialization with full DP group (RP × FS)
         # DistributedOptimizer will do uniform sharding across all DP ranks
         # Dion will handle 2D topology (RP × FS) at optimizer state level
         super().__init__(*args, **kwargs)
 
-        # Clean up class variable after super().__init__()
-        self._clear_fs_init()
-
         # Cache global rank for logging (avoid repeated dist.get_rank() calls)
         self._global_rank = dist.get_rank() if dist.is_initialized() else 0
 
-        self._resolve_fs_group()
-        self._resolve_rp_group()
-        self._resolve_state_replica_group()
+        self._init_runtime_groups()
 
-        # Standard-DO-aligned training path: keep post-step full restore disabled.
-        # Full-parameter visibility is provided by standard DO param-gather lifecycle.
-
-        # FS shard-alloc mode (bucket-wise all-gather/reduce-scatter via standard DO)
-        self.use_fs_shard_alloc = True
-
-        # Unified shard info mapping
-        # Consolidates model_param → DionShardInfo (data_shard, opt_shard, metadata)
-        self._dion_shard_info: Dict[torch.nn.Parameter, DionShardInfo] = {}
+        # Unified shard binding mapping.
         self._setup_dion_after_init()
 
-        if os.environ.get("DION_DEBUG_GROUPS"):
-            try:
-                grad_group = self.get_grad_stats_parallel_group()
-                logger.info(
-                    "[DION_GROUPS] rank=%s tp=%s pp=%s cp=%s fs=%s data_parallel_group_size=%s fs_group_size=%s grad_stats_group_size=%s",
-                    self._global_rank,
-                    getattr(self.config, "tensor_model_parallel_size", None),
-                    getattr(self.config, "pipeline_model_parallel_size", None),
-                    getattr(self.config, "context_parallel_size", None),
-                    self.fs_size,
-                    self.data_parallel_group.size() if self.data_parallel_group is not None else None,
-                    self.fs_group.size() if getattr(self, "fs_group", None) is not None else None,
-                    grad_group.size() if grad_group is not None else None,
+    def _all_gather_bucket_params(self, bucket, async_op=False):
+        """Gather all custom bucket params that do not follow the pure standard DO path."""
+        handles = []
+        dion_layout = getattr(bucket, "dion_layout", None)
+        has_dion = dion_layout is not None and dion_layout.has_params
+        has_mixed_non_dion = has_dion and bucket.has_non_dion_params
+
+        prepared_dion_entries = None
+        if has_mixed_non_dion:
+            prepared_dion_entries = self._prepare_dion_bucket_gather(bucket)
+            # Mixed non-Dion must restore canonical bucket.param_data first.
+            # Dion writes its own canonical spans afterwards from the prepacked local shards.
+            self._all_gather_mixed_non_dion_bucket(bucket, async_op=False)
+            dion_handle = self._all_gather_dion_bucket(
+                bucket,
+                async_op=async_op,
+                prepared_entries=prepared_dion_entries,
+            )
+            if dion_handle is not None:
+                handles.append(dion_handle)
+        else:
+            dion_handle = self._all_gather_dion_bucket(bucket, async_op=async_op)
+            if dion_handle is not None:
+                handles.append(dion_handle)
+            mixed_non_dion_handle = self._all_gather_mixed_non_dion_bucket(bucket, async_op=async_op)
+            if mixed_non_dion_handle is not None:
+                handles.append(mixed_non_dion_handle)
+        if async_op and handles:
+            return _HandleGroup(handles)
+        return None
+
+    def _bucket_dion_full_view(self, bucket, entry: DionBucketEntry) -> torch.Tensor:
+        """Return the canonical full-param view for one Dion entry."""
+        full_view_2d = self._bucket_full_param_view_2d(bucket, entry.param, entry)
+        if full_view_2d is None:
+            raise RuntimeError(
+                "[Dion] canonical FS gather requires bucket.param_data view "
+                f"for param={self._canonical_param_name(entry.param) or f'id_{id(entry.param)}'} "
+                f"bucket={getattr(bucket, 'bucket_id', -1)}"
+            )
+        return full_view_2d
+
+    def _fill_dion_shard_buffer(
+        self,
+        *,
+        entry: DionBucketEntry,
+        full_view_2d: torch.Tensor,
+        shard_buffer: torch.Tensor,
+    ) -> None:
+        """Pack one Dion local shard into a gather input buffer."""
+        local_source = self._get_data_shard(entry.param)
+        if local_source is None:
+            local_source = slice_fs_shard_2d(
+                full_view_2d,
+                int(entry.fs_split_dim),
+                int(entry.start_idx),
+                int(entry.end_idx),
+            )
+        local_numel = int(entry.local_numel)
+        if local_source.numel() != local_numel:
+            raise RuntimeError(
+                "[Dion] local gather source size mismatch "
+                f"param={self._canonical_param_name(entry.param) or f'id_{id(entry.param)}'} "
+                f"source={int(local_source.numel())} expected={local_numel}"
+            )
+        shard_buffer.zero_()
+        shard_buffer[:local_numel].copy_(local_source.reshape(-1)[:local_numel])
+
+    def _prepare_dion_bucket_gather(self, bucket) -> list[_PreparedDionGatherEntry]:
+        """Prepack Dion local shards so mixed-bucket canonical restore can run first."""
+        dion_layout = getattr(bucket, "dion_layout", None)
+        if dion_layout is None or not dion_layout.has_params:
+            return []
+
+        device = torch.cuda.current_device()
+        dtype = bucket.param_data.dtype
+        prepared_buffer = torch.empty(
+            int(dion_layout.shard_size),
+            dtype=dtype,
+            device=device,
+        )
+        prepared_entries = []
+        for entry in dion_layout.entries:
+            full_view_2d = self._bucket_dion_full_view(bucket, entry)
+            shard_start = int(entry.shard_offset)
+            shard_end = shard_start + int(entry.shard_capacity)
+            shard_buffer = prepared_buffer[shard_start:shard_end]
+            self._fill_dion_shard_buffer(
+                entry=entry,
+                full_view_2d=full_view_2d,
+                shard_buffer=shard_buffer,
+            )
+            prepared_entries.append(
+                _PreparedDionGatherEntry(
+                    entry=entry,
+                    full_view_2d=full_view_2d,
+                    shard_buffer=shard_buffer,
                 )
-            except Exception as error:
-                logger.info("[DION_GROUPS_FAILED] err=%r", error)
+            )
+        return prepared_entries
 
-    def _all_gather_params_bucket(self, buffer, bucket, dion_param_layout, async_op=False):
-        """
-        All-gather Dion parameters for one bucket from FS shards to full parameters.
-
-        Uses pack/unpack approach like Megatron-Core DO standard:
-        1. Pack all local shards into single pack_buffer
-        2. Single all_gather_into_tensor call (async-capable, no shard_list allocation)
-        3. Unpack full parameters from gathered_buffer
-
-        This eliminates per-parameter shard_list allocation, preventing memory leaks.
-
-        Args:
-            buffer: ParamAndGradBuffer for this bucket group
-            bucket: Specific bucket with cached workspace
-            dion_param_layout: List of pack entries with Dion parameter metadata
-            async_op: If True, launch async all-gather and return handle dict
-
-        Returns:
-            Dict with handle and unpack info if async_op=True, None otherwise
-        """
-        global_rank = self._global_rank
-
-        if not dion_param_layout:
+    def _all_gather_dion_bucket(self, bucket, async_op=False, prepared_entries=None):
+        """Gather Dion FS-local shards into canonical bucket.param_data for one bucket."""
+        dion_layout = getattr(bucket, "dion_layout", None)
+        if dion_layout is None or not dion_layout.has_params:
             return None
 
-        # Use cached instance attributes for FS group info
-        fs_group, fs_size, fs_rank = self.fs_group, self.fs_size, self.fs_rank
-        if fs_group is None or fs_size == 1:
+        shard_group, shard_group_size = self.fs_group, self.fs_size
+        if shard_group_size == 1:
+            debug_targets = _debug_target_params()
+            if prepared_entries is not None:
+                entry_iter = prepared_entries
+            else:
+                entry_iter = dion_layout.entries
+            for prepared in entry_iter:
+                if isinstance(prepared, _PreparedDionGatherEntry):
+                    entry = prepared.entry
+                    full_view_2d = prepared.full_view_2d
+                    shard_buffer = prepared.shard_buffer
+                else:
+                    entry = prepared
+                    full_view_2d = self._bucket_dion_full_view(bucket, entry)
+                    shard_buffer = torch.empty(
+                        int(entry.shard_capacity),
+                        dtype=bucket.param_data.dtype,
+                        device=torch.cuda.current_device(),
+                    )
+                    self._fill_dion_shard_buffer(
+                        entry=entry,
+                        full_view_2d=full_view_2d,
+                        shard_buffer=shard_buffer,
+                    )
+                local_target = slice_fs_shard_2d(
+                    full_view_2d,
+                    int(entry.fs_split_dim),
+                    int(entry.start_idx),
+                    int(entry.end_idx),
+                )
+                local_numel = int(entry.local_numel)
+                if local_numel != local_target.numel():
+                    raise RuntimeError(
+                        "[Dion] local restore shard size mismatch "
+                        f"param={self._canonical_param_name(entry.param) or f'id_{id(entry.param)}'} "
+                        f"source={local_numel} target={int(local_target.numel())}"
+                    )
+                local_target.copy_(shard_buffer[:local_numel].view(local_target.shape))
+                param_name = self._canonical_param_name(entry.param)
+                if param_name in debug_targets:
+                    logger.warning(
+                        "[DION_LOCAL_RESTORE] param=%s bucket=%s source_norm=%s target_norm=%s source_ptr=%s target_ptr=%s",
+                        param_name,
+                        getattr(bucket, "bucket_id", -1),
+                        float(shard_buffer[:local_numel].detach().float().norm().item()),
+                        float(local_target.detach().float().norm().item()),
+                        int(shard_buffer.data_ptr()),
+                        int(local_target.data_ptr()),
+                    )
+                self._update_data_shard(entry.param, local_target)
+                entry.param._fs_shard = local_target
+            return None
+        if shard_group is None:
             return None
 
-
-        # Verify layout invariants across FS group once per bucket.
-        # Avoid per-iteration object collectives in the training hot path.
-        plan_len = len(dion_param_layout)
-
-        # Allocate cached workspace on first use
-        pack_total = getattr(bucket, "fs_pack_total", None)
-        if pack_total is None:
-            raise RuntimeError(f"[Dion] Rank {global_rank}: fs_pack_total is None for bucket {bucket.bucket_id}")
-
-        if bucket.fs_pack_buffer is None or bucket.fs_pack_buffer.numel() != pack_total:
-            # Delete old buffer before reallocating to prevent memory leak
-            if bucket.fs_pack_buffer is not None:
-                logger.warning(f"[Dion] Rank {global_rank}: fs_pack_buffer size changed! Old={bucket.fs_pack_buffer.numel()}, New={pack_total}")
-                del bucket.fs_pack_buffer
-            bucket.fs_pack_buffer = torch.zeros(
-                pack_total,
-                dtype=buffer.param_dtype,
-                device=torch.cuda.current_device(),
+        layout_len = int(dion_layout.entry_count)
+        bucket_shard_size = int(dion_layout.shard_size)
+        expected_gathered_numel = int(dion_layout.gathered_numel)
+        if expected_gathered_numel != bucket_shard_size * shard_group_size:
+            raise RuntimeError(
+                "[Dion] FS gather shard size invariant mismatch "
+                f"bucket={getattr(bucket, 'bucket_id', -1)} "
+                f"shard_size={bucket_shard_size} fs_size={shard_group_size} "
+                f"expected_total={expected_gathered_numel}"
             )
-        if bucket.fs_gathered_buffer is None or bucket.fs_gathered_buffer.numel() != pack_total * fs_size:
-            # Delete old buffer before reallocating to prevent memory leak
-            if bucket.fs_gathered_buffer is not None:
-                logger.warning(f"[Dion] Rank {global_rank}: fs_gathered_buffer size changed! Old={bucket.fs_gathered_buffer.numel()}, New={pack_total * fs_size}")
-                del bucket.fs_gathered_buffer
-            bucket.fs_gathered_buffer = torch.zeros(
-                pack_total * fs_size,
-                dtype=buffer.param_dtype,
-                device=torch.cuda.current_device(),
-            )
-
-        pack_buffer = bucket.fs_pack_buffer
-        gathered_buffer = bucket.fs_gathered_buffer
 
         if not getattr(bucket, "_dion_ag_invariants_verified", False):
             device = torch.cuda.current_device()
-            local = torch.tensor([plan_len, int(pack_total)], device=device, dtype=torch.int64)
+            local = torch.tensor([layout_len, bucket_shard_size], device=device, dtype=torch.int64)
             local_min = local.clone()
             local_max = local.clone()
-            dist.all_reduce(local_min, op=dist.ReduceOp.MIN, group=fs_group)
-            dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=fs_group)
+            dist.all_reduce(local_min, op=dist.ReduceOp.MIN, group=shard_group)
+            dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=shard_group)
             if not torch.equal(local_min, local_max):
-                # Slow-path details for debugging only.
-                try:
-                    all_vals = [None] * fs_size
-                    dist.all_gather_object(all_vals, (plan_len, int(pack_total)), group=fs_group)
-                except Exception:
-                    all_vals = None
                 logger.error(
-                    "[Dion] FS AG invariants mismatch (bucket_id=%s): local(plan_len=%s, pack_total=%s) "
-                    "min=%s max=%s all=%s",
+                    "[Dion] FS AG invariants mismatch (bucket_id=%s): local(layout_len=%s, shard_size=%s) "
+                    "min=%s max=%s",
                     getattr(bucket, "bucket_id", -1),
-                    plan_len,
-                    int(pack_total),
+                    layout_len,
+                    bucket_shard_size,
                     tuple(int(x) for x in local_min.tolist()),
                     tuple(int(x) for x in local_max.tolist()),
-                    all_vals,
                 )
                 raise RuntimeError("Dion FS all-gather invariants mismatch across FS ranks")
 
             bucket._dion_ag_invariants_verified = True
-            bucket._dion_ag_verified_plan_len = int(plan_len)
-            bucket._dion_ag_verified_pack_total = int(pack_total)
+            bucket._dion_ag_verified_layout_len = layout_len
+            bucket._dion_ag_verified_shard_size = bucket_shard_size
 
-        pack_fs_shards_(
-            optimizer=self,
-            buffer=buffer,
-            pack_buffer=pack_buffer,
-            dion_param_layout=dion_param_layout,
-        )
-
-        # All-gather using cached gathered_buffer
-
-        # Use standard DO API for async support
-        handle = torch.distributed.all_gather_into_tensor(
-            output_tensor=gathered_buffer,
-            input_tensor=pack_buffer,
-            group=fs_group,
-            async_op=async_op
-        )
-
-        # One-time diagnostic: detect if the packed shard buffer is entirely zero.
-        # This avoids per-param host sync in the hot loop above.
-        if not getattr(bucket, "_dion_ag_pack_nonzero_checked", False):
-            bucket._dion_ag_pack_nonzero_checked = True
-            try:
-                if pack_buffer.numel() > 0 and not bool((pack_buffer != 0).any().item()):
-                    logger.error(
-                        "[DION_ZERO_PACKED_SHARDS] global_rank=%s fs_rank=%s bucket_id=%s plan_len=%s pack_total=%s",
-                        global_rank,
-                        fs_rank,
-                        getattr(bucket, "bucket_id", -1),
-                        plan_len,
-                        int(pack_total),
-                    )
-            except Exception:
-                pass
-
-        if async_op:
-            # Non-Dion params: AG only in pure non-Dion buckets, mixed buckets skip
-
-            # Return handle and unpack metadata for finish_param_sync()
-            return {
-                'handle': handle,
-                'gathered_buffer': gathered_buffer,
-                'pack_buffer': pack_buffer,  # Keep alive until wait()
-                'dion_param_layout': dion_param_layout,
-                'pack_total': pack_total,
-                'fs_size': fs_size,
-                'buffer': buffer,
-                'bucket': bucket,
-                'optimizer': self,  # Store optimizer reference for unpack!
-            }
-        else:
-            # Synchronous mode: unpack immediately
-            self._unpack_gathered_params(
-                gathered_buffer=gathered_buffer,
-                dion_param_layout=dion_param_layout,
-                pack_total=pack_total,
-                fs_size=fs_size,
-                buffer=buffer,
+        max_shard_capacity = int(dion_layout.max_shard_capacity)
+        if max_shard_capacity <= 0:
+            raise RuntimeError(
+                f"[Dion] invalid FS gather shard capacity for bucket={getattr(bucket, 'bucket_id', -1)}"
             )
 
-            # Release AG buffers (use = None, not resize_(0), to avoid view issues)
-            if hasattr(bucket, 'fs_pack_buffer') and bucket.fs_pack_buffer is not None:
-                bucket.fs_pack_buffer = None
-            if hasattr(bucket, 'fs_gathered_buffer') and bucket.fs_gathered_buffer is not None:
-                bucket.fs_gathered_buffer = None
+        handles = []
+        device = torch.cuda.current_device()
+        shared_shard_buffer = None if async_op else torch.empty(
+            max_shard_capacity,
+            dtype=bucket.param_data.dtype,
+            device=device,
+        )
+        if prepared_entries is not None:
+            entry_iter = prepared_entries
+        else:
+            entry_iter = dion_layout.entries
+        for prepared in entry_iter:
+            if isinstance(prepared, _PreparedDionGatherEntry):
+                entry = prepared.entry
+                full_view_2d = prepared.full_view_2d
+                shard_buffer = prepared.shard_buffer
+            else:
+                entry = prepared
+                full_view_2d = self._bucket_dion_full_view(bucket, entry)
+                shard_capacity = int(entry.shard_capacity)
+                shard_buffer = (
+                    torch.empty(
+                        shard_capacity,
+                        dtype=bucket.param_data.dtype,
+                        device=device,
+                    )
+                    if async_op
+                    else shared_shard_buffer[:shard_capacity]
+                )
+                self._fill_dion_shard_buffer(
+                    entry=entry,
+                    full_view_2d=full_view_2d,
+                    shard_buffer=shard_buffer,
+                )
 
-            # Mixed buckets skip non-Dion AG here; pure non-Dion use standard DO AG
+            handle = self._gather_dion_entry_into_bucket(
+                entry=entry,
+                shard_buffer=shard_buffer,
+                full_view_2d=full_view_2d,
+                shard_group=shard_group,
+                shard_group_size=shard_group_size,
+                async_op=async_op,
+                dtype=bucket.param_data.dtype,
+                device=device,
+            )
+            if handle is not None:
+                handles.append(handle)
 
+        if async_op and handles:
+            return _HandleGroup(handles)
+        return None
+
+    def _gather_dion_entry_into_bucket(
+        self,
+        *,
+        entry: DionBucketEntry,
+        shard_buffer: torch.Tensor,
+        full_view_2d: torch.Tensor,
+        shard_group,
+        shard_group_size: int,
+        async_op: bool,
+        dtype: torch.dtype,
+        device,
+    ):
+        """Gather one Dion local shard into the canonical full bucket destination."""
+        shard_capacity = int(entry.shard_capacity)
+        full_flat = full_view_2d.view(-1)
+        direct_flat = (
+            entry.fs_split_dim == 0
+            and len(entry.canonical_rank_flat_segments) == shard_group_size
+            and len(entry.canonical_rank_flat_segments[0]) == 1
+            and full_flat.numel() == shard_capacity * shard_group_size
+        )
+        if direct_flat:
+            return torch.distributed.all_gather_into_tensor(
+                output_tensor=full_flat,
+                input_tensor=shard_buffer,
+                group=shard_group,
+                async_op=async_op,
+            )
+
+        direct_cols = entry.fs_split_dim == 1 and all(
+            (int(rank_end) - int(rank_start)) == int(entry.size_per_rank)
+            for rank_start, rank_end in entry.rank_split_ranges
+        )
+        if direct_cols:
+            gather_tensor = shard_buffer.view(full_view_2d.shape[0], int(entry.size_per_rank))
+            gather_outputs = [
+                full_view_2d[:, int(rank_start) : int(rank_end)]
+                for rank_start, rank_end in entry.rank_split_ranges
+            ]
+            return torch.distributed.all_gather(
+                tensor_list=gather_outputs,
+                tensor=gather_tensor,
+                group=shard_group,
+                async_op=async_op,
+            )
+
+        # Irregular FS layouts cannot all-gather directly into the canonical destination
+        # without a padding mismatch. Use one rank-sized broadcast buffer and write each
+        # rank's true canonical segments directly into bucket.param_data.
+        group_rank = self._group_rank(shard_group)
+        broadcast_buffer = None
+        for rank_i, rank_segments in enumerate(entry.canonical_rank_flat_segments):
+            if rank_i == group_rank:
+                rank_source = shard_buffer
+            else:
+                if broadcast_buffer is None:
+                    broadcast_buffer = torch.empty(
+                        shard_capacity,
+                        dtype=dtype,
+                        device=device,
+                    )
+                rank_source = broadcast_buffer
+            torch.distributed.broadcast(
+                rank_source,
+                src=torch.distributed.get_global_rank(shard_group, rank_i),
+                group=shard_group,
+                async_op=False,
+            )
+            source_offset = 0
+            for seg_start, seg_end in rank_segments:
+                seg_len = int(seg_end) - int(seg_start)
+                if seg_len <= 0:
+                    continue
+                full_flat[
+                    int(seg_start) - int(entry.canonical_bucket_start) :
+                    int(seg_end) - int(entry.canonical_bucket_start)
+                ].copy_(rank_source[source_offset : source_offset + seg_len])
+                source_offset += seg_len
+        return None
+
+    def _all_gather_mixed_non_dion_bucket(self, bucket, async_op=False):
+        """Gather mixed-bucket non-Dion params back into canonical bucket.param_data."""
+        dion_layout = getattr(bucket, "dion_layout", None)
+        if dion_layout is None or not bucket.has_non_dion_params:
             return None
 
-    def _all_gather_non_dion(self, bucket, buffer, async_op=False):
-        """
-        All-gather Non-Dion parameters for Mixed buckets.
-
-        Non-Dion params (bias, layernorm, etc.) use standard DP sharding.
-        In forward pass, they need DP all-gather to restore full size.
-
-        Args:
-            bucket: _ParamAndGradBucket with Non-Dion params
-            buffer: ParamAndGradBuffer
-            async_op: If True, return async handles; if False, execute synchronously
-
-        Returns:
-            Dict with handles if async_op=True, None otherwise
-        """
-        global_rank = self._global_rank
-
-        # Use non_dion_pack_plan (populated after is_dion_param annotation)
-        if not hasattr(bucket, 'non_dion_pack_plan') or not bucket.non_dion_pack_plan:
-            return None
-
-        dp_group = getattr(bucket, 'non_dion_dp_group', None)
+        dp_group = getattr(bucket, 'intra_distributed_optimizer_instance_group', None)
         if dp_group is None:
             raise RuntimeError(
-                "[Dion] mixed non-Dion all-gather requires canonical non_dion_dp_group."
+                "[Dion] mixed non-Dion all-gather requires the standard local-shard group."
             )
         dp_size = dp_group.size()
-        dp_rank = dp_group.rank()
         if dp_size == 1:
-            # No all-gather needed for single rank
             return None
 
-        pack_total = getattr(bucket, "non_dion_pack_total", 0)
-        if pack_total <= 0:
+        shard_size = bucket.param_data.numel() // dp_size
+        if shard_size <= 0:
             return None
 
-        if (
-            not hasattr(bucket, "non_dion_pack_buffer")
-            or bucket.non_dion_pack_buffer is None
-            or bucket.non_dion_pack_buffer.numel() != pack_total
-        ):
-            bucket.non_dion_pack_buffer = torch.zeros(
-                pack_total,
-                dtype=buffer.param_dtype,
-                device=torch.cuda.current_device(),
-            )
-        if (
-            not hasattr(bucket, "non_dion_gathered_buffer")
-            or bucket.non_dion_gathered_buffer is None
-            or bucket.non_dion_gathered_buffer.numel() != pack_total * dp_size
-        ):
-            bucket.non_dion_gathered_buffer = torch.zeros(
-                pack_total * dp_size,
-                dtype=buffer.param_dtype,
-                device=torch.cuda.current_device(),
-            )
+        shard_buffer = torch.zeros(
+            shard_size,
+            dtype=bucket.param_data.dtype,
+            device=torch.cuda.current_device(),
+        )
 
-        pack_buffer = bucket.non_dion_pack_buffer
-        gathered_buffer = bucket.non_dion_gathered_buffer
-        pack_buffer.zero_()
-
-        for entry in bucket.non_dion_pack_plan:
-            param = entry["param"]
-            pack_offset = int(entry.get("local_bucket_start", 0))
-            local_start = int(entry.get("local_start", 0))
-            local_end = int(entry.get("local_end", local_start))
-            actual_size = max(0, local_end - local_start)
+        for param in select_non_dion_bucket_params_(
+            bucket_params=bucket.params_list,
+            dion_layout=dion_layout,
+        ):
+            full_start, full_end = bucket.param_to_index[param]
+            bucket_start, bucket_end = bucket_rank_range_(full_start, full_end, shard_size, dp_group.rank())
+            param_start, param_end = param_rank_range_(full_start, full_end, shard_size, dp_group.rank())
+            actual_size = max(0, int(param_end) - int(param_start))
             if actual_size <= 0:
                 continue
 
             full_view = self._bucket_param_view(bucket, param)
             if full_view is None:
-                param_name = self._param_name(getattr(buffer, "param_to_name", None), param)
+                param_name = self._canonical_param_name(param)
                 raise RuntimeError(
                     "[Dion] mixed non-Dion all-gather requires canonical bucket.param_data view "
                     f"for param={param_name or f'id_{id(param)}'} "
                     f"bucket={getattr(bucket, 'bucket_id', -1)}"
                 )
             param_flat = full_view.view(-1)
-            local_shard = param_flat[local_start:local_end]
-            pack_buffer[pack_offset : pack_offset + actual_size].copy_(local_shard)
+            local_shard = param_flat[int(param_start):int(param_end)]
+            shard_buffer[int(bucket_start) : int(bucket_start) + actual_size].copy_(local_shard)
 
-        handle = torch.distributed.all_gather_into_tensor(
-            output_tensor=gathered_buffer,
-            input_tensor=pack_buffer,
+        return torch.distributed.all_gather_into_tensor(
+            output_tensor=bucket.param_data,
+            input_tensor=shard_buffer,
             group=dp_group,
             async_op=async_op,
-        )
-
-        if async_op:
-            return {
-                "handle": handle,
-                "gathered_buffer": gathered_buffer,
-                "pack_plan": bucket.non_dion_pack_plan,
-                "pack_total": pack_total,
-                "dp_size": dp_size,
-                "buffer": buffer,
-                "optimizer": self,
-            }
-
-        self._unpack_non_dion_params(
-            gathered_buffer=gathered_buffer,
-            pack_plan=bucket.non_dion_pack_plan,
-            pack_total=pack_total,
-            dp_size=dp_size,
-            buffer=buffer,
-        )
-        bucket.non_dion_pack_buffer = None
-        bucket.non_dion_gathered_buffer = None
-        return None
-
-    def _unpack_non_dion_params(self, gathered_buffer, pack_plan, pack_total, dp_size, buffer):
-        """Unpack stock local-shard mixed non-Dion all-gather results into full `param.data`."""
-        if not pack_plan:
-            return
-        for entry in pack_plan:
-            param = entry["param"]
-            bucket = None
-            if hasattr(buffer, "param_to_bucket"):
-                bucket = buffer.param_to_bucket.get(param)
-            pack_offset = entry["pack_offset"]
-            full_view = self._bucket_param_view(bucket, param)
-            if full_view is None:
-                param_name = self._param_name(getattr(buffer, "param_to_name", None), param)
-                raise RuntimeError(
-                    "[Dion] mixed non-Dion unpack requires canonical bucket.param_data view "
-                    f"for param={param_name or f'id_{id(param)}'} "
-                    f"bucket={getattr(bucket, 'bucket_id', -1)}"
-                )
-            param_flat = full_view.view(-1)
-            rank_param_ranges = entry.get("rank_param_ranges", ())
-            rank_bucket_ranges = entry.get("rank_bucket_ranges", ())
-
-            for rank_i in range(dp_size):
-                if rank_param_ranges:
-                    shard_start, shard_end = rank_param_ranges[rank_i]
-                else:
-                    continue
-                if rank_bucket_ranges:
-                    bucket_start, bucket_end = rank_bucket_ranges[rank_i]
-                else:
-                    continue
-                actual_size = max(0, shard_end - shard_start)
-                if actual_size <= 0:
-                    continue
-                rank_pack_offset = rank_i * pack_total + int(bucket_start)
-                rank_segment = gathered_buffer[
-                    rank_pack_offset : rank_pack_offset + actual_size
-                ]
-                param_flat[shard_start:shard_end].copy_(rank_segment)
-
-    def _unpack_gathered_params(self, gathered_buffer, dion_param_layout, pack_total, fs_size, buffer):
-        """
-        Unpack full parameters from gathered_buffer and rebind param.data.
-
-        This is called either:
-        - Immediately after sync all-gather (_all_gather_params_bucket with async_op=False)
-        - In finish_param_sync() after async all-gather completes
-
-        Args:
-            gathered_buffer: (pack_total * fs_size,) buffer with all gathered shards
-            dion_param_layout: List of pack entries with metadata
-            pack_total: Size of pack_buffer per rank
-            fs_size: FS group size
-            buffer: ParamAndGradBuffer
-        """
-        unpack_fs_shards_(
-            optimizer=self,
-            gathered_buffer=gathered_buffer,
-            dion_param_layout=dion_param_layout,
-            pack_total=pack_total,
-            fs_size=fs_size,
-            fs_rank=self.fs_rank,
-            buffer=buffer,
-        )
-
-    # Backward-compatible alias for param_and_grad_buffer async param-gather path.
-    def _unpack_all_gathered_params(
-        self, gathered_buffer, dion_param_layout, pack_total, fs_size, buffer
-    ):
-        self._unpack_gathered_params(
-            gathered_buffer=gathered_buffer,
-            dion_param_layout=dion_param_layout,
-            pack_total=pack_total,
-            fs_size=fs_size,
-            buffer=buffer,
         )
 
     def _check_dion_params(self):
@@ -2054,30 +1417,29 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
         # Get FS and RP info from optimizer
         fs_group = self.optimizer.fs_group if hasattr(self.optimizer, 'fs_group') else None
-        rp_group = self.optimizer.rp_group if hasattr(self.optimizer, 'rp_group') else None
 
         if fs_group is not None:
             annotation_group = fs_group  # FS group (size=2)
             fs_rank = dist.get_rank(fs_group)
             fs_size = dist.get_world_size(fs_group)
         else:
-            # Fallback to DP group if FS not configured
+            # Standard single-instance DO may not materialize a separate fs_group.
             annotation_group = self.data_parallel_group
             fs_rank = annotation_group.rank()
             fs_size = dist.get_world_size(annotation_group)
-
-        global_rank = self._global_rank
-
-        self._param_owner_ranks = {}
-        self._fs_rank = fs_rank
-        self._fs_size = fs_size
 
         # Validate metadata created by `_build_model_gbuf_range()` and build
         # cheap lookup tables used later in the optimizer.
         total_params = 0
         total_dion_params = 0
-        mismatch_dion_flag = 0
-        repaired_missing_fields = 0
+        unique_param_ids = set()
+        unique_two_d_total = 0
+        unique_two_d_dion = 0
+        unique_two_d_fp8_skipped = 0
+        unique_two_d_manual_disabled = 0
+        unique_two_d_not_candidate = 0
+        unique_two_d_role_excluded = 0
+        unexpected_two_d_leftovers = []
 
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             buffer = self.buffers[gbuf_idx]
@@ -2091,22 +1453,20 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                         total_params += 1
                         pri = gbuf_range_map["param_map"][param]
 
-                        dion_info = pri.get("dion_info", None) or {"is_dion": False}
-                        pri["dion_info"] = dion_info  # Ensure key exists (behavior-preserving)
-
-                        is_dion = bool(dion_info.get("is_dion", False))
+                        shard_layout = pri.get("dion_shard_layout", None)
+                        is_dion = shard_layout is not None
                         flag_is_dion = bool(getattr(param, "is_dion_param", False))
                         if flag_is_dion != is_dion:
-                            mismatch_dion_flag += 1
                             pname = ""
                             try:
                                 pname = buffer.param_to_name.get(param, "")
                             except Exception:
                                 pname = ""
-                            logger.warning(
-                                f"[Dion] dion flag mismatch (will trust range-map dion_info): "
-                                f"name={pname or f'id_{id(param)}'} is_dion_param={flag_is_dion} dion_info.is_dion={is_dion} "
-                                f"(gbuf={gbuf_idx} bucket={bucket_idx})"
+                            raise RuntimeError(
+                                "[Dion] dion flag mismatch between param annotation and range map "
+                                f"(name={pname or f'id_{id(param)}'} "
+                                f"is_dion_param={flag_is_dion} dion_shard_layout_present={is_dion} "
+                                f"gbuf={gbuf_idx} bucket={bucket_idx})"
                             )
 
                         if not is_dion:
@@ -2114,93 +1474,104 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
                         total_dion_params += 1
 
-                        # `_build_model_gbuf_range()` should have fully populated these.
-                        # Keep a slow-path repair (log-only) for robustness in case of
-                        # stale checkpoints or upstream changes.
-                        missing = [k for k in ("shape", "start_idx", "end_idx", "fs_split_dim") if k not in dion_info]
-                        if missing:
-                            repaired_missing_fields += 1
-                            tp_split_dim = dion_info.get("tp_split_dim", get_tp_split_dim(param))
-                            fs_split_dim = dion_info.get("fs_split_dim", get_fs_split_dim(tp_split_dim))
-                            m, n = param.shape
-                            split_size = m if fs_split_dim == 0 else n
-                            start_idx, end_idx = compute_fs_shard_range(split_size, fs_size, fs_rank)
-                            local_shape = compute_local_shape(m, n, start_idx, end_idx, fs_split_dim)
-                            dion_info.update(
-                                {
-                                    "shape": local_shape,
-                                    "start_idx": start_idx,
-                                    "end_idx": end_idx,
-                                    "fs_split_dim": fs_split_dim,
-                                    "bucket_idx": dion_info.get("bucket_idx", bucket_idx),
-                                    "fs_owner_ranks": dion_info.get("fs_owner_ranks", tuple(range(fs_size))),
-                                }
-                            )
+                        if shard_layout.local_numel <= 0:
                             pname = ""
                             try:
                                 pname = buffer.param_to_name.get(param, "")
                             except Exception:
                                 pname = ""
-                            logger.warning(
-                                f"[Dion] Repaired missing dion_info fields {missing} for "
-                                f"name={pname or f'id_{id(param)}'} (gbuf={gbuf_idx} bucket={bucket_idx})"
+                            raise RuntimeError(
+                                "[Dion] invalid Dion local shard layout from _build_model_gbuf_range "
+                                f"(name={pname or f'id_{id(param)}'} local_shape={shard_layout.local_shape} "
+                                f"gbuf={gbuf_idx} bucket={bucket_idx})"
                             )
 
-                        # Cache the dict for any later lookups/debug.
-                        self._dion_param_info[param] = dion_info
-                        param.dion_info = dion_info
-                        self._param_owner_ranks[param] = tuple(range(fs_size))
+                        self._shard_layouts_by_param[param] = shard_layout
 
-        if mismatch_dion_flag and self._global_rank == 0:
-            logger.warning(f"[Dion] dion flag mismatches observed: {mismatch_dion_flag}")
-        if repaired_missing_fields and self._global_rank == 0:
-            logger.warning(f"[Dion] repaired dion_info missing fields for {repaired_missing_fields} params")
+                        if id(param) in unique_param_ids:
+                            continue
 
-        # Convert FS group members to DP rank indices for owner_tuples
-        # owner_tuples must be in DP rank space for later DP→world conversion
-        if fs_group is not None and fs_size > 1:
-            # Get FS group's world ranks
-            fs_world_ranks = dist.get_process_group_ranks(fs_group)
+                        unique_param_ids.add(id(param))
+                        if param.ndim != 2:
+                            continue
 
-            # Get full stock dp_cp world's ranks to create world→DP mapping
-            full_dp_group = self._original_dp_group if self._original_dp_group is not None else self.data_parallel_group
-            dp_world_ranks = dist.get_process_group_ranks(full_dp_group)
-            world_to_dp = {w: i for i, w in enumerate(dp_world_ranks)}
+                        unique_two_d_total += 1
+                        unique_two_d_dion += 1
 
-            # Verify all FS ranks are in DP group (sanity check)
-            for w in fs_world_ranks:
-                if w not in world_to_dp:
-                    raise RuntimeError(
-                        f"Global rank {global_rank}: FS group contains world rank {w} "
-                        f"which is not in my DP group {dp_world_ranks}! "
-                        f"This indicates incorrect group topology."
-                    )
+                    for param in gbuf_range_map["param_map"].keys():
+                        if id(param) in unique_param_ids:
+                            continue
 
-            # Convert FS world ranks to DP indices
-            fs_dp_ranks = tuple(world_to_dp[w] for w in fs_world_ranks)
-            self._global_owner_tuples.add(fs_dp_ranks)
+                        unique_param_ids.add(id(param))
+                        if param.ndim != 2:
+                            continue
 
+                        unique_two_d_total += 1
+                        if getattr(param, "use_dion", None) is False:
+                            unique_two_d_manual_disabled += 1
+                            continue
 
-        # Collect all unique owner_tuples across DP group (union across TP slices)
-        local_owner_tuples = sorted(list(self._global_owner_tuples))
-        full_dp_group = self._original_dp_group if self._original_dp_group is not None else self.data_parallel_group
-        dp_world_ranks = dist.get_process_group_ranks(full_dp_group)
-        dp_size = len(dp_world_ranks)
+                        if not getattr(param, "dion_candidate", False):
+                            unique_two_d_not_candidate += 1
+                            continue
 
-        gathered_tuples = [None] * dp_size
-        dist.all_gather_object(gathered_tuples, local_owner_tuples, group=full_dp_group)
+                        if getattr(param, "is_embedding_or_output_parameter", False) or getattr(
+                            param, "is_lm_head_parameter", False
+                        ):
+                            unique_two_d_role_excluded += 1
+                            continue
 
-        # Collect all unique tuples from all ranks (union instead of enforcing uniformity)
-        all_unique_tuples = set()
-        for tuples in gathered_tuples:
-            if tuples:
-                all_unique_tuples.update(tuples)
+                        if is_float8tensor(param):
+                            unique_two_d_fp8_skipped += 1
+                            continue
 
-        # Use union of all tuples
-        self._global_owner_tuples = all_unique_tuples
+                        pname = ""
+                        try:
+                            pname = buffer.param_to_name.get(param, "")
+                        except Exception:
+                            pname = ""
+                        unexpected_two_d_leftovers.append(pname or f"id_{id(param)}")
 
-        # No barrier needed - each FS group operates independently
-        # TP slices have different FS groups, barrier would hang
+        expected_dion_two_d = (
+            unique_two_d_total
+            - unique_two_d_fp8_skipped
+            - unique_two_d_manual_disabled
+            - unique_two_d_not_candidate
+            - unique_two_d_role_excluded
+        )
+        if unique_two_d_dion != expected_dion_two_d:
+            raise RuntimeError(
+                "[Dion] 2D Dion classification count mismatch "
+                f"(two_d_total={unique_two_d_total} "
+                f"dion_two_d={unique_two_d_dion} "
+                f"fp8_skipped={unique_two_d_fp8_skipped} "
+                f"manual_disabled={unique_two_d_manual_disabled} "
+                f"not_candidate={unique_two_d_not_candidate} "
+                f"role_excluded={unique_two_d_role_excluded} "
+                f"expected_dion_two_d={expected_dion_two_d})"
+            )
+
+        if unexpected_two_d_leftovers:
+            raise RuntimeError(
+                "[Dion] unexpected non-Dion 2D parameters remain after classification: "
+                + ", ".join(unexpected_two_d_leftovers[:32])
+            )
+
+        if self._global_rank == 0:
+            logger.info(
+                "[DION_PARAM_CLASSIFY_SUMMARY] total_params=%s dion_params=%s two_d_total=%s "
+                "dion_two_d=%s fp8_two_d_skipped=%s manual_disabled_two_d=%s "
+                "not_candidate_two_d=%s role_excluded_two_d=%s unexpected_two_d=%s",
+                total_params,
+                total_dion_params,
+                unique_two_d_total,
+                unique_two_d_dion,
+                unique_two_d_fp8_skipped,
+                unique_two_d_manual_disabled,
+                unique_two_d_not_candidate,
+                unique_two_d_role_excluded,
+                len(unexpected_two_d_leftovers),
+            )
 
     def _build_param_groups(
         self,
@@ -2212,7 +1583,9 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         """
         Build parameter groups with batch processing for 2D views.
         """
-        use_prec_opt = config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        use_precision_aware_optimizer = (
+            config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        )
         # Initialize parameter groups
         model_fp16_groups = []
         model_fp32_groups = []
@@ -2236,37 +1609,32 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             shard_fp32_groups.append(shard_fp32_params_this_group)
             main_shard_groups.append(main_shard_params)
 
-            # Batch process parameters in this group
-            param_batch = []
-            for model_param in group_range["params"]:
-                param_batch.append(model_param)
-
-                # Process batch when full or at end
-                if len(param_batch) >= self._batch_size or model_param is group_range["params"][-1]:
-                    try:
-                        self._process_param_batch(
-                            param_batch,
-                            gbuf_ranges,
-                            param_gbuf_map,
-                            config,
-                            model_fp16_params,
-                            model_fp32_params_this_group,
-                            shard_float16_params_this_group,
-                            shard_fp32_params_this_group,
-                            main_shard_params
-                        )
-                    except Exception as e:
-                        global_rank = self._global_rank
-                        logger.error(f"[Dion] Global rank {global_rank}: Failed in _process_param_batch for batch of {len(param_batch)} params: {e}")
-                        for i, p in enumerate(param_batch):
-                            logger.error(f"  Param {i}: shape={p.shape}, ndim={p.ndim}, requires_grad={p.requires_grad}")
-                        import traceback
-                        logger.error(traceback.format_exc())
-                        raise
-                    param_batch = []
+            try:
+                self._process_param_group(
+                    group_range["params"],
+                    gbuf_ranges,
+                    param_gbuf_map,
+                    config,
+                    model_fp16_params,
+                    model_fp32_params_this_group,
+                    shard_float16_params_this_group,
+                    shard_fp32_params_this_group,
+                    main_shard_params,
+                )
+            except Exception as e:
+                global_rank = self._global_rank
+                logger.error(
+                    f"[Dion] Global rank {global_rank}: Failed in _process_param_group "
+                    f"for group of {len(group_range['params'])} params: {e}"
+                )
+                for i, p in enumerate(group_range["params"]):
+                    logger.error(f"  Param {i}: shape={p.shape}, ndim={p.ndim}, requires_grad={p.requires_grad}")
+                import traceback
+                logger.error(traceback.format_exc())
+                raise
 
             # Update optimizer's params
-            if not use_prec_opt:
+            if not use_precision_aware_optimizer:
                 group_range["orig_group"]["params"] = [
                     *shard_fp32_params_this_group,
                     *main_shard_params,
@@ -2285,52 +1653,50 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             main_shard_groups,
         )
 
-    def _process_param_batch(self, param_batch, gbuf_ranges, param_gbuf_map, config,
+    def _process_param_group(self, model_params, gbuf_ranges, param_gbuf_map, config,
                             model_fp16_params, model_fp32_params,
                             shard_float16_params, shard_fp32_params,
                             main_shard_params):
-        """Process a batch of parameters efficiently."""
-        for model_param in param_batch:
+        """Process one optimizer param group into standard/Dion shard lists."""
+        for model_param in model_params:
             assert model_param.requires_grad
 
             gbuf_index, dtype, bucket_index = param_gbuf_map[model_param]
             gbuf_range = gbuf_ranges[gbuf_index][dtype][bucket_index]
             param_range_info = gbuf_range["param_map"][model_param]
             param_range = param_range_info["param"]
-            dion_info = param_range_info.get("dion_info", {})
-            if dion_info:
-                model_param.dion_info = dion_info
+            dion_shard_layout = param_range_info.get("dion_shard_layout", None)
 
             # Handle different parameter types
             if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                 self._process_float16_param(
-                    model_param, param_range, param_range_info, dion_info,
-                    config, gbuf_index, bucket_index,
+                    model_param, param_range, dion_shard_layout,
+                    config,
                     model_fp16_params, shard_float16_params,
                     main_shard_params
                 )
             elif model_param.type() == 'torch.cuda.FloatTensor':
                 self._process_float32_param(
-                    model_param, param_range, param_range_info, dion_info,
-                    config, gbuf_index, bucket_index,
+                    model_param, param_range, dion_shard_layout,
+                    config,
                     model_fp32_params, shard_fp32_params
                 )
             else:
                 raise TypeError(f'Unsupported parameter type: {model_param.type()}')
 
-    def _create_fs_shard(self, model_param, dion_info):
+    def _create_fs_shard(self, model_param, shard_layout: DionShardLayout):
         """Create the local FS shard view from `model_param`.
 
         Args:
             model_param: The model parameter tensor (2D, TP-partitioned)
-            dion_info: Dict containing 'start_idx', 'end_idx', 'fs_split_dim'
+            shard_layout: Typed Dion shard layout
 
         Returns:
             shard: The local FS shard tensor view into `model_param.data`
         """
-        start_idx = dion_info['start_idx']
-        end_idx = dion_info['end_idx']
-        fs_split_dim = dion_info['fs_split_dim']
+        start_idx = int(shard_layout.start_idx)
+        end_idx = int(shard_layout.end_idx)
+        fs_split_dim = int(shard_layout.fs_split_dim)
 
         # Keep the FP16 shard on the same storage graph as the forward-visible param.
         # This matches standard Megatron-Core more closely: local shard state is a view
@@ -2350,13 +1716,13 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             model_param: The model parameter tensor (FS-full, TP-sharded; Megatron-Core standard)
             shard: The FS shard tensor
         """
-        dion_info = getattr(model_param, 'dion_info', None)
-        if dion_info is not None:
+        shard_layout = self._param_shard_layout(model_param)
+        if shard_layout is not None:
             expected_view = slice_fs_shard_2d(
                 model_param.data,
-                dion_info['fs_split_dim'],
-                dion_info['start_idx'],
-                dion_info['end_idx'],
+                int(shard_layout.fs_split_dim),
+                int(shard_layout.start_idx),
+                int(shard_layout.end_idx),
             )
             if shard.shape != expected_view.shape or shard.data_ptr() != expected_view.data_ptr():
                 param_name = getattr(model_param, '_param_name', f'id_{id(model_param)}')
@@ -2377,64 +1743,22 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         model_param: torch.nn.Parameter,
         data_shard: torch.Tensor,
         opt_shard: torch.Tensor,
-        dion_info: dict,
-        gbuf_index: int,
-        bucket_index: int,
-        param_range_info: dict,
+        shard_layout: DionShardLayout,
     ) -> None:
         """Register all shard info for a Dion parameter in one call.
-
-        Creates DionShardInfo and stores in _dion_shard_info[model_param].
 
         Args:
             model_param: The model parameter tensor
             data_shard: FP16 shard tensor (all-gather source)
             opt_shard: FP32 shard tensor (optimizer state)
-            dion_info: Dict containing Dion metadata (shape, global_shape, etc.)
-            gbuf_index: Gradient buffer index
-            bucket_index: Bucket index
-            param_range_info: Parameter range info dict
+            shard_layout: Typed Dion shard layout
         """
-        # Dion packed RS remains a transient communication buffer. The canonical
-        # optimizer-side local shard contract stays aligned with stock DO:
-        # the final local optimizer shard is projected back into the parent
-        # bucket.grad_data / model_param.main_grad local shard range.
-        rs_start = None
-        rs_end = None
-        try:
-            bucket = self.buffers[gbuf_index].buckets[bucket_index]
-            dion_shard_range = getattr(bucket, "dion_param_shard_range", None)
-            if dion_shard_range is not None and model_param in dion_shard_range:
-                rs_start, rs_end = dion_shard_range[model_param]
-        except Exception:
-            rs_start = None
-            rs_end = None
-
-        if rs_start is None or rs_end is None:
-            param_name = getattr(model_param, "_param_name", f"id_{id(model_param)}")
-            raise RuntimeError(
-                "[Dion] Missing canonical dion_param_shard_range for optimizer grad source: "
-                f"param={param_name} buffer={gbuf_index} bucket={bucket_index}"
-            )
-
-        shard_info = DionShardInfo(
+        shard_info = DionShardBinding(
             data_shard=data_shard,
             opt_shard=opt_shard,
-            local_shape=dion_info['shape'],
-            global_shape=dion_info['global_shape'],
-            start_idx=dion_info['start_idx'],
-            end_idx=dion_info['end_idx'],
-            fs_split_dim=dion_info['fs_split_dim'],
-            gbuf_index=gbuf_index,
-            bucket_index=bucket_index,
-            param_range_info=param_range_info,
-            rs_start=int(rs_start),
-            rs_end=int(rs_end),
-            stock_param_start=int(dion_info["stock_param_start"]),
-            stock_param_end=int(dion_info["stock_param_end"]),
-            per_expert_global_shape=dion_info.get('per_expert_global_shape'),
         )
-        self._dion_shard_info[model_param] = shard_info
+        self._shard_bindings_by_param[model_param] = shard_info
+        self._shard_layouts_by_param[model_param] = shard_layout
 
     def _get_data_shard(self, model_param: torch.nn.Parameter) -> Optional[torch.Tensor]:
         """Get data shard (FP16) for a model parameter.
@@ -2445,7 +1769,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         Returns:
             Data shard tensor or None if not found
         """
-        info = self._dion_shard_info.get(model_param)
+        info = self._shard_bindings_by_param.get(model_param)
         return info.data_shard if info else None
 
     def _get_opt_shard(self, model_param: torch.nn.Parameter) -> Optional[torch.Tensor]:
@@ -2457,7 +1781,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         Returns:
             Optimizer shard tensor or None if not found
         """
-        info = self._dion_shard_info.get(model_param)
+        info = self._shard_bindings_by_param.get(model_param)
         return info.opt_shard if info else None
 
     def _update_data_shard(self, model_param: torch.nn.Parameter, new_data_shard: torch.Tensor) -> None:
@@ -2469,7 +1793,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             model_param: The model parameter tensor
             new_data_shard: The new data shard tensor
         """
-        info = self._dion_shard_info.get(model_param)
+        info = self._shard_bindings_by_param.get(model_param)
         if info is not None:
             info.data_shard = new_data_shard
 
@@ -2482,37 +1806,13 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             model_param: The model parameter tensor
             new_opt_shard: The new optimizer shard tensor
         """
-        info = self._dion_shard_info.get(model_param)
+        info = self._shard_bindings_by_param.get(model_param)
         if info is not None:
             info.opt_shard = new_opt_shard
 
-    def _param_dion_info(self, model_param: torch.nn.Parameter) -> dict:
-        """Get dion_info-like dict from DionShardInfo for runtime use.
-
-        Args:
-            model_param: The model parameter tensor
-
-        Returns:
-            Dict with dion info fields, or {"is_dion": False} if not a Dion param
-        """
-        shard_info = self._dion_shard_info.get(model_param)
-        if shard_info is None:
-            return {"is_dion": False}
-        return {
-            "is_dion": True,
-            "fs_split_dim": shard_info.fs_split_dim,
-            "start_idx": shard_info.start_idx,
-            "end_idx": shard_info.end_idx,
-            "shape": shard_info.local_shape,
-            "global_shape": shard_info.global_shape,
-            "buffer_idx": shard_info.gbuf_index,
-            "bucket_idx": shard_info.bucket_index,
-            "rs_start": shard_info.rs_start,
-            "rs_end": shard_info.rs_end,
-            "stock_param_start": shard_info.stock_param_start,
-            "stock_param_end": shard_info.stock_param_end,
-            "per_expert_global_shape": shard_info.per_expert_global_shape,
-        }
+    def _param_shard_layout(self, model_param: torch.nn.Parameter) -> Optional[DionShardLayout]:
+        """Return typed Dion shard layout for one model param, if any."""
+        return self._shard_layouts_by_param.get(model_param)
 
     def _check_is_dion(self, model_param, context=""):
         """Verify is_dion_param flag is set correctly.
@@ -2536,16 +1836,26 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 f"Dion processing path. param shape={model_param.shape}"
             )
 
-    def _process_float16_param(self, model_param, param_range, param_range_info, dion_info,
-                              config, gbuf_index, bucket_index,
+    def _process_float16_param(self, model_param, param_range, dion_shard_layout,
+                              config,
                               model_fp16_params, shard_float16_params,
                               main_shard_params):
         """Process float16/bfloat16 parameters."""
-        use_prec_opt = config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-        if dion_info.get('is_dion', False):
+        param_name = self._canonical_param_name(model_param)
+        if param_name in _debug_target_params():
+            logger.warning(
+                "[DION_PROCESS_FP16_ENTRY] param=%s model_norm=%s model_ptr=%s",
+                param_name,
+                float(model_param.data.detach().float().norm().item()),
+                int(model_param.data.data_ptr()),
+            )
+        use_precision_aware_optimizer = (
+            config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        )
+        if dion_shard_layout is not None:
             try:
                 # Create FS shard using helper
-                shard_model_param = self._create_fs_shard(model_param, dion_info)
+                shard_model_param = self._create_fs_shard(model_param, dion_shard_layout)
 
                 # Prepare FS shard (attach to model_param)
                 self._prepare_fs_shard(model_param, shard_model_param)
@@ -2556,7 +1866,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 global_rank = self._global_rank
                 logger.error(f"[Dion] Global rank {global_rank}: Failed for Dion param")
                 logger.error(f"  model_param.shape: {model_param.shape}")
-                logger.error(f"  dion_info: {dion_info}")
+                logger.error(f"  dion_shard_layout: {dion_shard_layout}")
                 import traceback
                 logger.error(traceback.format_exc())
                 raise
@@ -2569,22 +1879,19 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 shard_model_param.shared = model_param.shared
 
             # Create fp32 main param
-            if not use_prec_opt:
+            if not use_precision_aware_optimizer:
                 shard_main_param = shard_model_param.clone().float()
                 shard_main_param._model_param = model_param
             else:
                 shard_main_param = None
 
-            # Register shard info using unified helper (Phase 2)
+            # Register shard bindings/layout for Dion params.
             opt_shard = shard_main_param if shard_main_param is not None else shard_model_param
             self._register_dion_shard(
                 model_param=model_param,
                 data_shard=shard_model_param,
                 opt_shard=opt_shard,
-                dion_info=dion_info,
-                gbuf_index=gbuf_index,
-                bucket_index=bucket_index,
-                param_range_info=param_range_info,
+                shard_layout=dion_shard_layout,
             )
         else:
             # Standard 1D handling (non-Dion params)
@@ -2607,7 +1914,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     shard_model_param.shared = model_param.shared
 
             # Generate main param
-            if not use_prec_opt:
+            if not use_precision_aware_optimizer:
                 if is_float8tensor(model_param):
                     # Handle FP8 tensors - always use DP shard
                     if hasattr(model_param, 'get_high_precision_init_val'):
@@ -2630,18 +1937,6 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             else:
                 shard_main_param = None
 
-            # Preserve the exact parent-DO local shard contract used to build the
-            # non-Dion optimizer shard. Runtime write-back must target this same
-            # bucket-local range, not a later re-derived bookkeeping entry.
-            stock_param_range = param_range_info["param"]
-            stock_world_range = param_range_info["gbuf_world_in_bucket"]
-            model_param._stock_param_start = int(stock_param_range.start)
-            model_param._stock_param_end = int(stock_param_range.end)
-            model_param._stock_world_bucket_start = int(stock_world_range.start)
-            model_param._stock_world_bucket_end = int(stock_world_range.end)
-            model_param._stock_bucket_index = int(bucket_index)
-            model_param._stock_gbuf_index = int(gbuf_index)
-
         # Copy metadata to main param
         if shard_main_param is not None:
             tensor_parallel.copy_tensor_model_parallel_attributes(
@@ -2654,20 +1949,36 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         model_param.main_param = shard_main_param
         model_param.main_param_sharded = True
 
-        # Note: Non-Dion params use standard DO path, not registered in _dion_shard_info
+        if param_name in _debug_target_params():
+            logger.warning(
+                "[DION_PROCESS_FP16] param=%s model_norm=%s model_ptr=%s shard_norm=%s shard_ptr=%s main_norm=%s main_ptr=%s",
+                param_name,
+                float(model_param.data.detach().float().norm().item()),
+                int(model_param.data.data_ptr()),
+                None
+                if shard_model_param is None
+                else float(shard_model_param.detach().float().norm().item()),
+                None if shard_model_param is None else int(shard_model_param.data_ptr()),
+                None
+                if shard_main_param is None
+                else float(shard_main_param.detach().float().norm().item()),
+                None if shard_main_param is None else int(shard_main_param.data_ptr()),
+            )
+
+            # Note: Non-Dion params use standard DO path, not registered in shard bindings
 
         # Add to groups
         model_fp16_params.append(model_param)
         shard_float16_params.append(shard_model_param)
         main_shard_params.append(shard_main_param)
 
-    def _process_float32_param(self, model_param, param_range, param_range_info, dion_info,
-                              config, gbuf_index, bucket_index,
+    def _process_float32_param(self, model_param, param_range, dion_shard_layout,
+                              config,
                               model_fp32_params, shard_fp32_params):
         """Process float32 parameters."""
-        if dion_info.get('is_dion', False):
+        if dion_shard_layout is not None:
             # Create FS shard using helper
-            shard_model_param = self._create_fs_shard(model_param, dion_info)
+            shard_model_param = self._create_fs_shard(model_param, dion_shard_layout)
 
             # Prepare FS shard (attach to model_param)
             self._prepare_fs_shard(model_param, shard_model_param)
@@ -2686,16 +1997,13 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             # Verify is_dion_param flag
             self._check_is_dion(model_param, "FP32")
 
-            # Register shard info using unified helper (Phase 2)
+            # Register shard bindings/layout for Dion params.
             # FP32 params: data_shard == opt_shard == shard_model_param
             self._register_dion_shard(
                 model_param=model_param,
                 data_shard=shard_model_param,
                 opt_shard=shard_model_param,
-                dion_info=dion_info,
-                gbuf_index=gbuf_index,
-                bucket_index=bucket_index,
-                param_range_info=param_range_info,
+                shard_layout=dion_shard_layout,
             )
         else:
             # Standard 1D handling
@@ -2708,7 +2016,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             if hasattr(model_param, 'shared'):
                 shard_model_param.shared = model_param.shared
 
-            # Note: Non-Dion params use standard DO path, not registered in _dion_shard_info
+            # Note: Non-Dion params use standard DO path, not registered in shard bindings
 
         model_fp32_params.append(model_param)
         shard_fp32_params.append(shard_model_param)
@@ -2779,24 +2087,22 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 overlap_features.append("parameter AG")
             overlap_msg = " + ".join(overlap_features)
 
-        # Verify all ranks have rp_group before RP check
-        # Prevent partial participation in RP all_gather
-        have_rp = torch.tensor(
-            [1 if self.rp_group is not None else 0],
-            device=torch.cuda.current_device(), dtype=torch.int64
-        )
-        dist.all_reduce(have_rp, op=dist.ReduceOp.MIN, group=self.data_parallel_group)
-        all_have_rp = int(have_rp.item()) == 1
+        expected_rp_size = int(self._rp_size) if self._rp_size is not None else 1
+        if expected_rp_size > 1:
+            # Verify all ranks have rp_group before RP collectives. For RP=1, the
+            # standard contract is that no rp_group exists and no RP collectives run.
+            have_rp = torch.tensor(
+                [1 if self.rp_group is not None else 0],
+                device=torch.cuda.current_device(), dtype=torch.int64
+            )
+            dist.all_reduce(have_rp, op=dist.ReduceOp.MIN, group=self.data_parallel_group)
+            all_have_rp = int(have_rp.item()) == 1
+            if not all_have_rp:
+                raise RuntimeError(
+                    f"[Dion] Global rank {global_rank}: not all DP ranks have rp_group "
+                    f"(MIN={have_rp.item()}); RP topology must be identical across the data-parallel group"
+                )
 
-        if not all_have_rp:
-            # Not all ranks have rp_group - MUST skip collectively
-            # Cannot proceed with RP collective operations if only some ranks have the group
-            logger.warning(f"[Dion] Global rank {global_rank}: "
-                          f"Not all DP ranks have rp_group (MIN={have_rp.item()}), skipping RP consistency check collectively")
-            # Barrier to ensure all ranks skip together
-            dist.barrier(group=self.data_parallel_group)
-            # Skip to next section without RP collective operations
-        else:
             # All ranks should have rp_group when all_have_rp == True
             # Double-check to catch bugs
             if self.rp_group is None:
@@ -2849,7 +2155,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         DISABLED: No-op - RP/FS groups already created in __init__.py
 
         This function previously created additional subgroups based on owner_tuples,
-        but these groups are not actually used (dist_meta.replica_group uses self.rp_group instead).
+        but those extra groups are not part of the current runtime contract.
         Creating unnecessary groups causes new_group() call count mismatch across ranks,
         leading to NCCL hang.
 
@@ -2871,7 +2177,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
         if all_have_fs:
             # All ranks have the required FS group. RP may legitimately be None
-            # on every rank when the stock runtime has a single optimizer instance.
+            # on every rank when the standard runtime has a single optimizer instance.
             self.owner_tuple_to_subgroup = {}
             dist.barrier(group=dp_group)
             return
@@ -2885,7 +2191,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         # If we reach here, no ranks have fs_group - this is a real topology bug.
         raise RuntimeError(
             f"Global rank {global_rank}: No FS group found! "
-            f"FS group must be provided from the stock Megatron-Core optimizer topology."
+            f"FS group must be provided from the standard Megatron-Core optimizer topology."
         )
 
     def _init_topology_cache(self):
@@ -2906,7 +2212,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
 
         # FS group is required. RP group may legitimately be absent on every rank
-        # when the stock runtime has a single optimizer instance.
+        # when the standard runtime has a single optimizer instance.
         have_fs = torch.tensor(
             [1 if hasattr(self, 'fs_group') and self.fs_group is not None else 0],
             device=torch.cuda.current_device(), dtype=torch.int64
@@ -2916,17 +2222,6 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
         if all_have_fs:
             # All ranks have FS group. RP may be None on all ranks for RP=1.
-
-            # Initialize compatibility variables
-            self.shard_index_to_rp_group = {}
-            self.replica_index_to_fs_group = {}
-            self.my_replica_idx = -1
-            self.my_shard_idx = -1
-            self.num_replicas = (
-                dist.get_world_size(self.rp_group) if self.rp_group is not None else 1
-            )
-            self.num_shards = dist.get_world_size(self.fs_group)
-
             # Barrier to ensure all ranks finish together
             dist.barrier(group=dp_group)
             return
@@ -2941,76 +2236,8 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         # If we reach here, no ranks have fs_group - should never happen.
         raise RuntimeError(
             f"Global rank {global_rank}: No FS group found! "
-            f"FS group must be provided from the stock Megatron-Core optimizer topology."
+            f"FS group must be provided from the standard Megatron-Core optimizer topology."
         )
-
-    def _model_name_cache(self) -> Dict[int, str]:
-        """Return cached model-param-id -> canonical name mapping."""
-        key = tuple(
-            id(getattr(buffer, "param_to_name", None))
-            for buffer in getattr(self, "buffers", [])
-        )
-        cached_key = getattr(self, "_model_param_name_cache_key", None)
-        cached = getattr(self, "_model_param_name_cache", None)
-        if cached is not None and cached_key == key:
-            return cached
-
-        model_name_by_id: Dict[int, str] = {}
-        for buffer in getattr(self, "buffers", []):
-            param_to_name = getattr(buffer, "param_to_name", None)
-            if not param_to_name:
-                continue
-            for model_param, name in param_to_name.items():
-                model_name_by_id[id(model_param)] = name
-
-        self._model_param_name_cache = model_name_by_id
-        self._model_param_name_cache_key = key
-        return model_name_by_id
-
-    def _model_by_shard(self) -> Dict[int, torch.nn.Parameter]:
-        """Return cached shard-param-id -> model-param mapping."""
-        key = id(getattr(self, "gbuf_ranges", None))
-        cached_key = getattr(self, "_model_param_by_shard_cache_key", None)
-        cached = getattr(self, "_model_param_by_shard_cache", None)
-        if cached is not None and cached_key == key:
-            return cached
-
-        model_param_by_shard_id: Dict[int, torch.nn.Parameter] = {}
-        for gbuf_range_maps in getattr(self, "gbuf_ranges", []):
-            for gbuf_range_map_list in gbuf_range_maps.values():
-                for gbuf_range_map in gbuf_range_map_list:
-                    for model_param in gbuf_range_map["param_map"].keys():
-                        shard_param = getattr(model_param, "main_param", None)
-                        if shard_param is not None:
-                            model_param_by_shard_id[id(shard_param)] = model_param
-
-        self._model_param_by_shard_cache = model_param_by_shard_id
-        self._model_param_by_shard_cache_key = key
-        return model_param_by_shard_id
-
-    def _shard_name_cache(self) -> Dict[int, str]:
-        """Return cached shard-param-id -> canonical name mapping."""
-        model_name_by_id = self._model_name_cache()
-        _, _, _, shard_to_model = self._grad_norm_maps()
-        key = (
-            id(model_name_by_id),
-            len(shard_to_model),
-            getattr(self, "_grad_norm_param_maps_key", None),
-        )
-        cached_key = getattr(self, "_shard_param_name_cache_key", None)
-        cached = getattr(self, "_shard_param_name_cache", None)
-        if cached is not None and cached_key == key:
-            return cached
-
-        shard_name_by_id = {}
-        for shard_id, model_param in shard_to_model.items():
-            param_name = model_name_by_id.get(id(model_param))
-            if param_name is not None:
-                shard_name_by_id[shard_id] = param_name
-
-        self._shard_param_name_cache = shard_name_by_id
-        self._shard_param_name_cache_key = key
-        return shard_name_by_id
 
     @staticmethod
     def _group_info(group) -> Tuple[int, int]:
@@ -3056,7 +2283,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 expected_group=expert_group,
                 extra=(
                     f"param={getattr(model_param, '_param_name', '') or id(model_param)} "
-                    "Dion EP must keep expert params on the stock expert-local DO shard group."
+                    "Dion EP must keep expert params on the standard expert-local DO shard group."
                 ),
             )
             return expert_group
@@ -3090,106 +2317,59 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         *,
         model_param,
         shard_param,
-        shard_info: DionShardInfo,
     ) -> MegatronDionDistMeta:
         """Build one MegatronDionDistMeta from cached shard info."""
-        param_range_info = shard_info.param_range_info
         if is_tp_enabled(model_param):
             tp_split_dim = get_tp_split_dim(model_param)
         else:
             tp_split_dim = -1
 
-        model_name_by_id = self._model_name_cache()
-        param_name = model_name_by_id.get(id(model_param), "")
-        is_expert = is_moe_expert_param(model_param, param_name)
-
-        replica_group = self.rp_group
+        param_name = self._canonical_param_name(model_param) or ""
         shard_group = self._select_shard_group(model_param)
-        replica_group_world_size, replica_group_rank = self._group_info(replica_group)
         shard_group_world_size, shard_group_rank = self._group_info(shard_group)
+        dion_shard_layout = self._shard_layouts_by_param.get(model_param)
+        if dion_shard_layout is None:
+            raise RuntimeError(
+                "[Dion] missing dion_shard_layout while building distributed metadata "
+                f"for param={param_name or id(model_param)}"
+            )
 
         dist_meta = MegatronDionDistMeta(
-            buffer_idx=shard_info.gbuf_index,
-            bucket_idx=shard_info.bucket_index,
             shape=shard_param.shape,
-            global_shape=shard_info.global_shape,
-            global_range=(
-                param_range_info["gbuf_world"].start,
-                param_range_info["gbuf_world"].end,
-            ),
+            global_shape=dion_shard_layout.global_shape,
             tp_split_dim=tp_split_dim,
-            fs_split_dim=shard_info.fs_split_dim,
+            fs_split_dim=dion_shard_layout.fs_split_dim,
             rank_fraction=self.optimizer.defaults.get('rank_fraction', 0.25),
             is_dion_param=getattr(model_param, 'is_dion_param', True),
+            is_transposed=bool(shard_param.shape[0] < shard_param.shape[1]),
             param_uid=self._make_param_uid(
                 param_name=param_name,
                 logical_global_shape=(
-                    shard_info.per_expert_global_shape
-                    if shard_info.per_expert_global_shape is not None
-                    else shard_info.global_shape
+                    dion_shard_layout.per_expert_global_shape
+                    if dion_shard_layout.per_expert_global_shape is not None
+                    else dion_shard_layout.global_shape
                 ),
                 is_dion_param=True,
             ),
-            is_expert=is_expert,
             param_name=param_name,
+            shard_group=shard_group,
+            shard_group_world_size=shard_group_world_size,
+            shard_group_rank=shard_group_rank,
+            per_expert_global_shape=dion_shard_layout.per_expert_global_shape,
         )
-        dist_meta.replica_group = replica_group
-        dist_meta.replica_group_world_size = replica_group_world_size
-        dist_meta.replica_group_rank = replica_group_rank
-        dist_meta.shard_group = shard_group
-        dist_meta.shard_group_world_size = shard_group_world_size
-        dist_meta.shard_group_rank = shard_group_rank
-        dist_meta.replica_group_id = shard_group_rank if shard_group else 0
-        dist_meta.per_expert_global_shape = shard_info.per_expert_global_shape
 
-        if os.environ.get("DION_TOPO_DIAG", "0") == "1":
-            try:
-                target = os.environ.get("DION_TOPO_DIAG_PARAM")
-                if not target or target in param_name:
-                    shard_ranks = (
-                        dist.get_process_group_ranks(shard_group) if shard_group is not None else None
-                    )
-                    replica_ranks = (
-                        dist.get_process_group_ranks(replica_group)
-                        if replica_group is not None
-                        else None
-                    )
-                    state_ranks = (
-                        dist.get_process_group_ranks(self.state_replica_group)
-                        if getattr(self, "state_replica_group", None) is not None
-                        else None
-                    )
-                    logger.info(
-                        "[DION_TOPO_DIAG] param=%s rank=%s shard_group=%s shard_rank=%s "
-                        "replica_group=%s replica_rank=%s state_group=%s local_shape=%s "
-                        "global_shape=%s fs_split=%s tp_split=%s",
-                        param_name,
-                        self._global_rank,
-                        shard_ranks,
-                        shard_group_rank,
-                        replica_ranks,
-                        replica_group_rank,
-                        state_ranks,
-                        tuple(shard_param.shape),
-                        tuple(shard_info.global_shape) if shard_info.global_shape is not None else None,
-                        shard_info.fs_split_dim,
-                        tp_split_dim,
-                    )
-            except Exception as error:
-                logger.error("[DION_TOPO_DIAG_FAILED] param=%s err=%r", param_name, error)
         return dist_meta
 
     def _build_dist_metas(self):
         """Create dist_metas with batch processing."""
         dist_metas_sharded = {}
 
-        # Batch process Dion shard mappings (Phase 3: using unified _dion_shard_info)
-        for model_param, shard_info in self._dion_shard_info.items():
+        # Batch process Dion shard bindings.
+        for model_param, shard_info in self._shard_bindings_by_param.items():
             shard_param = shard_info.opt_shard  # Key for dist_metas_sharded
             dist_meta = self._build_dist_meta(
                 model_param=model_param,
                 shard_param=shard_param,
-                shard_info=shard_info,
             )
             dist_metas_sharded[shard_param] = dist_meta
             # Store param_uid directly on param for lookup after offload/reload
@@ -3203,9 +2383,8 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         for shard_param, meta in dist_metas_sharded.items():
             uid_to_entries.setdefault(meta.param_uid, []).append(
                 {
-                    "name": getattr(meta, "param_name", "") or self._shard_name(shard_param),
+                    "name": getattr(meta, "param_name", "") or self._canonical_param_name(shard_param),
                     "shape": tuple(meta.shape) if meta.shape is not None else tuple(shard_param.shape),
-                    "bucket": (meta.buffer_idx, meta.bucket_idx),
                     "is_dion": bool(getattr(meta, "is_dion_param", False)),
                 }
             )
@@ -3225,70 +2404,39 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         for group in self.optimizer.param_groups:
             for p in group['params']:
                 if p not in dist_metas_sharded:
-                    # Find model param
                     model_param = getattr(p, '_model_param', None)
-
                     if model_param is None:
-                        # Cached reverse lookup fallback
-                        model_param = self._find_model_param_for_shard(p)
-
-                    if model_param is None:
-                        logger.warning(f"[Dion] Could not find model_param for shard shape={p.shape}")
-                        continue
+                        raise RuntimeError(
+                            "[Dion] non-Dion optimizer shard is missing _model_param backlink; "
+                            f"shape={tuple(p.shape)} id={id(p)}"
+                        )
 
                     # Create basic dist_meta
-                    gbuf_index, dtype, bucket_index = self.model_param_gbuf_map[model_param]
-                    gbuf_range = self.gbuf_ranges[gbuf_index][dtype][bucket_index]
-                    pr = gbuf_range["param_map"][model_param]["gbuf_world"]
-
-                    param_name = self._model_name_cache().get(id(model_param), "") or self._shard_name(p)
+                    param_name = self._canonical_param_name(model_param) or self._canonical_param_name(p) or ""
                     param_uid = self._make_param_uid(
                         param_name=param_name,
                         logical_global_shape=None,
                         is_dion_param=getattr(model_param, 'is_dion_param', False),
                     )
                     dist_metas_sharded[p] = MegatronDionDistMeta(
-                        buffer_idx=gbuf_index,
-                        bucket_idx=bucket_index,
                         shape=p.shape,
-                        global_shape=None,
-                        global_range=(pr.start, pr.end),
+                        global_shape=tuple(model_param.shape) if model_param.ndim == 2 else None,
                         tp_split_dim=-1,
                         rank_fraction=self.optimizer.defaults.get('rank_fraction', 0.25),
                         is_dion_param=getattr(model_param, 'is_dion_param', False),
+                        is_transposed=bool(p.ndim == 2 and p.shape[0] < p.shape[1]),
                         param_uid=param_uid,
                         param_name=param_name,
                     )
                     # Store param_uid directly on param for lookup after offload/reload
                     p._dion_param_uid = param_uid
 
-
-    def _find_model_param_for_shard(self, shard_param):
-        """Find model parameter for a given shard."""
-        return self._model_by_shard().get(id(shard_param))
-
     def _build_grad_copy_context(self):
         """Build cached logging and group-pair context for grad wiring."""
-        use_prec_opt = bool(
+        use_precision_aware_optimizer = bool(
             getattr(self.config, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False)
         )
-        issue_seen = getattr(self, "_dion_grad_issue_seen", None)
-        if issue_seen is None:
-            issue_seen = set()
-            self._dion_grad_issue_seen = issue_seen
-
-        issue_logger = GradIssueLogger(
-            optimizer=getattr(self, "optimizer", None),
-            data_parallel_group=getattr(self, "data_parallel_group", None),
-            fs_rank=getattr(self, "fs_rank", -1),
-            fs_size=getattr(self, "fs_size", -1),
-            primary_name_fn=getattr(self, "_param_name", None),
-            param_to_name=getattr(self, "param_to_name", None),
-            buffers=getattr(self, "buffers", None),
-            seen=issue_seen,
-        )
-
-        if use_prec_opt:
+        if use_precision_aware_optimizer:
             grad_group_pairs = (
                 (self.model_float16_groups, self.shard_float16_groups),
                 (self.model_fp32_groups, self.shard_fp32_groups),
@@ -3300,16 +2448,33 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             )
 
         return {
-            "use_prec_opt": use_prec_opt,
+            "use_precision_aware_optimizer": use_precision_aware_optimizer,
             "grad_group_pairs": grad_group_pairs,
-            "issue_logger": issue_logger,
-            "state_replica_group": getattr(self, "state_replica_group", None),
+            "log_grad_issue": self._log_grad_issue,
         }
+
+    def _log_grad_issue(
+        self,
+        kind: str,
+        model_param: torch.nn.Parameter,
+        shard_param: Optional[torch.nn.Parameter] = None,
+        **extra,
+    ) -> None:
+        """Emit one structured grad-binding error log."""
+        payload = {
+            "kind": kind,
+            "param": self._find_param_name(model_param)
+            or getattr(model_param, "_param_name", f"id_{id(model_param)}"),
+            "model_shape": tuple(model_param.shape),
+            "shard_shape": tuple(shard_param.shape) if shard_param is not None else None,
+        }
+        payload.update(extra)
+        logger.error("[DION_GRAD_ISSUE] %s", payload)
 
     def _build_param_copy_context(self):
         """Build shared setup used by model<->main param copy paths."""
         return {
-            "use_prec_opt": bool(
+            "use_precision_aware_optimizer": bool(
                 getattr(self.config, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False)
             ),
             "main_shard_groups": getattr(self, "shard_fp32_from_float16_groups", None),
@@ -3317,11 +2482,6 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
     def _bucket_param_data(self, model_param: torch.nn.Parameter):
         """Return the canonical bucket.param_data buffer for a model param."""
-        if not getattr(model_param, "is_dion_param", False):
-            stock_gbuf = getattr(model_param, "_stock_gbuf_index", None)
-            stock_bucket = getattr(model_param, "_stock_bucket_index", None)
-            if stock_gbuf is not None and stock_bucket is not None:
-                return self.buffers[int(stock_gbuf)].buckets[int(stock_bucket)].param_data
         gbuf_index, _, bucket_index = self.model_param_gbuf_map[model_param]
         return self.buffers[gbuf_index].buckets[bucket_index].param_data
 
@@ -3339,9 +2499,6 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             )
 
     def _copy_model_grads_to_main_grads(self):
-        """Copy gradients from model params to main params with main_grad priority."""
-        dion_copied = 0  # Debug counter
-
         """Map canonical model-side grads onto optimizer-side shard grads.
 
         When RP=1 with DO overlap:
@@ -3356,7 +2513,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
         Dion parameters still need a custom bridge because the optimizer shard objects are
         separate FP32 tensors and Dion reads custom FS/TP-local grad slices. Non-Dion should
-        match stock Megatron-Core DO as closely as possible.
+        match standard Megatron-Core DO as closely as possible.
         """
         # Match parent's logging pattern (distrib_optimizer.py:2392)
 
@@ -3369,395 +2526,241 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
         # Copy non-Dion gradients through the standard DO local-shard contract first.
         # Dion params use the custom logical local-shard bridge below.
-        max_zero_grad_warnings = 8
-        # Avoid per-param host sync in the hot loop: collect max-abs scalars on GPU and
-        # evaluate/log in a post-pass once per step.
-        dion_grad_max_infos = []  # (model_param, shard_main_param, buffer_idx, bucket_idx, local_shape, expected_len)
-        dion_grad_max_tensors = []  # max-abs scalar per Dion param (GPU)
 
         grad_copy_ctx = self._build_grad_copy_context()
-        use_prec_opt = grad_copy_ctx["use_prec_opt"]
-        issue_logger = grad_copy_ctx["issue_logger"]
-        state_replica_group = grad_copy_ctx["state_replica_group"]
-        name_of = issue_logger.param_name
-        log_grad_issue = issue_logger.log
+        use_precision_aware_optimizer = grad_copy_ctx["use_precision_aware_optimizer"]
+        log_grad_issue = grad_copy_ctx["log_grad_issue"]
         grad_group_pairs = grad_copy_ctx["grad_group_pairs"]
-        copy_step = int(getattr(self, "_debug_grad_copy_call_idx", 0)) + 1
-        self._debug_grad_copy_call_idx = copy_step
-
-        if os.getenv("DION_PARAM_GRAD_FP_NAMES", "").strip():
-            self._maybe_log_target_grad_fingerprints()
 
         for model_groups, shard_groups in grad_group_pairs:
-            copy_stock_non_dion_grads_(
+            copy_non_dion_grads_(
                 model_groups=model_groups,
                 shard_groups=shard_groups,
                 get_param_range_fn=self._get_model_param_range_map,
                 log_grad_issue_fn=log_grad_issue,
-                use_prec_opt=use_prec_opt,
-                step=copy_step,
+                use_precision_aware_optimizer=use_precision_aware_optimizer,
             )
-            dion_copied = copy_grad_groups_(
+            copy_dion_grads_(
                 model_groups=model_groups,
                 shard_groups=shard_groups,
-                get_param_range_fn=self._get_model_param_range_map,
-                get_dion_info_fn=self._param_dion_info,
-                model_param_gbuf_map=self.model_param_gbuf_map,
-                buffers=self.buffers,
-                name_fn=name_of,
+                get_dion_shard_layout_fn=self._param_shard_layout,
                 log_grad_issue_fn=log_grad_issue,
-                use_prec_opt=use_prec_opt,
-                state_replica_group=state_replica_group,
-                debug_copy_count=dion_copied,
-                max_infos=dion_grad_max_infos,
-                max_tensors=dion_grad_max_tensors,
-                step=copy_step,
+                use_precision_aware_optimizer=use_precision_aware_optimizer,
             )
 
-        # Post-pass: exact-zero Dion grads + best-effort fallback (log-only, no crash).
-        #
-        # We avoid per-param host sync (`.item()`) in the hot loop by collecting scalar max-abs
-        # tensors on GPU and evaluating them here once per step.
-        fix_zero_dion_grads_(
-            max_tensors=dion_grad_max_tensors,
-            max_infos=dion_grad_max_infos,
-            max_zero_grad_warnings=max_zero_grad_warnings,
-            name_fn=name_of,
-            get_dion_info_fn=self._param_dion_info,
-            buffers=self.buffers,
-            use_prec_opt=use_prec_opt,
-        )
-
-        # Ensure optimizer params have stable classification flags.
-        # This is cheap (cached) and avoids relying on per-step grad-copy touching every param.
-        self._sync_dion_flags()
-        self._maybe_log_target_grad_fingerprints()
         self._release_post_copy_grad_buffers()
 
     def _release_post_copy_grad_buffers(self) -> None:
-        """Release temporary Dion/mixed RS buffers only after optimizer grad projection.
-
-        Stock Megatron-Core DO keeps the canonical local shard available through the
-        model->optimizer grad projection stage. Dion custom RS buffers must follow the
-        same timing: finish_grad_sync() may complete communication, but the temporary
-        local shard buffers cannot be cleared until _copy_model_grads_to_main_grads()
-        finishes consuming them.
-        """
+        """Clear any residual Dion grad-staging state after optimizer grad projection."""
         if not hasattr(self, "buffers"):
             return
 
         for buffer in self.buffers:
             for bucket in getattr(buffer, "buckets", []):
-                if hasattr(bucket, "dion_grad_buffer"):
-                    bucket.dion_grad_buffer = None
-                if hasattr(bucket, "dion_rs_local_buffer"):
-                    bucket.dion_rs_local_buffer = None
-                if hasattr(bucket, "dion_grad_local_view"):
-                    bucket.dion_grad_local_view = None
-                if hasattr(bucket, "non_dion_grad_local_view"):
-                    bucket.non_dion_grad_local_view = None
-                if hasattr(bucket, "_memory_reused"):
-                    bucket._memory_reused = False
+                if hasattr(bucket, "dion_state"):
+                    bucket.dion_state = None
 
-    def _grad_norm_maps(self):
-        """Return cached (flat_groups, maps) used by grad-norm/clip and flag propagation.
+    def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
+        """Return grad-norm inputs, with optional Dion-focused audit logging."""
+        debug_counts = os.getenv("DION_DEBUG_GRAD_NORM_COUNTS", "0") == "1"
+        debug_compare = os.getenv("DION_DEBUG_GRAD_NORM_COMPARE", "0") == "1"
+        if not debug_counts and not debug_compare:
+            return super().get_main_grads_for_grad_norm()
 
-        The model/shard param group structure is fixed after optimizer construction, so
-        we can cache id-based maps to avoid rebuilding every step.
-        """
-        use_prec_opt = bool(
-            getattr(self.config, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False)
-        )
-        key = (
-            id(getattr(self, "model_float16_groups", None)),
-            id(getattr(self, "model_fp32_groups", None)),
-            id(getattr(self, "shard_fp32_from_float16_groups", None)),
-            id(getattr(self, "shard_float16_groups", None)),
-            id(getattr(self, "shard_fp32_groups", None)),
-            use_prec_opt,
-        )
-        cached_key = getattr(self, "_grad_norm_param_maps_key", None)
-        cached = getattr(self, "_grad_norm_param_maps", None)
-        if cached is not None and cached_key == key:
-            return cached
+        from ..transformer.module import param_is_not_shared
 
-        model_groups = []
-        if hasattr(self, "model_float16_groups"):
-            model_groups.extend(self.model_float16_groups)
-        if hasattr(self, "model_fp32_groups"):
-            model_groups.extend(self.model_fp32_groups)
-
-        shard_groups = []
-        if use_prec_opt:
-            if hasattr(self, "shard_float16_groups"):
-                shard_groups.extend(self.shard_float16_groups)
-        else:
-            if hasattr(self, "shard_fp32_from_float16_groups"):
-                shard_groups.extend(self.shard_fp32_from_float16_groups)
-        if hasattr(self, "shard_fp32_groups"):
-            shard_groups.extend(self.shard_fp32_groups)
-
-        # Build both directions from the actual shard->model backlink.
-        # Standard DO semantics are model-side `main_grad` and optimizer-side shard
-        # params. The shard object itself is the reliable source of ownership.
-        model_to_shard: Dict[int, torch.nn.Parameter] = {}
-        shard_to_model: Dict[int, torch.nn.Parameter] = {}
-        for model_group, shard_group in zip(model_groups, shard_groups):
-            for zipped_model_param, shard_param in zip(model_group, shard_group):
-                if shard_param is None:
-                    continue
-                model_param = getattr(shard_param, "_model_param", None)
-                if model_param is None:
-                    raise RuntimeError(
-                        "[Dion] grad-norm map build requires shard_param._model_param "
-                        f"for shard shape={tuple(shard_param.shape)}"
-                    )
-                if model_param is not zipped_model_param:
-                    raise RuntimeError(
-                        "[Dion] grad-norm map zip/backlink mismatch: "
-                        f"zip_id={id(zipped_model_param)} backlink_id={id(model_param)} "
-                        f"shard_shape={tuple(shard_param.shape)}"
-                    )
-                model_to_shard[id(model_param)] = shard_param
-                shard_to_model[id(shard_param)] = model_param
-
-        cached = (model_groups, shard_groups, model_to_shard, shard_to_model)
-        self._grad_norm_param_maps = cached
-        self._grad_norm_param_maps_key = key
-        return cached
-
-    def _grad_norm_items(self):
-        """Return cached pre-filtered grad-norm/clip contribution entries."""
-        from megatron.core.transformer.module import param_is_not_shared
-        from megatron.core import tensor_parallel, parallel_state
-
-        cp_size = parallel_state.get_context_parallel_world_size()
-        model_groups, shard_groups, _, _ = self._grad_norm_maps()
-        key = (
-            self._grad_norm_param_maps_key,
-            cp_size,
-        )
-        cached_key = getattr(self, "_grad_norm_entries_key", None)
-        cached = getattr(self, "_grad_norm_entries", None)
-        if cached is not None and cached_key == key:
-            return cached
-
-        dion_entries, non_dion_entries = build_grad_norm_entries_(
-            model_groups=model_groups,
-            shard_groups=shard_groups,
-            is_unshared=param_is_not_shared,
-            is_tp_unique=tensor_parallel.param_is_not_tensor_parallel_duplicate,
-        )
-        cached = {
-            "cp_size": cp_size,
-            "dion_entries": dion_entries,
-            "non_dion_entries": non_dion_entries,
-        }
-        self._grad_norm_entries = cached
-        self._grad_norm_entries_key = key
-        return cached
-
-    def _sync_dion_flags(self) -> None:
-        """Ensure optimizer param objects have `is_dion_param` attribute set.
-
-        Most code paths set `shard_param.is_dion_param` during grad-copy, but this
-        makes the classification robust even if a param is skipped due to missing grad.
-        """
-        opt = getattr(self, "optimizer", None)
-        if opt is None:
-            return
-        param_groups = getattr(opt, "param_groups", None)
-        if not param_groups:
-            return
-
-        key = (id(opt), len(param_groups))
-        if getattr(self, "_dion_flag_cache_key", None) == key:
-            return
-
-        _, _, _, shard_to_model = self._grad_norm_maps()
-        for group in param_groups:
-            for p in group.get("params", []):
-                mp = shard_to_model.get(id(p))
-                if mp is None:
-                    continue
-                if hasattr(mp, "is_dion_param"):
-                    p.is_dion_param = mp.is_dion_param
-
-        self._dion_flag_cache_key = key
-
-
-    def get_main_grads_for_grad_norm(self):
-        """Override to use correct gradient sources for grad norm computation.
-
-        Dion params: use optimizer-side shard grads (`decoupled_grad` / `.grad`) produced
-        by the Dion bridge.
-        Non-Dion params: use stock optimizer-side shard grads (`decoupled_grad` / `.grad`)
-        sliced from canonical `model_param.main_grad`.
-
-        Grad-norm/clip should match the standard global norm semantics.
-        Stock Megatron-Core does not apply an extra CP-only correction factor in the
-        grad-norm path. CP handling must already be reflected in the reduced grad
-        storage before this method runs.
-        """
+        params = self.get_parameters()
         grads_for_norm = []
+        counts = {
+            "total": 0,
+            "grad_not_none": 0,
+            "kept": 0,
+            "shared_dropped": 0,
+            "tp_dup_dropped": 0,
+            "none_dropped": 0,
+        }
+        dropped_examples = []
 
-        if os.environ.get("DION_DEBUG_GROUPS") and not getattr(self, "_logged_grad_stats_group", False):
-            try:
-                from megatron.core import parallel_state
+        for param in params:
+            counts["total"] += 1
+            if getattr(param, "__fsdp_param__", False):
+                grad = param.grad._local_tensor if param.grad is not None else None
+            elif self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+            else:
+                grad = param.grad
 
-                grad_group = self.get_grad_stats_parallel_group()
-                cp_group = parallel_state.get_context_parallel_group()
-                logger.info(
-                    "[DION_GRAD_STATS_GROUP] rank=%s size=%s fs_group_size=%s cp_group_size=%s fs_group_ranks=%s cp_group_ranks=%s",
-                    self._global_rank,
-                    grad_group.size() if grad_group is not None else None,
-                    self.fs_group.size() if getattr(self, "fs_group", None) is not None else None,
-                    cp_group.size() if cp_group is not None else None,
-                    dist.get_process_group_ranks(self.fs_group) if getattr(self, "fs_group", None) is not None else None,
-                    dist.get_process_group_ranks(cp_group) if cp_group is not None else None,
+            grad_not_none = grad is not None
+            if grad_not_none:
+                counts["grad_not_none"] += 1
+            else:
+                counts["none_dropped"] += 1
+
+            is_not_shared = param_is_not_shared(param)
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
+
+            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+                grads_for_norm.append(grad)
+                counts["kept"] += 1
+                continue
+
+            if grad_not_none and not is_not_shared:
+                counts["shared_dropped"] += 1
+            if grad_not_none and not is_not_tp_duplicate:
+                counts["tp_dup_dropped"] += 1
+
+            if len(dropped_examples) < 8:
+                model_param = getattr(param, "_model_param", None)
+                dropped_examples.append(
+                    {
+                        "name": getattr(model_param, "_param_name", getattr(param, "_param_name", f"id_{id(param)}")),
+                        "shape": tuple(param.shape),
+                        "grad": bool(grad_not_none),
+                        "shared": bool(not is_not_shared),
+                        "tp_dup": bool(not is_not_tp_duplicate),
+                        "tp_attr": bool(getattr(param, "tensor_model_parallel", False)),
+                        "partition_dim": int(getattr(param, "partition_dim", -1)),
+                    }
                 )
-            except Exception as error:
-                logger.info("[DION_GRAD_STATS_GROUP_FAILED] err=%r", error)
-            self._logged_grad_stats_group = True
 
-        # Debug: log accumulated copy norm from _copy_model_grads_to_main_grads (no file I/O)
-        if os.environ.get("DEBUG_PERPARAM") and dist.get_rank() == 0 and hasattr(self, "_debug_copy_norm2"):
-            logger.info(
-                "[COPY_TOTAL] %d dion params copied, total_norm=%.6f",
-                int(getattr(self, "_debug_copy_count", 0)),
-                float(getattr(self, "_debug_copy_norm2", 0.0) ** 0.5),
+        logger.warning(
+            "[DION_GRAD_NORM_AUDIT] counts=%s dropped_examples=%s",
+            counts,
+            dropped_examples,
+        )
+
+        if debug_compare:
+            optimizer_sq = torch.zeros(3, dtype=torch.float64, device=torch.cuda.current_device())
+            canonical_sq = torch.zeros(3, dtype=torch.float64, device=torch.cuda.current_device())
+            model_sq = torch.zeros(3, dtype=torch.float64, device=torch.cuda.current_device())
+            all_model_sq = torch.zeros(3, dtype=torch.float64, device=torch.cuda.current_device())
+            scope_sq = torch.zeros(3, dtype=torch.float64, device=torch.cuda.current_device())
+
+            def _grad_attr(param):
+                if getattr(param, "__fsdp_param__", False):
+                    return param.grad._local_tensor if param.grad is not None else None
+                if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                    return param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+                return param.grad
+
+            def _accumulate(dst, idx, grad):
+                if grad is None:
+                    return
+                dst[idx] += grad.detach().float().pow(2).sum().to(dtype=torch.float64)
+
+            def _model_index(model_param):
+                return 0 if getattr(model_param, "is_dion_param", False) else 1
+
+            def _dion_scope(model_param):
+                param_name = self._canonical_param_name(model_param) or ""
+                if param_name.startswith("module.language_model.decoder.layers."):
+                    return 0
+                if param_name.startswith("module.vision_model.decoder.layers."):
+                    return 1
+                return 2
+
+            all_model_seen = set()
+
+            for model_group, shard_group in zip(
+                self.model_float16_groups + self.model_fp32_groups,
+                self.shard_fp32_from_float16_groups + self.shard_fp32_groups,
+            ):
+                if len(model_group) != len(shard_group):
+                    raise RuntimeError(
+                        "[Dion] grad norm compare requires equal model/shard group lengths "
+                        f"model_len={len(model_group)} shard_len={len(shard_group)}"
+                    )
+                for model_param, shard_param in zip(model_group, shard_group):
+                    if shard_param is None:
+                        continue
+                    model_grad = getattr(model_param, "main_grad", None)
+                    if id(model_param) not in all_model_seen:
+                        all_model_seen.add(id(model_param))
+                        idx = _model_index(model_param)
+                        _accumulate(all_model_sq, idx, model_grad)
+                        if idx == 0:
+                            _accumulate(scope_sq, _dion_scope(model_param), model_grad)
+                    is_not_shared = param_is_not_shared(shard_param)
+                    is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                        shard_param
+                    )
+                    if not (is_not_shared and is_not_tp_duplicate):
+                        continue
+
+                    shard_grad = _grad_attr(shard_param)
+                    idx = _model_index(model_param)
+                    _accumulate(optimizer_sq, idx, shard_grad)
+
+                    if model_grad is not None:
+                        _accumulate(model_sq, idx, model_grad)
+                        if getattr(model_param, "is_dion_param", False):
+                            shard_layout = self._param_shard_layout(model_param)
+                            if shard_layout is None:
+                                raise RuntimeError(
+                                    "[Dion] missing shard layout during grad norm compare "
+                                    f"param={self._canonical_param_name(model_param) or id(model_param)}"
+                                )
+                            canonical_grad = slice_fs_shard_2d(
+                                model_grad,
+                                int(shard_layout.fs_split_dim),
+                                int(shard_layout.start_idx),
+                                int(shard_layout.end_idx),
+                            )
+                        else:
+                            param_range = self._get_model_param_range_map(model_param)["param"]
+                            canonical_grad = model_grad.view(-1)[
+                                int(param_range.start) : int(param_range.end)
+                            ].view(shard_param.shape)
+                        _accumulate(canonical_sq, idx, canonical_grad)
+
+            optimizer_sq[2] = optimizer_sq[0] + optimizer_sq[1]
+            canonical_sq[2] = canonical_sq[0] + canonical_sq[1]
+            model_sq[2] = model_sq[0] + model_sq[1]
+            all_model_sq[2] = all_model_sq[0] + all_model_sq[1]
+            torch.distributed.all_reduce(
+                optimizer_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.get_grad_stats_parallel_group(),
             )
-            self._debug_copy_norm2 = 0.0
-            self._debug_copy_count = 0
-
-        grad_norm_entries = self._grad_norm_items()
-        cp_size = grad_norm_entries["cp_size"]
-
-        if cp_size > 1:
-            cp_debug_count = getattr(self, "_cp_gradnorm_debug_count", 0)
-            if cp_debug_count < 1:
-                setattr(self, "_cp_gradnorm_debug_count", cp_debug_count + 1)
-                debug_validate_precomputed_norm_grads_(
-                    dion_entries=grad_norm_entries["dion_entries"],
-                    non_dion_entries=grad_norm_entries["non_dion_entries"],
-                    name_fn=lambda p: self._find_param_name(p) or getattr(p, "_param_name", f"id_{id(p)}"),
+            torch.distributed.all_reduce(
+                canonical_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.get_grad_stats_parallel_group(),
+            )
+            torch.distributed.all_reduce(
+                model_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.get_grad_stats_parallel_group(),
+            )
+            torch.distributed.all_reduce(
+                all_model_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.get_grad_stats_parallel_group(),
+            )
+            torch.distributed.all_reduce(
+                scope_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.get_grad_stats_parallel_group(),
+            )
+            if dist.get_rank() == 0:
+                logger.warning(
+                    "[DION_GRAD_NORM_COMPARE] optimizer_norms=%s canonical_shard_norms=%s "
+                    "model_main_norms=%s all_model_main_norms=%s dion_scope_norms=%s",
+                    [float(x.sqrt().item()) for x in optimizer_sq],
+                    [float(x.sqrt().item()) for x in canonical_sq],
+                    [float(x.sqrt().item()) for x in model_sq],
+                    [float(x.sqrt().item()) for x in all_model_sq],
+                    {
+                        "language": float(scope_sq[0].sqrt().item()),
+                        "vision": float(scope_sq[1].sqrt().item()),
+                        "other": float(scope_sq[2].sqrt().item()),
+                    },
                 )
-
-        debug_gradnorm_every = os.environ.get("DION_DEBUG_GRADNORM_EVERY")
-        if debug_gradnorm_every:
-            try:
-                every_n = int(debug_gradnorm_every)
-            except ValueError:
-                every_n = -1
-            call_idx = int(getattr(self, "_debug_gradnorm_call_idx", 0)) + 1
-            self._debug_gradnorm_call_idx = call_idx
-            if every_n > 0 and call_idx % every_n == 0:
-                log_grad_norm_contributors_(
-                    dion_entries=grad_norm_entries["dion_entries"],
-                    non_dion_entries=grad_norm_entries["non_dion_entries"],
-                    name_fn=lambda p: self._find_param_name(p)
-                    or getattr(p, "_param_name", f"id_{id(p)}"),
-                    step=call_idx,
-                    topk=int(os.environ.get("DION_DEBUG_GRADNORM_TOPK", "12")),
-                )
-
-        append_precomputed_norm_grads_(
-            grads_for_norm=grads_for_norm,
-            dion_entries=grad_norm_entries["dion_entries"],
-            non_dion_entries=grad_norm_entries["non_dion_entries"],
-            name_fn=lambda p: self._find_param_name(p)
-            or getattr(p, "_param_name", f"id_{id(p)}"),
-            step=int(getattr(self, "_debug_gradnorm_call_idx", 0)) or None,
-        )
-
-        if os.environ.get("DION_DEBUG_GRADPTR_RANGES"):
-            try:
-                ptr_to_names = {}
-                for entry in grad_norm_entries["dion_entries"]:
-                    grad = get_optimizer_grad_(entry.shard_param)
-                    if grad is None or grad.numel() == 0:
-                        continue
-                    ptr_to_names.setdefault(grad.data_ptr(), []).append(
-                        ("dion", entry.model_param, entry.shard_param)
-                    )
-                for entry in grad_norm_entries["non_dion_entries"]:
-                    grad = get_optimizer_grad_(entry.shard_param)
-                    if grad is None or grad.numel() == 0:
-                        continue
-                    ptr_to_names.setdefault(grad.data_ptr(), []).append(
-                        ("non_dion", entry.model_param, entry.shard_param)
-                    )
-                for ptr, items in ptr_to_names.items():
-                    if len(items) < 2:
-                        continue
-                    details = []
-                    for kind, model_param, shard_param in items:
-                        try:
-                            range_map = self._get_model_param_range_map(model_param)
-                            local_range = range_map["param"]
-                            world_range = range_map["gbuf_world"]
-                        except Exception:
-                            local_range = None
-                            world_range = None
-                        try:
-                            gbuf_index, _, bucket_index = self.model_param_gbuf_map[model_param]
-                        except Exception:
-                            gbuf_index, bucket_index = None, None
-                        details.append(
-                            {
-                                "kind": kind,
-                                "param": self._find_param_name(model_param) or getattr(model_param, "_param_name", f"id_{id(model_param)}"),
-                                "shard_shape": tuple(shard_param.shape),
-                                "local_range": None if local_range is None else (local_range.start, local_range.end),
-                                "world_range": None if world_range is None else (world_range.start, world_range.end),
-                                "bucket": (gbuf_index, bucket_index),
-                            }
-                        )
-                    logger.error("[DION_GRADPTR_RANGE_DUP] ptr=%s details=%s", ptr, details)
-            except Exception as exc:
-                logger.error("[DION_GRADPTR_RANGE_DUP_FAILED] exc=%r", exc)
-
         return grads_for_norm
-
-    def clip_grad_norm(self, clip_grad: float) -> float:
-        """
-        Override to apply gradient clipping with correct sharding schemes.
-
-        Both Dion and non-Dion params should clip the optimizer-side shard grads
-        (`decoupled_grad` / `.grad`), matching standard Megatron-Core DO semantics
-        as closely as possible. Dion-specific communication is only in how those
-        shard grads are produced, not in how clip-grad consumes them.
-        """
-        from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
-
-        # Compute global grad norm using all shards (Dion + non-Dion params)
-        grads_for_norm = self.get_main_grads_for_grad_norm()
-
-        grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-        )
-
-        # Always-on diagnostics: exact zero global grad norm is a strong signal that
-        # gradients were not wired correctly for this step.
-        if grad_norm == 0.0:
-            log_zero_global_grad_norm_(self.optimizer, len(grads_for_norm))
-
-        # Apply clipping
-        if clip_grad > 0.0 and grad_norm > 0.0:
-            clip_coeff = clip_grad / (grad_norm + 1.0e-6)
-            if clip_coeff < 1.0:
-                grad_norm_entries = self._grad_norm_items()
-                clip_precomputed_grad_groups_(
-                    dion_entries=grad_norm_entries["dion_entries"],
-                    non_dion_entries=grad_norm_entries["non_dion_entries"],
-                    clip_coeff=clip_coeff,
-                )
-
-        return grad_norm
 
     def prepare_grads(self) -> bool:
         """
-        Match stock Megatron-Core prepare_grads semantics.
+        Match standard Megatron-Core prepare_grads semantics.
 
         The standard training loop already calls `finalize_model_grads()`, which in turn
         calls `model_chunk.finish_grad_sync()` before `optimizer.step()`. Repeating
@@ -3773,7 +2776,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         """
         from .cpu_offloading import HybridDeviceOptimizer
         copy_ctx = self._build_param_copy_context()
-        use_prec_opt = copy_ctx["use_prec_opt"]
+        use_precision_aware_optimizer = copy_ctx["use_precision_aware_optimizer"]
         main_shard_groups = copy_ctx["main_shard_groups"]
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer.update_fp32_param_by_new_param()
@@ -3783,7 +2786,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             return
 
         # Precision-aware optimizer early return
-        if use_prec_opt:
+        if use_precision_aware_optimizer:
             return
 
         if state_dict is not None:
@@ -3803,14 +2806,14 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             shard_main_groups=main_shard_groups,
             get_source_param_fn=get_source_param,
             get_param_range_fn=get_param_range,
-            get_dion_info_fn=self._param_dion_info,
+            get_dion_shard_layout_fn=self._param_shard_layout,
         )
         copy_group_params_to_main_shards_(
             model_groups=self.model_fp32_groups,
             shard_main_groups=self.shard_fp32_groups,
             get_source_param_fn=get_source_param,
             get_param_range_fn=get_param_range,
-            get_dion_info_fn=self._param_dion_info,
+            get_dion_shard_layout_fn=self._param_shard_layout,
         )
 
     def _copy_main_params_to_model_params(self):
@@ -3823,15 +2826,10 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         next forward when `overlap_param_gather=True`. In the training path we can
         therefore defer full-param materialization and keep local shards canonical here.
         """
-        pp_world_size = parallel_state.get_pipeline_model_parallel_world_size()
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if pp_world_size > 1:
-            logger.info("[DION_PP_DEBUG] rank=%s before copy_main_to_model", rank)
-
         if self.is_stub_optimizer:
             return
         copy_ctx = self._build_param_copy_context()
-        use_prec_opt = copy_ctx["use_prec_opt"]
+        use_precision_aware_optimizer = copy_ctx["use_precision_aware_optimizer"]
         main_shard_groups = copy_ctx["main_shard_groups"]
 
         # FSDP early return
@@ -3841,7 +2839,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             return
 
         # Precision-aware optimizer early return
-        if use_prec_opt:
+        if use_precision_aware_optimizer:
             return
 
         self._mark_buckets_full_param_ready(False)
@@ -3854,9 +2852,10 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
         self._check_main_shards(main_shard_groups)
 
-        apply_stock_non_dion_shards_(
+        apply_non_dion_shards_(
             model_groups=self.model_float16_groups,
             shard_groups=main_shard_groups,
+            get_param_range_map_fn=self._get_model_param_range_map,
             get_bucket_param_data_fn=self._bucket_param_data,
         )
         _, zero_range_warned = apply_group_shards_to_model_params_(
@@ -3865,7 +2864,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             shard16_groups=self.shard_float16_groups,
             get_data_shard_fn=self._get_data_shard,
             get_param_range_map_fn=self._get_model_param_range_map,
-            get_dion_info_fn=self._param_dion_info,
+            get_dion_shard_layout_fn=self._param_shard_layout,
             get_bucket_param_data_fn=self._bucket_param_data,
             zero_range_warned=zero_range_warned,
         )
@@ -3874,9 +2873,10 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
         # Keep model_fp32_groups current as local shards as well when deferring
         # the expensive full-param restore path.
-        apply_stock_non_dion_shards_(
+        apply_non_dion_shards_(
             model_groups=self.model_fp32_groups,
             shard_groups=self.shard_fp32_groups,
+            get_param_range_map_fn=self._get_model_param_range_map,
             get_bucket_param_data_fn=self._bucket_param_data,
         )
         _, zero_range_warned = apply_group_shards_to_model_params_(
@@ -3885,20 +2885,13 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             shard16_groups=self.shard_fp32_groups,
             get_data_shard_fn=self._get_data_shard,
             get_param_range_map_fn=self._get_model_param_range_map,
-            get_dion_info_fn=self._param_dion_info,
+            get_dion_shard_layout_fn=self._param_shard_layout,
             get_bucket_param_data_fn=self._bucket_param_data,
             zero_range_warned=zero_range_warned,
         )
         self._zero_range_warned = zero_range_warned
 
-        if os.getenv("DION_DEBUG_COMPARE_FS_PACK", "0") == "1":
-            self._debug_fs_pack_compare_armed = True
-
-        if pp_world_size > 1:
-            logger.info("[DION_PP_DEBUG] rank=%s after copy_main_to_model norestore", rank)
         return
-        if pp_world_size > 1:
-            logger.info("[DION_PP_DEBUG] rank=%s after copy_main_to_model restore", rank)
 
 
 
@@ -3947,11 +2940,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
     @torch.no_grad()
     def step_with_ready_grads(self):
-        """Step optimizer with extra PP debug logging."""
-        pp_world_size = parallel_state.get_pipeline_model_parallel_world_size()
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if pp_world_size > 1:
-            logger.info("[DION_PP_DEBUG] rank=%s before optimizer_step_with_ready_grads", rank)
+        """Step optimizer after gradient synchronization completes."""
 
         timers = self.config.timers
         if timers is not None:
@@ -3959,11 +2948,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            if pp_world_size > 1:
-                logger.info("[DION_PP_DEBUG] rank=%s before inner_optimizer_step", rank)
             self.optimizer.step()
-            if pp_world_size > 1:
-                logger.info("[DION_PP_DEBUG] rank=%s after inner_optimizer_step", rank)
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
@@ -3979,9 +2964,6 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 self._copy_main_params_to_model_params()
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
-
-        if pp_world_size > 1:
-            logger.info("[DION_PP_DEBUG] rank=%s after optimizer_step_with_ready_grads", rank)
         return True
 
     def sharded_state_dict(
@@ -3991,12 +2973,12 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         sharding_type=None,
         metadata=None,
     ):
-        """Build optimizer checkpoint state with stock common-state structure.
+        """Build optimizer checkpoint state with standard common-state structure.
 
-        Legacy checkpoint IO remains on the inherited stock path.
-        For distributed checkpoint, keep the stock common optimizer-state layout
+        Legacy checkpoint IO remains on the inherited standard path.
+        For distributed checkpoint, keep the standard common optimizer-state layout
         and store only Dion-specific per-param state as an extra payload keyed by
-        deterministic param name.
+        logical `param_uid`.
         """
         from ..dist_checkpointing.mapping import ShardedObject
 
@@ -4015,13 +2997,13 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         }
 
         # Part 2: Dion-only persistent parameter state. Keep it separate from the
-        # stock distributed-optimizer param_state protocol because Dion carries
-        # arbitrary-shape tensors such as Q that the stock sharding formats do not
+        # standard distributed-optimizer param_state protocol because Dion carries
+        # arbitrary-shape tensors such as Q that the standard sharding formats do not
         # represent.
-        dion_param_state = build_named_dion_param_state(
+        dion_param_state = build_persistent_dion_param_state(
             self.optimizer.param_groups,
             self.optimizer.state,
-            self._shard_name,
+            self._shard_param_uid,
         )
         state_dict['dion_param_state'] = ShardedObject(
             f'{base_key}.dion_param_state', dion_param_state, (1,), (0,),
@@ -4031,7 +3013,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
-        """Load optimizer checkpoint state with stock common-state outer protocol."""
+        """Load optimizer checkpoint state with standard common-state outer protocol."""
         dion_param_state = state_dict.get('dion_param_state', None)
         if dion_param_state is None and state_dict.get('param_state_sharding_type') == 'dion_non_reshardable':
             dion_param_state = state_dict.get('param_state', None)
@@ -4052,28 +3034,26 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         if not isinstance(dion_param_state, dict) or len(dion_param_state) == 0:
             raise RuntimeError("[Dion] distributed checkpoint missing Dion param state payload")
 
-        restore_summary = restore_named_dion_param_state_(
+        restore_summary = restore_persistent_dion_param_state_(
             param_groups=self.optimizer.param_groups,
             optimizer_state=self.optimizer.state,
-            get_param_name_fn=self._shard_name,
-            name_to_state=dion_param_state,
+            get_param_key_fn=self._shard_param_uid,
+            key_to_state=dion_param_state,
         )
-        if restore_summary["unnamed"] > 0:
-            logger.warning(
-                '[Dion] Restored %s Dion param states from distributed checkpoint '
-                '(no_payload_entry=%s, unnamed=%s)',
-                restore_summary["restored"],
-                restore_summary["no_payload_entry"],
-                restore_summary["unnamed"],
+        if restore_summary["unnamed"] > 0 or restore_summary["no_payload_entry"] > 0:
+            raise RuntimeError(
+                "[Dion] distributed checkpoint restore left unresolved param state entries "
+                f"(restored={restore_summary['restored']} "
+                f"no_payload_entry={restore_summary['no_payload_entry']} "
+                f"unnamed={restore_summary['unnamed']})"
             )
-        else:
-            logger.info(
-                '[Dion] Restored %s Dion param states from distributed checkpoint '
-                '(no_payload_entry=%s, unnamed=%s)',
-                restore_summary["restored"],
-                restore_summary["no_payload_entry"],
-                restore_summary["unnamed"],
-            )
+        logger.info(
+            '[Dion] Restored %s Dion param states from distributed checkpoint '
+            '(no_payload_entry=%s, unnamed=%s)',
+            restore_summary["restored"],
+            restore_summary["no_payload_entry"],
+            restore_summary["unnamed"],
+        )
 
         # Sync fp32 main params from bf16 model params.
         # The fp32 copies still hold stale values from __init__ (cloned before checkpoint
@@ -4082,7 +3062,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         self._copy_model_params_to_main_params()
 
     def _ensure_dion_state_initialized_for_load(self):
-        """Initialize Dion optimizer state tensors before calling stock common-state load."""
+        """Initialize Dion optimizer state tensors before calling standard common-state load."""
         init_state_fn = getattr(self.optimizer, "_init_state", None)
         if init_state_fn is None:
             return
@@ -4094,26 +3074,6 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     state = self.optimizer.state[param]
                 if len(state) == 0:
                     init_state_fn(param, state, group)
-
-    def _shard_name(self, shard_param):
-        """Get deterministic model param name for a shard param.
-
-        Traces shard_param → model_param → param_to_name mapping.
-        Returns None if name cannot be found.
-        """
-        param_name = self._shard_name_cache().get(id(shard_param))
-        if param_name is not None:
-            return param_name
-
-        model_param = getattr(shard_param, '_model_param', None)
-        if model_param is None:
-            _, _, _, shard_to_model = self._grad_norm_maps()
-            model_param = shard_to_model.get(id(shard_param))
-        if model_param is None:
-            model_param = self._model_by_shard().get(id(shard_param))
-        if model_param is None:
-            return None
-        return self._model_name_cache().get(id(model_param))
 
     def offload_to_cpu(self):
         """Clean up Dion-specific buffers during offload.

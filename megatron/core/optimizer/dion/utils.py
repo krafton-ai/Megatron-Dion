@@ -3,8 +3,6 @@
 from typing import Optional, Tuple
 
 import torch
-from torch import Tensor
-
 from .types import MegatronDionDistMeta
 
 
@@ -32,11 +30,9 @@ def get_global_shape(
             raise RuntimeError(
                 "Dion distributed param is missing global_shape required for "
                 f"LR/rank scaling: local_shape=({local_m}, {local_n}) "
-                f"buffer={getattr(meta, 'buffer_idx', 'NA')} "
-                f"bucket={getattr(meta, 'bucket_idx', 'NA')} "
                 f"param={getattr(meta, 'param_name', '')}"
             )
-    # Local non-distributed fallback.
+    # Local non-distributed case.
     return (local_m, local_n)
 
 
@@ -66,50 +62,9 @@ def str_to_dtype(dtype_val) -> Optional[torch.dtype]:
     }
     if isinstance(dtype_val, str):
         dtype_lower = dtype_val.lower()
+        if dtype_lower.startswith("torch."):
+            dtype_lower = dtype_lower.split(".", 1)[1]
         if dtype_lower in dtype_map:
             return dtype_map[dtype_lower]
         raise ValueError(f"Unknown dtype string: {dtype_val}")
     return dtype_val
-
-
-def infer_local_2d_shape(
-    p: Tensor,
-    meta: MegatronDionDistMeta,
-) -> Optional[Tuple[int, int]]:
-    """Infer local 2D shape from flattened parameter in Distributed mode.
-
-    Args:
-        p: Parameter tensor (may be flattened)
-        meta: Distribution metadata for the parameter
-
-    Returns:
-        Tuple of (m_local, n_local) or None if not a valid 2D parameter
-    """
-    if meta is None or meta.global_shape is None or len(meta.global_shape) != 2:
-        return None
-
-    m_g, n_g = meta.global_shape  # noqa: F841
-    elems = p.numel()
-
-    if meta.tp_split_dim == 1:
-        if meta.shape is None or len(meta.shape) != 2:
-            raise RuntimeError("meta.shape is missing for tp_split_dim == 1")
-        n_local = meta.shape[1]
-        if elems % n_local != 0:
-            raise RuntimeError(f"FS slice size {elems} not divisible by n_local {n_local}")
-        m_local = elems // n_local
-        return m_local, n_local
-    elif meta.tp_split_dim == 0:
-        if meta.shape is None or len(meta.shape) != 2:
-            raise RuntimeError("meta.shape is missing for tp_split_dim == 0")
-        m_local_pre_fs = meta.shape[0]
-        if elems % m_local_pre_fs != 0:
-            raise RuntimeError(f"FS slice size {elems} not divisible by m_local_pre_fs {m_local_pre_fs}")
-        n_local = elems // m_local_pre_fs
-        return m_local_pre_fs, n_local
-    else:
-        n_local = n_g
-        if elems % n_local != 0:
-            raise RuntimeError(f"FS slice size {elems} not divisible by n_global {n_local}")
-        m_local = elems // n_local
-        return m_local, n_local

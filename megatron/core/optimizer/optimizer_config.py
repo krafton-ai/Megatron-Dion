@@ -38,6 +38,12 @@ class OptimizerConfig:
     min_lr: Optional[float] = None
     """Minumum value for learning rate. The scheduler clip values below this threshold."""
 
+    decoupled_lr: Optional[float] = None
+    """Separate learning rate for the input and output layer."""
+
+    decoupled_min_lr: Optional[float] = None
+    """Minimum learning rate for the input and output layer."""
+
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
 
@@ -340,6 +346,9 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_scalar_optimizer: str = "adamw"
     """Optimizer for 1D parameters: 'lion' or 'adamw'."""
 
+    dion_lr_scaling: str = "moonlight"
+    """2D Dion learning-rate scaling rule: 'moonlight' or 'dion'."""
+
     dion_beta1: float = 0.9
     """Beta1 for scalar optimizer (AdamW/Lion)."""
 
@@ -354,6 +363,12 @@ class DionOptimizerConfig(OptimizerConfig):
 
     dion_Q_dtype: Optional[torch.dtype] = torch.float32
     """Dtype for Q basis matrices. Recommended: float32 for stability."""
+
+    dion_local_batch_size: Optional[int] = None
+    """Optional local-only Dion batch limit."""
+
+    dion_max_concurrent_tasks: Optional[int] = None
+    """Optional async Dion task width. EP>1 must set this explicitly to 1."""
 
     # 2D Parallelism for Dion
     fully_shard_model_parallel_size: int = 1

@@ -36,7 +36,5 @@ def release_rs_buffers_(buffers) -> None:
     """Release cached RS buffers after async grad sync completes."""
     for buffer in buffers or []:
         for bucket in getattr(buffer, "buckets", []):
-            if hasattr(bucket, "dion_grad_buffer") and bucket.dion_grad_buffer is not None:
-                bucket.dion_grad_buffer = None
-            if hasattr(bucket, "_cached_rs_pack_buffer") and bucket._cached_rs_pack_buffer is not None:
-                bucket._cached_rs_pack_buffer = None
+            if hasattr(bucket, "dion_state"):
+                bucket.dion_state = None

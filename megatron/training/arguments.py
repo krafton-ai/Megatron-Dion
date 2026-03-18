@@ -1006,10 +1006,6 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size == 1, \
             "retro currently does not support pipeline parallelism."
 
-    if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
-        assert not args.use_legacy_models, \
-            '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
-
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
@@ -1224,6 +1220,12 @@ def validate_args(args, defaults={}):
     elif args.replication_jump:
         print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
+
+    if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
+        if args.use_legacy_models:
+            raise RuntimeError(
+                '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
+            )
 
     if args.delay_wgrad_compute:
         assert args.transformer_impl == 'transformer_engine', \
@@ -2279,6 +2281,10 @@ def _add_training_args(parser):
     group.add_argument('--dion-scalar-optimizer', type=str, default='adamw',
                        choices=['lion', 'adamw'],
                        help='Scalar optimizer for 1D parameters in Dion.')
+    group.add_argument('--dion-lr-scaling', type=str, default='moonlight',
+                       choices=['moonlight', 'dion'],
+                       help='2D Dion LR scaling rule. "moonlight" keeps the current Megatron rule; '
+                            '"dion" matches dion_reference.py scaling.')
     group.add_argument('--dion-beta1', type=float, default=0.9,
                        help='Beta1 for Dion scalar optimizer.')
     group.add_argument('--dion-beta2', type=float, default=0.95,
@@ -2450,6 +2456,11 @@ def _add_learning_rate_args(parser):
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minimum value for learning rate. The scheduler'
                        'clip values below this threshold.')
+    group.add_argument('--decoupled-lr', type=float, default=None,
+                       help='Separate learning rate for the input and output layer')
+    group.add_argument('--decoupled-min-lr', type=float, default=None,
+                       help='Minimum value for learning rate for the input and output layer. The scheduler'
+                       'clip values below this threshold')
     group.add_argument('--override-opt_param-scheduler', '--override-opt-param-scheduler',
                        action='store_true',
                        help='Reset the values of the scheduler (learning rate,'
@@ -2463,12 +2474,6 @@ def _add_learning_rate_args(parser):
                        '(learning rate, warmup iterations, minimum learning '
                        'rate, maximum number of iterations, and decay style '
                        'from checkpoint and ignore input arguments.')
-    group.add_argument('--decoupled-lr', type=float, default=None,
-                       help='Separate learning rate for the input and output layer')
-    group.add_argument('--decoupled-min-lr', type=float, default=None,
-                       help='Minimum value for learning rate for the input and output layer. The scheduler'
-                       'clip values below this threshold')
-
     return parser
 
 

@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-import os
 from contextlib import contextmanager
 from typing import Optional
 
@@ -20,12 +19,6 @@ from .param_and_grad_buffer import (
     _ParamAndGradBuffer,
     partition_buckets,
 )
-
-# Import is_dion_param for Dion parameter classification
-try:
-    from megatron.core.optimizer.distrib_optimizer_for_dion import is_dion_param as _is_dion_param_fn
-except ImportError:
-    _is_dion_param_fn = None
 
 logger = logging.getLogger(__name__)
 
@@ -157,18 +150,6 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # Store param_to_name for backward hook to use name-based matching
         self.param_to_name = param_to_name
-
-        # Classify params and set is_dion_param attribute
-        self._dion_param_ids = set()
-        if _is_dion_param_fn is not None:
-            _dion_count = 0
-            for param, name in param_to_name.items():
-                param.is_dion_param = _is_dion_param_fn(param, name)
-                if param.is_dion_param:
-                    _dion_count += 1
-                    self._dion_param_ids.add(id(param))
-            if torch.distributed.get_rank() == 0:
-                logger.info(f"[Dion] Classified {_dion_count}/{len(param_to_name)} params as Dion")
 
         def _allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor
@@ -474,70 +455,6 @@ class DistributedDataParallel(_BaseDataParallel):
                 bucket_group.finish_param_sync(
                     skip_next_bucket_dispatch=skip_next_bucket_dispatch
                 )
-                bucket = bucket_group.param_to_bucket.get(param)
-                if (
-                    bucket is not None
-                    and getattr(bucket, "_dion_requires_param_sync_check", False)
-                    and not getattr(bucket, "_dion_full_param_ready", True)
-                ):
-                    raise RuntimeError(
-                        f"[Dion] forward pre-hook observed stale full params for bucket "
-                        f"{getattr(bucket, 'bucket_id', -1)} param shape={tuple(param.shape)}"
-                    )
-
-                if (
-                    os.getenv("DION_FULL_PARAM_REPLICA_DIAG", "0") == "1"
-                    and getattr(self, "dp_cp_group", None) is not None
-                    and torch.distributed.get_world_size(self.dp_cp_group) > 1
-                ):
-                    target = os.getenv("DION_FULL_PARAM_REPLICA_NAME", "")
-                    param_name = self.param_to_name.get(param, "")
-                    if target and target in param_name:
-                        tol = float(os.getenv("DION_FULL_PARAM_REPLICA_TOL", "1e-6"))
-                        warn_cap = int(os.getenv("DION_FULL_PARAM_REPLICA_MAX_LOGS", "16"))
-                        warn_count = getattr(self, "_dion_full_param_diag_warn_count", 0)
-                        if warn_count < warn_cap:
-                            tensor = param.data.detach().float()
-                            flat = tensor.view(-1)
-                            sample = flat[: min(16, flat.numel())].cpu().tolist()
-                            fp = {
-                                "name": param_name,
-                                "shape": tuple(tensor.shape),
-                                "norm": float(tensor.norm().item()),
-                                "sum": float(tensor.sum().item()),
-                                "amax": float(tensor.abs().max().item()) if flat.numel() > 0 else 0.0,
-                                "sample": sample,
-                            }
-                            gathered = [None] * torch.distributed.get_world_size(self.dp_cp_group)
-                            torch.distributed.all_gather_object(gathered, fp, group=self.dp_cp_group)
-                            ref = gathered[0]
-                            mismatch_ranks = []
-                            for idx, entry in enumerate(gathered[1:], start=1):
-                                same = (
-                                    entry["shape"] == ref["shape"]
-                                    and abs(entry["norm"] - ref["norm"]) <= tol
-                                    and abs(entry["sum"] - ref["sum"]) <= tol
-                                    and abs(entry["amax"] - ref["amax"]) <= tol
-                                    and len(entry["sample"]) == len(ref["sample"])
-                                )
-                                if same:
-                                    for lhs, rhs in zip(ref["sample"], entry["sample"]):
-                                        if abs(lhs - rhs) > tol:
-                                            same = False
-                                            break
-                                if not same:
-                                    mismatch_ranks.append(idx)
-                            if mismatch_ranks:
-                                setattr(self, "_dion_full_param_diag_warn_count", warn_count + 1)
-                                logger.error(
-                                    "[DION_FULL_PARAM_REPLICA_MISMATCH] rank=%s group_ranks=%s param=%s "
-                                    "mismatch_local_ranks=%s gathered=%s",
-                                    torch.distributed.get_rank(),
-                                    torch.distributed.get_process_group_ranks(self.dp_cp_group),
-                                    param_name,
-                                    mismatch_ranks,
-                                    gathered,
-                                )
 
         return hook
 
@@ -559,9 +476,6 @@ class DistributedDataParallel(_BaseDataParallel):
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
 
-                # Read is_dion_param attribute set during DDP init
-                is_dion = getattr(param, 'is_dion_param', False)
-
                 # GRAD_FUSION=1: skip processing, TE writes directly to main_grad
                 # GRAD_FUSION=0: process gradients from param.grad
                 should_process_grad = (
@@ -572,14 +486,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 )
 
                 if should_process_grad:
-                    if is_dion:
-                        # Dion params: accumulate to main_grad, packing in start_grad_sync
-                        param.main_grad.add_(param.grad.data)
-                    else:
-                        # Stock Megatron-Core DO contract: always accumulate non-Dion grads
-                        # directly into canonical model-side main_grad, regardless of whether
-                        # the bucket is pure non-Dion or mixed with Dion params.
-                        param.main_grad.add_(param.grad.data)
+                    param.main_grad.add_(param.grad.data)
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:

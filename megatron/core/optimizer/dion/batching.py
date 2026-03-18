@@ -1,54 +1,82 @@
-"""
-Dion optimizer batch processing utilities.
-"""
+"""Dion optimizer batching helpers aligned with the reference implementation."""
 
-from typing import List
+from __future__ import annotations
+
+from typing import Iterable, Iterator, List, Sequence
 
 import torch
 from torch import Tensor
 
-from .constants import DEFAULT_MAX_BATCH_SIZE
+
+def _normalize_shard_dim(dim, has_axis: bool) -> int:
+    if dim is None and not has_axis:
+        return -1
+    if dim is None:
+        raise RuntimeError(
+            "[Dion] missing shard tensor dim for active sharded axis in batch key construction"
+        )
+    return int(dim)
+
+
+def build_batch_key(shape, cfg, dtype: torch.dtype) -> tuple:
+    """Build the canonical Dion batch key used by local/distributed runtimes."""
+    if len(shape) == 2:
+        resolved_shape = (int(shape[0]), int(shape[1]))
+    else:
+        resolved_shape = tuple(int(dim) for dim in shape)
+    return (
+        resolved_shape,
+        bool(cfg.has_fs_axis),
+        bool(cfg.has_tp_axis),
+        bool(cfg.is_transposed),
+        bool(cfg.compressed_all_reduce),
+        _normalize_shard_dim(cfg.inner_shard_tensor_dim, cfg.has_tp_axis),
+        _normalize_shard_dim(cfg.outer_shard_tensor_dim, cfg.has_fs_axis),
+        dtype,
+    )
 
 
 class BatchProcessor:
     """Handles batch processing for Dion optimizer to ensure mathematical equivalence."""
-    def __init__(self, max_batch_size: int = DEFAULT_MAX_BATCH_SIZE):
+
+    def __init__(self, max_batch_size: int | None = None):
+        if max_batch_size is not None and int(max_batch_size) <= 0:
+            raise ValueError(f"Invalid max_batch_size={max_batch_size}")
         self.max_batch_size = max_batch_size
 
-    def create_batches(self, params, configs):
-        """Group parameters into reference-aligned batches while preserving input order."""
-        # Match reference batching semantics:
-        # - preserve first-seen parameter order
-        # - separate by sharding configuration, local shape, and dtype
-        shape_groups = {}
-        for (p, group), cfg in zip(params, configs):
-            shard_key = (
-                cfg.has_fs_axis,
-                cfg.has_tp_axis,
-                cfg.is_transposed,
-                cfg.outer_shard_tensor_dim,
-                cfg.inner_shard_tensor_dim,
+    def group_items(self, items: Sequence, batch_keys: Sequence[tuple]) -> list[tuple[tuple, list]]:
+        """Group items by canonical batch key while preserving first-seen key order."""
+        if len(items) != len(batch_keys):
+            raise RuntimeError(
+                f"[Dion] item/key length mismatch for batching: items={len(items)} keys={len(batch_keys)}"
             )
-            shape_key = tuple(p.shape) if len(p.shape) == 2 else (p.numel(),)
-            key = (shard_key, shape_key, p.dtype)
+        grouped = {}
+        for item, batch_key in zip(items, batch_keys):
+            grouped.setdefault(batch_key, []).append(item)
+        return list(grouped.items())
 
-            if key not in shape_groups:
-                shape_groups[key] = []
-            shape_groups[key].append((p, group, cfg))
-
-        # Dict insertion order preserves first occurrence order, matching reference.
-        for key in shape_groups.keys():
-            param_group = shape_groups[key]
-            for i in range(0, len(param_group), self.max_batch_size):
-                batch = param_group[i:i+self.max_batch_size]
+    def create_batches(
+        self,
+        items: Sequence,
+        batch_keys: Sequence[tuple],
+        batch_size: int | None = None,
+    ) -> Iterator[list]:
+        """Yield canonical batches, preserving first-seen group order."""
+        limit = self.max_batch_size if batch_size is None else batch_size
+        if limit is not None and int(limit) <= 0:
+            raise ValueError(f"Invalid batch_size={limit}")
+        for _, group_items in self.group_items(items, batch_keys):
+            effective_limit = len(group_items) if limit is None else int(limit)
+            for i in range(0, len(group_items), effective_limit):
+                batch = group_items[i : i + effective_limit]
                 if batch:
                     yield batch
 
 
 def pad_batch(batch: List[Tensor], batch_size: int) -> List[Tensor]:
-    """Match dion_reference.pad_batch(): use empty_like dummy tensors."""
+    """Pad with inert zero tensors so partial distributed batches remain numerically stable."""
     assert len(batch) > 0
     assert len(batch) <= batch_size
     while len(batch) < batch_size:
-        batch.append(torch.empty_like(batch[0]))
+        batch.append(torch.zeros_like(batch[0]))
     return batch

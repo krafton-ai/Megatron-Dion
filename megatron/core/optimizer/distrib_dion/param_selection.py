@@ -1,7 +1,7 @@
-"""Dion vs non-Dion parameter classification.
+"""Dion parameter classification.
 
-Keep this logic centralized so classification is consistent across the
-distributed optimizer plumbing.
+Keep this logic centralized so DDP, distributed optimizer setup, and focused
+validation scripts all classify the same params the same way.
 """
 
 from __future__ import annotations
@@ -11,24 +11,17 @@ from typing import Optional
 import torch
 
 from ...fp8_utils import is_float8tensor
+def annotate_dion_candidates(module: torch.nn.Module) -> None:
+    """Mark all local parameters as potential Dion candidates.
 
-
-# Keywords that exclude a 2D parameter from Dion classification.
-#
-# Note: router and experts are included in Dion (intentionally not excluded).
-DION_EXCLUDE_KEYWORDS = [
-    "embedding",
-    "word_embeddings",
-    "position_embeddings",
-    "output_layer",
-    "lm_head",
-    "vocab",
-    "norm",
-    "layernorm",
-    "rmsnorm",
-    "groupnorm",
-    "batchnorm",
-]
+    The final Dion decision remains centralized in `is_dion_param()`, which
+    applies the dimensionality / dtype / manual-disable checks. Marking every
+    parameter here lets the runtime opt any eligible 2D parameter into Dion,
+    including embeddings, lm heads, projector layers, and other trainable 2D
+    surfaces.
+    """
+    for param in module.parameters():
+        param.dion_candidate = True
 
 
 def is_dion_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool:
@@ -37,23 +30,26 @@ def is_dion_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool
     Rule:
     - Manual override: `param.use_dion is False` disables Dion.
     - Must be 2D.
+    - Exclude embedding/output and lm-head surfaces (scalar path).
     - Exclude FP8 tensors (handled by standard DO path).
-    - Exclude known embedding/output/norm parameters by name.
     """
     if getattr(param, "use_dion", None) is False:
+        return False
+
+    if not getattr(param, "dion_candidate", False):
         return False
 
     if param.ndim != 2:
         return False
 
-    if is_float8tensor(param):
+    if getattr(param, "is_embedding_or_output_parameter", False):
         return False
 
-    if param_name:
-        name_lower = param_name.lower()
-        for keyword in DION_EXCLUDE_KEYWORDS:
-            if keyword in name_lower:
-                return False
+    if getattr(param, "is_lm_head_parameter", False):
+        return False
+
+    if is_float8tensor(param):
+        return False
 
     return True
 

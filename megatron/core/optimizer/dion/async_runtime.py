@@ -1,10 +1,6 @@
-"""
-Dion optimizer async task runtime.
-"""
+"""Dion optimizer async task runtime."""
 
 from typing import Generator, List
-
-from .constants import DEFAULT_MAX_CONCURRENT_TASKS
 
 
 class AsyncTask:
@@ -29,10 +25,11 @@ class AsyncTask:
 
 class AsyncRuntime:
     """Runtime for managing and executing async tasks concurrently."""
-    def __init__(self, tasks: Generator[AsyncTask, None, None],
-                 max_concurrent_tasks: int = DEFAULT_MAX_CONCURRENT_TASKS):
+    def __init__(self, tasks: Generator[AsyncTask, None, None], max_concurrent_tasks: int):
+        if int(max_concurrent_tasks) <= 0:
+            raise ValueError(f"Invalid max_concurrent_tasks={max_concurrent_tasks}")
         self.tasks: List[AsyncTask] = list(tasks)
-        self.max_concurrent = max_concurrent_tasks
+        self.max_concurrent = int(max_concurrent_tasks)
 
     def run(self):
         """Execute all tasks with controlled concurrency."""
