@@ -110,6 +110,7 @@ class _ParamAndGradBucket:
         numel_unpadded: int,
         gradient_scaling_factor: float,
         bucket_id: int,
+        param_to_index: Optional[Dict[torch.nn.Parameter, tuple[int, int]]] = None,
     ):
         self.params_list = params
         self.params = set(params)
@@ -123,11 +124,14 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
-        self.param_to_index = {}
-        offset = 0
-        for param in params:
-            self.param_to_index[param] = (offset, offset + param.numel())
-            offset += param.numel()
+        if param_to_index is None:
+            self.param_to_index = {}
+            offset = 0
+            for param in params:
+                self.param_to_index[param] = (offset, offset + param.numel())
+                offset += param.numel()
+        else:
+            self.param_to_index = param_to_index
 
         # Dion transport metadata.
         self.dion_shard_group = None
@@ -260,9 +264,14 @@ class _ParamAndGradBucketGroup:
         if not target_names:
             return
         targets = set(target_names.split(","))
+        optimizer = getattr(bucket, "dion_optimizer", None)
+        optimizer_name_map = getattr(optimizer, "param_to_name", None)
         selected_params = []
         for param in bucket.params_list:
-            param_name = self.param_to_name.get(param, "")
+            if optimizer_name_map is not None:
+                param_name = optimizer_name_map.get(param, "")
+            else:
+                param_name = getattr(param, "_param_name", "")
             if param_name in targets:
                 selected_params.append((param, param_name))
         if not selected_params:
@@ -284,15 +293,19 @@ class _ParamAndGradBucketGroup:
             int(bucket_flat.numel()),
         )
         for param, param_name in selected_params:
+            logical_name = ""
+            if optimizer is not None and hasattr(optimizer, "_logical_param_name"):
+                logical_name = optimizer._logical_param_name(param) or ""
             start, end = bucket.param_to_index[param]
             bucket_view = bucket.param_data.view(-1)[start:end].view(param.shape)
             param_flat = param.data.detach().float().view(-1)
             bucket_view_flat = bucket_view.detach().float().view(-1)
             logger.warning(
-                "[DION_PARAM_SYNC_PARAM] param=%s is_dion=%s data_norm=%s data_sum=%s "
+                "[DION_PARAM_SYNC_PARAM] param=%s logical_param=%s is_dion=%s data_norm=%s data_sum=%s "
                 "data_amax=%s data_ptr=%s bucket_view_norm=%s bucket_view_sum=%s "
                 "bucket_view_amax=%s bucket_view_ptr=%s",
                 param_name,
+                logical_name,
                 bool(getattr(param, "is_dion_param", False)),
                 float(param_flat.norm().item()) if param_flat.numel() > 0 else 0.0,
                 float(param_flat.sum().item()) if param_flat.numel() > 0 else 0.0,
@@ -786,6 +799,35 @@ class _ParamAndGradBucketGroup:
                         m, n = grad.numel(), 1
 
                 grad_2d = grad.view(m, n)
+                optimizer = getattr(bucket, "dion_optimizer", None)
+                logical_name = ""
+                if optimizer is not None and hasattr(optimizer, "_logical_param_name"):
+                    logical_name = optimizer._logical_param_name(bucket_param) or ""
+                param_name = getattr(bucket_param, "_param_name", "")
+                debug_targets = {
+                    item.strip()
+                    for item in os.getenv("DION_DEBUG_HOOK_PARAMS", "").split(",")
+                    if item.strip()
+                }
+                should_debug = bool(debug_targets) and (
+                    param_name in debug_targets
+                    or logical_name in debug_targets
+                    or any(logical_name.endswith(target) for target in debug_targets)
+                )
+                if should_debug:
+                    logger.warning(
+                        "[DION_PACK_MAIN_GRAD] bucket=%s param=%s logical_param=%s grad_sum=%s grad_norm=%s fs_split_dim=%s size_per_rank=%s global_shape=%s local_shape=%s shard_offset=%s",
+                        bucket.bucket_id,
+                        param_name,
+                        logical_name,
+                        float(grad_2d.detach().float().sum().item()),
+                        float(grad_2d.detach().float().norm().item()),
+                        int(fs_split_dim),
+                        int(size_per_rank),
+                        tuple(int(x) for x in global_shape),
+                        tuple(int(x) for x in local_shape),
+                        int(shard_offset),
+                    )
                 # Scale the buffered Dion shard before reduce-scatter.
                 is_expert_bucket = not getattr(bucket_param, 'allreduce', True)
                 if is_expert_bucket:
@@ -812,6 +854,19 @@ class _ParamAndGradBucketGroup:
                     buf_offset = rank_j * dion_shard_size + shard_offset
                     out = grad_buffer[buf_offset:buf_offset + seg_2d.numel()].view_as(seg_2d)
                     out.copy_(seg_2d)
+                    if should_debug:
+                        logger.warning(
+                            "[DION_PACK_MAIN_GRAD_SEG] bucket=%s param=%s logical_param=%s rank_j=%s seg_sum=%s seg_norm=%s start_idx=%s end_idx=%s buf_offset=%s",
+                            bucket.bucket_id,
+                            param_name,
+                            logical_name,
+                            int(rank_j),
+                            float(seg_2d.detach().float().sum().item()),
+                            float(seg_2d.detach().float().norm().item()),
+                            int(start_idx),
+                            int(end_idx),
+                            int(buf_offset),
+                        )
                     if scale != 1.0:
                         out.mul_(scale)
 
@@ -999,10 +1054,51 @@ class _ParamAndGradBucketGroup:
                     tuple(int(dim) for dim in entry.local_shape)
                 )
                 model_grad_2d = model_grad.view(model_param.shape)
+                optimizer = getattr(bucket, "dion_optimizer", None)
+                logical_name = ""
+                if optimizer is not None and hasattr(optimizer, "_logical_param_name"):
+                    logical_name = optimizer._logical_param_name(model_param) or ""
+                param_name = getattr(model_param, "_param_name", "")
+                debug_targets = {
+                    item.strip()
+                    for item in os.getenv("DION_DEBUG_HOOK_PARAMS", "").split(",")
+                    if item.strip()
+                }
+                should_debug = bool(debug_targets) and (
+                    param_name in debug_targets
+                    or logical_name in debug_targets
+                    or any(logical_name.endswith(target) for target in debug_targets)
+                )
+                if should_debug:
+                    model_grad_float = model_grad_2d.detach().float()
+                    local_shard_float = local_shard.detach().float()
+                    logger.warning(
+                        "[DION_MATERIALIZE_LOCAL_GRAD] phase=before bucket=%s param=%s logical_param=%s model_grad_sum=%s local_shard_sum=%s fs_split_dim=%s range=[%s:%s]",
+                        bucket.bucket_id,
+                        param_name,
+                        logical_name,
+                        float(model_grad_float.sum().item()),
+                        float(local_shard_float.sum().item()),
+                        int(entry.fs_split_dim),
+                        int(entry.start_idx),
+                        int(entry.end_idx),
+                    )
                 if entry.fs_split_dim == 0:
                     model_grad_2d[entry.start_idx : entry.end_idx, :].copy_(local_shard)
                 else:
                     model_grad_2d[:, entry.start_idx : entry.end_idx].copy_(local_shard)
+                if should_debug:
+                    logger.warning(
+                        "[DION_MATERIALIZE_LOCAL_GRAD] phase=after bucket=%s param=%s logical_param=%s model_grad_sum=%s local_shard_sum=%s fs_split_dim=%s range=[%s:%s]",
+                        bucket.bucket_id,
+                        param_name,
+                        logical_name,
+                        float(model_grad_2d.detach().float().sum().item()),
+                        float(local_shard.detach().float().sum().item()),
+                        int(entry.fs_split_dim),
+                        int(entry.start_idx),
+                        int(entry.end_idx),
+                    )
 
             bucket.dion_state = None
 
@@ -1019,14 +1115,12 @@ class _ParamAndGradBucketGroup:
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
-            self._materialize_dion_local_grads()
             return
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             if self.communication_stream is not None:
                 torch.cuda.default_stream().wait_stream(self.communication_stream)
-            self._materialize_dion_local_grads()
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -1034,7 +1128,6 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
-        self._materialize_dion_local_grads()
 
     def register_grad_ready(self, param: torch.nn.Parameter):
         """
@@ -1433,6 +1526,13 @@ class _ParamAndGradBuffer:
         bucketed_grad_data = self._get(
             torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
         )
+        bucket_param_to_index = {}
+        for bucket_param in bucket_params:
+            param_start_index, param_end_index, _ = self.param_index_map[bucket_param]
+            bucket_param_to_index[bucket_param] = (
+                param_start_index - start_index,
+                param_end_index - start_index,
+            )
         bucket = _ParamAndGradBucket(
             params=bucket_params,
             param_data=bucketed_param_data,
@@ -1441,6 +1541,7 @@ class _ParamAndGradBuffer:
             numel_unpadded=numel_unpadded,
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
+            param_to_index=bucket_param_to_index,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket

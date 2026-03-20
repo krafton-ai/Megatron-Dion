@@ -255,6 +255,7 @@ def generate_random_sketch_matrix(
     P: Tensor,
     oversample: float = 1.25,
     shard_mesh_dim: Optional[int] = None,
+    sketch_fn=None,
 ) -> Tensor:
     """Exact reference sketch generation contract for local or DTensor orthogonalization."""
     assert P.ndim >= 3, "P must have batch dimension"
@@ -270,6 +271,15 @@ def generate_random_sketch_matrix(
         if shard_mesh_dim is not None:
             s_placements[shard_mesh_dim] = Shard(P.ndim - 1)
 
+        if sketch_fn is not None:
+            local_P = P.to_local()
+            local_S = sketch_fn(local_P, oversample)
+            return DTensor.from_local(
+                local_S,
+                device_mesh=P.device_mesh,
+                placements=tuple(s_placements),
+            )
+
         S = dtensor_randn(
             (*batch_size, k, m),
             device_mesh=P.device_mesh,
@@ -277,6 +287,9 @@ def generate_random_sketch_matrix(
             placements=s_placements,
         )
         return S * std
+
+    if sketch_fn is not None:
+        return sketch_fn(P, oversample)
 
     if shard_mesh_dim is not None:
         raise TypeError("Must use DTensor parameters for sharded random sketch.")
@@ -287,7 +300,9 @@ def generate_random_sketch_matrix(
 
 
 @torch.compile()
-def _orthogonalize_dtensor_exact_compiled(P: Tensor, oversample: float = 1.25) -> Tensor:
+def _orthogonalize_dtensor_exact_compiled(
+    P: Tensor, oversample: float = 1.25, sketch_fn=None
+) -> Tensor:
     """Compiled exact `dion_reference.py::orthogonalize()` contract."""
     assert P.ndim >= 3, "Expected P to have batch dimension"
     original_dtype = P.dtype
@@ -300,7 +315,7 @@ def _orthogonalize_dtensor_exact_compiled(P: Tensor, oversample: float = 1.25) -
     if P.size(-2) <= P.size(-1):
         P_local, _ = torch.linalg.qr(P_local.to(dtype=torch.float32))
     else:
-        S = generate_random_sketch_matrix(P, oversample)
+        S = generate_random_sketch_matrix(P, oversample, sketch_fn=sketch_fn)
         S_local = S.to_local() if isinstance(S, DTensor) else S
 
         SP = S_local @ P_local
@@ -318,7 +333,9 @@ def _orthogonalize_dtensor_exact_compiled(P: Tensor, oversample: float = 1.25) -
     return P_local.to(original_dtype).contiguous()
 
 
-def _orthogonalize_dtensor_exact_debug(P: Tensor, oversample: float = 1.25) -> Tensor:
+def _orthogonalize_dtensor_exact_debug(
+    P: Tensor, oversample: float = 1.25, sketch_fn=None
+) -> Tensor:
     """Debuggable exact `dion_reference.py::orthogonalize()` contract."""
     assert P.ndim >= 3, "Expected P to have batch dimension"
     original_dtype = P.dtype
@@ -344,7 +361,7 @@ def _orthogonalize_dtensor_exact_debug(P: Tensor, oversample: float = 1.25) -> T
             check_orthogonality=True,
         )
     else:
-        S = generate_random_sketch_matrix(P, oversample)
+        S = generate_random_sketch_matrix(P, oversample, sketch_fn=sketch_fn)
         S_local = S.to_local() if isinstance(S, DTensor) else S
         _log_ortho_stage(
             stage="exact_sketch",
@@ -411,12 +428,16 @@ def _orthogonalize_dtensor_exact_debug(P: Tensor, oversample: float = 1.25) -> T
     return P_local.to(original_dtype).contiguous()
 
 
-def orthogonalize_dtensor_exact(P: Tensor, oversample: float = 1.25) -> Tensor:
+def orthogonalize_dtensor_exact(
+    P: Tensor, oversample: float = 1.25, sketch_fn=None
+) -> Tensor:
     """Exact `dion_reference.py::orthogonalize()` contract."""
     with _dion_ortho_precision_context():
-        if _ortho_stage_debug_enabled():
-            return _orthogonalize_dtensor_exact_debug(P, oversample=oversample)
-        return _orthogonalize_dtensor_exact_compiled(P, oversample=oversample)
+        return _orthogonalize_dtensor_exact_debug(
+            P,
+            oversample=oversample,
+            sketch_fn=sketch_fn,
+        )
 
 
 @torch.compile()
@@ -424,6 +445,7 @@ def _distributed_orthogonalize_dtensor_exact_compiled(
     P: DTensor,
     oversample: float = 1.25,
     shard_mesh_dim: Optional[int] = None,
+    sketch_fn=None,
 ) -> DTensor:
     """Compiled exact `dion_reference.py::distributed_orthogonalize()` contract."""
     assert isinstance(P, DTensor)
@@ -446,7 +468,12 @@ def _distributed_orthogonalize_dtensor_exact_compiled(
             ref=P_single,
         ).redistribute(placements=original_placements)
     else:
-        S = generate_random_sketch_matrix(P, oversample, shard_mesh_dim=shard_mesh_dim)
+        S = generate_random_sketch_matrix(
+            P,
+            oversample,
+            shard_mesh_dim=shard_mesh_dim,
+            sketch_fn=sketch_fn,
+        )
         SP: DTensor = S @ P
 
         SP_single = SP.redistribute(placements=batch_sharded_placements)
@@ -487,6 +514,7 @@ def _distributed_orthogonalize_dtensor_exact_debug(
     P: DTensor,
     oversample: float = 1.25,
     shard_mesh_dim: Optional[int] = None,
+    sketch_fn=None,
 ) -> DTensor:
     """Debuggable exact `dion_reference.py::distributed_orthogonalize()` contract."""
     assert isinstance(P, DTensor)
@@ -509,7 +537,12 @@ def _distributed_orthogonalize_dtensor_exact_debug(
             ref=P_single,
         ).redistribute(placements=original_placements)
     else:
-        S = generate_random_sketch_matrix(P, oversample, shard_mesh_dim=shard_mesh_dim)
+        S = generate_random_sketch_matrix(
+            P,
+            oversample,
+            shard_mesh_dim=shard_mesh_dim,
+            sketch_fn=sketch_fn,
+        )
         SP: DTensor = S @ P
 
         P_single = SP.redistribute(placements=batch_sharded_placements)
@@ -550,19 +583,15 @@ def distributed_orthogonalize_dtensor_exact(
     P: DTensor,
     oversample: float = 1.25,
     shard_mesh_dim: Optional[int] = None,
+    sketch_fn=None,
 ) -> DTensor:
     """Exact `dion_reference.py::distributed_orthogonalize()` contract."""
     with _dion_ortho_precision_context():
-        if _ortho_stage_debug_enabled():
-            return _distributed_orthogonalize_dtensor_exact_debug(
-                P,
-                oversample=oversample,
-                shard_mesh_dim=shard_mesh_dim,
-            )
-        return _distributed_orthogonalize_dtensor_exact_compiled(
+        return _distributed_orthogonalize_dtensor_exact_debug(
             P,
             oversample=oversample,
             shard_mesh_dim=shard_mesh_dim,
+            sketch_fn=sketch_fn,
         )
 
 

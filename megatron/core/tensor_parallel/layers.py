@@ -3,8 +3,9 @@
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
 
-import os
 import warnings
+import logging
+import os
 from functools import partial
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -27,6 +28,8 @@ from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
     prepare_input_tensors_for_wgrad_compute,
 )
+
+logger = logging.getLogger(__name__)
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
@@ -156,6 +159,7 @@ def _initialize_affine_weight_cpu(
     rank=None,
     world_size=None,
     skip_set_tensor_parallel_attributes=False,
+    glu_aware_partition=False,
 ):
     """Initialize affine weight for model parallel.
 
@@ -172,12 +176,39 @@ def _initialize_affine_weight_cpu(
     init_method(master_weight)
     master_weight = master_weight.to(dtype=params_dtype)
     # Split and copy
-    per_partition_per_stride_size = divide(per_partition_size, stride)
-    weight_list = torch.split(master_weight, per_partition_per_stride_size, dim=partition_dim)
     if rank is None:
         rank = get_tensor_model_parallel_rank()
         world_size = get_tensor_model_parallel_world_size()
-    my_weight_list = weight_list[rank::world_size]
+
+    if glu_aware_partition:
+        if partition_dim != 0:
+            raise RuntimeError("SwiGLU-aware CPU initialization only supports partition_dim=0.")
+        if stride != 1:
+            raise RuntimeError("SwiGLU-aware CPU initialization only supports stride=1.")
+        if output_size % 2 != 0:
+            raise RuntimeError(
+                f"SwiGLU-aware CPU initialization requires even output_size, got {output_size}."
+            )
+        if per_partition_size % 2 != 0:
+            raise RuntimeError(
+                "SwiGLU-aware CPU initialization requires each TP shard to contain an even "
+                f"number of rows, got per_partition_size={per_partition_size}."
+            )
+        gate_master, value_master = torch.chunk(master_weight, 2, dim=partition_dim)
+        local_half = per_partition_size // 2
+        gate_chunks = torch.split(gate_master, local_half, dim=partition_dim)
+        value_chunks = torch.split(value_master, local_half, dim=partition_dim)
+        if len(gate_chunks) != world_size or len(value_chunks) != world_size:
+            raise RuntimeError(
+                "SwiGLU-aware CPU initialization expected one gate/value shard per TP rank, "
+                f"got gate_chunks={len(gate_chunks)} value_chunks={len(value_chunks)} "
+                f"world_size={world_size}."
+            )
+        my_weight_list = [gate_chunks[rank], value_chunks[rank]]
+    else:
+        per_partition_per_stride_size = divide(per_partition_size, stride)
+        weight_list = torch.split(master_weight, per_partition_per_stride_size, dim=partition_dim)
+        my_weight_list = weight_list[rank::world_size]
 
     with torch.no_grad():
         # all tensors must live on the same device
@@ -567,32 +598,18 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                     weight.main_grad = weight.get_main_grad()
                     torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
                 else:
-                    # Check if main_grad is valid before using fused kernel
-                    _use_fused = True
-                    if hasattr(weight, 'is_dion_param') and weight.is_dion_param:
-                        # For Dion params, use torch.matmul instead of fused kernel
-                        # to avoid potential memory layout issues
-                        _use_fused = False
-
-                    if _use_fused:
-                        if weight.main_grad.dtype == torch.float32:
-                            fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                                total_input, grad_output, weight.main_grad
-                            )
-                        elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                            fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                                total_input, grad_output, weight.main_grad
-                            )
-                        else:
-                            raise RuntimeError(
-                                "Unsupported gradient type for gradient accumulation fusion"
-                            )
+                    if weight.main_grad.dtype == torch.float32:
+                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                            total_input, grad_output, weight.main_grad
+                        )
+                    elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                            total_input, grad_output, weight.main_grad
+                        )
                     else:
-                        # Fallback to torch.matmul for Dion params
-                        # This accumulates gradient into main_grad
-                        grad_output_t = grad_output.t().contiguous()
-                        total_input_c = total_input.contiguous()
-                        weight.main_grad.addmm_(grad_output_t, total_input_c)
+                        raise RuntimeError(
+                            "Unsupported gradient type for gradient accumulation fusion"
+                        )
 
             if hasattr(weight, "grad_added_to_main_grad"):
                 # When overlap_grad_reduce is True, need to ensure that backward hooks
@@ -834,6 +851,7 @@ class ColumnParallelLinear(torch.nn.Module):
         tp_comm_buffer_name: str = None,  # Not used
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        glu_aware_partition: bool = False,
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -850,6 +868,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.config = config
         self.disable_grad_reduce = disable_grad_reduce
         self.tp_group = tp_group
+        self.glu_aware_partition = glu_aware_partition
 
         self.tp_group = get_tensor_model_parallel_group_if_none(
             self.tp_group, is_expert=self.is_expert
@@ -882,6 +901,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         return_master_weight=keep_master_weight_for_test,
                         rank=rank,
                         world_size=world_size,
+                        glu_aware_partition=self.glu_aware_partition,
                     )
                 else:
                     set_tensor_model_parallel_attributes(

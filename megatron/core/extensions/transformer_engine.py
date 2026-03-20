@@ -4,6 +4,7 @@ import dataclasses
 import enum
 import inspect
 import io
+import logging
 import os
 import pickle
 import warnings
@@ -46,6 +47,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.moe.expert_init import reinitialize_partitioned_expert_weight_
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -73,6 +75,7 @@ except ImportError:
     HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+logger = logging.getLogger(__name__)
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -720,6 +723,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        glu_aware_partition: bool = False,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -755,6 +759,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         extra_kwargs = _get_extra_te_kwargs(config)
         self.tp_size = get_pg_size(tp_group)
         self.tp_rank = get_pg_rank(tp_group)
+        self.glu_aware_partition = glu_aware_partition
 
         if self.config.delay_wgrad_compute:
             if is_te_min_version("2.3.0"):
@@ -850,6 +855,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 rank=self.tp_rank,
                 world_size=self.tp_size,
                 skip_set_tensor_parallel_attributes=True,
+                glu_aware_partition=self.glu_aware_partition,
             )
             if bias:
                 self.bias = Parameter(
@@ -935,6 +941,7 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        glu_aware_partition: bool = False,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -948,6 +955,7 @@ class TEColumnParallelLinear(TELinear):
         self._tp_group = tp_group
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
+        self.glu_aware_partition = glu_aware_partition
 
         super().__init__(
             input_size=input_size,
@@ -982,6 +990,7 @@ class TEColumnParallelLinear(TELinear):
                 rank=rank,
                 world_size=world_size,
                 skip_set_tensor_parallel_attributes=True,
+                glu_aware_partition=self.glu_aware_partition,
             )
             if bias:
                 self.bias = Parameter(
@@ -1448,6 +1457,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.te_return_bias = skip_bias_add and bias
             self.is_first_microbatch = True
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+            self.layer_number: Optional[int] = None
+            self._dion_is_expert = bool(is_expert)
+            self._dion_expert_linear_tag = tp_comm_buffer_name or "expert"
+            self._dion_expert_init_method = init_method
 
             extra_kwargs = _get_extra_te_kwargs(config)
 
@@ -1592,6 +1605,39 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 state_dict[f"{prefix}_extra_state"] = self._encode_extra_state(extra_state)
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
+
+        @torch.no_grad()
+        def set_layer_number(self, layer_number: int):
+            self.layer_number = int(layer_number)
+            if not (self._dion_is_expert and self.config.perform_initialization):
+                return
+
+            tp_world_size = get_pg_size(self._tp_group) if self._tp_group is not None else 1
+            tp_rank = get_pg_rank(self._tp_group) if self._tp_group is not None else 0
+            global_expert_offset = get_expert_model_parallel_rank() * self.num_gemms
+
+            for gemm_idx in range(self.num_gemms):
+                global_expert_idx = global_expert_offset + gemm_idx
+                weight = getattr(self, f"weight{gemm_idx}")
+                partition_dim = int(getattr(weight, "partition_dim", 0))
+                full_rows = int(weight.shape[0]) * int(tp_world_size) if partition_dim == 0 else int(weight.shape[0])
+                full_cols = int(weight.shape[1]) * int(tp_world_size) if partition_dim == 1 else int(weight.shape[1])
+                reinitialize_partitioned_expert_weight_(
+                    weight=weight,
+                    full_rows=full_rows,
+                    full_cols=full_cols,
+                    partition_dim=partition_dim,
+                    init_method=self._dion_expert_init_method,
+                    params_dtype=weight.dtype,
+                    tp_rank=int(tp_rank),
+                    tp_world_size=int(tp_world_size),
+                    layer_number=self.layer_number,
+                    linear_tag=self._dion_expert_linear_tag,
+                    global_expert_idx=int(global_expert_idx),
+                )
+                bias = getattr(self, f"bias{gemm_idx}", None)
+                if bias is not None:
+                    bias.zero_()
 
         def finish_init(self, quantization_config: QuantizationConfig):
             """Post-init of quantization override"""
@@ -1792,6 +1838,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 tp_group=tp_group,
             )
+            # Fix: When explicit_expert_comm=True, parallel_mode becomes None in parent class,
+            # causing TE to set partition_dim=0 (default). ColumnParallel-style means
+            # output dimension (dim=0) is sharded, so partition_dim=0 is correct.
+            # Setting explicitly for consistency with TERowParallelGroupedLinear.
+            for param in self.parameters():
+                setattr(param, "partition_dim", 0)
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
             """
@@ -1838,6 +1890,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 tp_group=tp_group,
             )
+            # Fix: When explicit_expert_comm=True, parallel_mode becomes None in parent class,
+            # causing TE to set partition_dim=0 (default). But RowParallel-style means
+            # input dimension (dim=1) is sharded, so partition_dim should be 1.
+            # This is needed for Dion optimizer's scaled_lr calculation.
+            for param in self.parameters():
+                setattr(param, "partition_dim", 1)
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
             """

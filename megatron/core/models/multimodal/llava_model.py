@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import logging
+import os
 from collections import namedtuple
 from functools import partial
 from typing import List, Optional
@@ -19,7 +20,15 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params, log_single_rank
+from megatron.core.utils import (
+    deprecate_inference_params,
+    log_single_rank,
+    topology_invariant_model_parallel_init,
+)
+from megatron.core.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 
 try:
     import transformer_engine  # pylint: disable=unused-import
@@ -43,7 +52,101 @@ IGNORE_INDEX = -100  # ID for labels that should be ignored.
 DEFAULT_IMAGE_TOKEN_INDEX = -200
 IMAGE_TOKEN = "<image>"
 VIDEO_TOKEN = "<video>"
+_SEQ_GEOM_DEBUG_COUNTER = 0
+_COMBINED_FP_DEBUG_COUNTER = 0
+_EMBED_PARTS_FP_DEBUG_COUNTER = 0
+_VISION_RAW_FP_DEBUG_COUNTER = 0
+_VISION_PARAM_FP_DEBUG_COUNTER = 0
+_PACKED_LM_FP_DEBUG_COUNTER = 0
+_VISION_SINGLETON_GROUP = None
 
+
+def _debug_print_global_param_fingerprint(
+    module: torch.nn.Module,
+    name: str,
+    pg_collection: Optional[ProcessGroupCollection],
+) -> None:
+    if pg_collection is None or not hasattr(pg_collection, "tp") or pg_collection.tp is None:
+        return
+
+    param = dict(module.named_parameters()).get(name)
+    if param is None:
+        return
+
+    local = param.detach().float().contiguous()
+    tp_group = pg_collection.tp
+    tp_world = tp_group.size()
+    tp_rank = tp_group.rank()
+
+    if getattr(param, "tensor_model_parallel", False) and tp_world > 1:
+        gather_device = local.device
+        if gather_device.type == "cpu":
+            gather_device = torch.device("cuda", torch.cuda.current_device())
+        local_for_gather = local.to(device=gather_device, non_blocking=False)
+        gathered = [torch.empty_like(local_for_gather) for _ in range(tp_world)]
+        torch.distributed.all_gather(gathered, local_for_gather, group=tp_group)
+        full = torch.cat(gathered, dim=int(getattr(param, "partition_dim", 0))).cpu()
+    else:
+        full = local
+
+    if tp_rank == 0:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        pp_rank = (
+            pg_collection.pp.rank()
+            if pg_collection is not None and hasattr(pg_collection, "pp") and pg_collection.pp is not None
+            else -1
+        )
+        flat = full.flatten()
+        limit = min(int(os.getenv("VLM_DEBUG_LM_PARAM_PREVIEW", "8")), flat.numel())
+        preview = ",".join(f"{float(x):.8f}" for x in flat[:limit].tolist())
+        if flat.numel() > 0:
+            weights = torch.arange(1, flat.numel() + 1, dtype=flat.dtype, device=flat.device)
+            weighted = float((flat * weights).sum().item())
+        else:
+            weighted = 0.0
+        print(
+            "VLM_VISION_PARAM_FP "
+            f"rank={rank} pp={pp_rank} tp={tp_rank} "
+            f"global_tp_rank={get_tensor_model_parallel_rank()} "
+            f"global_tp_world={get_tensor_model_parallel_world_size()} "
+            f"name={name} "
+            f"tensor_model_parallel={getattr(param, 'tensor_model_parallel', False)} "
+            f"partition_dim={getattr(param, 'partition_dim', None)} "
+            f"partition_stride={getattr(param, 'partition_stride', None)} "
+            f"allreduce={getattr(param, 'allreduce', None)} "
+            f"sequence_parallel={getattr(param, 'sequence_parallel', None)} "
+            f"shape={tuple(full.shape)} "
+            f"sum={float(full.sum().item()):.8f} "
+            f"abs={float(full.abs().sum().item()):.8f} "
+            f"norm={float(torch.linalg.vector_norm(full).item()):.8f} "
+            f"weighted_sum={weighted:.8f} "
+            f"preview=[{preview}]",
+            flush=True,
+        )
+
+
+def _get_or_create_vision_singleton_group():
+    global _VISION_SINGLETON_GROUP
+    if _VISION_SINGLETON_GROUP is None:
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("VLM vision singleton TP group requires initialized torch.distributed")
+        _VISION_SINGLETON_GROUP = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
+    return _VISION_SINGLETON_GROUP
+
+
+def _mark_module_params_as_global_tp_duplicates(module: Optional[torch.nn.Module]) -> None:
+    if module is None:
+        return
+    for param in module.parameters():
+        tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+        setattr(param, "tensor_model_parallel", False)
+        setattr(param, "partition_dim", -1)
+        setattr(param, "partition_stride", 1)
+        setattr(param, "expert_tp", False)
+        setattr(param, "is_qkv", False)
+        setattr(param, "sequence_parallel", False)
+        if getattr(param, "allreduce", None) is None:
+            setattr(param, "allreduce", True)
 
 # Note: This is under development and may be missing features.
 class LLaVAModel(MegatronModule):
@@ -125,6 +228,8 @@ class LLaVAModel(MegatronModule):
         tokenizer_type: str = "",
         vp_stage: Optional[int] = None,
         use_vision_backbone_fp8_arch: bool = False,
+        encoder_topology_invariant_init_seed: Optional[int] = None,
+        decoder_topology_invariant_init_seed: Optional[int] = None,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -151,6 +256,26 @@ class LLaVAModel(MegatronModule):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
+        self.vision_pg_collection = self.pg_collection
+
+        global_tp_group = getattr(self.pg_collection, "tp", None)
+        global_tp_size = global_tp_group.size() if global_tp_group is not None else 1
+        vision_tp_size = int(getattr(vision_transformer_config, "tensor_model_parallel_size", 1))
+        vision_proj_tp_size = int(
+            getattr(vision_projection_config, "tensor_model_parallel_size", 1)
+        )
+        if global_tp_size > 1:
+            if vision_tp_size != 1 or vision_proj_tp_size != 1:
+                raise RuntimeError(
+                    "VLM vision branch must use tensor_model_parallel_size=1 when language TP > 1"
+                )
+            vision_singleton_group = _get_or_create_vision_singleton_group()
+            pp_group = getattr(self.pg_collection, "pp", vision_singleton_group)
+            self.vision_pg_collection = ProcessGroupCollection(
+                tp=vision_singleton_group,
+                cp=vision_singleton_group,
+                pp=pp_group,
+            )
 
         language_model_type = getattr(language_transformer_config, "language_model_type", "")
         self.sequence_parallel_lm = language_transformer_config.sequence_parallel
@@ -177,6 +302,12 @@ class LLaVAModel(MegatronModule):
         # This attribute is needed to check if an all-reduce is required
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+
+        if decoder_topology_invariant_init_seed is not None:
+            language_transformer_config.use_cpu_initialization = True
+            language_transformer_config.topology_invariant_init_seed = (
+                int(decoder_topology_invariant_init_seed)
+            )
 
         if self.add_decoder:
             if getattr(language_transformer_config, "language_model_type", "").startswith("hf://"):
@@ -238,131 +369,161 @@ class LLaVAModel(MegatronModule):
 
         class_token_len = 1
         if self.add_encoder:
-            self._drop_vision_class_token = drop_vision_class_token
-            add_class_token = True
-            if vision_transformer_config.vision_model_type.startswith(
-                ("clip", "siglip", "internvit")
+            with topology_invariant_model_parallel_init(
+                encoder_topology_invariant_init_seed,
+                tp_rank=0,
+                ep_rank=0,
+                etp_rank=0,
             ):
-                if vision_transformer_config.vision_model_type in ("siglip", "siglip2_base"):
-                    class_token_len = 0
-                    add_class_token = False
-                    error_msg = (
-                        "Siglip does not support vision class token, "
-                        "set disable-vision-class-token to False."
+                self._drop_vision_class_token = drop_vision_class_token
+                add_class_token = True
+                if vision_transformer_config.vision_model_type.startswith(
+                    ("clip", "siglip", "internvit")
+                ):
+                    if vision_transformer_config.vision_model_type in ("siglip", "siglip2_base"):
+                        class_token_len = 0
+                        add_class_token = False
+                        error_msg = (
+                            "Siglip does not support vision class token, "
+                            "set disable-vision-class-token to False."
+                        )
+                        assert not self._drop_vision_class_token, error_msg
+                    self.vision_model = CLIPViTModel(
+                        vision_transformer_config,
+                        vision_transformer_layer_spec,
+                        img_h=img_h,
+                        img_w=img_w,
+                        class_token_len=class_token_len,
+                        patch_dim=patch_dim,
+                        model_subtype=vision_transformer_config.vision_model_type,
+                        add_class_token=add_class_token,
+                        pg_collection=self.vision_pg_collection,
+                        vp_stage=self.vp_stage,
                     )
-                    assert not self._drop_vision_class_token, error_msg
-                self.vision_model = CLIPViTModel(
-                    vision_transformer_config,
-                    vision_transformer_layer_spec,
-                    img_h=img_h,
-                    img_w=img_w,
-                    class_token_len=class_token_len,
-                    patch_dim=patch_dim,
-                    model_subtype=vision_transformer_config.vision_model_type,
-                    add_class_token=add_class_token,
-                    pg_collection=self.pg_collection,
-                    vp_stage=self.vp_stage,
-                )
-            elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
-                # TODO: should refactor into model code itself?
-                class_token_len = 0
-                max_img_h = 0
-                max_img_w = 0
-                embedder_bias = False
-                ln_post_impl = None
-                use_mask_token = False
-
-                if vision_transformer_config.vision_model_type == "radio":
-                    class_token_len = 8
-                    max_img_h = 2048
-                    max_img_w = 2048
-                    embedder_bias = False
-                    ln_post_impl = None
-                    use_mask_token = False
-                elif vision_transformer_config.vision_model_type == "radio-g":
-                    class_token_len = 5
-                    max_img_h = 1792
-                    max_img_w = 1792
-                    embedder_bias = True
-                    from megatron.core.extensions.transformer_engine import TENorm
-
-                    ln_post_impl = TENorm
-                    use_mask_token = True
-                elif vision_transformer_config.vision_model_type == "cradio-g":
-                    class_token_len = 8
-                    max_img_h = 2048
-                    max_img_w = 2048
+                elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
+                    # TODO: should refactor into model code itself?
+                    class_token_len = 0
+                    max_img_h = 0
+                    max_img_w = 0
                     embedder_bias = False
                     ln_post_impl = None
                     use_mask_token = False
 
-                if vision_transformer_config.fp8 or use_vision_backbone_fp8_arch:
-                    # FP8 padding for final sequence length to be a multiple of 16 or 32.
-                    class_token_len = 32 if vision_transformer_config.fp8_recipe == "mxfp8" else 16
+                    if vision_transformer_config.vision_model_type == "radio":
+                        class_token_len = 8
+                        max_img_h = 2048
+                        max_img_w = 2048
+                        embedder_bias = False
+                        ln_post_impl = None
+                        use_mask_token = False
+                    elif vision_transformer_config.vision_model_type == "radio-g":
+                        class_token_len = 5
+                        max_img_h = 1792
+                        max_img_w = 1792
+                        embedder_bias = True
+                        from megatron.core.extensions.transformer_engine import TENorm
 
-                self.vision_model = RADIOViTModel(
-                    vision_transformer_config,
-                    vision_transformer_layer_spec,
-                    ln_post_impl=ln_post_impl,
-                    img_h=img_h,
-                    img_w=img_w,
-                    max_img_h=max_img_h,
-                    max_img_w=max_img_w,
-                    class_token_len=class_token_len,
-                    patch_dim=patch_dim,
-                    add_class_token=add_class_token,
-                    embedder_bias=embedder_bias,
-                    use_mask_token=use_mask_token,
-                    pg_collection=self.pg_collection,
-                    vp_stage=self.vp_stage,
+                        ln_post_impl = TENorm
+                        use_mask_token = True
+                    elif vision_transformer_config.vision_model_type == "cradio-g":
+                        class_token_len = 8
+                        max_img_h = 2048
+                        max_img_w = 2048
+                        embedder_bias = False
+                        ln_post_impl = None
+                        use_mask_token = False
+
+                    if vision_transformer_config.fp8 or use_vision_backbone_fp8_arch:
+                        # FP8 padding for final sequence length to be a multiple of 16 or 32.
+                        class_token_len = 32 if vision_transformer_config.fp8_recipe == "mxfp8" else 16
+
+                    self.vision_model = RADIOViTModel(
+                        vision_transformer_config,
+                        vision_transformer_layer_spec,
+                        ln_post_impl=ln_post_impl,
+                        img_h=img_h,
+                        img_w=img_w,
+                        max_img_h=max_img_h,
+                        max_img_w=max_img_w,
+                        class_token_len=class_token_len,
+                        patch_dim=patch_dim,
+                        add_class_token=add_class_token,
+                        embedder_bias=embedder_bias,
+                        use_mask_token=use_mask_token,
+                        pg_collection=self.vision_pg_collection,
+                        vp_stage=self.vp_stage,
+                    )
+                elif vision_transformer_config.vision_model_type.startswith("hf://"):
+                    from megatron.core.models.huggingface.module import build_hf_model
+
+                    self.vision_model = build_hf_model(
+                        vision_transformer_config, vision_transformer_config.vision_model_type
+                    )
+                else:
+                    raise ValueError(
+                        "Vision model "
+                        f"{vision_transformer_config.vision_model_type} is not "
+                        "supported."
+                    )
+
+                self.vision_model.register_load_state_dict_post_hook(
+                    _load_state_dict_hook_ignore_extra_state
                 )
-            elif vision_transformer_config.vision_model_type.startswith("hf://"):
-                from megatron.core.models.huggingface.module import build_hf_model
 
-                self.vision_model = build_hf_model(
-                    vision_transformer_config, vision_transformer_config.vision_model_type
+                vision_projection_input_size = vision_transformer_config.hidden_size
+                if pixel_shuffle:
+                    ps_factor = pixel_shuffle if isinstance(pixel_shuffle, int) else 2
+                    vision_projection_input_size *= ps_factor ** 2
+
+                # Map (intermediate) vision model outputs to the language model input dimension.
+                self.vision_projection = MultimodalProjector(
+                    vision_projection_config,
+                    vision_projection_layer_spec,
+                    vision_projection_type,
+                    vision_projection_input_size,
+                    tp_group=self.vision_pg_collection.tp,
                 )
-            else:
-                raise ValueError(
-                    "Vision model "
-                    f"{vision_transformer_config.vision_model_type} is not "
-                    "supported."
-                )
+                # Ignore missing weights for the vision projection during checkpoint loading.
+                # This should be disabled by default but can be enabled if your checkpoint contains
+                # pretrained vision and language models but not the projection from vision model
+                # outputs to language model inputs.
+                if allow_missing_vision_projection_checkpoint:
+                    vision_projection_param_names = [
+                        f"vision_projection.{name}"
+                        for name in self.vision_projection.state_dict().keys()
+                    ]
+                    self.vision_projection.register_load_state_dict_post_hook(
+                        partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
+                    )
 
-            self.vision_model.register_load_state_dict_post_hook(
-                _load_state_dict_hook_ignore_extra_state
-            )
-
-            vision_projection_input_size = vision_transformer_config.hidden_size
-            if pixel_shuffle:
-                ps_factor = pixel_shuffle if isinstance(pixel_shuffle, int) else 2
-                vision_projection_input_size *= ps_factor ** 2
-
-
-            # Map (intermediate) vision model outputs to the language model input dimension.
-            self.vision_projection = MultimodalProjector(
-                vision_projection_config,
-                vision_projection_layer_spec,
-                vision_projection_type,
-                vision_projection_input_size,
-                tp_group=self.pg_collection.tp,
-            )
-            # Ignore missing weights for the vision projection during checkpoint loading.
-            # This should be disabled by default but can be enabled if your checkpoint contains
-            # pretrained vision and language models but not the projection from vision model
-            # outputs to language model inputs.
-            if allow_missing_vision_projection_checkpoint:
-                vision_projection_param_names = [
-                    f"vision_projection.{name}"
-                    for name in self.vision_projection.state_dict().keys()
-                ]
                 self.vision_projection.register_load_state_dict_post_hook(
-                    partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
+                    _load_state_dict_hook_ignore_extra_state
                 )
 
-            self.vision_projection.register_load_state_dict_post_hook(
-                _load_state_dict_hook_ignore_extra_state
-            )
+                if os.getenv("VLM_DEBUG_VISION_PARAM_FP", "0") == "1":
+                    global _VISION_PARAM_FP_DEBUG_COUNTER
+                    limit = int(os.getenv("VLM_DEBUG_VISION_PARAM_FP_LIMIT", "2"))
+                    if _VISION_PARAM_FP_DEBUG_COUNTER < limit:
+                        _VISION_PARAM_FP_DEBUG_COUNTER += 1
+                        layer_indices = [0]
+                        decoder_layers = getattr(self.vision_model.decoder, "layers", None)
+                        if decoder_layers is not None and len(decoder_layers) > 1:
+                            layer_indices.append(len(decoder_layers) - 1)
+                        for layer_idx in layer_indices:
+                            for suffix in (
+                                "self_attention.linear_qkv.weight",
+                                "self_attention.linear_proj.weight",
+                                "mlp.linear_fc1.weight",
+                                "mlp.linear_fc2.weight",
+                            ):
+                                name = f"decoder.layers.{layer_idx}.{suffix}"
+                                _debug_print_global_param_fingerprint(
+                                    self.vision_model, name, self.vision_pg_collection
+                                )
+
+        if global_tp_size > 1:
+            _mark_module_params_as_global_tp_duplicates(self.vision_model)
+            _mark_module_params_as_global_tp_duplicates(self.vision_projection)
 
         self.img_seq_len = get_num_image_embeddings(
             img_h,
@@ -518,13 +679,39 @@ class LLaVAModel(MegatronModule):
             # plus text sequence length.
             seq_lens = num_image_tiles_batch * img_seq_len - num_images_per_sample + text_seq_len
             max_seq_len = seq_lens.max()
-            # Pipeline parallel and context parallel expect fixed input size. Pad if needed.
-            if (
-                (self._language_is_pipeline_parallel or self.context_parallel_lm > 1)
-                and max_seq_len < self._language_max_sequence_length
-                and inference_context is None
-            ):
+            # The language-side multimodal path should use one fixed decoder geometry during
+            # training. If PP/CP alone force padding, the same sample takes different sequence
+            # lengths across topologies and diverges before the first optimizer step.
+            if max_seq_len < self._language_max_sequence_length and inference_context is None:
                 max_seq_len = self._language_max_sequence_length
+
+            if os.getenv("VLM_DEBUG_SEQ_GEOM", "0") == "1":
+                global _SEQ_GEOM_DEBUG_COUNTER
+                limit = int(os.getenv("VLM_DEBUG_SEQ_GEOM_LIMIT", "8"))
+                if _SEQ_GEOM_DEBUG_COUNTER < limit:
+                    _SEQ_GEOM_DEBUG_COUNTER += 1
+                    rank = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else -1
+                    )
+                    pp_rank = (
+                        self.pg_collection.pp.rank()
+                        if self.pg_collection is not None and self.pg_collection.pp is not None
+                        else -1
+                    )
+                    print(
+                        "VLM_SEQ_GEOM "
+                        f"count={_SEQ_GEOM_DEBUG_COUNTER} rank={rank} pp={pp_rank} "
+                        f"pipeline={int(self._language_is_pipeline_parallel)} "
+                        f"cp={self.context_parallel_lm} "
+                        f"text_seq_len={int(text_seq_len)} "
+                        f"seq_min={int(seq_lens.min().item())} "
+                        f"seq_max={int(seq_lens.max().item())} "
+                        f"chosen_max={int(max_seq_len)} "
+                        f"lm_max={int(self._language_max_sequence_length)}",
+                        flush=True,
+                    )
 
             batch_indices, non_image_indices = torch.where(image_token_mask != True)
 
@@ -860,6 +1047,32 @@ class LLaVAModel(MegatronModule):
             image_embeddings = torch.empty((0, 0, 0), dtype=empty_dtype, device=empty_device)
         elif self.add_encoder and has_images:
             image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
+            if os.getenv("VLM_DEBUG_VISION_RAW_FP", "0") == "1":
+                global _VISION_RAW_FP_DEBUG_COUNTER
+                limit = int(os.getenv("VLM_DEBUG_VISION_RAW_FP_LIMIT", "8"))
+                if _VISION_RAW_FP_DEBUG_COUNTER < limit:
+                    _VISION_RAW_FP_DEBUG_COUNTER += 1
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                    pp_rank = (
+                        self.pg_collection.pp.rank()
+                        if self.pg_collection is not None and self.pg_collection.pp is not None
+                        else -1
+                    )
+                    tp_rank = (
+                        self.pg_collection.tp.rank()
+                        if self.pg_collection is not None and self.pg_collection.tp is not None
+                        else -1
+                    )
+                    raw = image_embeddings.detach().float()
+                    print(
+                        "VLM_VISION_RAW_FP "
+                        f"count={_VISION_RAW_FP_DEBUG_COUNTER} rank={rank} pp={pp_rank} tp={tp_rank} "
+                        f"shape={tuple(image_embeddings.shape)} "
+                        f"sum={float(raw.sum().item()):.8f} "
+                        f"abs={float(raw.abs().sum().item()):.8f} "
+                        f"norm={float(torch.linalg.vector_norm(raw).item()):.8f}",
+                        flush=True,
+                    )
             if self._drop_vision_class_token:
                 image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
 
@@ -927,12 +1140,109 @@ class LLaVAModel(MegatronModule):
             num_image_tiles,
         )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
 
+        if os.getenv("VLM_DEBUG_EMBED_PARTS_FP", "0") == "1":
+            global _EMBED_PARTS_FP_DEBUG_COUNTER
+            limit = int(os.getenv("VLM_DEBUG_EMBED_PARTS_FP_LIMIT", "8"))
+            if _EMBED_PARTS_FP_DEBUG_COUNTER < limit:
+                _EMBED_PARTS_FP_DEBUG_COUNTER += 1
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                pp_rank = (
+                    self.pg_collection.pp.rank()
+                    if self.pg_collection is not None and self.pg_collection.pp is not None
+                    else -1
+                )
+                tp_rank = (
+                    self.pg_collection.tp.rank()
+                    if self.pg_collection is not None and self.pg_collection.tp is not None
+                    else -1
+                )
+                img = image_embeddings.detach().float() if image_embeddings is not None else None
+                txt = (
+                    language_embeddings.detach().float()
+                    if language_embeddings is not None
+                    else None
+                )
+                print(
+                    "VLM_EMBED_PARTS_FP "
+                    f"count={_EMBED_PARTS_FP_DEBUG_COUNTER} rank={rank} pp={pp_rank} tp={tp_rank} "
+                    f"img_shape={tuple(image_embeddings.shape) if image_embeddings is not None else None} "
+                    f"img_sum={float(img.sum().item()) if img is not None else 0.0:.8f} "
+                    f"img_abs={float(img.abs().sum().item()) if img is not None else 0.0:.8f} "
+                    f"img_norm={float(torch.linalg.vector_norm(img).item()) if img is not None else 0.0:.8f} "
+                    f"txt_shape={tuple(language_embeddings.shape) if language_embeddings is not None else None} "
+                    f"txt_sum={float(txt.sum().item()) if txt is not None else 0.0:.8f} "
+                    f"txt_abs={float(txt.abs().sum().item()) if txt is not None else 0.0:.8f} "
+                    f"txt_norm={float(torch.linalg.vector_norm(txt).item()) if txt is not None else 0.0:.8f}",
+                    flush=True,
+                )
+
+        if os.getenv("VLM_DEBUG_COMBINED_FP", "0") == "1":
+            global _COMBINED_FP_DEBUG_COUNTER
+            limit = int(os.getenv("VLM_DEBUG_COMBINED_FP_LIMIT", "8"))
+            if _COMBINED_FP_DEBUG_COUNTER < limit:
+                _COMBINED_FP_DEBUG_COUNTER += 1
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                pp_rank = (
+                    self.pg_collection.pp.rank()
+                    if self.pg_collection is not None and self.pg_collection.pp is not None
+                    else -1
+                )
+                emb = combined_embeddings.detach().float()
+                lab = new_labels.detach().long() if new_labels is not None else None
+                mask = new_loss_mask.detach().float() if new_loss_mask is not None else None
+                print(
+                    "VLM_COMBINED_FP "
+                    f"count={_COMBINED_FP_DEBUG_COUNTER} rank={rank} pp={pp_rank} "
+                    f"shape={tuple(combined_embeddings.shape)} "
+                    f"emb_sum={float(emb.sum().item()):.8f} "
+                    f"emb_abs={float(emb.abs().sum().item()):.8f} "
+                    f"emb_norm={float(torch.linalg.vector_norm(emb).item()):.8f} "
+                    f"lab_sum={int(lab.sum().item()) if lab is not None else -1} "
+                    f"mask_sum={float(mask.sum().item()) if mask is not None else -1.0:.8f}",
+                    flush=True,
+                )
+
         if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
             combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (
                 self._process_embedding_token_parallel(
                     combined_embeddings, new_labels, new_loss_mask, packed_seq_params
                 )
             )
+
+        if os.getenv("VLM_DEBUG_PACKED_FP", "0") == "1":
+            global _PACKED_LM_FP_DEBUG_COUNTER
+            limit = int(os.getenv("VLM_DEBUG_PACKED_FP_LIMIT", "16"))
+            if _PACKED_LM_FP_DEBUG_COUNTER < limit:
+                _PACKED_LM_FP_DEBUG_COUNTER += 1
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                pp_rank = (
+                    self.pg_collection.pp.rank()
+                    if self.pg_collection is not None and self.pg_collection.pp is not None
+                    else -1
+                )
+                tp_rank = (
+                    self.pg_collection.tp.rank()
+                    if self.pg_collection is not None and self.pg_collection.tp is not None
+                    else -1
+                )
+                qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else "none"
+                max_q = int(packed_seq_params.max_seqlen_q) if packed_seq_params is not None else -1
+                max_kv = int(packed_seq_params.max_seqlen_kv) if packed_seq_params is not None else -1
+                cu_last = (
+                    int(packed_seq_params.cu_seqlens_q[-1].item())
+                    if packed_seq_params is not None and packed_seq_params.cu_seqlens_q is not None
+                    else -1
+                )
+                print(
+                    "VLM_PACKED_FP "
+                    f"count={_PACKED_LM_FP_DEBUG_COUNTER} "
+                    f"rank={rank} pp={pp_rank} tp={tp_rank} "
+                    f"stage=lm "
+                    f"combined_shape={tuple(combined_embeddings.shape)} "
+                    f"qkv_format={qkv_format} "
+                    f"max_q={max_q} max_kv={max_kv} cu_last={cu_last}",
+                    flush=True,
+                )
 
         if isinstance(self.language_model, MambaModel):
             output = self.language_model(

@@ -121,6 +121,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
+            glu_aware_partition=self.config.gated_linear_unit,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):

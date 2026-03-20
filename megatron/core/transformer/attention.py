@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import copy
+import os
+import pathlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
@@ -43,6 +45,73 @@ from ..models.common.embeddings.yarn_rotary_pos_embedding import (
 )
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
+
+_ATTN_FP_DEBUG_COUNTER = 0
+
+
+def _maybe_log_attn_fp(
+    tag: str,
+    layer_number: int,
+    tensor: Tensor,
+    pg_collection: Optional[ProcessGroupCollection],
+) -> None:
+    if os.getenv("VLM_DEBUG_ATTN_FP", "0") != "1":
+        return
+
+    targets_raw = os.getenv("VLM_DEBUG_ATTN_LAYER_NUMBERS", "").strip()
+    if not targets_raw:
+        return
+    targets = {int(x.strip()) for x in targets_raw.split(",") if x.strip()}
+    if layer_number not in targets:
+        return
+
+    global _ATTN_FP_DEBUG_COUNTER
+    limit = int(os.getenv("VLM_DEBUG_ATTN_FP_LIMIT", "64"))
+    if _ATTN_FP_DEBUG_COUNTER >= limit:
+        return
+    _ATTN_FP_DEBUG_COUNTER += 1
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    pp_rank = get_pg_rank(getattr(pg_collection, "pp", None))
+    tp_rank = get_pg_rank(getattr(pg_collection, "tp", None))
+    t = tensor.detach().float()
+    print(
+        "VLM_ATTN_FP "
+        f"count={_ATTN_FP_DEBUG_COUNTER} "
+        f"tag={tag} layer={layer_number} rank={rank} pp={pp_rank} tp={tp_rank} "
+        f"shape={tuple(tensor.shape)} "
+        f"sum={float(t.sum().item()):.8f} "
+        f"abs={float(t.abs().sum().item()):.8f} "
+        f"norm={float(torch.linalg.vector_norm(t).item()):.8f}",
+        flush=True,
+    )
+
+    dump_dir = os.getenv("VLM_DEBUG_ATTN_DUMP_DIR", "").strip()
+    if not dump_dir:
+        return
+
+    dump_targets_raw = os.getenv("VLM_DEBUG_ATTN_DUMP_TAGS", "").strip()
+    if dump_targets_raw:
+        dump_targets = {x.strip() for x in dump_targets_raw.split(",") if x.strip()}
+        if tag not in dump_targets:
+            return
+
+    dump_ranks_raw = os.getenv("VLM_DEBUG_ATTN_DUMP_RANKS", "").strip()
+    if dump_ranks_raw:
+        dump_ranks = {int(x.strip()) for x in dump_ranks_raw.split(",") if x.strip()}
+        if rank not in dump_ranks:
+            return
+
+    dump_limit = int(os.getenv("VLM_DEBUG_ATTN_DUMP_LIMIT", "16"))
+    if _ATTN_FP_DEBUG_COUNTER > dump_limit:
+        return
+
+    path = pathlib.Path(dump_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        tensor.detach().float().cpu(),
+        path / f"layer{layer_number}_{tag}_rank{rank}_pp{pp_rank}_tp{tp_rank}_count{_ATTN_FP_DEBUG_COUNTER}.pt",
+    )
 
 try:
     from einops import rearrange
@@ -811,6 +880,12 @@ class Attention(MegatronModule, ABC):
             query, key, value = qkv_output
         else:
             mixed_qkv, qkv_split_arg_list = qkv_output
+        if split_qkv:
+            _maybe_log_attn_fp("query", self.layer_number, query, self.pg_collection)
+            _maybe_log_attn_fp("key", self.layer_number, key, self.pg_collection)
+            _maybe_log_attn_fp("value", self.layer_number, value, self.pg_collection)
+        else:
+            _maybe_log_attn_fp("mixed_qkv", self.layer_number, mixed_qkv, self.pg_collection)
         nvtx_range_pop(suffix="qkv")
 
         # ===================================================
@@ -871,7 +946,7 @@ class Attention(MegatronModule, ABC):
                 )
             )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
@@ -932,6 +1007,10 @@ class Attention(MegatronModule, ABC):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+        if split_qkv:
+            _maybe_log_attn_fp("query_post_rope", self.layer_number, query, self.pg_collection)
+            _maybe_log_attn_fp("key_post_rope", self.layer_number, key, self.pg_collection)
+            _maybe_log_attn_fp("value_post_rope", self.layer_number, value, self.pg_collection)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
         # ==================================
@@ -988,6 +1067,7 @@ class Attention(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
+        _maybe_log_attn_fp("core_attn_out", self.layer_number, core_attn_out, self.pg_collection)
 
         # =================
         # Output. [sq, b, h]
@@ -996,6 +1076,7 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
+        _maybe_log_attn_fp("proj_out", self.layer_number, output, self.pg_collection)
 
         return output, bias
 

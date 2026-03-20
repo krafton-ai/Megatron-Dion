@@ -177,11 +177,14 @@ def model_provider(
     vision_projection_config.recompute_method = None
     vision_projection_config.recompute_num_layers = None
 
-    # TODO: Vision model and projection do not use SP/CP yet.
+    # Vision model and projection currently use local-only model parallelism.
+    # Keep them independent from language TP/SP/CP until a validated TP path exists.
+    vision_config.tensor_model_parallel_size = 1
     vision_config.sequence_parallel = False
     vision_config.context_parallel_size = 1
     vision_config.tp_comm_overlap = False
 
+    vision_projection_config.tensor_model_parallel_size = 1
     vision_projection_config.sequence_parallel = False
     vision_projection_config.context_parallel_size = 1
     vision_projection_config.tp_comm_overlap = False
@@ -226,6 +229,8 @@ def model_provider(
         tile_tags=tile_tags,
         max_num_tiles=args.max_num_tiles,
         tokenizer_type=args.tokenizer_prompt_format,
+        encoder_topology_invariant_init_seed=args.seed + 170003,
+        decoder_topology_invariant_init_seed=args.seed + 170019,
     )
 
     model.freeze(

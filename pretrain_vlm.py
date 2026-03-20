@@ -51,11 +51,52 @@ from megatron.training.arguments import core_transformer_config_from_args
 from pretrain_gpt import loss_func as _gpt_loss_func
 
 _BATCH_FP_DEBUG_COUNTER = 0
+_POST_BCAST_FP_DEBUG_COUNTER = 0
+_BATCH_KEY_DEBUG_COUNTER = 0
+_COMBINED_FP_DEBUG_COUNTER = 0
+_PACKED_FP_DEBUG_COUNTER = 0
 
 
 def loss_func(loss_mask, output_tensor, model=None):
     """VLM loss function — delegates to standard GPT loss_func."""
     return _gpt_loss_func(loss_mask, output_tensor, model=model)
+
+
+def _debug_log_init_params(model):
+    patterns_raw = os.getenv("VLM_DEBUG_INIT_PARAM_PATTERNS", "").strip()
+    if not patterns_raw:
+        return
+    patterns = [p.strip() for p in patterns_raw.split(",") if p.strip()]
+    if not patterns:
+        return
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    pp_rank = get_pipeline_model_parallel_rank()
+    tp_rank = get_tensor_model_parallel_rank()
+
+    for name, param in model.named_parameters():
+        if not any(p in name for p in patterns):
+            continue
+        data = param.detach().float()
+        flat = data.flatten()
+        limit = min(int(os.getenv("VLM_DEBUG_INIT_PARAM_PREVIEW", "8")), flat.numel())
+        preview = ",".join(f"{float(x):.8f}" for x in flat[:limit].tolist())
+        if flat.numel() > 0:
+            weights = torch.arange(1, flat.numel() + 1, device=flat.device, dtype=flat.dtype)
+            weighted = float((flat * weights).sum().item())
+        else:
+            weighted = 0.0
+        print(
+            "VLM_INIT_PARAM "
+            f"rank={rank} pp={pp_rank} tp={tp_rank} "
+            f"name={name} shape={tuple(param.shape)} "
+            f"sum={float(data.sum().item()):.8f} "
+            f"abs_sum={float(data.abs().sum().item()):.8f} "
+            f"norm={float(torch.linalg.vector_norm(data).item()):.8f} "
+            f"weighted_sum={weighted:.8f} "
+            f"preview=[{preview}]",
+            flush=True,
+        )
 
 
 def model_provider(
@@ -125,13 +166,15 @@ def model_provider(
         add_encoder = bool(pre_process)
         add_decoder = True
 
-    return _multimodal_model_provider(
+    model = _multimodal_model_provider(
         pre_process=pre_process,
         post_process=post_process,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
         parallel_output=parallel_output,
     )
+    _debug_log_init_params(model)
+    return model
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -529,6 +572,28 @@ def get_batch_energon(data_iterator):
                     f"lab_sum={lab_sum} lab_abs={lab_abs}",
                     flush=True,
                 )
+            if os.getenv("VLM_DEBUG_BATCH_KEYS", "0") == "1":
+                global _BATCH_KEY_DEBUG_COUNTER
+                limit = int(os.getenv("VLM_DEBUG_BATCH_KEYS_LIMIT", "8"))
+                if _BATCH_KEY_DEBUG_COUNTER < limit:
+                    _BATCH_KEY_DEBUG_COUNTER += 1
+                    virt_idx = getattr(data_iterator, "_last_i", -1)
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+                    dp_rank = parallel_state.get_data_parallel_rank()
+                    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                    keys = data.get("__key__", [])
+                    if isinstance(keys, str):
+                        keys = [keys]
+                    joined = "|".join(str(k) for k in keys)
+                    print(
+                        "VLM_BATCH_KEYS "
+                        f"count={_BATCH_KEY_DEBUG_COUNTER} "
+                        f"rank={rank} pp={pp_rank} dp={dp_rank} tp={tp_rank} "
+                        f"vloader={virt_idx} "
+                        f"keys={joined}",
+                        flush=True,
+                    )
         else:
             data = None
 
@@ -624,6 +689,35 @@ def get_batch_energon(data_iterator):
             max_seqlen_kv=max_lengths,
         )
 
+    if os.getenv("VLM_DEBUG_PACKED_FP", "0") == "1":
+        global _PACKED_FP_DEBUG_COUNTER
+        limit = int(os.getenv("VLM_DEBUG_PACKED_FP_LIMIT", "16"))
+        if _PACKED_FP_DEBUG_COUNTER < limit:
+            _PACKED_FP_DEBUG_COUNTER += 1
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            dp_rank = parallel_state.get_data_parallel_rank()
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else "none"
+            max_q = int(packed_seq_params.max_seqlen_q) if packed_seq_params is not None else -1
+            max_kv = int(packed_seq_params.max_seqlen_kv) if packed_seq_params is not None else -1
+            cu_last = (
+                int(packed_seq_params.cu_seqlens_q[-1].item())
+                if packed_seq_params is not None and packed_seq_params.cu_seqlens_q is not None
+                else -1
+            )
+            print(
+                "VLM_PACKED_FP "
+                f"count={_PACKED_FP_DEBUG_COUNTER} "
+                f"rank={rank} pp={pp_rank} dp={dp_rank} tp={tp_rank} "
+                f"stage=batch "
+                f"text_shape={tuple(data_text.shape)} "
+                f"labels_shape={tuple(labels.shape)} "
+                f"qkv_format={qkv_format} "
+                f"max_q={max_q} max_kv={max_kv} cu_last={cu_last}",
+                flush=True,
+            )
+
     tokens_ = data_text.long()
     tokenizer = get_tokenizer()
     text_length = tokens_.shape[1]
@@ -633,9 +727,40 @@ def get_batch_energon(data_iterator):
 
     loss_mask, position_ids = _get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad)
 
+    if os.getenv("VLM_DEBUG_POST_BCAST_FP", "0") == "1":
+        global _POST_BCAST_FP_DEBUG_COUNTER
+        limit = int(os.getenv("VLM_DEBUG_POST_BCAST_FP_LIMIT", "16"))
+        if _POST_BCAST_FP_DEBUG_COUNTER < limit and _is_first_or_last_stage(pp_size):
+            _POST_BCAST_FP_DEBUG_COUNTER += 1
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            dp_rank = parallel_state.get_data_parallel_rank()
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            tok_sum = int(tokens.sum().item())
+            tok_abs = int(tokens.abs().sum().item())
+            lab_sum = int(labels.sum().item())
+            lab_abs = int(labels.abs().sum().item())
+            mask_sum = float(loss_mask.sum().item())
+            num_tiles_sum = int(num_tiles.sum().item()) if num_tiles is not None and num_tiles.numel() > 0 else 0
+            print(
+                "VLM_POST_BCAST_FP "
+                f"count={_POST_BCAST_FP_DEBUG_COUNTER} "
+                f"rank={rank} pp={pp_rank} dp={dp_rank} tp={tp_rank} "
+                f"first={int(is_first_stage)} last={int(is_last_stage)} "
+                f"text_len={int(text_length)} "
+                f"tok_sum={tok_sum} tok_abs={tok_abs} "
+                f"lab_sum={lab_sum} lab_abs={lab_abs} "
+                f"mask_sum={mask_sum:.1f} tiles_sum={num_tiles_sum}",
+                flush=True,
+            )
+
     # CP/SP sharding.
     if args.context_parallel_size > 1 or args.sequence_parallel:
-        assert tokens.shape[0], "micro-batch-size > 1 not supported yet with CP"
+        # Current multimodal CP path only supports a single sample per microbatch.
+        if args.context_parallel_size > 1:
+            assert (
+                tokens.shape[0] == 1
+            ), f"micro-batch-size must be 1 with CP for VLM energon path, got {tokens.shape[0]}"
 
         image_token_index = DEFAULT_IMAGE_TOKEN_INDEX
         _vmt = getattr(args, 'vision_model_type', None) or "clip"
