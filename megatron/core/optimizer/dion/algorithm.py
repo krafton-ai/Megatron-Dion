@@ -190,6 +190,7 @@ class MegatronDion(Optimizer):
         self._ortho_sanity_trace = os.getenv("DION_ORTHO_SANITY_TRACE", "0") == "1"
         self._debug_every = self._parse_positive_int_env("DION_DEBUG_EVERY", 1)
         self._debug_fs_only = os.getenv("DION_DEBUG_FS_ONLY", "0") == "1"
+        self._debug_fs_only_batch_trace = os.getenv("DION_DEBUG_FS_ONLY_BATCH_TRACE", "0") == "1"
         self._debug_batch_order = os.getenv("DION_DEBUG_BATCH_ORDER", "0") == "1"
         self._debug_large_r = os.getenv("DION_DEBUG_LARGE_R", "0") == "1"
         self._debug_large_r_min_r = self._parse_positive_int_env(
@@ -218,6 +219,9 @@ class MegatronDion(Optimizer):
         self._debug_dump_target_tags = {
             tag for tag in os.getenv("DION_DEBUG_DUMP_TARGET_TAGS", "").split(",") if tag
         }
+        self._debug_dump_unsharded_q = os.getenv("DION_DEBUG_DUMP_UNSHARDED_Q", "0") == "1"
+        self._debug_ortho_batch_trace = os.getenv("DION_DEBUG_ORTHO_BATCH_TRACE", "0") == "1"
+        self._ortho_batch_trace_counter = 0
 
     @staticmethod
     def _parse_positive_int_env(name: str, default: int) -> int:
@@ -462,7 +466,7 @@ class MegatronDion(Optimizer):
             return
 
         limit = len(metas) if real_batch_size is None else min(real_batch_size, len(metas))
-        dump_dir = self._repo_test_logs_dir()
+        dump_dir = self._debug_trace_dump_dir()
         dump_dir.mkdir(parents=True, exist_ok=True)
 
         rp_rank = None
@@ -534,6 +538,161 @@ class MegatronDion(Optimizer):
         if self.rp_group is None:
             return None
         return self.rp_group if dist.get_world_size(self.rp_group) > 1 else None
+
+    def _pure_dp_replicate_group(self):
+        """Return the pure-DP group that excludes CP."""
+        pure_dp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=False,
+            partial_data_parallel=False,
+        )
+        if pure_dp_group is None:
+            raise RuntimeError(
+                "[DION_COMPRESSED_MISSING_PURE_DP_GROUP] "
+                f"step={self._step_count} rank={self._global_rank}"
+            )
+        return pure_dp_group if dist.get_world_size(pure_dp_group) > 1 else None
+
+    def _reference_replicate_group_for_config(self, config: "DionParamConfig"):
+        """Return the lifted reference replicate mesh for one Dion batch config.
+
+        `dion_reference.py` models only TP / FS / RP. Under Megatron-Core, CP is
+        the gradient-construction axis, not part of the Dion replicate mesh. The
+        lifted replicate mesh must therefore remain the explicit Dion RP group for
+        all dense / TP / FS routes; CP may change how the logical gradient is
+        constructed, but it must not redefine the optimizer's replicate domain.
+        """
+        del config
+        return self._compressed_replicate_group()
+
+    def _fs_only_compressed_replicate_group(self):
+        """Return the fs-only compressed replicate mesh.
+
+        `dion_reference.py` models TP / FS / RP only. When CP>1 under Megatron-Core,
+        CP is not part of Dion's replicate mesh; it is only the gradient-construction
+        axis. For fs-only compressed batches, match the reference semantics by using:
+        - explicit RP replicas when CP==1
+        - pure DP replicas (without CP) when CP>1
+        """
+        replicate_group = self._compressed_replicate_group()
+        if replicate_group is None:
+            return None
+
+        cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+        cp_world_size = dist.get_world_size(cp_group) if cp_group is not None else 1
+        if cp_world_size <= 1:
+            return replicate_group
+
+        pure_dp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=False,
+            partial_data_parallel=False,
+        )
+        if pure_dp_group is None:
+            raise RuntimeError(
+                "[DION_FSONLY_COMPRESSED_MISSING_PURE_DP_GROUP] "
+                f"step={self._step_count} rank={self._global_rank} cp_world_size={cp_world_size}"
+            )
+        pure_dp_world_size = dist.get_world_size(pure_dp_group)
+        if pure_dp_world_size <= 1:
+            raise RuntimeError(
+                "[DION_FSONLY_COMPRESSED_INVALID_PURE_DP_GROUP] "
+                f"step={self._step_count} rank={self._global_rank} "
+                f"cp_world_size={cp_world_size} pure_dp_world_size={pure_dp_world_size}"
+            )
+        return pure_dp_group
+
+    def _fs_only_compressed_replicate_spec(
+        self,
+    ) -> Tuple[
+        Optional[torch.distributed.ProcessGroup],
+        Optional[List[int]],
+    ]:
+        """Resolve the fs-only compressed replicate collapse surface.
+
+        Reference fs-only compressed semantics require averaging only across ranks
+        that represent the same logical FS slot after reduce-scatter. Under
+        Megatron-Core with CP>1, using the full pure-DP group can mix different
+        FS slot positions (for example FS=8 on a 16-rank DP×CP domain). The
+        correct lifted surface is therefore:
+        - keep the standard RP inter-instance group as the primary gather domain
+        - restrict averaging to ranks that also share the same CP index
+        """
+        replicate_group = self._compressed_replicate_group()
+        if replicate_group is None:
+            return None, None
+
+        cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+        cp_world_size = dist.get_world_size(cp_group) if cp_group is not None else 1
+        if cp_world_size <= 1:
+            return replicate_group, None
+
+        pure_dp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=False,
+            partial_data_parallel=False,
+        )
+        if pure_dp_group is None:
+            raise RuntimeError(
+                "[DION_FSONLY_COMPRESSED_MISSING_PURE_DP_GROUP] "
+                f"step={self._step_count} rank={self._global_rank} cp_world_size={cp_world_size}"
+            )
+
+        replicate_ranks = dist.get_process_group_ranks(replicate_group)
+        pure_dp_ranks = set(dist.get_process_group_ranks(pure_dp_group))
+        subset_ranks = [rank for rank in replicate_ranks if rank in pure_dp_ranks]
+        if not subset_ranks:
+            raise RuntimeError(
+                "[DION_FSONLY_COMPRESSED_EMPTY_REPLICA_SUBSET] "
+                f"step={self._step_count} rank={self._global_rank} "
+                f"replicate_ranks={replicate_ranks} pure_dp_ranks={sorted(pure_dp_ranks)}"
+            )
+        if self._global_rank not in subset_ranks:
+            raise RuntimeError(
+                "[DION_FSONLY_COMPRESSED_RANK_NOT_IN_REPLICA_SUBSET] "
+                f"step={self._step_count} rank={self._global_rank} "
+                f"replicate_ranks={replicate_ranks} subset_ranks={subset_ranks}"
+            )
+        if len(subset_ranks) == len(replicate_ranks):
+            return replicate_group, None
+        return replicate_group, subset_ranks
+
+    def _maybe_dump_unsharded_q_batch(
+        self,
+        *,
+        metas: Optional[List],
+        q_for_matmul: List[Tensor],
+    ) -> None:
+        if not self._debug_dump_unsharded_q or not metas:
+            return
+
+        dump_dir = self._debug_trace_dump_dir()
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        for idx, meta in enumerate(metas):
+            param_name = getattr(meta, "param_name", "") if meta is not None else ""
+            if "*" not in self._debug_trace_params and param_name not in self._debug_trace_params:
+                continue
+            if idx >= len(q_for_matmul):
+                continue
+
+            safe_name = param_name.replace(".", "_").replace("/", "_") or "unknown"
+            dump_path = dump_dir / (
+                f"dion_unsharded_q_step{self._step_count}_rank{self._global_rank}_{safe_name}.pt"
+            )
+            payload = {
+                "step": self._step_count,
+                "rank": self._global_rank,
+                "slot": int(idx),
+                "meta": self._format_meta_id(meta),
+                "Q_full": q_for_matmul[idx].detach().cpu(),
+            }
+            torch.save(payload, dump_path)
+            logger.warning(
+                "[DION_UNSHARDED_Q_DUMP] step=%d rank=%d slot=%d path=%s meta=%s",
+                self._step_count,
+                self._global_rank,
+                idx,
+                str(dump_path),
+                payload["meta"],
+            )
 
     def _broadcast_replicate_domain_(self, tensor: Tensor) -> None:
         """Broadcast optimizer state across the true Dion replicate domain.
@@ -636,17 +795,7 @@ class MegatronDion(Optimizer):
         if not metas:
             return None
 
-        logical_ids = []
-        for meta in metas:
-            if meta is None:
-                logical_ids.append(None)
-                continue
-            logical_ids.append(
-                (
-                    getattr(meta, "param_uid", None),
-                    getattr(meta, "param_name", ""),
-                )
-            )
+        logical_ids = self._logical_sketch_seed_keys(metas=metas, tag=tag)
 
         def _make_sketch(P: Tensor, oversample: float) -> Tensor:
             batch_shape = P.shape[:-2]
@@ -674,13 +823,7 @@ class MegatronDion(Optimizer):
             std = math.sqrt(1.0 / k)
             if batch == 1 and len(batch_shape) == 0:
                 logical_id = logical_ids[0]
-                seed_key = repr(
-                    (
-                        tag,
-                        self._step_count,
-                        logical_id,
-                    )
-                ).encode("utf-8")
+                seed_key = repr(logical_id).encode("utf-8")
                 seed = int.from_bytes(
                     hashlib.blake2b(seed_key, digest_size=8).digest(), "little"
                 ) & ((1 << 63) - 1)
@@ -691,13 +834,7 @@ class MegatronDion(Optimizer):
                 return sketch
             sketch = torch.empty((batch, k, m), device=P.device, dtype=P.dtype)
             for idx, logical_id in enumerate(logical_ids):
-                seed_key = repr(
-                    (
-                        tag,
-                        self._step_count,
-                        logical_id,
-                    )
-                ).encode("utf-8")
+                seed_key = repr(logical_id).encode("utf-8")
                 seed = int.from_bytes(
                     hashlib.blake2b(seed_key, digest_size=8).digest(), "little"
                 ) & ((1 << 63) - 1)
@@ -710,7 +847,46 @@ class MegatronDion(Optimizer):
                 )
             return sketch
 
+        setattr(_make_sketch, "_dion_sketch_tag", tag)
+        setattr(_make_sketch, "_dion_logical_seed_keys", tuple(logical_ids))
+        setattr(
+            _make_sketch,
+            "_dion_batch_meta_ids",
+            tuple(self._format_meta_id(meta) for meta in metas),
+        )
+
         return _make_sketch
+
+    def _logical_sketch_seed_keys(
+        self,
+        *,
+        metas: Optional[List],
+        tag: str,
+    ) -> Optional[List[object]]:
+        """Return topology-invariant logical sketch ids for one Dion update batch.
+
+        Sketch generation must be keyed only by the logical parameter identity and
+        optimizer step, not by ambient RNG state, node count, or batch composition.
+        The returned objects are passed by value into the sketch generator so both
+        local and distributed RCQR routes consume the same logical sketch contract.
+        """
+        if not metas:
+            return None
+
+        logical_ids: List[object] = []
+        for meta in metas:
+            if meta is None:
+                logical_ids.append((tag, self._step_count, None))
+                continue
+            logical_ids.append(
+                (
+                    tag,
+                    self._step_count,
+                    getattr(meta, "param_uid", None),
+                    getattr(meta, "param_name", ""),
+                )
+            )
+        return logical_ids
 
     def _logical_local_sketch_fn(self, *, metas: Optional[List]):
         """Return the topology-invariant local sketch contract.
@@ -786,6 +962,8 @@ class MegatronDion(Optimizer):
             local_sketch.normal_(mean=0.0, std=std, generator=gen)
             return local_sketch
 
+        setattr(_make_sketch, "_dion_sketch_tag", "reference_fs_only")
+
         return _make_sketch
 
     def _sync_state_replica_q_init_(self, dion_params: List[Tuple]) -> None:
@@ -818,9 +996,12 @@ class MegatronDion(Optimizer):
     def _collapse_grads_across_cp(
         self,
         grads: List[Tensor],
+        *,
+        replicate_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Generator[None, None, None]:
         """Collapse true Dion replicate replicas on G for non-compressed batches."""
-        replicate_group = self._compressed_replicate_group()
+        if replicate_group is None:
+            replicate_group = self._compressed_replicate_group()
         if replicate_group is None or not grads:
             return
 
@@ -838,14 +1019,50 @@ class MegatronDion(Optimizer):
     def _collapse_batch_across_cp(
         self,
         batch: Tensor,
+        *,
+        replicate_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Generator[None, None, None]:
         """Collapse true Dion replicate replicas on a batched tensor."""
-        replicate_group = self._compressed_replicate_group()
+        if replicate_group is None:
+            replicate_group = self._compressed_replicate_group()
         if replicate_group is None:
             return
 
         dist.all_reduce(batch, op=self._replicate_reduce_op(), group=replicate_group)
         yield
+
+    def _collapse_batch_over_rank_subset(
+        self,
+        batch: Tensor,
+        *,
+        primary_group: torch.distributed.ProcessGroup,
+        subset_ranks: List[int],
+    ) -> Generator[None, None, None]:
+        """Average `batch` across a deterministic subset of an existing group."""
+        if primary_group is None:
+            raise RuntimeError("[DION_INVALID_PRIMARY_GROUP_FOR_SUBSET_COLLAPSE]")
+        if not subset_ranks:
+            raise RuntimeError("[DION_EMPTY_SUBSET_FOR_SUBSET_COLLAPSE]")
+
+        primary_ranks = dist.get_process_group_ranks(primary_group)
+        rank_to_index = {rank: idx for idx, rank in enumerate(primary_ranks)}
+        subset_indices = [rank_to_index[rank] for rank in subset_ranks]
+
+        gathered = funcol.all_gather_tensor(
+            batch.contiguous(),
+            gather_dim=0,
+            group=primary_group,
+        )
+        yield
+
+        gathered = gathered.view(len(primary_ranks), *batch.shape)
+        index_tensor = torch.tensor(
+            subset_indices,
+            device=batch.device,
+            dtype=torch.long,
+        )
+        reduced = gathered.index_select(0, index_tensor).mean(dim=0)
+        batch.copy_(reduced)
 
     def _resolve_async_task_limit(self, task_count: int) -> int:
         """Resolve the async runtime width without relying on hidden global defaults."""
@@ -994,6 +1211,13 @@ class MegatronDion(Optimizer):
     def _repo_test_logs_dir() -> Path:
         return Path(__file__).resolve().parents[4] / "test_logs"
 
+    @staticmethod
+    def _debug_trace_dump_dir() -> Path:
+        dump_dir_env = os.getenv("DION_DEBUG_TRACE_DUMP_DIR", "").strip()
+        if dump_dir_env:
+            return Path(dump_dir_env)
+        return MegatronDion._repo_test_logs_dir()
+
     def _maybe_dump_bad_ortho_input(
         self,
         *,
@@ -1078,18 +1302,48 @@ class MegatronDion(Optimizer):
             return
         if P_in.size(-1) < self._debug_large_r_min_r:
             return
+        param_name = getattr(meta, "param_name", "") if meta is not None else ""
+        if self._debug_trace_params and "*" not in self._debug_trace_params:
+            if param_name not in self._debug_trace_params:
+                return
 
-        local_ref = orthogonalize(
-            P_in.clone(),
-            rcqr_oversample=self.defaults['rcqr_oversample'],
-            sketch_fn=self._logical_local_sketch_fn(metas=[meta] if meta is not None else None),
-        ).to(P_in.dtype)
+        ortho_mesh = self._device_mesh_for_group(shard_group, "fs_only_exact_compare")
+        p_dtensor = DTensor.from_local(
+            P_in.contiguous(),
+            device_mesh=ortho_mesh,
+            placements=(Shard(0),),
+        )
+        local_ref = orthogonalize_dtensor_exact(
+            p_dtensor,
+            oversample=self.defaults['rcqr_oversample'],
+            logical_seed_keys=self._logical_sketch_seed_keys(
+                metas=[meta] if meta is not None else None,
+                tag="logical_local",
+            ),
+            batch_meta_ids=[self._format_meta_id(meta)] if meta is not None else None,
+        ).to_local().to(P_in.dtype)
+        out_diff = (P_exact[0] - local_ref[0]).to(torch.float32)
+        out_diff_finite = bool(torch.isfinite(out_diff).all().item())
+        out_diff_max_abs = (
+            float(out_diff.abs().max().item()) if out_diff_finite else float("inf")
+        )
+        out_diff_rel = (
+            float(out_diff.norm().item())
+            / max(
+                float(P_exact[0].to(torch.float32).norm().item()),
+                float(local_ref[0].to(torch.float32).norm().item()),
+                1e-12,
+            )
+            if out_diff_finite
+            else float("inf")
+        )
         exact_finite, exact_max_err, exact_fro = self._p_orthogonality_metrics(P_exact[0])
         ref_finite, ref_max_err, ref_fro = self._p_orthogonality_metrics(local_ref[0])
         logger.info(
             "[DION_DEBUG_FS_ONLY_EXACT_COMPARE] step=%d rank=%d tag=%s meta=%s "
             "exact_finite=%s exact_max_err=%.6e exact_fro=%.6e "
-            "local_ref_finite=%s local_ref_max_err=%.6e local_ref_fro=%.6e",
+            "local_ref_finite=%s local_ref_max_err=%.6e local_ref_fro=%.6e "
+            "out_diff_finite=%s out_diff_rel=%.6e out_diff_max_abs=%.6e",
             self._step_count,
             self._global_rank,
             tag,
@@ -1100,6 +1354,9 @@ class MegatronDion(Optimizer):
             ref_finite,
             ref_max_err,
             ref_fro,
+            out_diff_finite,
+            out_diff_rel,
+            out_diff_max_abs,
         )
         self._maybe_dump_bad_ortho_input(
             P_in=P_in[0],
@@ -1108,6 +1365,77 @@ class MegatronDion(Optimizer):
             meta=meta,
             tag=tag,
             extra={"shard_rank": shard_rank},
+        )
+
+    def _maybe_compare_local_logical(
+        self,
+        *,
+        P_in: torch.Tensor,
+        P_runtime: torch.Tensor,
+        meta,
+        tag: str,
+    ) -> None:
+        if not self._debug_compare_sketch:
+            return
+        if not self._should_run_debug_probe(self._debug_compare_sketch):
+            return
+        if P_in.ndim != 3 or P_in.size(0) != 1:
+            return
+        if P_in.size(-1) < self._debug_large_r_min_r:
+            return
+        param_name = getattr(meta, "param_name", "") if meta is not None else ""
+        if self._debug_trace_params and "*" not in self._debug_trace_params:
+            if param_name not in self._debug_trace_params:
+                return
+
+        logical_ref = orthogonalize(
+            P_in.clone(),
+            rcqr_oversample=self.defaults['rcqr_oversample'],
+            sketch_fn=self._logical_local_sketch_fn(metas=[meta] if meta is not None else None),
+        ).to(P_in.dtype)
+        out_diff = (P_runtime[0] - logical_ref[0]).to(torch.float32)
+        out_diff_finite = bool(torch.isfinite(out_diff).all().item())
+        out_diff_max_abs = (
+            float(out_diff.abs().max().item()) if out_diff_finite else float("inf")
+        )
+        out_diff_rel = (
+            float(out_diff.norm().item())
+            / max(
+                float(P_runtime[0].to(torch.float32).norm().item()),
+                float(logical_ref[0].to(torch.float32).norm().item()),
+                1e-12,
+            )
+            if out_diff_finite
+            else float("inf")
+        )
+        runtime_finite, runtime_max_err, runtime_fro = self._p_orthogonality_metrics(P_runtime[0])
+        logical_finite, logical_max_err, logical_fro = self._p_orthogonality_metrics(logical_ref[0])
+        logger.warning(
+            "[DION_DEBUG_LOCAL_LOGICAL_COMPARE] step=%d rank=%d tag=%s meta=%s "
+            "runtime_finite=%s runtime_max_err=%.6e runtime_fro=%.6e "
+            "logical_finite=%s logical_max_err=%.6e logical_fro=%.6e "
+            "out_diff_finite=%s out_diff_rel=%.6e out_diff_max_abs=%.6e",
+            self._step_count,
+            self._global_rank,
+            tag,
+            self._format_meta_id(meta) if meta is not None else None,
+            runtime_finite,
+            runtime_max_err,
+            runtime_fro,
+            logical_finite,
+            logical_max_err,
+            logical_fro,
+            out_diff_finite,
+            out_diff_rel,
+            out_diff_max_abs,
+        )
+        self._maybe_dump_bad_ortho_input(
+            P_in=P_in[0],
+            P_exact=P_runtime[0],
+            P_local_ref=logical_ref[0],
+            meta=meta,
+            tag=tag,
+            extra={"mode": "local_logical_compare"},
         )
 
     def _maybe_log_sketch_comparison(
@@ -1688,16 +2016,20 @@ class MegatronDion(Optimizer):
             local_shape = batch_key[0]
             m, n = local_shape
 
-            has_tp_axis = batch_key[2]
-            has_fs_axis = batch_key[1]
+            cfg = self._batch_key_to_config(batch_key)
+            has_tp_axis = self._has_active_tp_axis(cfg)
+            has_fs_axis = self._has_active_fs_axis(cfg)
             sync_groups = self._batch_sync_groups(batch_key)
+            replicate_group = self._reference_replicate_group_for_config(cfg)
 
             if has_tp_axis and self.tp_group:
                 batch_size = dist.get_world_size(self.tp_group)
             elif has_fs_axis and self.fs_group:
                 batch_size = dist.get_world_size(self.fs_group)
+            elif cfg.compressed_all_reduce and replicate_group is not None:
+                batch_size = dist.get_world_size(replicate_group)
             else:
-                batch_size = dist.get_world_size(self.rp_group) if self.rp_group else 1
+                batch_size = dist.get_world_size(replicate_group) if replicate_group else 1
 
             if os.getenv("DION_DEBUG_FORCE_BATCH1", "0") == "1":
                 batch_size = 1
@@ -2163,11 +2495,12 @@ class MegatronDion(Optimizer):
         """Build a DionParamConfig from a synchronized Dion batch key."""
         return DionParamConfig(
             has_fs_axis=bool(batch_key[1]),
-            has_tp_axis=bool(batch_key[2]),
-            is_transposed=bool(batch_key[3]),
-            compressed_all_reduce=bool(batch_key[4]),
-            inner_shard_tensor_dim=batch_key[5] if batch_key[5] != -1 else None,
-            outer_shard_tensor_dim=batch_key[6] if batch_key[6] != -1 else None,
+            active_fs_axis=bool(batch_key[2]),
+            has_tp_axis=bool(batch_key[3]),
+            is_transposed=bool(batch_key[4]),
+            compressed_all_reduce=bool(batch_key[5]),
+            inner_shard_tensor_dim=batch_key[6] if batch_key[6] != -1 else None,
+            outer_shard_tensor_dim=batch_key[7] if batch_key[7] != -1 else None,
         )
 
     def _restore_tp_global_shape(
@@ -2239,6 +2572,7 @@ class MegatronDion(Optimizer):
 
         config = DionParamConfig()
         config.has_fs_axis = False
+        config.active_fs_axis = False
         config.has_tp_axis = False
 
         meta = self.dist_metas.get(param, None) if hasattr(self, 'dist_metas') else None
@@ -2276,6 +2610,7 @@ class MegatronDion(Optimizer):
                 fs_split_dim = getattr(meta, 'fs_split_dim', -1) if meta else -1
                 if fs_split_dim in (0, 1):
                     config.has_fs_axis = True
+                    config.active_fs_axis = getattr(meta, "shard_group_world_size", 1) > 1
                     config.outer_shard_tensor_dim = fs_split_dim
 
                 # Determine is_transposed
@@ -2540,9 +2875,10 @@ class MegatronDion(Optimizer):
                 bool(sk[2]),
                 bool(sk[3]),
                 bool(sk[4]),
-                int(sk[5]) if sk[5] is not None else -1,
+                bool(sk[5]),
                 int(sk[6]) if sk[6] is not None else -1,
-                str(sk[7]),
+                int(sk[7]) if sk[7] is not None else -1,
+                str(sk[8]),
             )
             local_keys_serialized.append(key_data)
 
@@ -2581,7 +2917,8 @@ class MegatronDion(Optimizer):
                 key_data[4],
                 key_data[5],
                 key_data[6],
-                str_to_dtype(key_data[7]),
+                key_data[7],
+                str_to_dtype(key_data[8]),
             )
             for key_data in canonical_keys
         ]
@@ -2649,17 +2986,26 @@ class MegatronDion(Optimizer):
         """Return all process groups that must see the same batch schedule for this batch key."""
         cfg = self._batch_key_to_config(batch_key)
         groups = []
+        compressed_replicate_group = self._reference_replicate_group_for_config(cfg)
+        if (
+            cfg.compressed_all_reduce
+            and compressed_replicate_group is not None
+            and dist.get_world_size(compressed_replicate_group) > 1
+        ):
+            groups.append(compressed_replicate_group)
         if (
             self.state_replica_group is not None
             and self.state_replica_world_size > 1
         ):
-            groups.append(self.state_replica_group)
+            if all(id(self.state_replica_group) != id(existing) for existing in groups):
+                groups.append(self.state_replica_group)
         if (
-            cfg.has_tp_axis
+            self._has_active_tp_axis(cfg)
             and self.tp_group is not None
             and dist.get_world_size(self.tp_group) > 1
         ):
-            groups.append(self.tp_group)
+            if all(id(self.tp_group) != id(existing) for existing in groups):
+                groups.append(self.tp_group)
         if (
             cfg.has_fs_axis
             and self.use_fs_collectives
@@ -2689,18 +3035,33 @@ class MegatronDion(Optimizer):
     @staticmethod
     def _needs_fs_p_reduce(config: DionParamConfig) -> bool:
         """Return whether STEP 3.5 must reduce P across FS shards."""
-        return config.has_fs_axis and (
+        return config.active_fs_axis and (
             (not config.is_transposed and config.outer_shard_tensor_dim == 1)
             or (config.is_transposed and config.outer_shard_tensor_dim == 0)
         )
 
+    def _has_active_tp_axis(self, config: DionParamConfig) -> bool:
+        """Return whether TP sharding is logically present and physically active."""
+        return config.has_tp_axis and self.tp_group is not None and self.tp_world_size > 1
+
+    def _has_active_fs_axis(self, config: DionParamConfig, meta=None) -> bool:
+        """Return whether FS sharding is logically present and physically active."""
+        if not config.has_fs_axis:
+            return False
+        if getattr(config, "active_fs_axis", False):
+            return True
+        shard_group = self._fs_group_for_meta(meta)
+        if shard_group is None:
+            return False
+        return dist.get_world_size(shard_group) > 1
+
     def _needs_tp_q_unshard(self, config: DionParamConfig) -> bool:
         """Return whether STEP 2 must all-gather Q across TP ranks."""
-        return config.has_tp_axis and self.tp_group is not None and self.tp_world_size > 1
+        return self._has_active_tp_axis(config)
 
     def _needs_tp_r_reduce(self, config: DionParamConfig) -> bool:
         """Return whether STEP 5 must all-reduce R across TP ranks."""
-        return self._p_is_tp_sharded(config) and self.tp_group is not None and self.tp_world_size > 1
+        return self._p_is_tp_sharded(config)
 
     def _fs_group_for_meta(self, meta=None):
         """Return the FS shard group for a param, including expert-local groups."""
@@ -2709,10 +3070,9 @@ class MegatronDion(Optimizer):
             shard_group = self.fs_group
         return shard_group
 
-    @staticmethod
-    def _p_is_tp_sharded(config: DionParamConfig) -> bool:
+    def _p_is_tp_sharded(self, config: DionParamConfig) -> bool:
         """Return whether P is sharded along TP for this config."""
-        return config.has_tp_axis and (
+        return self._has_active_tp_axis(config) and (
             (not config.is_transposed and config.inner_shard_tensor_dim == 0)
             or (config.is_transposed and config.inner_shard_tensor_dim == 1)
         )
@@ -2720,7 +3080,7 @@ class MegatronDion(Optimizer):
     @staticmethod
     def _p_is_fs_sharded(config: DionParamConfig) -> bool:
         """Return whether P is sharded along FS for this config."""
-        return config.has_fs_axis and (
+        return config.active_fs_axis and (
             (not config.is_transposed and config.outer_shard_tensor_dim == 0)
             or (config.is_transposed and config.outer_shard_tensor_dim == 1)
         )
@@ -2755,6 +3115,7 @@ class MegatronDion(Optimizer):
         m_shard_local = P_batch.size(1)
         r = P_batch.size(2)
         original_dtype = P_batch.dtype
+        self._ortho_batch_trace_counter += 1
 
         if shard_group is not None:
             shard_world_size = dist.get_world_size(shard_group)
@@ -2767,16 +3128,50 @@ class MegatronDion(Optimizer):
                 result[i] = self._orthogonalize(P_batch[i], rcqr_oversample=oversample)
             return result
 
+        if self._debug_ortho_batch_trace:
+            logger.info(
+                "[DION_DEBUG_ORTHO_BATCH_TRACE] step=%d rank=%d counter=%d shard_world=%d batch_size=%d m_local=%d r=%d metas=%s",
+                self._step_count,
+                self._global_rank,
+                self._ortho_batch_trace_counter,
+                shard_world_size,
+                batch_size,
+                m_shard_local,
+                r,
+                [self._format_meta_id(meta) for meta in metas] if metas is not None else [],
+            )
+        if os.getenv("DION_DEBUG_ORTHO_GROUP_TRACE", "0") == "1":
+            logger.info(
+                "[DION_DEBUG_ORTHO_GROUP_TRACE] step=%d rank=%d counter=%d shard_world=%d group_ranks=%s mesh=%s metas=%s",
+                self._step_count,
+                self._global_rank,
+                self._ortho_batch_trace_counter,
+                shard_world_size,
+                list(dist.get_process_group_ranks(shard_group)),
+                self._device_mesh_for_group(shard_group, "ortho").mesh.detach().cpu().tolist(),
+                [self._format_meta_id(meta) for meta in metas] if metas is not None else [],
+            )
+
         ortho_mesh = self._device_mesh_for_group(shard_group, "ortho")
         p_dtensor = DTensor.from_local(
             P_batch,
             device_mesh=ortho_mesh,
             placements=(Shard(P_batch.ndim - 2),),
         )
+        batch_meta_ids = (
+            [self._format_meta_id(meta) for meta in metas[:batch_size]]
+            if metas is not None
+            else None
+        )
         p_out = distributed_orthogonalize_dtensor_exact(
             p_dtensor,
             oversample=oversample,
             shard_mesh_dim=0,
+            logical_seed_keys=self._logical_sketch_seed_keys(
+                metas=metas[:batch_size] if metas is not None else None,
+                tag="logical_local",
+            ),
+            batch_meta_ids=batch_meta_ids,
         ).to_local().contiguous()
         return p_out.to(original_dtype)
 
@@ -2786,6 +3181,7 @@ class MegatronDion(Optimizer):
         self,
         Qs: List[Tensor],
         configs: List[DionParamConfig],
+        metas: Optional[List] = None,
     ) -> Generator[List[Tensor], None, None]:
         """All-gather TP-sharded Q blocks needed for local matmul."""
         batch_size = len(Qs)
@@ -2842,7 +3238,9 @@ class MegatronDion(Optimizer):
                     Q_for_matmul[idx] = q_full_batch[slot]
                 del local_batch
 
-        return [q for q in Q_for_matmul]
+        q_result = [q for q in Q_for_matmul]
+        self._maybe_dump_unsharded_q_batch(metas=metas, q_for_matmul=q_result)
+        return q_result
 
     def _reduce_p_across_fs_groups(
         self,
@@ -2985,6 +3383,24 @@ class MegatronDion(Optimizer):
                 metas=metas,
                 tag=sketch_tag if sketch_tag is not None else tag,
             )
+        if metas is not None and self._debug_trace_params:
+            target_names = {
+                getattr(meta, "param_name", "")
+                for meta in metas
+                if meta is not None
+            }
+            if "*" in self._debug_trace_params or target_names.intersection(self._debug_trace_params):
+                logger.warning(
+                    "[DION_DEBUG_LOCAL_SKETCH_ROUTE] step=%d rank=%d tag=%s sketch_tag=%s "
+                    "use_seeded_sketch=%s sketch_fn_is_none=%s metas=%s",
+                    self._step_count,
+                    self._global_rank,
+                    tag,
+                    sketch_tag,
+                    use_seeded_sketch,
+                    sketch_fn is None,
+                    [self._format_meta_id(meta) for meta in metas],
+                )
 
         P_ortho_slice = orthogonalize(
             P_slice,
@@ -3002,10 +3418,32 @@ class MegatronDion(Optimizer):
                 )
         return P_ortho_slice.to(P_slice.dtype)
 
-    @staticmethod
-    def _is_fs_only_config(config: DionParamConfig) -> bool:
+    def _orthogonalize_reference_local_slice(
+        self,
+        P_slice: torch.Tensor,
+        metas: Optional[List] = None,
+        *,
+        tag: str = "reference_local",
+    ) -> torch.Tensor:
+        """Regular-Tensor local orthogonalization for one logical full matrix.
+
+        `dion_reference.py::orthogonalize()` is the correct mathematical kernel
+        for DDP / unsharded and fs-only single-matrix orthogonalization routes.
+        The sketch itself, however, must be a function of the logical parameter
+        identity / step rather than ambient RNG state so the same logical Dion
+        update is preserved when the topology is re-embedded across different
+        replica counts or node counts.
+        """
+        return self._orthogonalize_local_slice(
+            P_slice,
+            metas=metas,
+            tag=tag,
+            sketch_tag="logical_local",
+        )
+
+    def _is_fs_only_config(self, config: DionParamConfig) -> bool:
         """Return whether the config follows dion_reference.py fs-only semantics."""
-        return config.has_fs_axis and not config.has_tp_axis
+        return self._has_active_fs_axis(config) and not self._has_active_tp_axis(config)
 
     def _orthogonalize_fs_only_batch(
         self,
@@ -3013,6 +3451,7 @@ class MegatronDion(Optimizer):
         metas: List,
         *,
         replicate_group: Optional[torch.distributed.ProcessGroup] = None,
+        replicate_ranks: Optional[List[int]] = None,
     ) -> Generator[torch.Tensor, None, None]:
         """Match `dion_reference.dion_update_fsdp()` for fs-only batches.
 
@@ -3052,6 +3491,7 @@ class MegatronDion(Optimizer):
             )
 
         shard_rank = dist.get_rank(shard_group)
+        local_meta = [metas[shard_rank]] if metas and shard_rank < len(metas) else None
         # Reference FSDP path: Partial() -> Shard(0), i.e. reduce-scatter along the
         # batch dimension so each rank receives the reduced slot at its shard index.
         P_single = funcol.reduce_scatter_tensor(
@@ -3062,13 +3502,45 @@ class MegatronDion(Optimizer):
         )
         yield
 
+        self._maybe_log_target_trace(
+            tag="fs_only_single_pre_replicate",
+            metas=local_meta,
+            p_batch=P_single,
+            real_batch_size=1,
+            extra={
+                "shard_rank": int(shard_rank),
+                "shard_world": int(shard_world),
+            },
+        )
+
         if replicate_group is not None and dist.get_world_size(replicate_group) > 1:
-            dist.all_reduce(
-                P_single,
-                op=self._replicate_reduce_op(),
-                group=replicate_group,
-            )
-            yield
+            if replicate_ranks is not None:
+                yield from self._collapse_batch_over_rank_subset(
+                    P_single,
+                    primary_group=replicate_group,
+                    subset_ranks=replicate_ranks,
+                )
+            else:
+                dist.all_reduce(
+                    P_single,
+                    op=self._replicate_reduce_op(),
+                    group=replicate_group,
+                )
+                yield
+
+        self._maybe_log_target_trace(
+            tag="fs_only_single_post_replicate",
+            metas=local_meta,
+            p_batch=P_single,
+            real_batch_size=1,
+            extra={
+                "shard_rank": int(shard_rank),
+                "shard_world": int(shard_world),
+                "replicate_world": int(dist.get_world_size(replicate_group))
+                if replicate_group is not None
+                else 1,
+            },
+        )
 
         if self._debug_verify_fs_route and self._should_run_debug_probe(self._debug_verify_fs_route):
             expected_batch = P_batch.clone()
@@ -3092,8 +3564,42 @@ class MegatronDion(Optimizer):
                 route_fro,
                 self._format_meta_id(metas[shard_rank]) if metas and shard_rank < len(metas) else None,
             )
-        local_meta = [metas[shard_rank]] if metas and shard_rank < len(metas) else None
-        logical_sketch_fn = self._logical_local_sketch_fn(metas=local_meta)
+        if self._should_run_debug_probe(self._debug_fs_only_batch_trace):
+            pure_dp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=False,
+                partial_data_parallel=False,
+            )
+            cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+            pure_dp_ranks = (
+                dist.get_process_group_ranks(pure_dp_group) if pure_dp_group is not None else None
+            )
+            cp_group_ranks = (
+                dist.get_process_group_ranks(cp_group) if cp_group is not None else None
+            )
+            candidate_replicate_ranks = None
+            if replicate_group is not None and pure_dp_ranks is not None:
+                candidate_replicate_ranks = [
+                    rank
+                    for rank in dist.get_process_group_ranks(replicate_group)
+                    if rank in pure_dp_ranks
+                ]
+            logger.warning(
+                "[DION_DEBUG_FS_ONLY_SINGLE] step=%d rank=%d shard_rank=%d shard_group_ranks=%s "
+                "rp_group_ranks=%s pure_dp_ranks=%s cp_group_ranks=%s candidate_replicate_ranks=%s "
+                "meta_order=%s local_meta=%s p_single_sum=%.6e p_single_norm=%.6e",
+                self._step_count,
+                self._global_rank,
+                shard_rank,
+                dist.get_process_group_ranks(shard_group),
+                dist.get_process_group_ranks(replicate_group) if replicate_group is not None else None,
+                pure_dp_ranks,
+                cp_group_ranks,
+                candidate_replicate_ranks,
+                [self._format_meta_id(meta) for meta in metas],
+                [self._format_meta_id(meta) for meta in local_meta] if local_meta is not None else [],
+                float(P_single.detach().to(torch.float32).sum().item()),
+                float(P_single.detach().to(torch.float32).norm().item()),
+            )
         if self._should_run_debug_probe(self._debug_fs_only):
             logger.info(
                 "[DION_DEBUG_FS_ONLY_ROUTE] step=%d rank=%d shard_rank=%d local_meta=%s",
@@ -3114,49 +3620,42 @@ class MegatronDion(Optimizer):
             },
             force=self._debug_fs_only,
         )
-        fs_mesh = self._device_mesh_for_group(shard_group, "fs")
+        # Match `dion_reference.py::dion_update_fsdp()` literally: after
+        # reduce-scatter over the outer-shard mesh (and optional replicate
+        # averaging), each rank holds one batch-sharded full matrix as a DTensor
+        # and applies `orthogonalize()` on that DTensor. This path must therefore
+        # follow the exact DTensor orthogonalize contract rather than the regular
+        # local-Tensor orthogonalizer.
+        fs_only_mesh = self._device_mesh_for_group(shard_group, "fs_only_ortho")
         p_single_dtensor = DTensor.from_local(
-            P_single,
-            device_mesh=fs_mesh,
+            P_single.contiguous(),
+            device_mesh=fs_only_mesh,
             placements=(Shard(0),),
         )
-        try:
-            P_single_ortho = orthogonalize_dtensor_exact(
-                p_single_dtensor,
-                oversample=self.defaults['rcqr_oversample'],
-                sketch_fn=logical_sketch_fn,
-            ).to_local().contiguous()
-        except Exception as exc:
-            local_ref = orthogonalize(
-                P_single.clone(),
-                rcqr_oversample=self.defaults['rcqr_oversample'],
-                sketch_fn=logical_sketch_fn,
-            ).to(P_single.dtype)
-            _, ref_max_err, ref_fro = self._p_orthogonality_metrics(local_ref[0])
-            logger.warning(
-                "[DION_DEBUG_FS_ONLY_EXACT_EXCEPTION] step=%d rank=%d shard_rank=%d meta=%s "
-                "local_ref_max_err=%.6e local_ref_fro=%.6e exc=%r",
-                self._step_count,
-                self._global_rank,
-                shard_rank,
-                self._format_meta_id(local_meta[0]) if local_meta else None,
-                ref_max_err,
-                ref_fro,
-                exc,
-            )
-            self._maybe_dump_bad_ortho_input(
-                P_in=P_single[0],
-                P_exact=None,
-                P_local_ref=local_ref[0],
-                meta=local_meta[0] if local_meta else None,
-                tag="fs_only_exact_exception",
-                extra={
-                    "shard_rank": shard_rank,
-                    "exception": repr(exc),
-                },
-                force=True,
-            )
-            raise
+        batch_meta_ids = (
+            [self._format_meta_id(meta) for meta in local_meta]
+            if local_meta is not None
+            else None
+        )
+        P_single_ortho = orthogonalize_dtensor_exact(
+            p_single_dtensor,
+            oversample=self.defaults['rcqr_oversample'],
+            logical_seed_keys=self._logical_sketch_seed_keys(
+                metas=local_meta,
+                tag="logical_local",
+            ),
+            batch_meta_ids=batch_meta_ids,
+        ).to_local().contiguous().to(P_single.dtype)
+        self._maybe_log_target_trace(
+            tag="fs_only_single_post_ortho",
+            metas=local_meta,
+            p_batch=P_single_ortho,
+            real_batch_size=1,
+            extra={
+                "shard_rank": int(shard_rank),
+                "shard_world": int(shard_world),
+            },
+        )
         self._maybe_compare_fs_only_exact(
             P_in=P_single,
             P_exact=P_single_ortho,
@@ -3185,6 +3684,43 @@ class MegatronDion(Optimizer):
             group=shard_group,
         )
         yield
+        if self._should_run_debug_probe(self._debug_fs_only_batch_trace):
+            pure_dp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=False,
+                partial_data_parallel=False,
+            )
+            cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+            pure_dp_ranks = (
+                dist.get_process_group_ranks(pure_dp_group) if pure_dp_group is not None else None
+            )
+            cp_group_ranks = (
+                dist.get_process_group_ranks(cp_group) if cp_group is not None else None
+            )
+            candidate_replicate_ranks = None
+            if replicate_group is not None and pure_dp_ranks is not None:
+                candidate_replicate_ranks = [
+                    rank
+                    for rank in dist.get_process_group_ranks(replicate_group)
+                    if rank in pure_dp_ranks
+                ]
+            slot_sums = [float(P_ortho[i].detach().to(torch.float32).sum().item()) for i in range(P_ortho.size(0))]
+            slot_norms = [float(P_ortho[i].detach().to(torch.float32).norm().item()) for i in range(P_ortho.size(0))]
+            logger.warning(
+                "[DION_DEBUG_FS_ONLY_GATHER] step=%d rank=%d shard_rank=%d shard_group_ranks=%s "
+                "rp_group_ranks=%s pure_dp_ranks=%s cp_group_ranks=%s candidate_replicate_ranks=%s "
+                "meta_order=%s slot_sums=%s slot_norms=%s",
+                self._step_count,
+                self._global_rank,
+                shard_rank,
+                dist.get_process_group_ranks(shard_group),
+                dist.get_process_group_ranks(replicate_group) if replicate_group is not None else None,
+                pure_dp_ranks,
+                cp_group_ranks,
+                candidate_replicate_ranks,
+                [self._format_meta_id(meta) for meta in metas],
+                slot_sums,
+                slot_norms,
+            )
         self._log_p_orthogonality_snapshot(
             tag="DION_ORTHO_TRACE_FS_BATCH_POST_GATHER",
             P_batch=P_ortho,
@@ -3221,11 +3757,10 @@ class MegatronDion(Optimizer):
                 real_batch_size=real_batch_size,
             )
         else:
-            P_batch = self._orthogonalize_local_slice(
+            P_batch = self._orthogonalize_reference_local_slice(
                 P_batch,
                 metas=metas,
-                tag="dense_replicate_local",
-                sketch_tag="logical_local",
+                tag="dense_replicate_reference_local",
             )
         yield
         return P_batch
@@ -3248,7 +3783,11 @@ class MegatronDion(Optimizer):
         comm_world_size = dist.get_world_size(comm_group)
         if comm_world_size <= 1:
             yield
-            return self._orthogonalize_local_slice(P_batch, metas=metas, tag="dense_replicate_local")
+            return self._orthogonalize_reference_local_slice(
+                P_batch,
+                metas=metas,
+                tag="dense_replicate_reference_local",
+            )
 
         batch_size = P_batch.size(0)
         original_batch_size = batch_size
@@ -3267,44 +3806,57 @@ class MegatronDion(Optimizer):
             metas = list(metas) + [None] * pad
             batch_size = P_batch.size(0)
 
-        local_chunk = batch_size // comm_world_size
         comm_rank = dist.get_rank(comm_group)
-        start = comm_rank * local_chunk
-        end = start + local_chunk
-        P_local = P_batch[start:end].contiguous()
-        local_metas = metas[start:end] if metas else None
-        self._maybe_log_target_trace(
-            tag="dense_replicate_pre_ortho",
-            metas=local_metas,
-            p_batch=P_local,
-            real_batch_size=local_chunk,
-            extra={
+        P_ortho_full = self._cached_buffer(
+            "dense_replicate_p_ortho_full",
+            P_batch.shape,
+            P_batch.dtype,
+            P_batch.device,
+        )
+
+        # Reference dion_update_ddp() orthogonalizes exactly one full matrix per
+        # replicate rank. If the Megatron backend batches more logical parameters
+        # than the replicate world size, replay that same contract chunk-wise
+        # instead of orthogonalizing a rank-local batch with one shared RNG stream.
+        for chunk_start in range(0, batch_size, comm_world_size):
+            chunk_end = chunk_start + comm_world_size
+            P_chunk = P_batch[chunk_start:chunk_end].contiguous()
+            P_single = P_chunk[comm_rank : comm_rank + 1]
+            local_index = chunk_start + comm_rank
+            local_metas = metas[local_index : local_index + 1] if metas else None
+            trace_extra = {
                 "comm_rank": int(comm_rank),
                 "comm_world_size": int(comm_world_size),
-            },
-        )
-        P_local_ortho = self._orthogonalize_local_slice(
-            P_local,
-            metas=local_metas,
-            tag="dense_replicate_local",
-            sketch_tag="logical_local",
-        )
-        self._maybe_log_target_trace(
-            tag="dense_replicate_post_ortho",
-            metas=local_metas,
-            p_batch=P_local_ortho,
-            real_batch_size=local_chunk,
-            extra={
-                "comm_rank": int(comm_rank),
-                "comm_world_size": int(comm_world_size),
-            },
-        )
-        P_ortho_full = funcol.all_gather_tensor(
-            P_local_ortho.contiguous(),
-            gather_dim=0,
-            group=comm_group,
-        )
-        yield
+                "chunk_start": int(chunk_start),
+                "chunk_end": int(chunk_end),
+            }
+            self._maybe_log_target_trace(
+                tag="dense_replicate_pre_ortho",
+                metas=local_metas,
+                p_batch=P_single,
+                real_batch_size=1,
+                extra=trace_extra,
+            )
+            P_single_ortho = self._orthogonalize_reference_local_slice(
+                P_single,
+                metas=local_metas,
+                tag="dense_replicate_reference_local",
+            )
+            self._maybe_log_target_trace(
+                tag="dense_replicate_post_ortho",
+                metas=local_metas,
+                p_batch=P_single_ortho,
+                real_batch_size=1,
+                extra=trace_extra,
+            )
+            P_ortho_chunk = funcol.all_gather_tensor(
+                P_single_ortho.contiguous(),
+                gather_dim=0,
+                group=comm_group,
+            )
+            yield
+            P_ortho_full[chunk_start:chunk_end].copy_(P_ortho_chunk)
+
         return P_ortho_full[:original_batch_size]
 
     def _apply_batch_updates(
@@ -3313,6 +3865,7 @@ class MegatronDion(Optimizer):
         momentums: List[Tensor],
         Qs: List[Tensor],
         Q_new_batch: torch.Tensor,
+        Q_state_batch: torch.Tensor,
         P_batch: torch.Tensor,
         configs: List[DionParamConfig],
         groups: List[dict],
@@ -3381,7 +3934,7 @@ class MegatronDion(Optimizer):
 
         wd_mult = groups[0].get('wd_mult', 1.0)
         weight_decay = groups[0].get('weight_decay', self.defaults['weight_decay'] * wd_mult)
-        has_tp = configs[0].has_tp_axis and self.tp_group is not None
+        has_tp = self._has_active_tp_axis(configs[0])
         self._maybe_log_target_trace(
             tag="pre_param_update",
             metas=metas,
@@ -3430,10 +3983,10 @@ class MegatronDion(Optimizer):
                 param.mul_(1 - lr * weight_decay)
             param.add_(delta.to(param.dtype), alpha=-scaled_lr)
 
-            Q_new = Q_new_batch[i].to(Qs[i].dtype)
+            Q_state = Q_state_batch[i].to(Qs[i].dtype)
             if has_tp:
-                Q_new = self._reshard_q_along_tp(Q_new, self.tp_group, self.tp_rank)
-            Qs[i].copy_(Q_new)
+                Q_state = self._reshard_q_along_tp(Q_state, self.tp_group, self.tp_rank)
+            Qs[i].copy_(Q_state)
 
         self._maybe_log_target_trace(
             tag="post_param_update",
@@ -3463,15 +4016,19 @@ class MegatronDion(Optimizer):
         if real_batch_size is None:
             real_batch_size = batch_size
 
-        rp_world_size = dist.get_world_size(self.rp_group) if self.rp_group is not None else 1
+        cfg0 = configs[0] if configs else DionParamConfig()
+        replicate_group = self._reference_replicate_group_for_config(cfg0)
+        replicate_world_size = (
+            dist.get_world_size(replicate_group) if replicate_group is not None else 1
+        )
         use_compressed = (
             self.use_compressed_comm
-            and rp_world_size > 1
+            and replicate_world_size > 1
             and any(c.compressed_all_reduce for c in configs)
         )
 
         if not use_compressed:
-            yield from self._collapse_grads_across_cp(grads)
+            yield from self._collapse_grads_across_cp(grads, replicate_group=replicate_group)
         self._maybe_log_target_trace(
             tag="pre_momentum_add",
             metas=metas,
@@ -3482,7 +4039,7 @@ class MegatronDion(Optimizer):
             real_batch_size=real_batch_size,
             extra={
                 "use_compressed": bool(use_compressed),
-                "rp_world_size": int(rp_world_size),
+                "replicate_world_size": int(replicate_world_size),
             },
         )
 
@@ -3504,12 +4061,24 @@ class MegatronDion(Optimizer):
             real_batch_size=real_batch_size,
             extra={
                 "use_compressed": bool(use_compressed),
-                "rp_world_size": int(rp_world_size),
+                "replicate_world_size": int(replicate_world_size),
             },
         )
 
         # STEP 2: Q Unshard
-        Q_for_matmul = yield from self._unshard_q_batch(Qs, configs)
+        Q_for_matmul = yield from self._unshard_q_batch(Qs, configs, metas)
+        self._maybe_log_target_trace(
+            tag="post_q_unshard",
+            metas=metas,
+            momentums=momentums,
+            qs=Q_for_matmul,
+            params=params,
+            real_batch_size=real_batch_size,
+            extra={
+                "use_compressed": bool(use_compressed),
+                "replicate_world_size": int(replicate_world_size),
+            },
+        )
 
         # STEP 3: P = M @ Q
         M_batch = torch.stack(
@@ -3531,11 +4100,37 @@ class MegatronDion(Optimizer):
         )
 
         P_batch = M_batch @ Q_batch
+        self._maybe_log_target_trace(
+            tag="post_matmul_pre_fs_reduce",
+            metas=metas,
+            momentums=momentums,
+            qs=Qs,
+            p_batch=P_batch,
+            params=params,
+            real_batch_size=real_batch_size,
+            extra={
+                "use_compressed": bool(use_compressed),
+                "replicate_world_size": int(replicate_world_size),
+            },
+        )
 
         # STEP 3.5: All-Reduce for P (only if FS collectives are enabled)
         # NOTE: Expert params use different shard_group (EP-internal), so we group by shard_group
         if not (configs and all(self._is_fs_only_config(cfg) for cfg in configs)):
             yield from self._reduce_p_across_fs_groups(P_batch, configs, metas)
+        self._maybe_log_target_trace(
+            tag="post_fs_reduce_pre_ortho",
+            metas=metas,
+            momentums=momentums,
+            qs=Qs,
+            p_batch=P_batch,
+            params=params,
+            real_batch_size=real_batch_size,
+            extra={
+                "use_compressed": bool(use_compressed),
+                "replicate_world_size": int(replicate_world_size),
+            },
+        )
 
         # STEP 4: Orthogonalize P
         if use_compressed:
@@ -3545,7 +4140,7 @@ class MegatronDion(Optimizer):
         else:
             ortho_group = self._ortho_group_for_config(configs[0], metas[0] if metas else None)
             use_dense_replicate_batch = (
-                rp_world_size > 1
+                replicate_world_size > 1
                 and ortho_group is None
                 and not (configs and all(self._is_fs_only_config(cfg) for cfg in configs))
             )
@@ -3553,7 +4148,7 @@ class MegatronDion(Optimizer):
                 P_batch = yield from self._orthogonalize_dense_replicate_batch_async(
                     P_batch,
                     metas,
-                    comm_group=self.rp_group,
+                    comm_group=replicate_group,
                 )
             else:
                 P_batch = yield from self._orthogonalize_p_batch(
@@ -3624,12 +4219,19 @@ class MegatronDion(Optimizer):
             params=params,
             real_batch_size=real_batch_size,
         )
+        # `dion_reference.py` persists the column-normalized `Q_new` directly.
+        # Do not apply any extra basis alignment or right-rotation here: those
+        # operations are outside the reference Dion contract and can make the
+        # persisted optimizer state topology-dependent even when the current-step
+        # update `delta = P @ Q_new^T` is still close.
+        Q_state_batch = Q_new_batch
 
         self._apply_batch_updates(
             params,
             momentums,
             Qs,
             Q_new_batch,
+            Q_state_batch,
             P_batch,
             configs,
             groups,
@@ -3639,7 +4241,7 @@ class MegatronDion(Optimizer):
             real_batch_size,
         )
 
-        del M_batch, Q_batch, P_batch, R_batch, Q_new_batch
+        del M_batch, Q_batch, P_batch, R_batch, Q_new_batch, Q_state_batch
 
     def _run_compressed_comm_async(
         self,
@@ -3650,14 +4252,55 @@ class MegatronDion(Optimizer):
         metas: List,
     ) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
         """Compressed communication for Dion optimizer."""
-        comm_group = self.rp_group
-        comm_world_size = dist.get_world_size(comm_group) if comm_group else 1
         cfg0 = configs[0] if configs else DionParamConfig()
         meta0 = metas[0] if metas else None
+        comm_group = self._reference_replicate_group_for_config(cfg0)
+        comm_world_size = dist.get_world_size(comm_group) if comm_group else 1
         ortho_group = self._ortho_group_for_config(cfg0, meta0)
+        batch_size = P_batch.size(0)
+        cfg = configs[0] if configs else DionParamConfig()
+        p_is_tp_sharded = self._p_is_tp_sharded(cfg)
+        all_fs_only = bool(configs) and all(self._is_fs_only_config(config) for config in configs)
+        fs_group = self._fs_group_for_meta(metas[0] if metas else None)
+        fs_only_replicate_group = None
+        fs_only_replicate_ranks = None
+
+        if all_fs_only and self.use_fs_collectives and fs_group and dist.get_world_size(fs_group) > 1:
+            # Reference `dion_update_fsdp()` semantics do not depend on replicate mesh size.
+            # The fs-only kernel always:
+            # 1. reduce-scatters P across the outer-shard mesh,
+            # 2. orthogonalizes one full matrix per shard rank,
+            # 3. all-gathers P_ortho back before forming R,
+            # and only additionally averages P/R over the replicate mesh when that mesh
+            # actually has size > 1. RP=1 must therefore still take the fs-only kernel.
+            if comm_group is not None and comm_world_size > 1:
+                fs_only_replicate_group, fs_only_replicate_ranks = (
+                    self._fs_only_compressed_replicate_spec()
+                )
+            P_ortho_full = yield from self._orthogonalize_fs_only_batch(
+                P_batch,
+                metas,
+                replicate_group=fs_only_replicate_group,
+                replicate_ranks=fs_only_replicate_ranks,
+            )
+            R_batch = M_batch.mT @ P_ortho_full
+            yield from self._reduce_r_across_tp(R_batch, configs)
+            if fs_only_replicate_group is not None:
+                if fs_only_replicate_ranks is not None:
+                    yield from self._collapse_batch_over_rank_subset(
+                        R_batch,
+                        primary_group=fs_only_replicate_group,
+                        subset_ranks=fs_only_replicate_ranks,
+                    )
+                else:
+                    yield from self._collapse_batch_across_cp(
+                        R_batch,
+                        replicate_group=fs_only_replicate_group,
+                    )
+            return P_ortho_full, R_batch
 
         if comm_group is None or comm_world_size <= 1:
-            yield from self._collapse_batch_across_cp(P_batch)
+            yield from self._collapse_batch_across_cp(P_batch, replicate_group=comm_group)
             # RP=1: no P all-reduce needed, but orthogonalization is always required
             if ortho_group is not None:
                 P_ortho = self._distributed_orthogonalize(
@@ -3677,42 +4320,28 @@ class MegatronDion(Optimizer):
 
             R_batch = M_batch.mT @ P_ortho
             yield from self._reduce_r_across_tp(R_batch, configs)
-            yield from self._collapse_batch_across_cp(R_batch)
+            yield from self._collapse_batch_across_cp(R_batch, replicate_group=comm_group)
 
             return P_ortho, R_batch
 
         # Rest of compressed communication for RP > 1
-        batch_size = P_batch.size(0)
-
         original_batch_size = batch_size
-        cfg = configs[0] if configs else DionParamConfig()
-
-        p_is_tp_sharded = self._p_is_tp_sharded(cfg)
-        p_is_fs_sharded = (not p_is_tp_sharded) and self._p_is_fs_sharded(cfg)
-        fs_group = self._fs_group_for_meta(metas[0] if metas else None)
 
         if p_is_tp_sharded and self.tp_group and dist.get_world_size(self.tp_group) > 1:
             # Match dion_reference FSDP+TP compressed contract:
             # average replicated P shards before distributed orthogonalization.
-            yield from self._collapse_batch_across_cp(P_batch)
+            yield from self._collapse_batch_across_cp(P_batch, replicate_group=comm_group)
             P_ortho_full = self._distributed_orthogonalize(
                 P_batch,
                 shard_group=self.tp_group,
                 oversample=self.defaults['rcqr_oversample'],
                 metas=metas,
             )
-        elif p_is_fs_sharded and self.use_fs_collectives and fs_group and dist.get_world_size(fs_group) > 1:
-            # Match dion_reference fs-only compressed contract:
-            # reduce-scatter on FS batch dim, then average P_single over RP.
-            P_ortho_full = yield from self._orthogonalize_fs_only_batch(
-                P_batch,
-                metas,
-                replicate_group=comm_group,
-            )
         else:
-            # Match dense compressed contract:
-            # reduce-scatter P along batch over RP, orthogonalize local chunk,
-            # then all-gather the orthogonalized batch back.
+            # Match dion_reference.dion_update_ddp() compressed contract:
+            # batch the dense params in comm_world_size-sized chunks, reduce-scatter
+            # each chunk along the batch dim, orthogonalize exactly one matrix per
+            # rank, then all-gather the orthogonalized chunk back.
             if batch_size % comm_world_size != 0:
                 pad = comm_world_size - (batch_size % comm_world_size)
                 padded_batch_size = batch_size + pad
@@ -3750,55 +4379,90 @@ class MegatronDion(Optimizer):
                     metas = list(metas) + [None] * pad
                 batch_size = P_batch.size(0)
 
-            P_single = funcol.reduce_scatter_tensor(
-                P_batch.contiguous(),
-                reduceOp="avg",
-                scatter_dim=0,
-                group=comm_group,
-            )
-            yield
-
-            local_chunk = P_single.size(0)
             comm_rank = dist.get_rank(comm_group)
-            start = comm_rank * local_chunk
-            end = start + local_chunk
-            local_metas = metas[start:end] if metas else None
-            self._maybe_log_target_trace(
-                tag="compressed_pre_ortho",
-                metas=local_metas,
-                p_batch=P_single,
-                real_batch_size=local_chunk,
-                extra={
+            P_ortho_full = self._cached_buffer(
+                "compressed_p_ortho_full",
+                P_batch.shape,
+                P_batch.dtype,
+                P_batch.device,
+            )
+
+            for chunk_start in range(0, batch_size, comm_world_size):
+                chunk_end = chunk_start + comm_world_size
+                P_chunk = P_batch[chunk_start:chunk_end].contiguous()
+                P_single = funcol.reduce_scatter_tensor(
+                    P_chunk,
+                    reduceOp="avg",
+                    scatter_dim=0,
+                    group=comm_group,
+                )
+                yield
+
+                if P_single.size(0) != 1:
+                    raise RuntimeError(
+                        "[DION_INVALID_DENSE_COMPRESSED_LOCAL_CHUNK] "
+                        f"step={self._step_count} comm_world_size={comm_world_size} "
+                        f"local_chunk={P_single.size(0)} chunk_start={chunk_start}"
+                    )
+
+                local_index = chunk_start + comm_rank
+                local_metas = metas[local_index : local_index + 1] if metas else None
+                trace_extra = {
                     "comm_rank": int(comm_rank),
                     "comm_world_size": int(comm_world_size),
-                },
-            )
-            P_ortho_single = self._orthogonalize_local_slice(
-                P_single,
-                metas=local_metas,
-                tag="compressed_local",
-                sketch_tag="logical_local",
-            )
-            self._maybe_log_target_trace(
-                tag="compressed_post_ortho",
-                metas=local_metas,
-                p_batch=P_ortho_single,
-                real_batch_size=local_chunk,
-                extra={
-                    "comm_rank": int(comm_rank),
-                    "comm_world_size": int(comm_world_size),
-                },
-            )
-            P_ortho_full = funcol.all_gather_tensor(
-                P_ortho_single.contiguous(),
-                gather_dim=0,
-                group=comm_group,
-            )
-            yield
+                    "chunk_start": int(chunk_start),
+                    "chunk_end": int(chunk_end),
+                }
+                self._maybe_log_target_trace(
+                    tag="compressed_pre_ortho",
+                    metas=local_metas,
+                    p_batch=P_single,
+                    real_batch_size=1,
+                    extra=trace_extra,
+                )
+                P_ortho_single = self._orthogonalize_reference_local_slice(
+                    P_single,
+                    metas=local_metas,
+                    tag="compressed_reference_local",
+                )
+                if local_metas and len(local_metas) == 1:
+                    self._maybe_compare_local_logical(
+                        P_in=P_single,
+                        P_runtime=P_ortho_single,
+                        meta=local_metas[0],
+                        tag="compressed_local",
+                    )
+                self._maybe_log_target_trace(
+                    tag="compressed_post_ortho",
+                    metas=local_metas,
+                    p_batch=P_ortho_single,
+                    real_batch_size=1,
+                    extra=trace_extra,
+                )
+                P_ortho_chunk = funcol.all_gather_tensor(
+                    P_ortho_single.contiguous(),
+                    gather_dim=0,
+                    group=comm_group,
+                )
+                yield
+                P_ortho_full[chunk_start:chunk_end].copy_(P_ortho_chunk)
 
         R_batch = M_batch.mT @ P_ortho_full
         yield from self._reduce_r_across_tp(R_batch, configs)
-        yield from self._collapse_batch_across_cp(R_batch)
+        if all_fs_only and self.use_fs_collectives and fs_group and dist.get_world_size(fs_group) > 1:
+            if fs_only_replicate_ranks is not None:
+                yield from self._collapse_batch_over_rank_subset(
+                    R_batch,
+                    primary_group=fs_only_replicate_group,
+                    subset_ranks=fs_only_replicate_ranks,
+                )
+            else:
+                yield from self._collapse_batch_across_cp(
+                    R_batch,
+                    replicate_group=fs_only_replicate_group,
+                )
+        else:
+            yield from self._collapse_batch_across_cp(R_batch, replicate_group=comm_group)
 
         P_ortho_full = P_ortho_full[:original_batch_size]
         R_batch = R_batch[:original_batch_size]

@@ -24,6 +24,7 @@ class DionParamConfig:
     outer_shard_mesh_dim: Optional[int] = None
     inner_shard_mesh_dim: Optional[int] = None
     has_fs_axis: bool = False
+    active_fs_axis: bool = False
     has_tp_axis: bool = False
     is_transposed: bool = False
     compressed_all_reduce: bool = False

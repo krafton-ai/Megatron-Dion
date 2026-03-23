@@ -125,16 +125,42 @@ def _apply_dion_scalar_param_rules(
 ) -> tuple[OptimizerConfig, bool]:
     """Apply Dion scalar-param rules using parameter-local metadata.
 
-    Current parity rule:
-    - no scalar-path LR overrides
-
-    Weight decay follows the normal Adam/MCore param-group rule so that
-    scalar-path embeddings and lm heads behave like the baseline optimizer.
+    Contract:
+    - scalar-path text embeddings use the base LR and zero weight decay
+    - untied lm_head surfaces use LR / sqrt(fan_in) and zero weight decay
+    - shared embedding/output surfaces must keep the embedding-side base LR so
+      that duplicated PP copies stay optimizer-identical across stages
     """
     if not isinstance(config_for_param, DionOptimizerConfig):
         return config_for_param, False
 
-    return config_for_param, False
+    is_text_embedding = bool(getattr(param, "is_text_embedding_parameter", False))
+    is_lm_head = bool(getattr(param, "is_lm_head_parameter", False))
+    is_shared_embedding = bool(getattr(param, "shared_embedding", False))
+    is_tied_embedding_output = is_shared_embedding or (is_text_embedding and is_lm_head)
+
+    if not is_text_embedding and not is_lm_head:
+        return config_for_param, False
+
+    override = copy.deepcopy(config_for_param)
+    override.weight_decay = 0.0
+
+    if is_lm_head and not is_tied_embedding_output:
+        if param.ndim < 2:
+            raise RuntimeError(
+                f"[DION_LM_HEAD_INVALID_DIM] expected ndim>=2 for lm_head, got shape={tuple(param.shape)}"
+            )
+        fan_in = int(param.shape[1])
+        if fan_in <= 0:
+            raise RuntimeError(
+                f"[DION_LM_HEAD_INVALID_FAN_IN] lm_head fan_in must be > 0, got {fan_in}"
+            )
+        scale = math.sqrt(float(fan_in))
+        override.lr = config_for_param.lr / scale
+        if config_for_param.min_lr is not None:
+            override.min_lr = config_for_param.min_lr / scale
+
+    return override, True
 
 
 def _get_param_groups(
@@ -183,7 +209,10 @@ def _get_param_groups(
                 param, config_for_param
             )
             uses_default_config = (
-                config_for_param.lr == config.lr and config_for_param.min_lr == config.min_lr
+                config_for_param.lr == config.lr
+                and config_for_param.min_lr == config.min_lr
+                and config_for_param.weight_decay == config.weight_decay
+                and not has_dion_scalar_override
             )
 
             is_expert_parallel = not getattr(param, 'allreduce', True)

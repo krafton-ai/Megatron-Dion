@@ -66,16 +66,60 @@ from megatron.core.utils import (
 try:
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
+    import transformer_engine.pytorch.module.linear as te_linear_module
 
     HAVE_TE = True
 except ImportError:
     from unittest.mock import MagicMock
 
     te = MagicMock()
+    te_linear_module = None
     HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 logger = logging.getLogger(__name__)
+
+
+def _patch_te_row_parallel_sync_collectives() -> None:
+    """Make TE sync row-parallel collectives accumulate in FP32.
+
+    Proven issue boundary:
+    - identical `core_attn_out`
+    - identical local row-parallel weights
+    - first SP divergence at TE row-parallel forward output
+
+    We keep async collectives untouched to avoid changing overlap/runtime behavior
+    in backward paths that are not yet proved problematic.
+    """
+
+    if not HAVE_TE or te_linear_module is None:
+        return
+    if getattr(te_linear_module, "_mcore_fp32_row_collectives_patched", False):
+        return
+
+    original_allreduce = te_linear_module.allreduce
+    original_reduce_scatter = te_linear_module.reduce_scatter_along_first_dim
+
+    def _fp32_sync_allreduce(inp: torch.Tensor, tp_group=None, async_op: bool = False):
+        if async_op or not isinstance(inp, torch.Tensor) or inp.dtype not in (torch.float16, torch.bfloat16):
+            return original_allreduce(inp, tp_group, async_op=async_op)
+        out_fp32 = inp.float()
+        out_fp32, _ = original_allreduce(out_fp32, tp_group, async_op=False)
+        return out_fp32.to(inp.dtype), None
+
+    def _fp32_sync_reduce_scatter(inp: torch.Tensor, tp_group, async_op: bool = False):
+        if async_op or not isinstance(inp, torch.Tensor) or inp.dtype not in (torch.float16, torch.bfloat16):
+            return original_reduce_scatter(inp, tp_group, async_op=async_op)
+        out_fp32 = inp.float()
+        out_fp32, _ = original_reduce_scatter(out_fp32, tp_group, async_op=False)
+        return out_fp32.to(inp.dtype), None
+
+    te_linear_module.allreduce = _fp32_sync_allreduce
+    te_linear_module.reduce_scatter_along_first_dim = _fp32_sync_reduce_scatter
+    te_linear_module._mcore_fp32_row_collectives_patched = True
+
+
+_patch_te_row_parallel_sync_collectives()
 
 
 class TransformerEngineConfigType(enum.Enum):

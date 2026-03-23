@@ -27,6 +27,7 @@ def build_batch_key(shape, cfg, dtype: torch.dtype) -> tuple:
     return (
         resolved_shape,
         bool(cfg.has_fs_axis),
+        bool(getattr(cfg, "active_fs_axis", cfg.has_fs_axis)),
         bool(cfg.has_tp_axis),
         bool(cfg.is_transposed),
         bool(cfg.compressed_all_reduce),

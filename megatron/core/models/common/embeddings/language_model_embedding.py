@@ -67,6 +67,8 @@ class LanguageModelEmbedding(MegatronModule):
             self.position_embeddings = torch.nn.Embedding(
                 self.max_sequence_length, self.config.hidden_size
             )
+            self.position_embeddings.weight.is_embedding_or_output_parameter = True
+            self.position_embeddings.weight.is_text_embedding_parameter = True
 
             # Initialize the position embeddings.
             if self.config.perform_initialization:
@@ -76,6 +78,8 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings = torch.nn.Embedding(
                 self.num_tokentypes, self.config.hidden_size
             )
+            self.tokentype_embeddings.weight.is_embedding_or_output_parameter = True
+            self.tokentype_embeddings.weight.is_text_embedding_parameter = True
             # Initialize the token-type embeddings.
             if self.config.perform_initialization:
                 self.config.embedding_init_method(self.tokentype_embeddings.weight)
