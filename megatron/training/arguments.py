@@ -643,7 +643,13 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 
     dtype_map = {
-        'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8,
+        'fp32': torch.float32,
+        'float32': torch.float32,
+        'bf16': torch.bfloat16,
+        'bfloat16': torch.bfloat16,
+        'fp16': torch.float16,
+        'float16': torch.float16,
+        'fp8': torch.uint8,
     }
     map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
 
@@ -651,6 +657,10 @@ def validate_args(args, defaults={}):
     args.main_params_dtype = map_dtype(args.main_params_dtype)
     args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
+    if hasattr(args, "dion_momentum_dtype"):
+        args.dion_momentum_dtype = map_dtype(args.dion_momentum_dtype)
+    if hasattr(args, "dion_Q_dtype"):
+        args.dion_Q_dtype = map_dtype(args.dion_Q_dtype)
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
@@ -2054,8 +2064,46 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
+                       choices=['adam', 'sgd', 'dion', 'muon', 'dist_muon'],
                        help='Optimizer function')
+    group.add_argument('--dion-momentum', type=float, default=0.95,
+                       help='Dion error-feedback momentum (mu parameter).')
+    group.add_argument('--dion-rank-fraction', type=float, default=0.25,
+                       help='Dion low-rank approximation fraction.')
+    group.add_argument('--dion-rank-multiple-of', type=int, default=1,
+                       help='Round the Dion rank up to a multiple of this value.')
+    group.add_argument('--dion-epsilon', type=float, default=1e-8,
+                       help='Dion epsilon for numerical stability.')
+    group.add_argument('--dion-oversample', type=float, default=1.25,
+                       help='Oversampling factor for Dion RCQR.')
+    group.add_argument('--dion-use-fs-collectives', action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='Use Dion FS collectives when distributed Dion runs on sharded layouts.')
+    group.add_argument('--dion-use-compressed-comm', action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Use Dion compressed P/R communication when the logical compression contract applies.')
+    group.add_argument('--dion-scalar-optimizer', type=str, default='adamw',
+                       choices=['lion', 'adamw'],
+                       help='Scalar optimizer used for non-2D Dion parameters.')
+    group.add_argument('--dion-lr-scaling', type=str, default='moonlight',
+                       choices=['moonlight', 'dion'],
+                       help='2D Dion learning-rate scaling rule.')
+    group.add_argument('--dion-beta1', type=float, default=0.9,
+                       help='Beta1 for the Dion scalar optimizer.')
+    group.add_argument('--dion-beta2', type=float, default=0.95,
+                       help='Beta2 for the Dion scalar optimizer.')
+    group.add_argument('--dion-eps', type=float, default=1e-8,
+                       help='Epsilon for the Dion scalar optimizer.')
+    group.add_argument('--dion-momentum-dtype', type=str, default='float32',
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for Dion momentum state.')
+    group.add_argument('--dion-Q-dtype', type=str, default='float32',
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for Dion Q state.')
+    group.add_argument('--fully-shard-model-parallel-size', type=int, default=1,
+                       help='Dion fully-sharded optimizer axis size.')
+    group.add_argument('--replicate-model-parallel-size', type=int, default=1,
+                       help='Dion replicate optimizer axis size.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,

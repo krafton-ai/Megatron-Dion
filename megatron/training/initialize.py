@@ -38,6 +38,90 @@ from megatron.training.yaml_arguments import validate_yaml
 logger = logging.getLogger(__name__)
 
 
+def _resolve_dion_fs_rp_topology(args):
+    requested_fs = getattr(args, "fully_shard_model_parallel_size", 1) or 1
+    requested_rp = getattr(args, "replicate_model_parallel_size", 1) or 1
+    dense_dp_cp_domain = args.world_size // (
+        args.tensor_model_parallel_size * args.pipeline_model_parallel_size
+    )
+
+    fs_explicit = requested_fs != 1
+    rp_explicit = requested_rp != 1
+
+    if fs_explicit and rp_explicit:
+        resolved_fs = requested_fs
+        resolved_rp = requested_rp
+    elif fs_explicit:
+        resolved_fs = requested_fs
+        if dense_dp_cp_domain % resolved_fs != 0:
+            raise RuntimeError(
+                "Dion FS topology is incompatible with the standard Megatron-Core "
+                "distributed-optimizer shard domain. "
+                f"dense_dp_cp_domain={dense_dp_cp_domain} requested_fs={resolved_fs}"
+            )
+        resolved_rp = dense_dp_cp_domain // resolved_fs
+    elif rp_explicit:
+        resolved_rp = requested_rp
+        if dense_dp_cp_domain % resolved_rp != 0:
+            raise RuntimeError(
+                "Dion RP topology is incompatible with the standard Megatron-Core "
+                "distributed-optimizer shard domain. "
+                f"dense_dp_cp_domain={dense_dp_cp_domain} requested_rp={resolved_rp}"
+            )
+        resolved_fs = dense_dp_cp_domain // resolved_rp
+    else:
+        resolved_fs = dense_dp_cp_domain
+        resolved_rp = 1
+
+    if dense_dp_cp_domain % resolved_fs != 0:
+        raise RuntimeError(
+            "Dion FS topology is incompatible with the standard Megatron-Core "
+            "distributed-optimizer shard domain. "
+            f"dense_dp_cp_domain={dense_dp_cp_domain} requested_fs={resolved_fs}"
+        )
+
+    expected_rp = dense_dp_cp_domain // resolved_fs
+    if resolved_rp != expected_rp:
+        raise RuntimeError(
+            "Dion RP/FS topology is incompatible with the standard Megatron-Core "
+            "distributed-optimizer instance topology. "
+            f"dense_dp_cp_domain={dense_dp_cp_domain} requested_fs={resolved_fs} "
+            f"requested_rp={resolved_rp} expected_rp={expected_rp}"
+        )
+
+    expert_model_parallel_size = getattr(args, "expert_model_parallel_size", 1) or 1
+    expert_tensor_parallel_size = (
+        getattr(args, "expert_tensor_parallel_size", None) or args.tensor_model_parallel_size
+    )
+    expert_tensor_model_pipeline_parallel_size = (
+        expert_tensor_parallel_size
+        * expert_model_parallel_size
+        * args.pipeline_model_parallel_size
+    )
+    if args.world_size % expert_tensor_model_pipeline_parallel_size != 0:
+        raise RuntimeError(
+            "Dion topology is incompatible with the standard Megatron-Core expert "
+            "parallel topology. "
+            f"world_size={args.world_size} "
+            f"expert_tensor_model_pipeline_parallel_size="
+            f"{expert_tensor_model_pipeline_parallel_size}"
+        )
+    expert_data_parallel_size = args.world_size // expert_tensor_model_pipeline_parallel_size
+    if expert_data_parallel_size % expected_rp != 0:
+        raise RuntimeError(
+            "Dion RP/FS topology is incompatible with the standard Megatron-Core "
+            "expert distributed-optimizer shard domain. "
+            f"expert_data_parallel_size={expert_data_parallel_size} "
+            f"requested_rp={expected_rp} requested_fs={resolved_fs} "
+            f"tensor_model_parallel_size={args.tensor_model_parallel_size} "
+            f"expert_tensor_parallel_size={expert_tensor_parallel_size} "
+            f"expert_model_parallel_size={expert_model_parallel_size} "
+            f"pipeline_model_parallel_size={args.pipeline_model_parallel_size}"
+        )
+
+    return resolved_fs, expected_rp
+
+
 def initialize_megatron(
     extra_args_provider=None,
     args_defaults={},
@@ -358,6 +442,25 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     if device_count > 0:
+        if args.optimizer == "dion" and args.use_distributed_optimizer:
+            resolved_fs, resolved_rp = _resolve_dion_fs_rp_topology(args)
+            dist_opt_instances_explicit = (
+                (getattr(args, "num_distributed_optimizer_instances", 1) or 1) != 1
+            )
+            if (
+                dist_opt_instances_explicit
+                and args.num_distributed_optimizer_instances != resolved_rp
+            ):
+                raise RuntimeError(
+                    "Explicit --num-distributed-optimizer-instances is incompatible with "
+                    "the standard Megatron-Core Dion topology. "
+                    f"requested_num_distributed_optimizer_instances="
+                    f"{args.num_distributed_optimizer_instances} "
+                    f"expected_num_distributed_optimizer_instances={resolved_rp}"
+                )
+            args.fully_shard_model_parallel_size = resolved_fs
+            args.replicate_model_parallel_size = resolved_rp
+            args.num_distributed_optimizer_instances = resolved_rp
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:

@@ -125,7 +125,14 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
+from megatron.core.optimizer import (
+    get_megatron_optimizer,
+    AdamOptimizerConfig,
+    DionOptimizerConfig,
+    OptimizerConfig,
+    ParamKey,
+    SGDOptimizerConfig,
+)
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
@@ -790,7 +797,6 @@ def pretrain(
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
-
     timestamp_after_set_jit_fusion_options = time.time()
 
     # Adjust the startup time so it reflects the global minimum.
@@ -1425,6 +1431,12 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
             if hasattr(args, f.name):
                 kwargs[f.name] = getattr(args, f.name)
         config = SGDOptimizerConfig(**kwargs)
+    elif args.optimizer == 'dion':
+        kwargs = {}
+        for f in dataclasses.fields(DionOptimizerConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        config = DionOptimizerConfig(**kwargs)
     else:
         raise ValueError("Invalid optimizer type!")
 

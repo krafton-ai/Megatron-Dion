@@ -29,7 +29,6 @@ from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
-
 try:
     if is_torch_min_version("1.13.0"):
         dist_all_gather_func = torch.distributed.all_gather_into_tensor
@@ -41,8 +40,6 @@ except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
-import megatron.core.nccl_allocator as nccl_allocator
-
 
 class BufferType(Enum):
     """
@@ -51,6 +48,19 @@ class BufferType(Enum):
 
     PARAM = 1
     GRAD = 2
+
+
+class _HandleGroup:
+    """Aggregate multiple waitable handles behind a single `.wait()` surface."""
+
+    def __init__(self, handles):
+        self._handles = [handle for handle in handles if handle is not None]
+
+    def wait(self):
+        for handle in self._handles:
+            if hasattr(handle, "wait"):
+                handle.wait()
+        self._handles = []
 
 
 def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
@@ -108,6 +118,30 @@ class _ParamAndGradBucket:
         for param in params:
             self.param_to_index[param] = (offset, offset + param.numel())
             offset += param.numel()
+
+        # Dion transport metadata.
+        self.dion_shard_group = None
+        self.dion_layout = None
+
+    # Helper Properties
+
+    @property
+    def dion_param_ids(self):
+        """Set of Dion param IDs from the bucket layout."""
+        if self.dion_layout is None:
+            return frozenset()
+        return self.dion_layout.param_ids
+
+    @property
+    def has_dion_params(self) -> bool:
+        """Whether bucket carries any Dion params."""
+        return self.dion_layout is not None and self.dion_layout.has_params
+
+    @property
+    def has_non_dion_params(self) -> bool:
+        """Whether bucket has non-Dion params."""
+        dion_param_ids = self.dion_param_ids
+        return any(id(param) not in dion_param_ids for param in self.params)
 
 
 class _ParamAndGradBucketGroup:
@@ -184,7 +218,7 @@ class _ParamAndGradBucketGroup:
         self.is_last_microbatch = True
         self.is_first_batch = True
 
-        # Other metadata to keep track of collectives.
+        self.reset()
         self.param_gather_handle = None
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
@@ -197,12 +231,70 @@ class _ParamAndGradBucketGroup:
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
+    def _mark_dion_param_sync_ready(self, ready: bool):
+        """Update forward-readiness state for custom Dion param-gather buckets."""
+        for bucket in self.buckets:
+            if hasattr(bucket, "_dion_full_param_ready"):
+                bucket._dion_full_param_ready = ready
+
+    def _check_dion_param_sync_ready(self):
+        """Verify bucket.param_data remains the forward-visible canonical storage."""
+        for bucket in self.buckets:
+            if not getattr(bucket, "_dion_requires_param_sync_check", False):
+                continue
+            optimizer = getattr(bucket, "dion_optimizer", None)
+            if optimizer is None:
+                continue
+            optimizer._check_bucket_param_views(bucket, context="finish_param_sync")
+            bucket._dion_full_param_ready = True
+
+    def _get_standard_local_grad_view(self, idx: int, bucket: _ParamAndGradBucket) -> torch.Tensor:
+        """Return the canonical standard local optimizer shard for one bucket."""
+        if self.cached_grad_buffer_shard_list[idx] is None:
+            self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                bucket.grad_data, self.intra_distributed_optimizer_instance_size
+            )
+        return self.cached_grad_buffer_shard_list[idx][
+            self.intra_distributed_optimizer_instance_rank
+        ]
+
+    def _collect_param_gather_launches(self, async_op: bool):
+        """Collect bucket-wise param-gather launches for one dispatch.
+
+        Pure non-Dion buckets follow the stock DO path from the standard local
+        contiguous bucket shard. Buckets that contain Dion params must instead
+        launch the Dion bucket-wise gather helper, because a Dion local FS shard
+        is not generally the same layout as the stock flat bucket shard source.
+        """
+        standard_bucket_indices = []
+        custom_handles = []
+
+        for idx, bucket in enumerate(self.buckets):
+            has_dion = bucket.has_dion_params
+            has_non_dion = bucket.has_non_dion_params
+
+            if has_dion:
+                optimizer = getattr(bucket, "dion_optimizer", None)
+                if optimizer is None or not hasattr(optimizer, "_all_gather_bucket_params"):
+                    raise RuntimeError(
+                        "[Dion] missing bucket-wise Dion param-gather helper "
+                        f"for bucket={getattr(bucket, 'bucket_id', -1)}"
+                    )
+                handle = optimizer._all_gather_bucket_params(bucket, async_op=async_op)
+                if handle is not None:
+                    custom_handles.append(handle)
+                continue
+
+            if has_non_dion:
+                standard_bucket_indices.append(idx)
+
+        return standard_bucket_indices, custom_handles
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
         """
         if self.is_first_batch and len(self.per_param_grad_ready_counts) > 0:
-            # Record golden per_param_grad_ready_counts.
             assert len(self.per_param_grad_ready_counts) == len(self.params)
             self.golden_per_param_grad_ready_counts = self.per_param_grad_ready_counts
             self.is_first_batch = False
@@ -265,38 +357,41 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                self._check_dion_param_sync_ready()
                 return
         else:
             assert self.param_gather_handle is None
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
-        # Coalesce communication kernels across buckets in the bucket group.
-        with _coalescing_manager(
-            self.intra_distributed_optimizer_instance_group, async_ops=async_op
-        ) as cm:
-            for idx, bucket in enumerate(self.buckets):
-                if self.cached_param_buffer_shard_list[idx] is None:
-                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                        bucket.param_data, self.intra_distributed_optimizer_instance_size
+        self._mark_dion_param_sync_ready(False)
+        pure_non_dion_indices, custom_handles = self._collect_param_gather_launches(async_op=async_op)
+        standard_handle = None
+        if pure_non_dion_indices:
+            with _coalescing_manager(
+                self.intra_distributed_optimizer_instance_group, async_ops=async_op
+            ) as cm:
+                for idx in pure_non_dion_indices:
+                    bucket = self.buckets[idx]
+                    if self.cached_param_buffer_shard_list[idx] is None:
+                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                            bucket.param_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_param_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
+                    dist_all_gather_func(
+                        bucket.param_data,
+                        local_data_view,
+                        group=self.intra_distributed_optimizer_instance_group,
+                        async_op=async_op,
                     )
-                local_data_view = self.cached_param_buffer_shard_list[idx][
-                    self.intra_distributed_optimizer_instance_rank
-                ]
-                dist_all_gather_func(
-                    bucket.param_data,
-                    local_data_view,
-                    group=self.intra_distributed_optimizer_instance_group,
-                    async_op=async_op,
-                )
+            standard_handle = cm if async_op else None
+
         if async_op:
-            self.param_gather_handle = cm
+            self.param_gather_handle = _HandleGroup([standard_handle, *custom_handles])
         else:
-            # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
-            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
-            # which case the torch.distributed._all_gather_base() will return None. In order to
-            # maintain consistency with prior code, we need to manually set communication handle to
-            # None.
             self.param_gather_handle = None
+            self._check_dion_param_sync_ready()
         self.param_gather_dispatched = True
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -325,7 +420,8 @@ class _ParamAndGradBucketGroup:
         if self.param_gather_handle is not None:
             self.param_gather_handle.wait()
             self.param_gather_handle = None
-            # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
+            self._check_dion_param_sync_ready()
+
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
                 if self.next_param_gather_bucket_group.param_gather_dispatched:
                     warnings.warn(
@@ -337,20 +433,12 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
-            # we need to copy the param_data from the shared_param/grad_buffer to param.data
-            # after the param all-gather.
             if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 for bucket in self.buckets:
                     for param in bucket.params:
                         param_start, param_end = bucket.param_to_index[param]
                         param_slice = bucket.param_data.view(-1)[param_start:param_end]
                         param.data.copy_(param_slice.view(param.data.shape))
-                    # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
-                    # We cannot zero out the entire grad buffer because one grad buffer may
-                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
-                    # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
             else:
                 fp8_params = []
@@ -371,8 +459,6 @@ class _ParamAndGradBucketGroup:
         synchronous call.
         """
         if self.is_first_batch and self.grad_reduce_handle is not None:
-            # Make this start_grad_sync call a no-op if in first batch and collective has
-            # already been dispatched.
             return
 
         assert (
@@ -423,23 +509,17 @@ class _ParamAndGradBucketGroup:
         else:
             stream_context = nullcontext()
 
-        if self.ddp_config.use_distributed_optimizer:
-            communication_group = self.intra_distributed_optimizer_instance_group
-        else:
-            communication_group = self.data_parallel_group
+        communication_group = (
+            self.intra_distributed_optimizer_instance_group
+            if self.ddp_config.use_distributed_optimizer
+            else self.data_parallel_group
+        )
 
-        # Coalesce communication kernels across buckets in the bucket group.
         grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
-                    if self.cached_grad_buffer_shard_list[idx] is None:
-                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
-                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                        )
-                    local_data_view = self.cached_grad_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
+                    local_data_view = self._get_standard_local_grad_view(idx, bucket)
                     grad_reduce_handle = dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
@@ -455,7 +535,6 @@ class _ParamAndGradBucketGroup:
                     torch.distributed.all_reduce(
                         bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                     )
-
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
             self.ddp_config.use_distributed_optimizer
@@ -470,39 +549,93 @@ class _ParamAndGradBucketGroup:
                 ) as cm,
             ):
                 for idx, bucket in enumerate(self.buckets):
-                    if self.cached_grad_buffer_shard_list[idx] is None:
-                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
-                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                        )
-                    local_data_view = self.cached_grad_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-
+                    local_data_view = self._get_standard_local_grad_view(idx, bucket)
+                    if local_data_view is None or local_data_view.numel() == 0:
+                        continue
                     torch.distributed.all_reduce(
                         local_data_view,
                         op=reduce_op,
                         group=self.inter_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
-
         if async_op:
             if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
                 assert (
                     len(self.buckets) == 1
                 ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
-                # torch.distributed._coalescing_manager does not correctly handle calling our custom
-                # collective handle's .wait() method, so we take matters into our own hands here.
                 assert grad_reduce_handle is not None
                 self.grad_reduce_handle = grad_reduce_handle
             else:
                 self.grad_reduce_handle = cm
         else:
-            # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
-            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
-            # which case the torch.distributed._reduce_scatter_base() will return None. In order to
-            # maintain consistency with prior code, we need to manually set communication handle to
-            # None.
             self.grad_reduce_handle = None
+
+    def _copy_bucket_grads_to_main_grads(self) -> None:
+        """Copy standard bucket grads into Dion `model_param.main_grad` slices.
+
+        Stock DO owns the bucket-wise RS/AR lifecycle and leaves each rank with
+        its standard local bucket shard. Dion optimizer entry, however, needs the
+        per-parameter FS-local gradient slice on every rank that owns that FS
+        shard. Reconstruct the canonical full bucket grad surface from the
+        completed stock local ownership shards, then write each Dion param's
+        logical FS-local slice back into `model_param.main_grad` before Dion grad
+        copy. This preserves stock bucket-wise communication while restoring the
+        Dion logical main-grad invariant.
+        """
+        communication_group = (
+            self.intra_distributed_optimizer_instance_group
+            if self.ddp_config.use_distributed_optimizer
+            else self.data_parallel_group
+        )
+        group_size = 1 if communication_group is None else int(communication_group.size())
+
+        for idx, bucket in enumerate(self.buckets):
+            dion_layout = getattr(bucket, "dion_layout", None)
+            if dion_layout is None or not dion_layout.has_params:
+                continue
+
+            local_data_view = self._get_standard_local_grad_view(idx, bucket)
+            if local_data_view is None or local_data_view.numel() == 0:
+                continue
+
+            local_flat = local_data_view.contiguous().view(-1)
+            if group_size == 1:
+                full_bucket_flat = local_flat
+            else:
+                full_bucket_flat = torch.empty(
+                    local_flat.numel() * group_size,
+                    dtype=local_flat.dtype,
+                    device=local_flat.device,
+                )
+                dist_all_gather_func(
+                    full_bucket_flat,
+                    local_flat,
+                    group=communication_group,
+                    async_op=False,
+                )
+
+            for entry in dion_layout.entries:
+                model_param = entry.param
+                model_grad = getattr(model_param, "main_grad", None)
+                if model_grad is None:
+                    raise RuntimeError(
+                        "[Dion] grad restore requires canonical model_param.main_grad "
+                        f"bucket={bucket.bucket_id} param={getattr(model_param, '_param_name', id(model_param))}"
+                    )
+
+                full_start = int(entry.canonical_bucket_start)
+                full_end = int(entry.canonical_bucket_end)
+                full_param = full_bucket_flat[full_start:full_end].view(model_param.shape)
+                if int(entry.fs_split_dim) == 0:
+                    local_shard = full_param[int(entry.start_idx) : int(entry.end_idx), :]
+                    model_grad.view(model_param.shape)[
+                        int(entry.start_idx) : int(entry.end_idx), :
+                    ].copy_(local_shard)
+                else:
+                    local_shard = full_param[:, int(entry.start_idx) : int(entry.end_idx)]
+                    model_grad.view(model_param.shape)[
+                        :, int(entry.start_idx) : int(entry.end_idx)
+                    ].copy_(local_shard)
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
@@ -514,19 +647,20 @@ class _ParamAndGradBucketGroup:
         makes synchronous call.
         """
         self.param_gather_dispatched = False
+
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
+            self._copy_bucket_grads_to_main_grads()
             return
-        # If first batch, start asynchronous communication here. register_grad_ready() launches
-        # asynchronous communication only once self.golden_per_param_grad_ready_counts is
-        # populated at the end of this first batch.
         if self.is_first_batch:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
-            torch.cuda.default_stream().wait_stream(self.communication_stream)
+            if self.communication_stream is not None:
+                torch.cuda.default_stream().wait_stream(self.communication_stream)
+            self._copy_bucket_grads_to_main_grads()
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -535,6 +669,7 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
+        self._copy_bucket_grads_to_main_grads()
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
@@ -626,6 +761,7 @@ class _ParamAndGradBuffer:
         self.data_parallel_world_size = self.data_parallel_group.size()
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
+        self.param_to_name = param_to_name  # Store for Dion optimizer's _build_model_gbuf_range
 
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
@@ -762,8 +898,8 @@ class _ParamAndGradBuffer:
                 group=self.data_parallel_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
-            # Since nccl communicator group is created lazily, we need to perform a warmup call to
-            # initialize NCCL comm buffers for this dp_group before doing buffer registration.
+            # Since nccl communicator group is created lazily, perform a warmup call
+            # before buffer registration to initialize NCCL comm buffers.
             torch.distributed.barrier()
             tmp_warmup_tensor = torch.zeros([1], device="cuda")
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
@@ -806,7 +942,6 @@ class _ParamAndGradBuffer:
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
-
         self.grad_data_size = 0
         self.param_data_size = 0
         self.param_data_cpu = None
@@ -940,6 +1075,13 @@ class _ParamAndGradBuffer:
         bucketed_grad_data = self._get(
             torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
         )
+        bucket_param_to_index = {}
+        for bucket_param in bucket_params:
+            param_start_index, param_end_index, _ = self.param_index_map[bucket_param]
+            bucket_param_to_index[bucket_param] = (
+                param_start_index - start_index,
+                param_end_index - start_index,
+            )
         bucket = _ParamAndGradBucket(
             params=bucket_params,
             param_data=bucketed_param_data,
@@ -949,6 +1091,7 @@ class _ParamAndGradBuffer:
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
         )
+        bucket.param_to_index = bucket_param_to_index
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
             self.param_to_bucket[bucket_param] = bucket

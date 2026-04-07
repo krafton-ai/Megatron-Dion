@@ -37,6 +37,11 @@ except ImportError:
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
+try:
+    from megatron.core.optimizer.megatron_dion import MegatronDion
+except ImportError:
+    MegatronDion = None
+
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
@@ -511,11 +516,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
-        assert (
-            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
-            or optimizer is None
-        ), (
-            "Only Adam and HybridDeviceOptimizer currently supported, "
+        allowed_optimizers = (Adam, torch.optim.AdamW, HybridDeviceOptimizer)
+        if MegatronDion is not None:
+            allowed_optimizers = allowed_optimizers + (MegatronDion,)
+
+        assert isinstance(optimizer, allowed_optimizers) or optimizer is None, (
+            "Only Adam, HybridDeviceOptimizer, and MegatronDion currently supported, "
             "due to checkpointing requirements."
         )
 

@@ -35,6 +35,7 @@ from megatron.core.tensor_parallel.layers import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.expert_init import reinitialize_partitioned_expert_weight_
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
@@ -121,6 +122,7 @@ class GroupedMLP(MegatronModule):
         self.tp_group = pg_collection.expt_tp
         # use pg_collection.expt_dp_group as data parallel group in this module.
         self.dp_group = pg_collection.expt_dp
+        self.layer_number: Optional[int] = None
         # How many feature each rank holds for fc1 and fc2, respectively.
         tp_size = self.tp_group.size()
         tp_rank = self.tp_group.rank()
@@ -202,6 +204,8 @@ class GroupedMLP(MegatronModule):
                 )
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
+        setattr(self.weight1, 'num_local_experts', num_local_experts)
+        setattr(self.weight2, 'num_local_experts', num_local_experts)
 
         def remove_extra_states_check(self, incompatible_keys):
             """
@@ -214,6 +218,61 @@ class GroupedMLP(MegatronModule):
                     incompatible_keys.unexpected_keys.remove(key)
 
         self.register_load_state_dict_post_hook(remove_extra_states_check)
+
+    @torch.no_grad()
+    def set_layer_number(self, layer_number: int):
+        """Reinitialize expert weights from topology-invariant logical seeds."""
+
+        self.layer_number = int(layer_number)
+        if not self.config.perform_initialization:
+            return
+
+        tp_size = self.tp_group.size()
+        tp_rank = self.tp_group.rank()
+        global_expert_offset = self.ep_group.rank() * self.num_local_experts
+        fc1_partition_width = self.weight1.shape[1] // self.num_local_experts
+        fc2_partition_height = self.weight2.shape[0] // self.num_local_experts
+
+        for local_expert_idx in range(self.num_local_experts):
+            global_expert_idx = global_expert_offset + local_expert_idx
+
+            fc1_weight = self.weight1[
+                :,
+                local_expert_idx * fc1_partition_width : (local_expert_idx + 1)
+                * fc1_partition_width,
+            ]
+            reinitialize_partitioned_expert_weight_(
+                weight=fc1_weight,
+                full_rows=int(fc1_weight.shape[0]),
+                full_cols=int(fc1_weight.shape[1]) * int(tp_size),
+                partition_dim=1,
+                init_method=self.config.init_method,
+                params_dtype=self.weight1.dtype,
+                tp_rank=int(tp_rank),
+                tp_world_size=int(tp_size),
+                layer_number=self.layer_number,
+                linear_tag="fc1",
+                global_expert_idx=int(global_expert_idx),
+            )
+
+            fc2_weight = self.weight2[
+                local_expert_idx * fc2_partition_height : (local_expert_idx + 1)
+                * fc2_partition_height,
+                :,
+            ]
+            reinitialize_partitioned_expert_weight_(
+                weight=fc2_weight,
+                full_rows=int(fc2_weight.shape[0]) * int(tp_size),
+                full_cols=int(fc2_weight.shape[1]),
+                partition_dim=0,
+                init_method=self.config.output_layer_init_method,
+                params_dtype=self.weight2.dtype,
+                tp_rank=int(tp_rank),
+                tp_world_size=int(tp_size),
+                layer_number=self.layer_number,
+                linear_tag="fc2",
+                global_expert_idx=int(global_expert_idx),
+            )
 
     def forward(
         self,
@@ -526,6 +585,7 @@ class TEGroupedMLP(MegatronModule):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
+        self.layer_number: Optional[int] = None
         assert not (
             self.config.add_bias_linear and config.bias_dropout_fusion
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
@@ -604,6 +664,14 @@ class TEGroupedMLP(MegatronModule):
             assert HAVE_TE, "FP8 and FP4 requires TE."
             self.quantization_padding = Fp8Padding(self.num_local_experts)
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
+
+    @torch.no_grad()
+    def set_layer_number(self, layer_number: int):
+        self.layer_number = int(layer_number)
+        if hasattr(self.linear_fc1, "set_layer_number"):
+            self.linear_fc1.set_layer_number(self.layer_number)
+        if hasattr(self.linear_fc2, "set_layer_number"):
+            self.linear_fc2.set_layer_number(self.layer_number)
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):

@@ -456,3 +456,65 @@ class SGDOptimizerConfig(OptimizerConfig):
 
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
+
+
+@dataclass
+class DionOptimizerConfig(OptimizerConfig):
+    """Dion optimizer configuration object."""
+
+    optimizer: str = 'dion'
+    """Optimizer name."""
+
+    dion_momentum: float = 0.95
+    """Momentum factor for Dion error feedback."""
+
+    dion_rank_fraction: float = 0.25
+    """Logical low-rank fraction."""
+
+    dion_rank_multiple_of: int = 1
+    """Round the effective rank to a multiple of this value."""
+
+    dion_epsilon: float = 1e-8
+    """Numerical epsilon for Dion updates."""
+
+    dion_oversample: float = 1.25
+    """Oversampling factor used by Dion orthogonalization."""
+
+    dion_use_fs_collectives: bool = True
+    """Enable Dion FS-aware communication when distributed optimizer is active."""
+
+    dion_use_compressed_comm: bool = False
+    """Enable Dion compressed P/R communication."""
+
+    dion_scalar_optimizer: str = "adamw"
+    """Scalar optimizer used for non-Dion parameter surfaces."""
+
+    dion_lr_scaling: str = "moonlight"
+    """Dion 2D learning-rate scaling rule."""
+
+    dion_beta1: float = 0.9
+    """Beta1 for Dion scalar optimizer states."""
+
+    dion_beta2: float = 0.95
+    """Beta2 for Dion scalar optimizer states."""
+
+    dion_eps: float = 1e-8
+    """Epsilon for Dion scalar optimizer states."""
+
+    dion_momentum_dtype: Optional[torch.dtype] = torch.float32
+    """Dtype for Dion momentum state."""
+
+    dion_Q_dtype: Optional[torch.dtype] = torch.float32
+    """Dtype for Dion right-factor state."""
+
+    dion_local_batch_size: Optional[int] = None
+    """Optional Dion local batching hint."""
+
+    dion_max_concurrent_tasks: Optional[int] = None
+    """Optional Dion async task width."""
+
+    fully_shard_model_parallel_size: int = 1
+    """Dion fully-sharded model-parallel size."""
+
+    replicate_model_parallel_size: int = 1
+    """Dion replicate-parallel size."""

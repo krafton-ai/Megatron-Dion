@@ -43,6 +43,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.moe.expert_init import reinitialize_partitioned_expert_weight_
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -1490,6 +1491,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.te_return_bias = skip_bias_add and bias
             self.is_first_microbatch = True
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+            self.layer_number: Optional[int] = None
+            self._dion_is_expert = bool(is_expert)
+            self._dion_expert_linear_tag = tp_comm_buffer_name or "expert"
+            self._dion_expert_init_method = init_method
 
             extra_kwargs = _get_extra_te_kwargs(config)
 
@@ -1549,6 +1554,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.te_quant_params: Optional[TEQuantizationParams] = None
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
+                if is_expert:
+                    setattr(param, "num_local_experts", num_gemms)
 
             def merge_extra_states(
                 self,
@@ -1639,6 +1646,47 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 state_dict[f"{prefix}_extra_state"] = self._encode_extra_state(extra_state)
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
+
+        @torch.no_grad()
+        def set_layer_number(self, layer_number: int):
+            self.layer_number = int(layer_number)
+            if not (self._dion_is_expert and self.config.perform_initialization):
+                return
+
+            tp_world_size = get_pg_size(self._tp_group) if self._tp_group is not None else 1
+            tp_rank = get_pg_rank(self._tp_group) if self._tp_group is not None else 0
+            global_expert_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
+
+            for gemm_idx in range(self.num_gemms):
+                global_expert_idx = global_expert_offset + gemm_idx
+                weight = getattr(self, f"weight{gemm_idx}")
+                partition_dim = int(getattr(weight, "partition_dim", 0))
+                full_rows = (
+                    int(weight.shape[0]) * int(tp_world_size)
+                    if partition_dim == 0
+                    else int(weight.shape[0])
+                )
+                full_cols = (
+                    int(weight.shape[1]) * int(tp_world_size)
+                    if partition_dim == 1
+                    else int(weight.shape[1])
+                )
+                reinitialize_partitioned_expert_weight_(
+                    weight=weight,
+                    full_rows=full_rows,
+                    full_cols=full_cols,
+                    partition_dim=partition_dim,
+                    init_method=self._dion_expert_init_method,
+                    params_dtype=weight.dtype,
+                    tp_rank=int(tp_rank),
+                    tp_world_size=int(tp_world_size),
+                    layer_number=self.layer_number,
+                    linear_tag=self._dion_expert_linear_tag,
+                    global_expert_idx=int(global_expert_idx),
+                )
+                bias = getattr(self, f"bias{gemm_idx}", None)
+                if bias is not None:
+                    bias.zero_()
 
         def finish_init(self, quantization_config: QuantizationConfig):
             """Post-init of quantization override"""

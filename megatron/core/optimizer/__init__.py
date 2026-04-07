@@ -46,6 +46,12 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
+from .distrib_dion.integration import (
+    build_distributed_optimizer_for_dion,
+    build_megatron_dion,
+    get_dion_scalar_param_override,
+)
+from .distrib_dion.param_selection import annotate_dion_candidates
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import (
@@ -57,6 +63,7 @@ from .optimizer import (
 )
 from .optimizer_config import (
     AdamOptimizerConfig,
+    DionOptimizerConfig,
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
@@ -161,6 +168,15 @@ def _get_param_groups(
                 )
             else:
                 param_override = None
+
+            dion_scalar_override = get_dion_scalar_param_override(config, param, param_override)
+            if dion_scalar_override is not None:
+                if param_override is None:
+                    param_override = dion_scalar_override
+                else:
+                    param_override = combine_param_group_overrides(
+                        [param_override, dion_scalar_override]
+                    )
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
@@ -276,6 +292,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    is_expert_parallel: bool = False,
 ) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
 
@@ -406,6 +423,15 @@ def _get_megatron_optimizer_based_on_param_groups(
                 momentum=config.sgd_momentum,
             )
             init_state_fn = None
+        elif config.optimizer == 'dion':
+            optimizer = build_megatron_dion(
+                config=config,
+                param_groups=param_groups,
+                data_parallel_group=data_parallel_group,
+                pg_collection=pg_collection,
+                is_expert_parallel=is_expert_parallel,
+            )
+            init_state_fn = None
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:
@@ -444,15 +470,29 @@ def _get_megatron_optimizer_based_on_param_groups(
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
-            optimizer = DistributedOptimizer(
-                *optimizer_args,
-                model_chunks=model_chunks,
-                per_model_buffers=per_model_buffers,
-                data_parallel_group=data_parallel_group,
-                data_parallel_group_gloo=data_parallel_group_gloo,
-                data_parallel_group_idx=data_parallel_group_idx,
-                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-            )
+            if config.optimizer == 'dion':
+                optimizer = build_distributed_optimizer_for_dion(
+                    optimizer_args=optimizer_args,
+                    config=config,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                    pg_collection=pg_collection,
+                    is_expert_parallel=is_expert_parallel,
+                )
+            else:
+                optimizer = DistributedOptimizer(
+                    *optimizer_args,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                )
             # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
             # weight gradients are all-reduced across optimizer instances, so each instance has
             # the duplicated weight gradients, need to reduce gradient stats inside each instance.
@@ -532,6 +572,10 @@ def get_megatron_optimizer(
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
     check_config_overrides_consistency(config, config_overrides)
+
+    if getattr(config, 'optimizer', None) == 'dion':
+        for model_chunk in model_chunks:
+            annotate_dion_candidates(model_chunk)
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
@@ -678,6 +722,7 @@ def get_megatron_optimizer(
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
+                is_expert_parallel=True,
             )
         )
 
