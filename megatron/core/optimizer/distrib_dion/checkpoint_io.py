@@ -38,8 +38,8 @@ def build_persistent_dion_param_state(param_groups, optimizer_state, get_param_k
     per-call gather buffers and transient sync flags are excluded.
     """
     key_to_state = {}
-    for group in param_groups:
-        for param in group["params"]:
+    for param_group in param_groups:
+        for param in param_group["params"]:
             state = optimizer_state.get(param)
             if not state:
                 continue
@@ -80,8 +80,8 @@ def restore_persistent_dion_param_state_(
         "no_payload_entry": 0,
     }
 
-    for group in param_groups:
-        for param in group["params"]:
+    for param_group in param_groups:
+        for param in param_group["params"]:
             param_key = get_param_key_fn(param)
             current_state = optimizer_state.get(param, {})
             if param_key is None:
@@ -115,6 +115,104 @@ def restore_persistent_dion_param_state_(
             summary["restored"] += 1
 
     return summary
+
+
+def build_distributed_dion_checkpoint_state(
+    *,
+    common_state: dict,
+    param_groups,
+    optimizer_state,
+    get_param_key_fn,
+    base_key: str,
+    replica_id,
+    sharded_object_cls,
+) -> dict:
+    """Build distributed checkpoint state with standard common-state outer layout."""
+    state_dict = {
+        key: sharded_object_cls(
+            f"{base_key}.{key}",
+            value,
+            (1,),
+            (0,),
+            replica_id=replica_id,
+        )
+        for key, value in common_state.items()
+    }
+
+    dion_param_state = build_persistent_dion_param_state(
+        param_groups,
+        optimizer_state,
+        get_param_key_fn,
+    )
+    state_dict["dion_param_state"] = sharded_object_cls(
+        f"{base_key}.dion_param_state",
+        dion_param_state,
+        (1,),
+        (0,),
+        replica_id=replica_id,
+    )
+    return state_dict
+
+
+def split_distributed_dion_checkpoint_state(state_dict: dict) -> tuple[Optional[dict], dict]:
+    """Split Dion payload from the standard common-state outer protocol."""
+    dion_param_state = state_dict.get("dion_param_state", None)
+    if dion_param_state is None and state_dict.get("param_state_sharding_type") == "dion_non_reshardable":
+        dion_param_state = state_dict.get("param_state", None)
+
+    common_state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if key not in ("dion_param_state", "param_state", "param_state_sharding_type")
+    }
+    return dion_param_state, common_state_dict
+
+
+def ensure_dion_state_initialized_for_load_(
+    *,
+    param_groups,
+    optimizer_state,
+    init_state_fn,
+) -> None:
+    """Initialize Dion optimizer state tensors before loading persistent payload."""
+    if init_state_fn is None:
+        return
+
+    for param_group in param_groups:
+        for param in param_group["params"]:
+            state = optimizer_state.get(param)
+            if state is None:
+                optimizer_state[param] = {}
+                state = optimizer_state[param]
+            if len(state) == 0:
+                init_state_fn(param, state, param_group)
+
+
+def restore_distributed_dion_checkpoint_state_(
+    *,
+    dion_param_state,
+    param_groups,
+    optimizer_state,
+    get_param_key_fn,
+) -> dict[str, int]:
+    """Restore Dion-specific distributed checkpoint payload and validate completeness."""
+    if not isinstance(dion_param_state, dict) or len(dion_param_state) == 0:
+        raise RuntimeError("[Dion] distributed checkpoint missing Dion param state payload")
+
+    restore_summary = restore_persistent_dion_param_state_(
+        param_groups=param_groups,
+        optimizer_state=optimizer_state,
+        get_param_key_fn=get_param_key_fn,
+        key_to_state=dion_param_state,
+    )
+    if restore_summary["unnamed"] > 0 or restore_summary["no_payload_entry"] > 0:
+        raise RuntimeError(
+            "[Dion] distributed checkpoint restore left unresolved param state entries "
+            f"(restored={restore_summary['restored']} "
+            f"no_payload_entry={restore_summary['no_payload_entry']} "
+            f"unnamed={restore_summary['unnamed']})"
+        )
+    return restore_summary
 
 
 def all_gather_flat_shards_(
@@ -166,7 +264,7 @@ def all_gather_flat_shards_(
 def all_gather_fs_shards_2d_(
     param_2d: torch.Tensor,
     *,
-    fs_split_dim: int,
+    fs_shard_dim: int,
     start_idx: int,
     end_idx: int,
     fs_group: dist.ProcessGroup,
@@ -181,13 +279,13 @@ def all_gather_fs_shards_2d_(
     if local_shard_size <= 0:
         return
 
-    local_shard = slice_fs_shard_2d(param_2d, fs_split_dim, start_idx, end_idx).contiguous()
-    other_dim_size = param_2d.shape[1] if fs_split_dim == 0 else param_2d.shape[0]
+    local_shard = slice_fs_shard_2d(param_2d, fs_shard_dim, start_idx, end_idx).contiguous()
+    other_dim_size = param_2d.shape[1] if fs_shard_dim == 0 else param_2d.shape[0]
 
-    split_dim_size = param_2d.shape[fs_split_dim]
+    split_dim_size = param_2d.shape[fs_shard_dim]
     max_shard_size = (split_dim_size + fs_size - 1) // fs_size
 
-    if fs_split_dim == 0:
+    if fs_shard_dim == 0:
         padded_shard = torch.zeros(
             max_shard_size, other_dim_size, dtype=param_2d.dtype, device=param_2d.device
         )
@@ -204,11 +302,11 @@ def all_gather_fs_shards_2d_(
     for rank_i in range(fs_size):
         r_start, r_end = compute_fs_shard_range(split_dim_size, fs_size, rank_i)
         actual_size = r_end - r_start
-        if fs_split_dim == 0:
+        if fs_shard_dim == 0:
             rank_shard_2d = gathered_shards[rank_i][:actual_size, :]
         else:
             rank_shard_2d = gathered_shards[rank_i][:, :actual_size]
-        write_fs_shard_2d_(param_2d, fs_split_dim, r_start, r_end, rank_shard_2d)
+        write_fs_shard_2d_(param_2d, fs_shard_dim, r_start, r_end, rank_shard_2d)
 
 
 def copy_param_to_shard_main_(
@@ -229,7 +327,7 @@ def copy_param_to_shard_main_(
     if dion_shard_layout is not None:
         start_idx = int(dion_shard_layout.start_idx)
         end_idx = int(dion_shard_layout.end_idx)
-        fs_split_dim = int(dion_shard_layout.fs_split_dim)
+        fs_shard_dim = int(dion_shard_layout.fs_shard_dim)
 
         if source_param_fp32.ndim == 2:
             source_2d = source_param_fp32
@@ -237,12 +335,12 @@ def copy_param_to_shard_main_(
             source_2d = source_param_fp32.view(shard_main_param.shape)
 
         shard_model_param = (
-            slice_fs_shard_2d(source_2d, fs_split_dim, start_idx, end_idx).clone().view(-1)
+            slice_fs_shard_2d(source_2d, fs_shard_dim, start_idx, end_idx).clone().view(-1)
         )
         assert shard_model_param.numel() == shard_main_param.numel(), (
             f"FS shard size mismatch: shard_model_param={shard_model_param.numel()}, "
             f"shard_main_param={shard_main_param.numel()}, "
-            f"fs_split_dim={fs_split_dim}, start_idx={start_idx}, end_idx={end_idx}, "
+            f"fs_shard_dim={fs_shard_dim}, start_idx={start_idx}, end_idx={end_idx}, "
             f"source_shape={source_param_fp32.shape}, "
             f"global_shape={tuple(dion_shard_layout.global_shape)}"
         )
@@ -284,6 +382,61 @@ def copy_group_params_to_main_shards_(
             )
 
 
+def copy_model_params_to_main_shards_(
+    *,
+    is_hybrid_device_optimizer: bool,
+    hybrid_optimizer_update_fn: Callable | None,
+    use_megatron_fsdp: bool,
+    use_precision_aware_optimizer: bool,
+    state_dict,
+    build_model_param_to_state_dict_param_map_fn: Callable,
+    model_float16_groups,
+    main_shard_groups,
+    model_fp32_groups,
+    shard_fp32_groups,
+    get_model_param_range_map_fn: Callable,
+    get_dion_shard_layout_fn: Callable,
+) -> None:
+    """Copy model params onto optimizer main shards using the canonical adapter mapping."""
+    if is_hybrid_device_optimizer:
+        if hybrid_optimizer_update_fn is None:
+            raise RuntimeError(
+                "[Dion] HybridDeviceOptimizer path requires update_fp32_param_by_new_param callback"
+            )
+        hybrid_optimizer_update_fn()
+        return
+
+    if use_megatron_fsdp or use_precision_aware_optimizer:
+        return
+
+    model_param_to_state_dict_param_map = None
+    if state_dict is not None:
+        model_param_to_state_dict_param_map = build_model_param_to_state_dict_param_map_fn(
+            state_dict
+        )
+
+    if model_param_to_state_dict_param_map is not None:
+        get_source_param = lambda model_param: model_param_to_state_dict_param_map[model_param]
+    else:
+        get_source_param = lambda model_param: model_param
+    get_param_range = lambda model_param: get_model_param_range_map_fn(model_param)["param"]
+
+    copy_group_params_to_main_shards_(
+        model_groups=model_float16_groups,
+        shard_main_groups=main_shard_groups,
+        get_source_param_fn=get_source_param,
+        get_param_range_fn=get_param_range,
+        get_dion_shard_layout_fn=get_dion_shard_layout_fn,
+    )
+    copy_group_params_to_main_shards_(
+        model_groups=model_fp32_groups,
+        shard_main_groups=shard_fp32_groups,
+        get_source_param_fn=get_source_param,
+        get_param_range_fn=get_param_range,
+        get_dion_shard_layout_fn=get_dion_shard_layout_fn,
+    )
+
+
 def apply_optimizer_shard_to_model_param_(
     *,
     model_param: torch.nn.Parameter,
@@ -299,7 +452,7 @@ def apply_optimizer_shard_to_model_param_(
     model_param._fs_shard = data_shard
 
     if dion_shard_layout is not None:
-        fs_split_dim = int(dion_shard_layout.fs_split_dim)
+        fs_shard_dim = int(dion_shard_layout.fs_shard_dim)
         start_idx = int(dion_shard_layout.start_idx)
         end_idx = int(dion_shard_layout.end_idx)
 
@@ -312,7 +465,7 @@ def apply_optimizer_shard_to_model_param_(
             )
             zero_range_warned += 1
 
-        if fs_split_dim == 0:
+        if fs_shard_dim == 0:
             expected_rows = end_idx - start_idx
             expected_cols = model_param.data.shape[1]
         else:
@@ -325,27 +478,27 @@ def apply_optimizer_shard_to_model_param_(
                 f"[Dion] FS shard shape mismatch: param={param_name}, "
                 f"data_shard.numel()={data_shard.numel()}, "
                 f"expected={expected_rows}x{expected_cols}={expected_rows * expected_cols}, "
-                f"fs_split_dim={fs_split_dim}, range=[{start_idx}:{end_idx}]"
+                f"fs_shard_dim={fs_shard_dim}, range=[{start_idx}:{end_idx}]"
             )
 
-        target_slice = slice_fs_shard_2d(model_param.data, fs_split_dim, start_idx, end_idx)
+        target_slice = slice_fs_shard_2d(model_param.data, fs_shard_dim, start_idx, end_idx)
         src_view = data_shard.view(expected_rows, expected_cols)
         if src_view.data_ptr() == target_slice.data_ptr():
             return zero_range_warned
         param_name = getattr(model_param, "_param_name", f"id_{id(model_param)}")
         logger.error(
-            "[DION_FS_ALIAS_MISMATCH] param=%s data_shard_ptr=%s target_ptr=%s fs_split_dim=%s range=[%s:%s]",
+            "[DION_FS_ALIAS_MISMATCH] param=%s data_shard_ptr=%s target_ptr=%s fs_shard_dim=%s range=[%s:%s]",
             param_name,
             src_view.data_ptr(),
             target_slice.data_ptr(),
-            fs_split_dim,
+            fs_shard_dim,
             start_idx,
             end_idx,
         )
         raise RuntimeError(
             f"[Dion] FS shard alias mismatch for {param_name}: "
             f"data_shard no longer aliases canonical model_param.data slice "
-            f"(fs_split_dim={fs_split_dim}, range=[{start_idx}:{end_idx}])"
+            f"(fs_shard_dim={fs_shard_dim}, range=[{start_idx}:{end_idx}])"
         )
 
     if param_range_map is None or "gbuf_world_in_bucket" not in param_range_map:
@@ -398,8 +551,8 @@ def apply_non_dion_shards_(
 ) -> int:
     """Write back non-Dion optimizer shards using the standard DO local-shard contract."""
     param_count = 0
-    for model_group, shard_group in zip(model_groups, shard_groups):
-        for model_param, shard_param in zip(model_group, shard_group):
+    for model_group, shard_param_group in zip(model_groups, shard_groups):
+        for model_param, shard_param in zip(model_group, shard_param_group):
             if shard_param is None or getattr(model_param, "is_dion_param", False):
                 continue
             if get_bucket_param_data_fn is None:
@@ -450,13 +603,13 @@ def apply_group_shards_to_model_params_(
     """Apply updated Dion optimizer shards to grouped model params."""
     param_count = 0
 
-    for model_group, shard_group, shard16_group in zip(
+    for model_group, shard_param_group, shard16_param_group in zip(
         model_groups,
         shard_groups,
         shard16_groups,
     ):
         for model_param, shard_param, shard16_param in zip(
-            model_group, shard_group, shard16_group
+            model_group, shard_param_group, shard16_param_group
         ):
             if shard_param is None:
                 continue
@@ -480,6 +633,84 @@ def apply_group_shards_to_model_params_(
             param_count += 1
 
     return param_count, zero_range_warned
+
+
+def copy_main_params_to_model_shards_(
+    *,
+    is_stub_optimizer: bool,
+    use_megatron_fsdp: bool,
+    copy_fsdp_main_to_model_weights_fn: Callable | None,
+    use_precision_aware_optimizer: bool,
+    model_float16_groups,
+    main_shard_groups,
+    shard_float16_groups,
+    model_fp32_groups,
+    shard_fp32_groups,
+    get_data_shard_fn: Callable[[torch.nn.Parameter], torch.Tensor],
+    get_param_range_map_fn: Callable[[torch.nn.Parameter], dict],
+    get_dion_shard_layout_fn: Callable[[torch.nn.Parameter], Optional[DionShardLayout]],
+    get_bucket_param_data_fn: Callable[[torch.nn.Parameter], torch.Tensor] | None,
+    mark_buckets_full_param_ready_fn: Callable[[bool], None],
+    check_main_shards_fn: Callable,
+    rebind_model_params_to_canonical_bucket_storage_fn: Callable,
+    zero_range_warned: int,
+) -> int:
+    """Copy updated optimizer main shards back onto model-param local shards."""
+    if is_stub_optimizer:
+        return zero_range_warned
+
+    if use_megatron_fsdp:
+        if copy_fsdp_main_to_model_weights_fn is None:
+            raise RuntimeError(
+                "[Dion] FSDP param writeback requires copy_main_weights_to_model_weights callback"
+            )
+        copy_fsdp_main_to_model_weights_fn()
+        return zero_range_warned
+
+    if use_precision_aware_optimizer:
+        return zero_range_warned
+
+    mark_buckets_full_param_ready_fn(False)
+    check_main_shards_fn(main_shard_groups)
+
+    apply_non_dion_shards_(
+        model_groups=model_float16_groups,
+        shard_groups=main_shard_groups,
+        get_param_range_map_fn=get_param_range_map_fn,
+        get_bucket_param_data_fn=get_bucket_param_data_fn,
+    )
+    _, zero_range_warned = apply_group_shards_to_model_params_(
+        model_groups=model_float16_groups,
+        shard_groups=main_shard_groups,
+        shard16_groups=shard_float16_groups,
+        get_data_shard_fn=get_data_shard_fn,
+        get_param_range_map_fn=get_param_range_map_fn,
+        get_dion_shard_layout_fn=get_dion_shard_layout_fn,
+        get_bucket_param_data_fn=get_bucket_param_data_fn,
+        zero_range_warned=zero_range_warned,
+    )
+
+    apply_non_dion_shards_(
+        model_groups=model_fp32_groups,
+        shard_groups=shard_fp32_groups,
+        get_param_range_map_fn=get_param_range_map_fn,
+        get_bucket_param_data_fn=get_bucket_param_data_fn,
+    )
+
+    rebind_model_params_to_canonical_bucket_storage_fn(dion_only=True)
+
+    _, zero_range_warned = apply_group_shards_to_model_params_(
+        model_groups=model_fp32_groups,
+        shard_groups=shard_fp32_groups,
+        shard16_groups=shard_fp32_groups,
+        get_data_shard_fn=get_data_shard_fn,
+        get_param_range_map_fn=get_param_range_map_fn,
+        get_dion_shard_layout_fn=get_dion_shard_layout_fn,
+        get_bucket_param_data_fn=get_bucket_param_data_fn,
+        zero_range_warned=zero_range_warned,
+    )
+
+    return zero_range_warned
 
 
 def restore_full_model_param_(
@@ -508,7 +739,7 @@ def restore_full_model_param_(
         )
         return True
 
-    fs_split_dim = int(dion_shard_layout.fs_split_dim)
+    fs_shard_dim = int(dion_shard_layout.fs_shard_dim)
     start_idx = int(dion_shard_layout.start_idx)
     end_idx = int(dion_shard_layout.end_idx)
     if start_idx == end_idx:
@@ -516,7 +747,7 @@ def restore_full_model_param_(
 
     all_gather_fs_shards_2d_(
         model_param.data,
-        fs_split_dim=fs_split_dim,
+        fs_shard_dim=fs_shard_dim,
         start_idx=start_idx,
         end_idx=end_idx,
         fs_group=fs_group,
@@ -538,8 +769,8 @@ def restore_group_params_(
     dion_count = 0
     non_dion_count = 0
 
-    for model_group, shard_group in zip(model_groups, shard_groups):
-        for model_param, shard_param in zip(model_group, shard_group):
+    for model_group, shard_param_group in zip(model_groups, shard_groups):
+        for model_param, shard_param in zip(model_group, shard_param_group):
             if shard_param is None:
                 continue
 

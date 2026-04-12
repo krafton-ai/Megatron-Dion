@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import os
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
@@ -40,6 +41,94 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
+_PP_BACKWARD_STEP_PROBE_CALL_IDX = 0
+
+
+def _dump_pp_backward_step_tensor(
+    dump_dir: str, base_name: str, tag: str, tensor: torch.Tensor
+) -> None:
+    flat = tensor.detach().float().view(-1)
+    torch.save(
+        {
+            "tag": tag,
+            "shape": tuple(int(dim) for dim in tensor.shape),
+            "dtype": str(tensor.dtype),
+            "sum": float(flat.sum().item()) if flat.numel() > 0 else 0.0,
+            "sq_sum": float(flat.pow(2).sum().item()) if flat.numel() > 0 else 0.0,
+            "amax": float(flat.abs().max().item()) if flat.numel() > 0 else 0.0,
+            "sample": flat[:256].cpu(),
+        },
+        os.path.join(dump_dir, base_name + f"_{tag}.pt"),
+    )
+
+
+def _maybe_dump_pp_backward_step_value(
+    dump_dir: str, base_name: str, tag: str, value: Union[torch.Tensor, List[torch.Tensor], None]
+) -> None:
+    if value is None:
+        return
+    if isinstance(value, torch.Tensor):
+        _dump_pp_backward_step_tensor(dump_dir, base_name, tag, value)
+        return
+    if isinstance(value, list):
+        for idx, item in enumerate(value):
+            if isinstance(item, torch.Tensor):
+                _dump_pp_backward_step_tensor(
+                    dump_dir, base_name, f"{tag}_item{idx:02d}", item
+                )
+
+
+def _maybe_dump_pp_backward_step_probe(
+    *,
+    output_tensor: Union[torch.Tensor, List[torch.Tensor]],
+    output_tensor_grad: Union[torch.Tensor, List[torch.Tensor], None],
+    input_tensor_grad: Optional[Union[torch.Tensor, List[torch.Tensor]]],
+) -> None:
+    if os.getenv("DION_DEBUG_PP_BACKWARD_STEP_PROBE", "0") != "1":
+        return
+
+    dump_dir = os.getenv("DION_DEBUG_PP_BACKWARD_STEP_PROBE_DIR", "").strip()
+    if not dump_dir:
+        raise RuntimeError(
+            "[DION_INVALID_ENV] DION_DEBUG_PP_BACKWARD_STEP_PROBE=1 requires "
+            "DION_DEBUG_PP_BACKWARD_STEP_PROBE_DIR"
+        )
+
+    max_calls_raw = os.getenv("DION_DEBUG_PP_BACKWARD_STEP_MAX_CALLS", "1").strip()
+    max_calls = int(max_calls_raw) if max_calls_raw else 1
+
+    global _PP_BACKWARD_STEP_PROBE_CALL_IDX
+    if _PP_BACKWARD_STEP_PROBE_CALL_IDX >= max_calls:
+        return
+
+    os.makedirs(dump_dir, exist_ok=True)
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    pp_rank = (
+        parallel_state.get_pipeline_model_parallel_rank()
+        if parallel_state.is_initialized()
+        else 0
+    )
+    tp_rank = (
+        parallel_state.get_tensor_model_parallel_rank()
+        if parallel_state.is_initialized()
+        else 0
+    )
+    cp_rank = (
+        parallel_state.get_context_parallel_rank()
+        if parallel_state.is_initialized()
+        else 0
+    )
+    call_idx = _PP_BACKWARD_STEP_PROBE_CALL_IDX
+    _PP_BACKWARD_STEP_PROBE_CALL_IDX += 1
+
+    base_name = (
+        f"pp_bwd_step_rank{rank:03d}_pp{pp_rank:02d}_tp{tp_rank:02d}_cp{cp_rank:02d}_"
+        f"call{call_idx:04d}"
+    )
+    _maybe_dump_pp_backward_step_value(dump_dir, base_name, "out", output_tensor)
+    _maybe_dump_pp_backward_step_value(dump_dir, base_name, "out_grad", output_tensor_grad)
+    _maybe_dump_pp_backward_step_value(dump_dir, base_name, "in_grad", input_tensor_grad)
 
 
 def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
@@ -500,6 +589,12 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if unwrap_input_tensor_grad:
         input_tensor_grad = input_tensor_grad[0]
+
+    _maybe_dump_pp_backward_step_probe(
+        output_tensor=output_tensor,
+        output_tensor_grad=output_tensor_grad,
+        input_tensor_grad=input_tensor_grad,
+    )
 
     if config.timers is not None:
         config.timers('backward-compute').stop()

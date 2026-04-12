@@ -34,40 +34,40 @@ def compute_fs_shard_range(global_size: int, fs_size: int, fs_rank: int) -> Tupl
     return start_idx, end_idx
 
 
-def get_fs_split_dim(tp_split_dim: int) -> int:
+def get_fs_split_dim(tp_shard_dim: int) -> int:
     """Return FS split dim orthogonal to TP split dim.
 
-    - tp_split_dim=0 (ColumnParallel, TP splits rows) -> FS splits cols (dim=1)
-    - tp_split_dim=1 (RowParallel, TP splits cols) -> FS splits rows (dim=0)
-    - tp_split_dim=-1 (no TP) -> default row split (dim=0)
+    - tp_shard_dim=0 (ColumnParallel, TP splits rows) -> FS splits cols (dim=1)
+    - tp_shard_dim=1 (RowParallel, TP splits cols) -> FS splits rows (dim=0)
+    - tp_shard_dim=-1 (no TP) -> default row split (dim=0)
     """
-    if tp_split_dim == 0:
+    if tp_shard_dim == 0:
         return 1
-    if tp_split_dim == 1:
+    if tp_shard_dim == 1:
         return 0
     return 0
 
 
-def compute_local_shape(m: int, n: int, start_idx: int, end_idx: int, fs_split_dim: int) -> Tuple[int, int]:
+def compute_local_shape(m: int, n: int, start_idx: int, end_idx: int, fs_shard_dim: int) -> Tuple[int, int]:
     """Return local (m, n) shape after FS sharding."""
     local_split_size = end_idx - start_idx
-    if fs_split_dim == 0:
+    if fs_shard_dim == 0:
         return (local_split_size, n)
     return (m, local_split_size)
 
 
-def slice_fs_shard_2d(tensor2d: torch.Tensor, fs_split_dim: int, start_idx: int, end_idx: int) -> torch.Tensor:
+def slice_fs_shard_2d(tensor2d: torch.Tensor, fs_shard_dim: int, start_idx: int, end_idx: int) -> torch.Tensor:
     """Return a view for the FS shard slice of a 2D tensor."""
-    if fs_split_dim == 0:
+    if fs_shard_dim == 0:
         return tensor2d[start_idx:end_idx, :]
     return tensor2d[:, start_idx:end_idx]
 
 
 def write_fs_shard_2d_(
-    dst2d: torch.Tensor, fs_split_dim: int, start_idx: int, end_idx: int, src2d: torch.Tensor
+    dst2d: torch.Tensor, fs_shard_dim: int, start_idx: int, end_idx: int, src2d: torch.Tensor
 ) -> None:
     """In-place write `src2d` into `dst2d` at the FS shard slice."""
-    if fs_split_dim == 0:
+    if fs_shard_dim == 0:
         dst2d[start_idx:end_idx, :].copy_(src2d)
     else:
         dst2d[:, start_idx:end_idx].copy_(src2d)
@@ -78,7 +78,7 @@ def compute_fs_flat_segments(
     full_start: int,
     m: int,
     n: int,
-    fs_split_dim: int,
+    fs_shard_dim: int,
     start_idx: int,
     end_idx: int,
 ) -> Tuple[Tuple[int, int], ...]:
@@ -87,14 +87,14 @@ def compute_fs_flat_segments(
     The returned `(start, end)` ranges are offsets inside the bucket-level flat
     `bucket.param_data` coordinate system.
 
-    For row FS sharding (`fs_split_dim == 0`) the local shard is one contiguous
-    flat range. For column FS sharding (`fs_split_dim == 1`) the local shard is
+    For row FS sharding (`fs_shard_dim == 0`) the local shard is one contiguous
+    flat range. For column FS sharding (`fs_shard_dim == 1`) the local shard is
     strided in the flattened row-major layout, so we represent it as one segment
     per row.
     """
     if start_idx < 0 or end_idx < start_idx:
         raise ValueError(f"invalid FS shard range: start_idx={start_idx} end_idx={end_idx}")
-    if fs_split_dim == 0:
+    if fs_shard_dim == 0:
         return ((full_start + start_idx * n, full_start + end_idx * n),)
 
     width = end_idx - start_idx

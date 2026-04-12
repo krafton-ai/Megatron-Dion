@@ -35,8 +35,8 @@ class DionBucketEntry:
         return self.shard_layout.global_shape
 
     @property
-    def fs_split_dim(self) -> int:
-        return int(self.shard_layout.fs_split_dim)
+    def fs_shard_dim(self) -> int:
+        return int(self.shard_layout.fs_shard_dim)
 
     @property
     def start_idx(self) -> int:
@@ -95,15 +95,15 @@ def build_dion_entries_(
             continue
 
         global_shape = tuple(static_info["global_shape"])
-        fs_split_dim = int(static_info["fs_split_dim"])
+        fs_shard_dim = int(static_info["fs_shard_dim"])
         m, n = tuple(int(dim) for dim in param.shape)
 
-        split_size = m if fs_split_dim == 0 else n
+        split_size = m if fs_shard_dim == 0 else n
         start_idx, end_idx = compute_fs_shard_range(split_size, fs_size, fs_rank)
         local_split_size = int(end_idx) - int(start_idx)
         size_per_rank = math.ceil(split_size / fs_size)
 
-        if fs_split_dim == 0:
+        if fs_shard_dim == 0:
             local_shape = (local_split_size, n)
             shard_capacity = size_per_rank * n
         else:
@@ -130,7 +130,7 @@ def build_dion_entries_(
                     full_start=canonical_bucket_start,
                     m=m,
                     n=n,
-                    fs_split_dim=fs_split_dim,
+                    fs_shard_dim=fs_shard_dim,
                     start_idx=rank_start,
                     end_idx=rank_end,
                 )
@@ -139,7 +139,7 @@ def build_dion_entries_(
         shard_layout = DionShardLayout(
             local_shape=tuple(int(dim) for dim in local_shape),
             global_shape=tuple(int(dim) for dim in global_shape),
-            fs_split_dim=fs_split_dim,
+            fs_shard_dim=fs_shard_dim,
             start_idx=int(start_idx),
             end_idx=int(end_idx),
             per_expert_global_shape=static_info.get("per_expert_global_shape"),

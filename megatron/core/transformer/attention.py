@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional, Protocol, Tuple, Union
 
 import torch
@@ -115,6 +117,135 @@ try:
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
+
+_ATTN_PROBE_CALL_IDX = {}
+_ATTN_PROBE_SEEN_WEIGHTS = set()
+
+
+def _attn_probe_enabled() -> bool:
+    return os.getenv("DION_DEBUG_ATTN_PROBE", "0") == "1"
+
+
+def _attn_probe_selected_ranks() -> set[int] | None:
+    raw = os.getenv("DION_DEBUG_ATTN_PROBE_RANKS", "").strip()
+    if not raw:
+        return None
+    return {int(token.strip()) for token in raw.split(",") if token.strip()}
+
+
+def _attn_probe_full_tags() -> set[str]:
+    raw = os.getenv("DION_DEBUG_ATTN_PROBE_FULL_TAGS", "").strip()
+    if not raw:
+        return set()
+    return {token.strip() for token in raw.split(",") if token.strip()}
+
+
+def _maybe_dump_attn_probe_tensor(
+    tensor: Tensor,
+    *,
+    layer_number: int,
+    tag: str,
+    pg_collection: ProcessGroupCollection | None,
+) -> None:
+    if not _attn_probe_enabled():
+        return
+    if not isinstance(tensor, torch.Tensor):
+        return
+
+    dump_dir = os.getenv("DION_DEBUG_ATTN_PROBE_DIR", "").strip()
+    if not dump_dir:
+        raise RuntimeError(
+            "[DION_INVALID_ENV] DION_DEBUG_ATTN_PROBE=1 requires DION_DEBUG_ATTN_PROBE_DIR"
+        )
+
+    target_layer_raw = os.getenv("DION_DEBUG_ATTN_PROBE_LAYER", "").strip()
+    if not target_layer_raw:
+        raise RuntimeError(
+            "[DION_INVALID_ENV] DION_DEBUG_ATTN_PROBE=1 requires DION_DEBUG_ATTN_PROBE_LAYER"
+        )
+    if int(layer_number) != int(target_layer_raw):
+        return
+
+    tags_raw = os.getenv(
+        "DION_DEBUG_ATTN_PROBE_TAGS",
+        "mixed_qkv,core_attn_out,proj_out,linear_qkv_weight,linear_proj_weight",
+    ).strip()
+    tags = {token.strip() for token in tags_raw.split(",") if token.strip()}
+    if tags and tag not in tags:
+        return
+
+    max_calls_raw = os.getenv("DION_DEBUG_ATTN_PROBE_MAX_CALLS", "1").strip()
+    max_calls = int(max_calls_raw) if max_calls_raw else 1
+    key = (int(layer_number), tag)
+    call_idx = _ATTN_PROBE_CALL_IDX.get(key, 0)
+    if call_idx >= max_calls:
+        return
+    _ATTN_PROBE_CALL_IDX[key] = call_idx + 1
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    pp_rank = get_pg_rank(getattr(pg_collection, "pp", None))
+    tp_rank = get_pg_rank(getattr(pg_collection, "tp", None))
+    cp_rank = get_pg_rank(getattr(pg_collection, "cp", None))
+
+    flat = tensor.detach().float().contiguous().view(-1)
+    payload = {
+        "rank": rank,
+        "pp_rank": pp_rank,
+        "tp_rank": tp_rank,
+        "cp_rank": cp_rank,
+        "layer_number": int(layer_number),
+        "tag": tag,
+        "call_idx": call_idx,
+        "shape": tuple(int(dim) for dim in tensor.shape),
+        "dtype": str(tensor.dtype),
+        "sum": float(flat.sum().item()) if flat.numel() > 0 else 0.0,
+        "sq_sum": float(flat.pow(2).sum().item()) if flat.numel() > 0 else 0.0,
+        "amax": float(flat.abs().max().item()) if flat.numel() > 0 else 0.0,
+        "sample": flat[:256].cpu(),
+    }
+    selected_ranks = _attn_probe_selected_ranks()
+    full_tags = _attn_probe_full_tags()
+    if (selected_ranks is None or rank in selected_ranks) and tag in full_tags:
+        payload["full_tensor"] = tensor.detach().cpu()
+    dump_path = Path(dump_dir)
+    dump_path.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        payload,
+        dump_path
+        / (
+            f"attn_probe_rank{rank:03d}_pp{pp_rank:02d}_tp{tp_rank:02d}_cp{cp_rank:02d}_"
+            f"layer{int(layer_number):02d}_{tag}_call{call_idx:04d}.pt"
+        ),
+    )
+
+
+def _maybe_dump_attn_probe_weight(
+    module: torch.nn.Module,
+    *,
+    layer_number: int,
+    tag: str,
+    pg_collection: ProcessGroupCollection | None,
+) -> None:
+    if not _attn_probe_enabled():
+        return
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    key = (int(layer_number), tag, rank)
+    if key in _ATTN_PROBE_SEEN_WEIGHTS:
+        return
+
+    weight = getattr(module, "weight", None)
+    if weight is None:
+        raise RuntimeError(f"[DION_ATTN_PROBE] module for tag={tag} has no weight")
+
+    _ATTN_PROBE_SEEN_WEIGHTS.add(key)
+    _maybe_dump_attn_probe_tensor(
+        weight,
+        layer_number=layer_number,
+        tag=tag,
+        pg_collection=pg_collection,
+    )
 
 
 class LinearQkv(Protocol):
@@ -1193,6 +1324,12 @@ class Attention(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
+        _maybe_dump_attn_probe_tensor(
+            core_attn_out,
+            layer_number=self.layer_number,
+            tag="core_attn_out",
+            pg_collection=self.pg_collection,
+        )
 
         # Output gate
         if gate is not None:
@@ -1204,6 +1341,12 @@ class Attention(MegatronModule, ABC):
         # Output. [sq, b, h]
         # =================
         nvtx_range_push(suffix="linear_proj")
+        _maybe_dump_attn_probe_weight(
+            self.linear_proj,
+            layer_number=self.layer_number,
+            tag="linear_proj_weight",
+            pg_collection=self.pg_collection,
+        )
         with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
@@ -1211,6 +1354,39 @@ class Attention(MegatronModule, ABC):
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
         nvtx_range_pop(suffix="linear_proj")
+        if _attn_probe_enabled():
+            proj_bias = getattr(self.linear_proj, "bias", None)
+            if proj_bias is not None and proj_bias.numel() == 0:
+                proj_bias = None
+            proj_weight_fp32 = self.linear_proj.weight.detach().float().to(core_attn_out.device)
+            proj_bias_fp32 = (
+                proj_bias.detach().float().to(core_attn_out.device) if proj_bias is not None else None
+            )
+            proj_out_fp32_ref = torch.nn.functional.linear(
+                core_attn_out.detach().float(),
+                proj_weight_fp32,
+                proj_bias_fp32,
+            )
+            if get_pg_size(self.pg_collection.tp) > 1:
+                torch.distributed.all_reduce(proj_out_fp32_ref, group=self.pg_collection.tp)
+            _maybe_dump_attn_probe_tensor(
+                proj_out_fp32_ref,
+                layer_number=self.layer_number,
+                tag="proj_out_fp32_ref",
+                pg_collection=self.pg_collection,
+            )
+            _maybe_dump_attn_probe_tensor(
+                output.detach().float() - proj_out_fp32_ref,
+                layer_number=self.layer_number,
+                tag="proj_out_fp32_gap",
+                pg_collection=self.pg_collection,
+            )
+        _maybe_dump_attn_probe_tensor(
+            output,
+            layer_number=self.layer_number,
+            tag="proj_out",
+            pg_collection=self.pg_collection,
+        )
 
         return output, bias
 
@@ -1386,6 +1562,12 @@ class SelfAttention(Attention):
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
+        _maybe_dump_attn_probe_weight(
+            self.linear_qkv,
+            layer_number=self.layer_number,
+            tag="linear_qkv_weight",
+            pg_collection=self.pg_collection,
+        )
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
@@ -1414,6 +1596,12 @@ class SelfAttention(Attention):
             )
             size = mixed_qkv.size()[-1] // self.config.num_query_groups
             mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
+        _maybe_dump_attn_probe_tensor(
+            mixed_qkv,
+            layer_number=self.layer_number,
+            tag="mixed_qkv",
+            pg_collection=self.pg_collection,
+        )
 
         # If no output gate: [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         # If have output gate: [sq, b, hp] --> [sq, b, ng, (2 * np/ng + 2) * hn]

@@ -6,10 +6,12 @@
 import time
 _PROGRAM_START_TIME = time.time()
 
+import hashlib
 import json
 
 # Suppress warnings on all ranks but rank 0.
 import os
+from pathlib import Path
 import warnings
 rank = int(os.environ.get('RANK', 0))
 if rank != 0:
@@ -60,6 +62,94 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+_BATCH_TRACE_CALL_INDEX = 0
+
+
+def _batch_trace_enabled() -> bool:
+    return os.getenv("GPT_DEBUG_BATCH_TRACE", "0") == "1"
+
+
+def _batch_trace_max_calls() -> int:
+    raw = os.getenv("GPT_DEBUG_BATCH_TRACE_MAX_CALLS", "1").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 1
+    return max(1, value)
+
+
+def _batch_trace_dump_dir() -> Path:
+    dump_dir = os.getenv("GPT_DEBUG_BATCH_TRACE_DIR", "").strip()
+    if dump_dir:
+        return Path(dump_dir)
+    return Path(__file__).resolve().parent / "test_logs"
+
+
+def _tensor_trace_hash(tensor: torch.Tensor) -> str:
+    tensor_bytes = tensor.detach().contiguous().cpu().numpy().tobytes()
+    return hashlib.blake2b(tensor_bytes, digest_size=8).hexdigest()
+
+
+def _maybe_dump_batch_trace(tag: str, batch: dict, vp_stage: Optional[int]) -> None:
+    global _BATCH_TRACE_CALL_INDEX
+
+    if not _batch_trace_enabled():
+        return
+    if _BATCH_TRACE_CALL_INDEX >= _batch_trace_max_calls():
+        return
+    if parallel_state.get_tensor_model_parallel_rank() != 0:
+        return
+
+    dump_dir = _batch_trace_dump_dir()
+    dump_dir.mkdir(parents=True, exist_ok=True)
+
+    tensors = {}
+    stats = {}
+    for key in ("tokens", "labels", "loss_mask", "position_ids"):
+        value = batch.get(key)
+        if value is None:
+            continue
+        tensor_cpu = value.detach().cpu()
+        tensors[key] = tensor_cpu
+        flat = tensor_cpu.reshape(-1)
+        stats[key] = {
+            "shape": tuple(tensor_cpu.shape),
+            "sum": float(flat.float().sum().item()) if flat.numel() > 0 else 0.0,
+            "amax": float(flat.float().abs().max().item()) if flat.numel() > 0 else 0.0,
+            "hash": _tensor_trace_hash(tensor_cpu),
+        }
+
+    stage_role = "middle"
+    if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+        stage_role = "first"
+    if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+        stage_role = "last"
+
+    payload = {
+        "tag": tag,
+        "call_index": _BATCH_TRACE_CALL_INDEX,
+        "vp_stage": vp_stage,
+        "global_rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+        "tp_rank": parallel_state.get_tensor_model_parallel_rank(),
+        "pp_rank": parallel_state.get_pipeline_model_parallel_rank(),
+        "cp_rank": parallel_state.get_context_parallel_rank(),
+        "stage_role": stage_role,
+        "stats": stats,
+        "tensors": tensors,
+    }
+
+    dump_path = dump_dir / (
+        f"gpt_batch_trace_call{_BATCH_TRACE_CALL_INDEX:03d}_rank{payload['global_rank']}_"
+        f"pp{payload['pp_rank']}_cp{payload['cp_rank']}_tag_{tag}.pt"
+    )
+    torch.save(payload, dump_path)
+    print(
+        f"[GPT_BATCH_TRACE] tag={tag} call={_BATCH_TRACE_CALL_INDEX} rank={payload['global_rank']} "
+        f"pp_rank={payload['pp_rank']} cp_rank={payload['cp_rank']} stage={stage_role} "
+        f"path={dump_path} stats={stats}",
+        flush=True,
+    )
+    _BATCH_TRACE_CALL_INDEX += 1
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
@@ -76,6 +166,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         data_iterator,
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
         )
+    _maybe_dump_batch_trace("post_tp_broadcast", batch, vp_stage)
 
     cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
@@ -93,7 +184,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-    
+
+    _maybe_dump_batch_trace("post_cp_slice", batch, vp_stage)
     return (*batch.values(), packed_seq_params)
 
 

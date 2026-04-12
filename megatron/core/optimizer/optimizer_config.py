@@ -504,10 +504,9 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_momentum_dtype: Optional[torch.dtype] = torch.float32
     """Dtype for Dion momentum state."""
 
-    dion_Q_dtype: Optional[torch.dtype] = torch.float32
+    dion_q_dtype: Optional[torch.dtype] = torch.float32
     """Dtype for Dion right-factor state."""
 
-    dion_local_batch_size: Optional[int] = None
     """Optional Dion local batching hint."""
 
     dion_max_concurrent_tasks: Optional[int] = None

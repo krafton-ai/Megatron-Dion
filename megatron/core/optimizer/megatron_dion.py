@@ -6,22 +6,17 @@ from .dion import (
     # Configuration types
     DionMixedPrecisionConfig,
     DionParamConfig,
-    MegatronDionDistMeta,
+    DionDistMeta,
     # Async runtime
     AsyncTask,
     AsyncRuntime,
-    # Batch processing
-    BatchProcessor,
-    pad_batch,
 )
 
 __all__ = [
     "MegatronDion",
     "DionMixedPrecisionConfig",
     "DionParamConfig",
-    "MegatronDionDistMeta",
+    "DionDistMeta",
     "AsyncTask",
     "AsyncRuntime",
-    "BatchProcessor",
-    "pad_batch",
 ]

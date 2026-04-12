@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -70,6 +71,131 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_PP_BOUNDARY_PROBE_FWD_CALL_IDX = {}
+_PP_BOUNDARY_PROBE_BWD_CALL_IDX = {}
+
+
+def _pp_boundary_probe_phase_enabled(boundary: str) -> bool:
+    phases_raw = os.getenv("DION_DEBUG_PP_BOUNDARY_PHASES", "post").strip().lower()
+    phases = {token.strip() for token in phases_raw.split(",") if token.strip()}
+    if not phases:
+        phases = {"post"}
+    return "both" in phases or boundary in phases
+
+
+def _maybe_register_pp_boundary_probe(
+    hidden_states: Tensor, *, layer_number: int, boundary: str
+) -> None:
+    if os.getenv("DION_DEBUG_PP_BOUNDARY_PROBE", "0") != "1":
+        return
+    if not isinstance(hidden_states, torch.Tensor):
+        return
+    if not _pp_boundary_probe_phase_enabled(boundary):
+        return
+
+    dump_dir = os.getenv("DION_DEBUG_PP_BOUNDARY_PROBE_DIR", "").strip()
+    if not dump_dir:
+        raise RuntimeError(
+            "[DION_INVALID_ENV] DION_DEBUG_PP_BOUNDARY_PROBE=1 requires "
+            "DION_DEBUG_PP_BOUNDARY_PROBE_DIR"
+        )
+
+    target_layer_raw = os.getenv("DION_DEBUG_PP_BOUNDARY_LAYER", "").strip()
+    if not target_layer_raw:
+        raise RuntimeError(
+            "[DION_INVALID_ENV] DION_DEBUG_PP_BOUNDARY_PROBE=1 requires "
+            "DION_DEBUG_PP_BOUNDARY_LAYER"
+        )
+
+    target_layer = int(target_layer_raw)
+    if int(layer_number) != target_layer:
+        return
+
+    max_calls_raw = os.getenv("DION_DEBUG_PP_BOUNDARY_MAX_CALLS", "1").strip()
+    max_calls = int(max_calls_raw) if max_calls_raw else 1
+
+    global _PP_BOUNDARY_PROBE_FWD_CALL_IDX
+    fwd_key = (int(layer_number), boundary)
+    fwd_call_idx = _PP_BOUNDARY_PROBE_FWD_CALL_IDX.get(fwd_key, 0)
+    if fwd_call_idx >= max_calls:
+        return
+
+    os.makedirs(dump_dir, exist_ok=True)
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    pp_rank = (
+        parallel_state.get_pipeline_model_parallel_rank()
+        if parallel_state.is_initialized()
+        else 0
+    )
+    tp_rank = (
+        parallel_state.get_tensor_model_parallel_rank()
+        if parallel_state.is_initialized()
+        else 0
+    )
+    cp_rank = (
+        parallel_state.get_context_parallel_rank()
+        if parallel_state.is_initialized()
+        else 0
+    )
+
+    call_idx = fwd_call_idx
+    _PP_BOUNDARY_PROBE_FWD_CALL_IDX[fwd_key] = fwd_call_idx + 1
+
+    flat = hidden_states.detach().float().view(-1)
+    base_name = (
+        f"pp_boundary_rank{rank:03d}_pp{pp_rank:02d}_tp{tp_rank:02d}_cp{cp_rank:02d}_"
+        f"layer{int(layer_number):02d}_{boundary}_call{call_idx:04d}"
+    )
+    torch.save(
+        {
+            "kind": "forward",
+            "boundary": boundary,
+            "rank": rank,
+            "pp_rank": pp_rank,
+            "tp_rank": tp_rank,
+            "cp_rank": cp_rank,
+            "layer_number": int(layer_number),
+            "shape": tuple(int(dim) for dim in hidden_states.shape),
+            "dtype": str(hidden_states.dtype),
+            "sum": float(flat.sum().item()) if flat.numel() > 0 else 0.0,
+            "sq_sum": float(flat.pow(2).sum().item()) if flat.numel() > 0 else 0.0,
+            "amax": float(flat.abs().max().item()) if flat.numel() > 0 else 0.0,
+            "sample": flat[:256].cpu(),
+        },
+        os.path.join(dump_dir, base_name + "_fwd.pt"),
+    )
+
+    def _dump_grad_hook(grad: Tensor) -> Tensor:
+        global _PP_BOUNDARY_PROBE_BWD_CALL_IDX
+
+        bwd_key = (int(layer_number), boundary)
+        bwd_call_idx = _PP_BOUNDARY_PROBE_BWD_CALL_IDX.get(bwd_key, 0)
+        grad_flat = grad.detach().float().view(-1)
+        torch.save(
+            {
+                "kind": "backward",
+                "boundary": boundary,
+                "rank": rank,
+                "pp_rank": pp_rank,
+                "tp_rank": tp_rank,
+                "cp_rank": cp_rank,
+                "layer_number": int(layer_number),
+                "call_idx": int(call_idx),
+                "bwd_call_idx": int(bwd_call_idx),
+                "shape": tuple(int(dim) for dim in grad.shape),
+                "dtype": str(grad.dtype),
+                "sum": float(grad_flat.sum().item()) if grad_flat.numel() > 0 else 0.0,
+                "sq_sum": float(grad_flat.pow(2).sum().item()) if grad_flat.numel() > 0 else 0.0,
+                "amax": float(grad_flat.abs().max().item()) if grad_flat.numel() > 0 else 0.0,
+                "sample": grad_flat[:256].cpu(),
+            },
+            os.path.join(dump_dir, base_name + "_bwd.pt"),
+        )
+        _PP_BOUNDARY_PROBE_BWD_CALL_IDX[bwd_key] = bwd_call_idx + 1
+        return grad
+
+    hidden_states.register_hook(_dump_grad_hook)
 
 
 def get_num_layers_to_build(
@@ -332,10 +458,44 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # if self.apply_query_key_layer_scaling:
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
+        #
+        # Optional: make initialization invariant to PP partitioning when doing CPU init.
+        # Megatron's default seeding offsets by pipeline rank, which changes which random
+        # numbers each layer sees when PP changes. For debugging/sweeps we sometimes want
+        # identical initialization across PP sizes.
+        # Enabled only when:
+        # - `MEGATRON_LAYER_SEEDED_INIT=1` (env var)
+        # - `config.use_cpu_initialization` (so TP shards are derived from the same master weight)
+        layer_seed_base = None
+        topology_invariant_init_seed = getattr(self.config, "topology_invariant_init_seed", None)
+        if (
+            topology_invariant_init_seed is not None
+            and bool(getattr(self.config, "use_cpu_initialization", False))
+            and bool(getattr(self.config, "perform_initialization", True))
+        ):
+            layer_seed_base = int(topology_invariant_init_seed) % (2**63 - 1)
+        elif (
+            os.getenv("MEGATRON_LAYER_SEEDED_INIT", "0") == "1"
+            and bool(getattr(self.config, "use_cpu_initialization", False))
+            and bool(getattr(self.config, "perform_initialization", True))
+        ):
+            pp_rank = get_pg_rank(getattr(self.pg_collection, "pp", None))
+            # `_set_random_seed()` uses: seed = seed_ + 100 * pp_rank (+ optional dp offset).
+            # Remove the PP contribution so all PP stages share the same base seed.
+            layer_seed_base = int(torch.initial_seed()) - 100 * int(pp_rank)
+            # Normalize into a valid 64-bit seed range.
+            layer_seed_base = layer_seed_base % (2**63 - 1)
+
         def build_layer(layer_spec, layer_number):
             global_layer_number = layer_number + get_transformer_layer_offset(
                 self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
             )  # 1-based index
+
+            if layer_seed_base is not None:
+                # Use a per-global-layer seed so init is independent of PP partitioning.
+                # The multiplier is arbitrary; it just reduces the chance of collisions.
+                layer_seed = (layer_seed_base + 1000 * int(global_layer_number)) % (2**63 - 1)
+                torch.manual_seed(layer_seed)
             if self.config.heterogeneous_block_specs:
                 layer_config = self.config.get_config_for_layer(global_layer_number)
             else:
@@ -486,6 +646,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         inner_quantization_context = nullcontext()
 
                     with inner_quantization_context:
+                        _maybe_register_pp_boundary_probe(
+                            hidden_states,
+                            layer_number=layer.layer_number,
+                            boundary="pre",
+                        )
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -496,6 +661,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
+                        )
+                        _maybe_register_pp_boundary_probe(
+                            hidden_states,
+                            layer_number=layer.layer_number,
+                            boundary="post",
                         )
                 return hidden_states, context
 
@@ -762,6 +932,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         inner_quantization_context = nullcontext()
 
                     with self.offload_context, inner_quantization_context:
+                        _maybe_register_pp_boundary_probe(
+                            hidden_states,
+                            layer_number=layer.layer_number,
+                            boundary="pre",
+                        )
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -776,6 +951,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                        )
+                        _maybe_register_pp_boundary_probe(
+                            hidden_states,
+                            layer_number=layer.layer_number,
+                            boundary="post",
                         )
 
                     if (

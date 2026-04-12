@@ -2,6 +2,7 @@
 
 import functools
 import logging
+import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -34,6 +35,84 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+_TLAYER_PROBE_CALL_IDX = {}
+
+
+def _maybe_dump_tlayer_probe(tensor: Tensor, *, layer_number: int, tag: str) -> None:
+    if os.getenv("DION_DEBUG_TLAYER_PROBE", "0") != "1":
+        return
+    if not isinstance(tensor, torch.Tensor):
+        return
+
+    dump_dir = os.getenv("DION_DEBUG_TLAYER_PROBE_DIR", "").strip()
+    if not dump_dir:
+        raise RuntimeError(
+            "[DION_INVALID_ENV] DION_DEBUG_TLAYER_PROBE=1 requires "
+            "DION_DEBUG_TLAYER_PROBE_DIR"
+        )
+
+    target_layer_raw = os.getenv("DION_DEBUG_TLAYER_PROBE_LAYER", "").strip()
+    if not target_layer_raw:
+        raise RuntimeError(
+            "[DION_INVALID_ENV] DION_DEBUG_TLAYER_PROBE=1 requires "
+            "DION_DEBUG_TLAYER_PROBE_LAYER"
+        )
+    if int(layer_number) != int(target_layer_raw):
+        return
+
+    tags_raw = os.getenv("DION_DEBUG_TLAYER_PROBE_TAGS", "input_ln,attn_out,attn_bda").strip()
+    tags = {token.strip() for token in tags_raw.split(",") if token.strip()}
+    if tags and tag not in tags:
+        return
+
+    max_calls_raw = os.getenv("DION_DEBUG_TLAYER_PROBE_MAX_CALLS", "1").strip()
+    max_calls = int(max_calls_raw) if max_calls_raw else 1
+    key = (int(layer_number), tag)
+    call_idx = _TLAYER_PROBE_CALL_IDX.get(key, 0)
+    if call_idx >= max_calls:
+        return
+    _TLAYER_PROBE_CALL_IDX[key] = call_idx + 1
+
+    os.makedirs(dump_dir, exist_ok=True)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    pp_rank = (
+        parallel_state.get_pipeline_model_parallel_rank()
+        if parallel_state.is_initialized()
+        else 0
+    )
+    tp_rank = (
+        parallel_state.get_tensor_model_parallel_rank()
+        if parallel_state.is_initialized()
+        else 0
+    )
+    cp_rank = (
+        parallel_state.get_context_parallel_rank()
+        if parallel_state.is_initialized()
+        else 0
+    )
+    flat = tensor.detach().float().contiguous().view(-1)
+    torch.save(
+        {
+            "rank": rank,
+            "pp_rank": pp_rank,
+            "tp_rank": tp_rank,
+            "cp_rank": cp_rank,
+            "layer_number": int(layer_number),
+            "tag": tag,
+            "call_idx": call_idx,
+            "shape": tuple(int(dim) for dim in tensor.shape),
+            "dtype": str(tensor.dtype),
+            "sum": float(flat.sum().item()) if flat.numel() > 0 else 0.0,
+            "sq_sum": float(flat.pow(2).sum().item()) if flat.numel() > 0 else 0.0,
+            "amax": float(flat.abs().max().item()) if flat.numel() > 0 else 0.0,
+            "sample": flat[:256].cpu(),
+        },
+        os.path.join(
+            dump_dir,
+            f"tlayer_probe_rank{rank:03d}_pp{pp_rank:02d}_tp{tp_rank:02d}_cp{cp_rank:02d}_"
+            f"layer{int(layer_number):02d}_{tag}_call{call_idx:04d}.pt",
+        ),
+    )
 
 
 def get_transformer_layer_offset(
@@ -582,6 +661,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
+        _maybe_dump_tlayer_probe(
+            input_layernorm_output, layer_number=self.layer_number, tag="input_ln"
+        )
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -607,6 +689,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
+        _maybe_dump_tlayer_probe(
+            attention_output_with_bias[0], layer_number=self.layer_number, tag="attn_out"
+        )
 
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
@@ -629,6 +714,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     attention_output_with_bias, residual, self.hidden_dropout
                 )
         nvtx_range_pop(suffix="self_attn_bda")
+        _maybe_dump_tlayer_probe(hidden_states, layer_number=self.layer_number, tag="attn_bda")
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.

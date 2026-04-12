@@ -1,4 +1,4 @@
-"""Scalar optimizer functions for non-Dion parameters (AdamW, Lion)."""
+"""Scalar optimizer helpers for non-Dion parameters."""
 
 import math
 
@@ -149,3 +149,38 @@ def lion_update(
     # Weight update
     # X = X - lr * sign(update)
     p.add_(update_sign.to(p.dtype), alpha=-lr)
+
+
+def apply_scalar_update(
+    *,
+    optimizer_name: str,
+    p: Tensor,
+    grad: Tensor,
+    state: dict,
+    optim_group: dict,
+    default_betas: tuple,
+    default_eps: float,
+    lr: float,
+    weight_decay: float,
+) -> None:
+    """Apply the configured scalar optimizer without Megatron runtime branching."""
+    if optimizer_name == "lion":
+        lion_update(
+            p,
+            grad,
+            state,
+            default_betas,
+            lr,
+            weight_decay,
+        )
+        return
+
+    adamw_update(
+        p,
+        grad,
+        state,
+        default_betas,
+        optim_group.get("eps", default_eps),
+        lr,
+        weight_decay,
+    )

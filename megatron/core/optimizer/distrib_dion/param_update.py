@@ -29,10 +29,10 @@ def check_shard_identity_(
                 continue
             opt_param_by_ptr[param.data_ptr()] = param
 
-    for group_index, (model_group, shard_group) in enumerate(
+    for group_index, (model_group, shard_param_group) in enumerate(
         zip(model_float16_groups, main_shard_groups)
     ):
-        for param_index, (_, shard_param) in enumerate(zip(model_group, shard_group)):
+        for param_index, (_, shard_param) in enumerate(zip(model_group, shard_param_group)):
             if shard_param is None:
                 continue
             if shard_param.numel() == 0:

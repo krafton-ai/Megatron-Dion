@@ -119,7 +119,8 @@ def _vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
     still having GPU friendly size."""
 
     after = orig_vocab_size
-    multiple = args.make_vocab_size_divisible_by * args.tensor_model_parallel_size
+    logical_tp_divisor = max(int(getattr(args, "num_attention_heads", 0) or 0), 1)
+    multiple = math.lcm(int(args.make_vocab_size_divisible_by), logical_tp_divisor)
     after = int(math.ceil(after / multiple) * multiple)
     if args.rank == 0 and logging_enabled:
         print(

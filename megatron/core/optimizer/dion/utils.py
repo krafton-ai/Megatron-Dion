@@ -3,34 +3,34 @@
 from typing import Optional, Tuple
 
 import torch
-from .types import MegatronDionDistMeta
+from .types import DionDistMeta
 
 
 def get_global_shape(
-    meta: Optional[MegatronDionDistMeta],
+    dist_meta: Optional[DionDistMeta],
     local_m: int,
     local_n: int,
 ) -> Tuple[int, int]:
     """Get fully global shape (FS and TP restored) for rank calculation.
 
-    meta.global_shape is already fully global when set by DistributedOptimizer.
+    dist_meta.global_shape is already fully global when set by DistributedOptimizer.
 
     Args:
-        meta: Distribution metadata for the parameter
+        dist_meta: Distribution metadata for the parameter
         local_m: Local m dimension
         local_n: Local n dimension
 
     Returns:
         Tuple of (global_m, global_n)
     """
-    if meta is not None:
-        if getattr(meta, 'global_shape', None) is not None:
-            return tuple(meta.global_shape)
-        if getattr(meta, 'is_dion_param', False):
+    if dist_meta is not None:
+        if getattr(dist_meta, 'global_shape', None) is not None:
+            return tuple(dist_meta.global_shape)
+        if getattr(dist_meta, 'is_dion_param', False):
             raise RuntimeError(
                 "Dion distributed param is missing global_shape required for "
                 f"LR/rank scaling: local_shape=({local_m}, {local_n}) "
-                f"param={getattr(meta, 'param_name', '')}"
+                f"param={getattr(dist_meta, 'param_name', '')}"
             )
     # Local non-distributed case.
     return (local_m, local_n)
@@ -68,3 +68,13 @@ def str_to_dtype(dtype_val) -> Optional[torch.dtype]:
             return dtype_map[dtype_lower]
         raise ValueError(f"Unknown dtype string: {dtype_val}")
     return dtype_val
+
+
+def format_meta_id(dist_meta: Optional[DionDistMeta]) -> dict[str, object]:
+    """Return a compact logical parameter identifier for reporting."""
+    if dist_meta is None:
+        return {"param_uid": None, "param_name": ""}
+    return {
+        "param_uid": getattr(dist_meta, "param_uid", None),
+        "param_name": getattr(dist_meta, "param_name", ""),
+    }

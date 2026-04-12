@@ -111,6 +111,38 @@ def null_decorator(*args, **kwargs):
         return inner
 
 
+@contextmanager
+def topology_invariant_model_parallel_init(
+    seed: Optional[int],
+    *,
+    tp_rank: Optional[int] = None,
+    ep_rank: Optional[int] = None,
+    etp_rank: Optional[int] = None,
+):
+    """Temporarily reset model-parallel RNG state to a topology-invariant seed."""
+
+    if seed is None:
+        yield
+        return
+
+    from megatron.core import tensor_parallel
+
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state()
+    cuda_rng_tracker = tensor_parallel.get_cuda_rng_tracker()
+    cuda_rng_tracker_states = cuda_rng_tracker.get_states()
+
+    tensor_parallel.model_parallel_cuda_manual_seed(
+        int(seed), tp_rank=tp_rank, ep_rank=ep_rank, etp_rank=etp_rank
+    )
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_rng_state)
+        torch.cuda.set_rng_state(cuda_rng_state)
+        cuda_rng_tracker.set_states(cuda_rng_tracker_states)
+
+
 class ExperimentalNotEnabledError(Exception):
     """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
 

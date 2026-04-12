@@ -1,9 +1,9 @@
-"""Orthogonalization functions for Dion optimizer."""
+"""Orthogonalization and sketch helpers for Dion."""
 
 import contextlib
 import hashlib
 import math
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -11,6 +11,8 @@ from torch import Tensor
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor import randn as dtensor_randn
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+
+from .utils import format_meta_id as format_meta_id_
 
 
 @contextlib.contextmanager
@@ -31,6 +33,7 @@ def _dion_ortho_precision_context():
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
         torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+
 
 def orthogonalize(
     P: Tensor,
@@ -124,6 +127,220 @@ def _seeded_normal_tensor(
     tensor = torch.empty(shape, device=device, dtype=dtype)
     tensor.normal_(mean=0.0, std=std, generator=gen)
     return tensor
+
+
+def logical_sketch_keys(
+    *,
+    dist_metas: Optional[List],
+    tag: str,
+    step_count: int,
+) -> Optional[List[object]]:
+    """Return topology-invariant logical sketch ids for one Dion update batch."""
+    if not dist_metas:
+        return None
+
+    logical_ids: List[object] = []
+    for dist_meta in dist_metas:
+        if dist_meta is None:
+            logical_ids.append((tag, step_count, None))
+            continue
+        logical_ids.append(
+            (
+                tag,
+                step_count,
+                getattr(dist_meta, "param_uid", None),
+                getattr(dist_meta, "param_name", ""),
+            )
+        )
+    return logical_ids
+
+
+def make_seeded_sketch(
+    *,
+    dist_metas: Optional[List],
+    tag: str,
+    step_count: int,
+    format_meta_id: Callable[[object], Dict[str, Any]],
+):
+    """Build a topology-independent sketch generator for one logical Dion update batch."""
+    if not dist_metas:
+        return None
+
+    logical_ids = logical_sketch_keys(
+        dist_metas=dist_metas,
+        tag=tag,
+        step_count=step_count,
+    )
+
+    def _make_sketch(P: Tensor, oversample: float) -> Tensor:
+        batch_shape = P.shape[:-2]
+        if len(batch_shape) == 0:
+            batch = 1
+        elif len(batch_shape) == 1:
+            batch = batch_shape[0]
+        else:
+            raise RuntimeError(
+                "[DION_INVALID_SKETCH_BATCH] "
+                f"tag={tag} expected batched 3D tensor, got shape={tuple(P.shape)}"
+            )
+        if batch != len(logical_ids):
+            raise RuntimeError(
+                "[DION_SKETCH_META_MISMATCH] "
+                f"tag={tag} batch={batch} logical_ids={len(logical_ids)}"
+            )
+        m = P.size(-2)
+        r = P.size(-1)
+        k = math.ceil(oversample * r / 128.0) * 128
+        if k <= 0:
+            raise RuntimeError(
+                f"[DION_INVALID_SKETCH_RANK] tag={tag} r={r} oversample={oversample} k={k}"
+            )
+        std = math.sqrt(1.0 / k)
+        if batch == 1 and len(batch_shape) == 0:
+            logical_id = logical_ids[0]
+            sketch = _seeded_normal_tensor(
+                (k, m),
+                seed_key=logical_id,
+                device=P.device,
+                dtype=P.dtype,
+                std=std,
+            )
+            return sketch
+        sketch = torch.empty((batch, k, m), device=P.device, dtype=P.dtype)
+        for idx, logical_id in enumerate(logical_ids):
+            sketch[idx].copy_(
+                _seeded_normal_tensor(
+                    (k, m),
+                    seed_key=logical_id,
+                    device=P.device,
+                    dtype=P.dtype,
+                    std=std,
+                )
+            )
+        return sketch
+
+    setattr(_make_sketch, "_dion_sketch_tag", tag)
+    setattr(_make_sketch, "_dion_logical_seed_keys", tuple(logical_ids))
+    setattr(
+        _make_sketch,
+        "_dion_batch_meta_ids",
+        tuple(format_meta_id(dist_meta) for dist_meta in dist_metas),
+    )
+
+    return _make_sketch
+
+
+def make_local_sketch(
+    *,
+    dist_metas: Optional[List],
+    step_count: int,
+    format_meta_id: Callable[[object], Dict[str, Any]],
+):
+    """Return the topology-invariant local sketch contract."""
+    return make_seeded_sketch(
+        dist_metas=dist_metas,
+        tag="logical_local",
+        step_count=step_count,
+        format_meta_id=format_meta_id,
+    )
+
+
+def make_seeded_sketch_for_update(
+    optimizer,
+    *,
+    dist_metas: Optional[List],
+    tag: str,
+):
+    """Bind logical sketch generation to one optimizer step."""
+    return make_seeded_sketch(
+        dist_metas=dist_metas,
+        tag=tag,
+        step_count=optimizer._step_count,
+        format_meta_id=format_meta_id_,
+    )
+
+
+def sketch_keys_for_update(
+    optimizer,
+    *,
+    dist_metas: Optional[List],
+    tag: str,
+) -> Optional[List[object]]:
+    """Bind logical sketch ids to one optimizer step."""
+    return logical_sketch_keys(
+        dist_metas=dist_metas,
+        tag=tag,
+        step_count=optimizer._step_count,
+    )
+
+
+def make_local_sketch_for_update(
+    optimizer,
+    *,
+    dist_metas: Optional[List],
+):
+    """Bind the local sketch contract to one optimizer step."""
+    return make_local_sketch(
+        dist_metas=dist_metas,
+        step_count=optimizer._step_count,
+        format_meta_id=format_meta_id_,
+    )
+
+
+def make_fs_only_sketch(
+    *,
+    outer_shard_group: torch.distributed.ProcessGroup,
+    outer_shard_rank: int,
+    broadcast_replicate_domain: Callable[[Tensor], None],
+):
+    """Reproduce the reference DTensor sketch RNG for fs-only local orthogonalization."""
+    outer_shard_group_ranks = dist.get_process_group_ranks(outer_shard_group)
+    broadcast_src = outer_shard_group_ranks[0]
+
+    def _make_sketch(P: Tensor, oversample: float) -> Tensor:
+        if P.ndim != 3:
+            raise RuntimeError(
+                "[DION_FSONLY_SKETCH_INVALID_RANK] "
+                f"expected batched 3D tensor, got shape={tuple(P.shape)}"
+            )
+        if P.size(0) != 1:
+            raise RuntimeError(
+                "[DION_FSONLY_SKETCH_INVALID_BATCH] "
+                f"expected local fs-only batch size 1, got shape={tuple(P.shape)}"
+            )
+
+        m = P.size(-2)
+        r = P.size(-1)
+        k = math.ceil(oversample * r / 128.0) * 128
+        if k <= 0:
+            raise RuntimeError(
+                f"[DION_INVALID_SKETCH_RANK] r={r} oversample={oversample} k={k}"
+            )
+
+        std = math.sqrt(1.0 / k)
+        seed_tensor = torch.zeros((), device=P.device, dtype=torch.int64)
+        if dist.get_rank() == broadcast_src:
+            seed_tensor.random_()
+        dist.broadcast(seed_tensor, src=broadcast_src, group=outer_shard_group)
+        broadcast_replicate_domain(seed_tensor)
+
+        gen = torch.Generator(device=P.device)
+        gen.manual_seed(int(seed_tensor.item()))
+
+        for _ in range(outer_shard_rank):
+            torch.empty((1, k, m), device=P.device, dtype=P.dtype).normal_(
+                mean=0.0,
+                std=std,
+                generator=gen,
+            )
+
+        local_sketch = torch.empty((1, k, m), device=P.device, dtype=P.dtype)
+        local_sketch.normal_(mean=0.0, std=std, generator=gen)
+        return local_sketch
+
+    setattr(_make_sketch, "_dion_sketch_tag", "fs_only")
+
+    return _make_sketch
 
 
 def _extract_dtensor_local_shard_from_global(

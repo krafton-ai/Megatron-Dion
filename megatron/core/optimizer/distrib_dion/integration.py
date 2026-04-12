@@ -83,7 +83,7 @@ def build_megatron_dion(
 
     mixed_precision_config = DionMixedPrecisionConfig(
         momentum_dtype=config.dion_momentum_dtype,
-        Q_dtype=config.dion_Q_dtype,
+        q_dtype=config.dion_q_dtype,
     )
 
     user_fs_world_size = getattr(config, 'fully_shard_model_parallel_size', 1) or 1
@@ -152,6 +152,11 @@ def build_megatron_dion(
         and parallel_state.get_expert_tensor_parallel_group(check_initialized=False) is not None
         else parallel_state.get_tensor_model_parallel_group()
     )
+    if not config.use_distributed_optimizer:
+        raise RuntimeError(
+            "MegatronDion requires --use-distributed-optimizer. "
+            "Legacy ctor-time TP/RP/FS bootstrap is unsupported."
+        )
 
     return MegatronDion(
         param_groups,
@@ -169,11 +174,7 @@ def build_megatron_dion(
         mixed_precision_config=mixed_precision_config,
         use_fs_collectives=config.dion_use_fs_collectives,
         use_compressed_comm=config.dion_use_compressed_comm,
-        rp_group=rp_process_group,
-        fs_group=fs_process_group,
-        tp_group=tp_group,
         enable_async=True,
-        local_batch_size=config.dion_local_batch_size,
         max_concurrent_tasks=config.dion_max_concurrent_tasks,
     )
 

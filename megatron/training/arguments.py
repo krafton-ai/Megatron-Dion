@@ -659,8 +659,8 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
     if hasattr(args, "dion_momentum_dtype"):
         args.dion_momentum_dtype = map_dtype(args.dion_momentum_dtype)
-    if hasattr(args, "dion_Q_dtype"):
-        args.dion_Q_dtype = map_dtype(args.dion_Q_dtype)
+    if hasattr(args, "dion_q_dtype"):
+        args.dion_q_dtype = map_dtype(args.dion_q_dtype)
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
@@ -2097,7 +2097,7 @@ def _add_training_args(parser):
     group.add_argument('--dion-momentum-dtype', type=str, default='float32',
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
                        help='Dtype for Dion momentum state.')
-    group.add_argument('--dion-Q-dtype', type=str, default='float32',
+    group.add_argument('--dion-q-dtype', type=str, default='float32',
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
                        help='Dtype for Dion Q state.')
     group.add_argument('--fully-shard-model-parallel-size', type=int, default=1,

@@ -3,13 +3,16 @@
 """Dataloaders."""
 
 
+import os
 import random
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from megatron.core import mpu
+from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.datasets.utils import Split
 
 from megatron.training import get_args
@@ -22,6 +25,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     if dataset is None:
         return None
     args = get_args()
+    proof_replay_dir = os.getenv("GPT_STEP_BATCH_REPLAY_DIR", "").strip()
+    proof_record_dir = os.getenv("GPT_STEP_BATCH_RECORD_DIR", "").strip()
+    if (proof_replay_dir or proof_record_dir) and args.dataloader_type != 'single':
+        raise RuntimeError(
+            "GPT step-batch record/replay harness currently requires dataloader_type=single"
+        )
 
     if hasattr(dataset, 'split'):
         split = dataset.split
@@ -135,6 +144,73 @@ class MegatronPretrainingSampler:
     def __len__(self):
         return self.total_samples
 
+    def _proof_step_batch_record_dir(self) -> str:
+        return os.getenv("GPT_STEP_BATCH_RECORD_DIR", "").strip()
+
+    def _proof_step_batch_replay_dir(self) -> str:
+        return os.getenv("GPT_STEP_BATCH_REPLAY_DIR", "").strip()
+
+    def _proof_step_batch_max_steps(self) -> int:
+        raw = os.getenv("GPT_STEP_BATCH_MAX_STEPS", "").strip()
+        return int(raw) if raw else 0
+
+    def _proof_step_batch_path(self, root: str, step_idx: int) -> Path:
+        return Path(root) / f"shared_stream_step{step_idx:06d}.pt"
+
+    def _proof_should_record(self) -> bool:
+        if not torch.distributed.is_initialized():
+            return True
+        if mpu.get_data_parallel_rank(with_context_parallel=True) != 0:
+            return False
+        if mpu.get_tensor_model_parallel_rank() != 0:
+            return False
+        return mpu.is_pipeline_first_stage()
+
+    def _proof_load_replay_step(self, replay_dir: str, step_idx: int, expected_count: int):
+        path = self._proof_step_batch_path(replay_dir, step_idx)
+        if not path.exists():
+            raise RuntimeError(
+                f"Missing GPT step-batch replay file for step {step_idx}: {path}"
+            )
+        payload = torch.load(path, map_location="cpu")
+        if isinstance(payload, dict):
+            sample_indices = payload.get("sample_indices")
+            source_count = payload.get("global_batch_size")
+        else:
+            sample_indices = payload
+            source_count = None
+        if sample_indices is None:
+            raise RuntimeError(f"Invalid GPT step-batch replay payload at {path}")
+        if torch.is_tensor(sample_indices):
+            sample_indices = sample_indices.tolist()
+        else:
+            sample_indices = list(sample_indices)
+        if source_count is not None and int(source_count) != expected_count:
+            raise RuntimeError(
+                f"Replay batch-size mismatch at {path}: source={source_count} current={expected_count}"
+            )
+        if len(sample_indices) != expected_count:
+            raise RuntimeError(
+                f"Replay sample count mismatch at {path}: got={len(sample_indices)} expected={expected_count}"
+            )
+        return sample_indices
+
+    def _proof_save_record_step(
+        self, record_dir: str, step_idx: int, sample_indices, global_batch_size: int
+    ):
+        path = self._proof_step_batch_path(record_dir, step_idx)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "sample_indices": torch.tensor(sample_indices, dtype=torch.long),
+            "global_batch_size": int(global_batch_size),
+            "micro_batch_size": int(self.micro_batch_size),
+            "data_parallel_size": int(
+                self.micro_batch_times_data_parallel_size // self.micro_batch_size
+            ),
+            "num_microbatches": int(get_num_microbatches()),
+        }
+        torch.save(payload, path)
+
     def get_start_end_idx(self):
         """
         Calculate the start and end indices for the current data parallel worker's
@@ -149,12 +225,50 @@ class MegatronPretrainingSampler:
 
     def __iter__(self):
         batch = []
+        record_dir = self._proof_step_batch_record_dir()
+        replay_dir = self._proof_step_batch_replay_dir()
+        if record_dir and replay_dir:
+            raise RuntimeError("GPT step-batch harness cannot record and replay at the same time")
+        num_microbatches = get_num_microbatches()
+        step_global_batch_size = self.micro_batch_times_data_parallel_size * num_microbatches
+        max_steps = self._proof_step_batch_max_steps()
+        current_step = 1
+        microbatch_in_step = 0
+        record_step_samples = []
+        replay_step_samples = None
         # Last batch will be dropped if drop_last is not set False
         for idx in range(self.consumed_samples, self.total_samples):
             batch.append(idx)
             if len(batch) == self.micro_batch_times_data_parallel_size:
+                global_batch = batch
+                if replay_dir:
+                    if replay_step_samples is None and (not max_steps or current_step <= max_steps):
+                        replay_step_samples = self._proof_load_replay_step(
+                            replay_dir, current_step, step_global_batch_size
+                        )
+                    if replay_step_samples is not None:
+                        mb_start = microbatch_in_step * self.micro_batch_times_data_parallel_size
+                        mb_end = mb_start + self.micro_batch_times_data_parallel_size
+                        global_batch = replay_step_samples[mb_start:mb_end]
+                if record_dir and self._proof_should_record():
+                    if not max_steps or current_step <= max_steps:
+                        record_step_samples.extend(batch)
                 start_idx, end_idx = self.get_start_end_idx()
-                yield batch[start_idx:end_idx]
+                yield global_batch[start_idx:end_idx]
+                microbatch_in_step += 1
+                if microbatch_in_step == num_microbatches:
+                    if record_dir and self._proof_should_record():
+                        if not max_steps or current_step <= max_steps:
+                            self._proof_save_record_step(
+                                record_dir,
+                                current_step,
+                                record_step_samples,
+                                step_global_batch_size,
+                            )
+                    current_step += 1
+                    microbatch_in_step = 0
+                    record_step_samples = []
+                    replay_step_samples = None
                 batch = []
 
         # Check the last partial batch and see drop_last is set

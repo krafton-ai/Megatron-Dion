@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
@@ -39,7 +40,78 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     is_using_quantization_scales,
+    topology_invariant_model_parallel_init,
 )
+
+_GPT_PARAM_FP_DEBUG_COUNTER = 0
+
+
+def _debug_print_gpt_global_param_fingerprint(
+    module: torch.nn.Module,
+    name: str,
+    pg_collection: Optional[ProcessGroupCollection],
+) -> None:
+    if pg_collection is None or getattr(pg_collection, "tp", None) is None:
+        return
+
+    param = dict(module.named_parameters()).get(name)
+    if param is None:
+        return
+
+    local = param.detach().float().contiguous()
+    tp_group = pg_collection.tp
+    tp_world = tp_group.size()
+    tp_rank = tp_group.rank()
+
+    if getattr(param, "tensor_model_parallel", False) and tp_world > 1:
+        gather_device = local.device
+        if gather_device.type == "cpu":
+            gather_device = torch.device("cuda", torch.cuda.current_device())
+        local_for_gather = local.to(device=gather_device, non_blocking=False)
+        gathered = [torch.empty_like(local_for_gather) for _ in range(tp_world)]
+        torch.distributed.all_gather(gathered, local_for_gather, group=tp_group)
+        full = torch.cat(gathered, dim=int(getattr(param, "partition_dim", 0))).cpu()
+    else:
+        full = local
+
+    if tp_rank == 0:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        pp_rank = (
+            pg_collection.pp.rank()
+            if pg_collection is not None and getattr(pg_collection, "pp", None) is not None
+            else -1
+        )
+        flat = full.flatten()
+        limit = min(int(os.getenv("VLM_DEBUG_LM_PARAM_PREVIEW", "8")), flat.numel())
+        preview = ",".join(f"{float(x):.8f}" for x in flat[:limit].tolist())
+        if flat.numel() > 0:
+            weights = torch.arange(1, flat.numel() + 1, dtype=flat.dtype, device=flat.device)
+            weighted = float((flat * weights).sum().item())
+        else:
+            weighted = 0.0
+        print(
+            "VLM_LM_PARAM_FP "
+            f"rank={rank} pp={pp_rank} tp={tp_rank} "
+            f"name={name} "
+            f"shape={tuple(full.shape)} "
+            f"sum={float(full.sum().item()):.8f} "
+            f"abs={float(full.abs().sum().item()):.8f} "
+            f"norm={float(torch.linalg.vector_norm(full).item()):.8f} "
+            f"weighted_sum={weighted:.8f} "
+            f"preview=[{preview}]",
+            flush=True,
+        )
+        dump_dir = os.getenv("VLM_DEBUG_LM_PARAM_DUMP_DIR", "").strip()
+        dump_targets_raw = os.getenv("VLM_DEBUG_LM_PARAM_DUMP_SUBSTR", "").strip()
+        if dump_dir:
+            dump_targets = [item for item in dump_targets_raw.split(",") if item]
+            if not dump_targets or any(target in name for target in dump_targets):
+                dump_path = os.path.join(
+                    dump_dir,
+                    f"rank{rank}_pp{pp_rank}_tp{tp_rank}_{name.replace('.', '__')}.pt",
+                )
+                os.makedirs(dump_dir, exist_ok=True)
+                torch.save(full.cpu(), dump_path)
 
 
 class GPTModel(LanguageModule):
@@ -124,6 +196,7 @@ class GPTModel(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
+        self.topology_invariant_init_seed = getattr(self.config, 'topology_invariant_init_seed', None)
 
         if hasattr(self.config, 'position_embedding_type'):
             self.position_embedding_type = self.config.position_embedding_type
@@ -146,112 +219,140 @@ class GPTModel(LanguageModule):
         self.mtp_block_spec = mtp_block_spec
         self.mtp_process = mtp_block_spec is not None
 
-        if self.pre_process or self.mtp_process:
-            self.embedding = LanguageModelEmbedding(
+        with topology_invariant_model_parallel_init(self.topology_invariant_init_seed):
+            if self.pre_process or self.mtp_process:
+                self.embedding = LanguageModelEmbedding(
+                    config=self.config,
+                    vocab_size=self.vocab_size,
+                    max_sequence_length=self.max_sequence_length,
+                    position_embedding_type=position_embedding_type,
+                    scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
+                    tp_group=self.pg_collection.tp,
+                )
+
+            if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+                self.rotary_pos_emb = RotaryEmbedding(
+                    kv_channels=self.config.kv_channels,
+                    rotary_percent=rotary_percent,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                    seq_len_interpolation_factor=seq_len_interpolation_factor,
+                    rotary_base=rotary_base,
+                    rope_scaling=rope_scaling,
+                    rope_scaling_factor=rope_scaling_factor,
+                    use_cpu_initialization=self.config.use_cpu_initialization,
+                    cp_group=self.pg_collection.cp,
+                )
+
+            elif self.position_embedding_type == 'yarn':
+                self.rotary_pos_emb = YarnRotaryEmbedding(
+                    kv_channels=self.config.kv_channels,
+                    rotary_percent=rotary_percent,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                    seq_len_interpolation_factor=seq_len_interpolation_factor,
+                    rotary_base=rotary_base,
+                    scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
+                    original_max_position_embeddings=getattr(
+                        self.config, "yarn_original_max_position_embeddings"
+                    ),
+                    beta_fast=getattr(self.config, "yarn_beta_fast"),
+                    beta_slow=getattr(self.config, "yarn_beta_slow"),
+                    mscale=getattr(self.config, "yarn_mscale"),
+                    mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
+                    correction_range_round_to_int=getattr(
+                        self.config, "yarn_correction_range_round_to_int"
+                    ),
+                    use_cpu_initialization=self.config.use_cpu_initialization,
+                )
+            elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+                self.rotary_pos_emb = MultimodalRotaryEmbedding(
+                    kv_channels=self.config.kv_channels,
+                    rotary_percent=rotary_percent,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                    seq_len_interpolation_factor=seq_len_interpolation_factor,
+                    rotary_base=rotary_base,
+                )
+                self.mrope_section = self.config.mrope_section
+                assert (
+                    self.mrope_section is not None
+                ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+
+            # Cache for RoPE tensors which do not change between iterations.
+            self.rotary_pos_emb_cache = {}
+
+            # Transformer.
+            self.decoder = TransformerBlock(
                 config=self.config,
-                vocab_size=self.vocab_size,
-                max_sequence_length=self.max_sequence_length,
-                position_embedding_type=position_embedding_type,
-                scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
-                tp_group=self.pg_collection.tp,
+                spec=transformer_layer_spec,
+                pre_process=self.pre_process,
+                post_process=self.post_process,
+                pg_collection=self.pg_collection,
+                vp_stage=vp_stage,
             )
 
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            self.rotary_pos_emb = RotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-                rope_scaling=rope_scaling,
-                rope_scaling_factor=rope_scaling_factor,
-                use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=self.pg_collection.cp,
-            )
+            if self.mtp_process:
+                self.mtp = MultiTokenPredictionBlock(
+                    config=self.config, spec=self.mtp_block_spec, vp_stage=vp_stage
+                )
 
-        elif self.position_embedding_type == 'yarn':
-            self.rotary_pos_emb = YarnRotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
-                original_max_position_embeddings=getattr(
-                    self.config, "yarn_original_max_position_embeddings"
-                ),
-                beta_fast=getattr(self.config, "yarn_beta_fast"),
-                beta_slow=getattr(self.config, "yarn_beta_slow"),
-                mscale=getattr(self.config, "yarn_mscale"),
-                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
-                correction_range_round_to_int=getattr(
-                    self.config, "yarn_correction_range_round_to_int"
-                ),
-                use_cpu_initialization=self.config.use_cpu_initialization,
-            )
-        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
-            self.rotary_pos_emb = MultimodalRotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-            )
-            self.mrope_section = self.config.mrope_section
-            assert (
-                self.mrope_section is not None
-            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+            # Output
+            if self.post_process:
 
-        # Cache for RoPE tensors which do not change between iterations.
-        self.rotary_pos_emb_cache = {}
+                if self.config.defer_embedding_wgrad_compute:
+                    # The embedding activation buffer preserves a reference to the input activations
+                    # of the final embedding projection layer GEMM. It will hold the activations for
+                    # all the micro-batches of a global batch for the last pipeline stage. Once we are
+                    # done with all the back props for all the microbatches for the last pipeline stage,
+                    # it will be in the pipeline flush stage. During this pipeline flush we use the
+                    # input activations stored in embedding activation buffer and gradient outputs
+                    # stored in gradient buffer to calculate the weight gradients for the embedding
+                    # final linear layer.
+                    self.embedding_activation_buffer = []
+                    self.grad_output_buffer = []
+                else:
+                    self.embedding_activation_buffer = None
+                    self.grad_output_buffer = None
 
-        # Transformer.
-        self.decoder = TransformerBlock(
-            config=self.config,
-            spec=transformer_layer_spec,
-            pre_process=self.pre_process,
-            post_process=self.post_process,
-            pg_collection=self.pg_collection,
-            vp_stage=vp_stage,
-        )
+                self.output_layer = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    self.vocab_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    gather_output=not self.parallel_output,
+                    skip_weight_param_allocation=self.pre_process
+                    and self.share_embeddings_and_output_weights,
+                    embedding_activation_buffer=self.embedding_activation_buffer,
+                    grad_output_buffer=self.grad_output_buffer,
+                    tp_group=self.pg_collection.tp,
+                )
 
-        if self.mtp_process:
-            self.mtp = MultiTokenPredictionBlock(
-                config=self.config, spec=self.mtp_block_spec, vp_stage=vp_stage
-            )
-
-        # Output
-        if self.post_process:
-
-            if self.config.defer_embedding_wgrad_compute:
-                # The embedding activation buffer preserves a reference to the input activations
-                # of the final embedding projection layer GEMM. It will hold the activations for
-                # all the micro-batches of a global batch for the last pipeline stage. Once we are
-                # done with all the back props for all the microbatches for the last pipeline stage,
-                # it will be in the pipeline flush stage. During this pipeline flush we use the
-                # input activations stored in embedding activation buffer and gradient outputs
-                # stored in gradient buffer to calculate the weight gradients for the embedding
-                # final linear layer.
-                self.embedding_activation_buffer = []
-                self.grad_output_buffer = []
-            else:
-                self.embedding_activation_buffer = None
-                self.grad_output_buffer = None
-
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                self.vocab_size,
-                config=config,
-                init_method=config.init_method,
-                bias=False,
-                skip_bias_add=False,
-                gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
-                and self.share_embeddings_and_output_weights,
-                embedding_activation_buffer=self.embedding_activation_buffer,
-                grad_output_buffer=self.grad_output_buffer,
-                tp_group=self.pg_collection.tp,
-            )
+        if os.getenv("VLM_DEBUG_LM_PARAM_FP", "0") == "1":
+            global _GPT_PARAM_FP_DEBUG_COUNTER
+            limit = int(os.getenv("VLM_DEBUG_LM_PARAM_FP_LIMIT", "2"))
+            if _GPT_PARAM_FP_DEBUG_COUNTER < limit:
+                _GPT_PARAM_FP_DEBUG_COUNTER += 1
+                layer_indices = [0]
+                if len(self.decoder.layers) > 1:
+                    layer_indices.append(len(self.decoder.layers) - 1)
+                for layer_idx in layer_indices:
+                    for suffix in (
+                        "self_attention.linear_qkv.layer_norm_weight",
+                        "mlp.linear_fc1.layer_norm_weight",
+                        "self_attention.linear_qkv.weight",
+                        "self_attention.linear_proj.weight",
+                        "mlp.linear_fc1.weight",
+                        "mlp.linear_fc2.weight",
+                    ):
+                        name = f"decoder.layers.{layer_idx}.{suffix}"
+                        _debug_print_gpt_global_param_fingerprint(
+                            self, name, self.pg_collection
+                        )
+                for name in (
+                    "embedding.word_embeddings.weight",
+                    "output_layer.weight",
+                ):
+                    _debug_print_gpt_global_param_fingerprint(self, name, self.pg_collection)
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
@@ -520,6 +621,60 @@ class GPTModel(LanguageModule):
         ) = preproc_output[:6]
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
+
+        if (
+            os.getenv("DION_DEBUG_GPT_PREDECODER_PROBE", "0") == "1"
+            and isinstance(decoder_input, torch.Tensor)
+        ):
+            dump_dir = os.getenv("DION_DEBUG_GPT_PREDECODER_PROBE_DIR", "").strip()
+            if not dump_dir:
+                raise RuntimeError(
+                    "[DION_INVALID_ENV] DION_DEBUG_GPT_PREDECODER_PROBE=1 requires "
+                    "DION_DEBUG_GPT_PREDECODER_PROBE_DIR"
+                )
+            max_calls_raw = os.getenv("DION_DEBUG_GPT_PREDECODER_MAX_CALLS", "1").strip()
+            max_calls = int(max_calls_raw) if max_calls_raw else 1
+            call_idx = int(getattr(self, "_dion_debug_gpt_predecoder_call_idx", 0))
+            if call_idx < max_calls:
+                os.makedirs(dump_dir, exist_ok=True)
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                pp_rank = (
+                    self.pg_collection.pp.rank()
+                    if self.pg_collection is not None and getattr(self.pg_collection, "pp", None)
+                    else -1
+                )
+                tp_rank = (
+                    self.pg_collection.tp.rank()
+                    if self.pg_collection is not None and getattr(self.pg_collection, "tp", None)
+                    else -1
+                )
+                cp_rank = (
+                    parallel_state.get_context_parallel_rank()
+                    if parallel_state.is_initialized()
+                    else -1
+                )
+                flat = decoder_input.detach().float().contiguous().view(-1)
+                torch.save(
+                    {
+                        "rank": rank,
+                        "pp_rank": pp_rank,
+                        "tp_rank": tp_rank,
+                        "cp_rank": cp_rank,
+                        "call_idx": call_idx,
+                        "shape": tuple(int(dim) for dim in decoder_input.shape),
+                        "dtype": str(decoder_input.dtype),
+                        "sum": float(flat.sum().item()) if flat.numel() > 0 else 0.0,
+                        "sq_sum": float(flat.pow(2).sum().item()) if flat.numel() > 0 else 0.0,
+                        "amax": float(flat.abs().max().item()) if flat.numel() > 0 else 0.0,
+                        "sample": flat[:256].cpu(),
+                    },
+                    os.path.join(
+                        dump_dir,
+                        f"gpt_predecoder_rank{rank:03d}_pp{pp_rank:02d}_tp{tp_rank:02d}_"
+                        f"cp{cp_rank:02d}_call{call_idx:04d}.pt",
+                    ),
+                )
+                setattr(self, "_dion_debug_gpt_predecoder_call_idx", call_idx + 1)
 
         # Run decoder.
         hidden_states = self.decoder(

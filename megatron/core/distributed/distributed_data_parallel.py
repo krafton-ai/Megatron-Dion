@@ -1,11 +1,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Optional
 
 import torch
 
+from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
@@ -17,6 +19,15 @@ from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 
 logger = logging.getLogger(__name__)
+
+
+def _ddp_debug_name_matches(param_name: str, target_name: str) -> bool:
+    """Allow exact or suffix matching across PP-local parameter names."""
+    if not target_name:
+        return True
+    if not param_name:
+        return False
+    return param_name == target_name or param_name.endswith(target_name)
 
 
 class DistributedDataParallel(_BaseDataParallel):
@@ -434,10 +445,73 @@ class DistributedDataParallel(_BaseDataParallel):
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                trace_main_grad_add = os.getenv("DION_DEBUG_TRACE_DDP_MAIN_GRAD_ADD", "0") == "1"
+                param_name = getattr(param, "_param_name", "") or ""
+                target_name = os.getenv("DION_DEBUG_TRACE_DDP_MAIN_GRAD_ADD_PARAM", "").strip()
+                trace_this_param = trace_main_grad_add and _ddp_debug_name_matches(param_name, target_name)
+                hook_call_idx = None
+                rank = pp_rank = tp_rank = dp_rank = None
+                grad_before_norm = grad_before_sum = 0.0
+                main_before_norm = main_before_sum = 0.0
+                grad_added_before = bool(getattr(param, "grad_added_to_main_grad", False))
+                if trace_this_param:
+                    hook_call_idx = int(getattr(param, "_dion_ddp_main_grad_add_call_idx", 0))
+                    param._dion_ddp_main_grad_add_call_idx = hook_call_idx + 1
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    pp_rank = (
+                        parallel_state.get_pipeline_model_parallel_rank()
+                        if parallel_state.is_initialized()
+                        else 0
+                    )
+                    tp_rank = (
+                        parallel_state.get_tensor_model_parallel_rank()
+                        if parallel_state.is_initialized()
+                        else 0
+                    )
+                    dp_rank = (
+                        parallel_state.get_data_parallel_rank(with_context_parallel=True)
+                        if parallel_state.is_initialized()
+                        else 0
+                    )
+                    if param.grad is not None:
+                        grad_before_norm = float(param.grad.detach().float().norm().item())
+                        grad_before_sum = float(param.grad.detach().float().sum().item())
+                    if hasattr(param, "main_grad") and isinstance(param.main_grad, torch.Tensor):
+                        main_before_norm = float(param.main_grad.detach().float().norm().item())
+                        main_before_sum = float(param.main_grad.detach().float().sum().item())
+                will_add = param.grad is not None and (
+                    not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
+                )
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
                     param.main_grad.add_(param.grad.data)
+                if trace_this_param:
+                    main_after_norm = main_after_sum = 0.0
+                    if hasattr(param, "main_grad") and isinstance(param.main_grad, torch.Tensor):
+                        main_after_norm = float(param.main_grad.detach().float().norm().item())
+                        main_after_sum = float(param.main_grad.detach().float().sum().item())
+                    logger.warning(
+                        "[DION_DDP_MAIN_GRAD_ADD] rank=%s pp_rank=%s tp_rank=%s dp_rank=%s "
+                        "call=%s param=%s grad_added_before=%s zero_out_wgrad=%s will_add=%s "
+                        "grad_norm=%.9e grad_sum=%.9e main_before_norm=%.9e main_before_sum=%.9e "
+                        "main_after_norm=%.9e main_after_sum=%.9e",
+                        rank,
+                        pp_rank,
+                        tp_rank,
+                        dp_rank,
+                        hook_call_idx,
+                        param_name or f"id_{id(param)}",
+                        grad_added_before,
+                        bool(getattr(param, 'zero_out_wgrad', False)),
+                        will_add,
+                        grad_before_norm,
+                        grad_before_sum,
+                        main_before_norm,
+                        main_before_sum,
+                        main_after_norm,
+                        main_after_sum,
+                    )
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
