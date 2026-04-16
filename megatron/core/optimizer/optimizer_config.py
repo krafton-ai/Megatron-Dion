@@ -489,7 +489,7 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_scalar_optimizer: str = "adamw"
     """Scalar optimizer used for non-Dion parameter surfaces."""
 
-    dion_lr_scaling: str = "moonlight"
+    dion_lr_scaling: str = "dion"
     """Dion 2D learning-rate scaling rule."""
 
     dion_beta1: float = 0.9
@@ -509,8 +509,8 @@ class DionOptimizerConfig(OptimizerConfig):
 
     """Optional Dion local batching hint."""
 
-    dion_max_concurrent_tasks: Optional[int] = None
-    """Optional Dion async task width."""
+    dion_max_concurrent_tasks: Optional[int] = 3
+    """Dion async task width. Defaults to the reference runtime width of 3."""
 
     fully_shard_model_parallel_size: int = 1
     """Dion fully-sharded model-parallel size."""

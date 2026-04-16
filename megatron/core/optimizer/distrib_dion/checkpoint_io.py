@@ -12,8 +12,12 @@ from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 
-from .fs_layout import compute_fs_shard_range, slice_fs_shard_2d, write_fs_shard_2d_
-from .shard_info import DionShardLayout
+from .sharding import (
+    DionShardLayout,
+    compute_fs_shard_range,
+    slice_fs_shard_2d,
+    write_fs_shard_2d,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +172,7 @@ def split_distributed_dion_checkpoint_state(state_dict: dict) -> tuple[Optional[
     return dion_param_state, common_state_dict
 
 
-def ensure_dion_state_initialized_for_load_(
+def ensure_dion_state_initialized_for_load(
     *,
     param_groups,
     optimizer_state,
@@ -188,7 +192,7 @@ def ensure_dion_state_initialized_for_load_(
                 init_state_fn(param, state, param_group)
 
 
-def restore_distributed_dion_checkpoint_state_(
+def restore_distributed_dion_checkpoint_state(
     *,
     dion_param_state,
     param_groups,
@@ -261,7 +265,7 @@ def all_gather_flat_shards_(
             param_flat[r_start:r_end].copy_(gathered_shards[rank_i][:r_size])
 
 
-def all_gather_fs_shards_2d_(
+def all_gather_fs_shards_2d(
     param_2d: torch.Tensor,
     *,
     fs_shard_dim: int,
@@ -306,7 +310,7 @@ def all_gather_fs_shards_2d_(
             rank_shard_2d = gathered_shards[rank_i][:actual_size, :]
         else:
             rank_shard_2d = gathered_shards[rank_i][:, :actual_size]
-        write_fs_shard_2d_(param_2d, fs_shard_dim, r_start, r_end, rank_shard_2d)
+        write_fs_shard_2d(param_2d, fs_shard_dim, r_start, r_end, rank_shard_2d)
 
 
 def copy_param_to_shard_main_(
@@ -382,7 +386,7 @@ def copy_group_params_to_main_shards_(
             )
 
 
-def copy_model_params_to_main_shards_(
+def copy_model_params_to_main_shards(
     *,
     is_hybrid_device_optimizer: bool,
     hybrid_optimizer_update_fn: Callable | None,
@@ -635,7 +639,7 @@ def apply_group_shards_to_model_params_(
     return param_count, zero_range_warned
 
 
-def copy_main_params_to_model_shards_(
+def copy_main_params_to_model_shards(
     *,
     is_stub_optimizer: bool,
     use_megatron_fsdp: bool,
@@ -652,7 +656,7 @@ def copy_main_params_to_model_shards_(
     get_bucket_param_data_fn: Callable[[torch.nn.Parameter], torch.Tensor] | None,
     mark_buckets_full_param_ready_fn: Callable[[bool], None],
     check_main_shards_fn: Callable,
-    rebind_model_params_to_canonical_bucket_storage_fn: Callable,
+    restore_model_params_to_canonical_bucket_storage_fn: Callable,
     zero_range_warned: int,
 ) -> int:
     """Copy updated optimizer main shards back onto model-param local shards."""
@@ -662,7 +666,7 @@ def copy_main_params_to_model_shards_(
     if use_megatron_fsdp:
         if copy_fsdp_main_to_model_weights_fn is None:
             raise RuntimeError(
-                "[Dion] FSDP param writeback requires copy_main_weights_to_model_weights callback"
+                "[Dion] FSDP param restore requires copy_main_weights_to_model_weights callback"
             )
         copy_fsdp_main_to_model_weights_fn()
         return zero_range_warned
@@ -697,7 +701,7 @@ def copy_main_params_to_model_shards_(
         get_bucket_param_data_fn=get_bucket_param_data_fn,
     )
 
-    rebind_model_params_to_canonical_bucket_storage_fn(dion_only=True)
+    restore_model_params_to_canonical_bucket_storage_fn(dion_only=True)
 
     _, zero_range_warned = apply_group_shards_to_model_params_(
         model_groups=model_fp32_groups,
@@ -745,7 +749,7 @@ def restore_full_model_param_(
     if start_idx == end_idx:
         return False
 
-    all_gather_fs_shards_2d_(
+    all_gather_fs_shards_2d(
         model_param.data,
         fs_shard_dim=fs_shard_dim,
         start_idx=start_idx,

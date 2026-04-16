@@ -51,7 +51,7 @@ from .distrib_dion.integration import (
     build_megatron_dion,
     get_dion_scalar_param_override,
 )
-from .distrib_dion.param_selection import annotate_dion_candidates
+from .distrib_dion.parameter import annotate_dion_candidates
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import (
@@ -287,6 +287,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     per_model_buffers: Optional[Dict[int, List[_ParamAndGradBuffer]]] = None,
     model_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    logical_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_idx: Optional[int] = None,
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -428,6 +429,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 config=config,
                 param_groups=param_groups,
                 data_parallel_group=data_parallel_group,
+                logical_data_parallel_group=logical_data_parallel_group,
                 pg_collection=pg_collection,
                 is_expert_parallel=is_expert_parallel,
             )
@@ -477,6 +479,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                     model_chunks=model_chunks,
                     per_model_buffers=per_model_buffers,
                     data_parallel_group=data_parallel_group,
+                    logical_data_parallel_group=logical_data_parallel_group,
                     data_parallel_group_gloo=data_parallel_group_gloo,
                     data_parallel_group_idx=data_parallel_group_idx,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
@@ -590,6 +593,7 @@ def get_megatron_optimizer(
         pg_collection, model_chunks, use_gloo_process_groups
     )
 
+    dp_group = process_groups_dict['dp_group']
     dp_cp_group = process_groups_dict['dp_cp_group']
     intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
     intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
@@ -631,6 +635,7 @@ def get_megatron_optimizer(
                     per_model_buffers=buffers,
                     model_parallel_group=mp_group,
                     data_parallel_group=dp_cp_group,
+                    logical_data_parallel_group=dp_group,
                     data_parallel_group_gloo=intra_dp_cp_group_gloo,
                     data_parallel_group_idx=model_parallel_rank,
                     intra_dist_opt_group=intra_dist_opt_group,
@@ -679,6 +684,7 @@ def get_megatron_optimizer(
                 per_model_buffers=buffers,
                 model_parallel_group=mp_group,
                 data_parallel_group=intra_dp_cp_group,
+                logical_data_parallel_group=dp_group,
                 data_parallel_group_gloo=intra_dp_cp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
@@ -717,6 +723,7 @@ def get_megatron_optimizer(
                 per_model_buffers=moe_buffers,
                 model_parallel_group=expt_tp_pp_group,
                 data_parallel_group=intra_expt_dp_group,
+                logical_data_parallel_group=process_groups_dict['expt_dp_group'],
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,

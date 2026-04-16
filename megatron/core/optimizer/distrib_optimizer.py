@@ -6,6 +6,7 @@
 import gc
 import itertools
 import logging
+import os
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -2431,6 +2432,169 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+
+    def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
+        """Return stock grad-norm inputs, with optional shard-vs-model debug compare."""
+        from ..transformer.module import param_is_not_shared
+
+        debug_compare = os.getenv("DION_DEBUG_GRAD_NORM_COMPARE", "0") == "1"
+        params = self.get_parameters()
+        grads_for_norm = []
+        counts = {
+            "total": 0,
+            "grad_not_none": 0,
+            "kept": 0,
+            "shared_dropped": 0,
+            "tp_dup_dropped": 0,
+            "none_dropped": 0,
+        }
+        dropped_examples = []
+        optimizer_sq = (
+            torch.zeros(1, dtype=torch.float64, device=torch.cuda.current_device())
+            if debug_compare
+            else None
+        )
+        canonical_sq = (
+            torch.zeros(1, dtype=torch.float64, device=torch.cuda.current_device())
+            if debug_compare
+            else None
+        )
+        model_sq = (
+            torch.zeros(1, dtype=torch.float64, device=torch.cuda.current_device())
+            if debug_compare
+            else None
+        )
+        returned_sq = (
+            torch.zeros(1, dtype=torch.float64, device=torch.cuda.current_device())
+            if debug_compare
+            else None
+        )
+        returned_tensor_ids = set()
+
+        for param in params:
+            counts["total"] += 1
+            if getattr(param, "__fsdp_param__", False):
+                grad = param.grad._local_tensor if param.grad is not None else None
+            elif self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+            else:
+                grad = param.grad
+            grad_not_none = grad is not None
+            if grad_not_none:
+                counts["grad_not_none"] += 1
+            else:
+                counts["none_dropped"] += 1
+
+            is_not_shared = param_is_not_shared(param)
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                param, getattr(self, "tp_group", None)
+            )
+            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+                grads_for_norm.append(grad)
+                counts["kept"] += 1
+                if debug_compare:
+                    returned_sq += grad.detach().float().pow(2).sum().to(dtype=torch.float64)
+                    returned_tensor_ids.add(id(grad))
+                continue
+
+            if grad_not_none and not is_not_shared:
+                counts["shared_dropped"] += 1
+            if grad_not_none and not is_not_tp_duplicate:
+                counts["tp_dup_dropped"] += 1
+            if len(dropped_examples) < 8:
+                model_param = getattr(param, "_model_param", None)
+                dropped_examples.append(
+                    {
+                        "name": getattr(
+                            model_param,
+                            "_param_name",
+                            getattr(param, "_param_name", f"id_{id(param)}"),
+                        ),
+                        "shape": tuple(param.shape),
+                        "grad": bool(grad_not_none),
+                        "shared": bool(not is_not_shared),
+                        "tp_dup": bool(not is_not_tp_duplicate),
+                        "tp_attr": bool(getattr(param, "tensor_model_parallel", False)),
+                        "partition_dim": int(getattr(param, "partition_dim", -1)),
+                    }
+                )
+
+        if debug_compare:
+            for model_group, shard_group in zip(
+                self.model_float16_groups + self.model_fp32_groups,
+                self.shard_fp32_from_float16_groups + self.shard_fp32_groups,
+            ):
+                if len(model_group) != len(shard_group):
+                    raise RuntimeError(
+                        "[DistributedOptimizer] grad-norm compare requires equal model/shard group lengths "
+                        f"model_len={len(model_group)} shard_len={len(shard_group)}"
+                    )
+                for model_param, shard_param in zip(model_group, shard_group):
+                    if shard_param is None:
+                        continue
+
+                    model_grad = getattr(model_param, "main_grad", None)
+                    if model_grad is not None:
+                        model_sq += model_grad.detach().float().pow(2).sum().to(dtype=torch.float64)
+
+                    is_not_shared = param_is_not_shared(shard_param)
+                    is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                        shard_param, getattr(self, "tp_group", None)
+                    )
+                    if not (is_not_shared and is_not_tp_duplicate):
+                        continue
+
+                    if shard_param.grad is not None:
+                        optimizer_sq += (
+                            shard_param.grad.detach().float().pow(2).sum().to(dtype=torch.float64)
+                        )
+                    if model_grad is None:
+                        continue
+
+                    param_range = self._get_model_param_range_map(model_param)["param"]
+                    if param_range.size == 0:
+                        continue
+                    shard_grad = model_grad.view(-1)[
+                        int(param_range.start) : int(param_range.end)
+                    ].view(shard_param.shape)
+                    canonical_sq += shard_grad.detach().float().pow(2).sum().to(dtype=torch.float64)
+
+            torch.distributed.all_reduce(
+                optimizer_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.get_grad_stats_parallel_group(),
+            )
+            torch.distributed.all_reduce(
+                canonical_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.get_grad_stats_parallel_group(),
+            )
+            torch.distributed.all_reduce(
+                model_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.get_grad_stats_parallel_group(),
+            )
+            torch.distributed.all_reduce(
+                returned_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.get_grad_stats_parallel_group(),
+            )
+            if torch.distributed.get_rank() == 0:
+                logger.warning(
+                    "[STOCK_GRAD_NORM_COMPARE] optimizer_norm=%s canonical_shard_norm=%s "
+                    "model_main_norm=%s returned_norm=%s returned_grad_count=%s "
+                    "returned_unique_tensor_count=%s counts=%s dropped_examples=%s",
+                    float(optimizer_sq.sqrt().item()),
+                    float(canonical_sq.sqrt().item()),
+                    float(model_sq.sqrt().item()),
+                    float(returned_sq.sqrt().item()),
+                    len(grads_for_norm),
+                    len(returned_tensor_ids),
+                    counts,
+                    dropped_examples,
+                )
+
+        return grads_for_norm
 
     def _copy_main_params_to_model_params(self):
         """

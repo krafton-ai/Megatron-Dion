@@ -19,6 +19,7 @@ from torch import Tensor
 from .types import (
     DionMixedPrecisionConfig,
     DionParamConfig,
+    DionQLayout,
     DionQInit,
     DionDistMeta,
 )
@@ -77,11 +78,11 @@ def resolve_q_state_layout(
     config: DionParamConfig,
     *,
     tp_world_size: int,
-    q_needs_tp_unshard: bool,
+    use_q_unshard: bool,
     global_shape: Optional[Tuple[int, int]] = None,
     rank_fraction: float = 1.0,
     rank_multiple_of: int = 1,
-) -> Dict[str, Any]:
+) -> DionQLayout:
     """Resolve global/local Q layout and rank dimensions for a 2D Dion param."""
     if global_shape is None:
         m_global, n_global = restore_tp_shape(
@@ -101,7 +102,7 @@ def resolve_q_state_layout(
     r_global = min(r_global, m_global, n_global)
     r_global = max(1, int(r_global))
 
-    if q_needs_tp_unshard:
+    if use_q_unshard:
         if r_global < tp_world_size:
             r_global = tp_world_size
         elif r_global % tp_world_size != 0:
@@ -110,14 +111,21 @@ def resolve_q_state_layout(
     else:
         r_local = r_global
 
-    return {
-        "global_shape": (m_global, n_global),
-        "q_base_local": q_base_local,
-        "q_base_global": q_base_global,
-        "r_global": r_global,
-        "r_local": max(1, int(r_local)),
-        "q_shape": (q_base_local, max(1, int(r_local))),
-    }
+    q_local_layout = (
+        "shard(0)" if bool(getattr(config, "use_fs_shard", False)) else "replicate",
+        "shard(1)" if use_q_unshard and tp_world_size > 1 else "replicate",
+    )
+    return DionQLayout(
+        q_global_shape=(int(q_base_global), int(r_global)),
+        q_local_shape=(int(q_base_local), max(1, int(r_local))),
+        q_gathered_shape=(int(q_base_local), int(r_global)),
+        q_base_global=int(q_base_global),
+        q_base_local=int(q_base_local),
+        r_global=int(r_global),
+        r_local=max(1, int(r_local)),
+        q_local_layout=q_local_layout,
+        q_gathered_layout=(q_local_layout[0], "replicate"),
+    )
 
 
 def should_compress_all_reduce(
@@ -218,7 +226,7 @@ def build_param_config(
                 local_n,
                 config,
                 tp_world_size=tp_world_size,
-                q_needs_tp_unshard=bool(config.has_tp_shard and use_tp_shard),
+                use_q_unshard=bool(config.has_tp_shard and use_tp_shard),
                 global_shape=tuple(dist_meta.global_shape),
                 rank_fraction=dist_meta.rank_fraction,
                 rank_multiple_of=rank_multiple_of_default,
@@ -226,9 +234,9 @@ def build_param_config(
             r_global = (
                 int(r_global_override)
                 if r_global_override is not None
-                else int(layout["r_global"])
+                else int(layout.r_global)
             )
-            m_global, n_global = layout["global_shape"]
+            m_global, n_global = tuple(int(dim) for dim in dist_meta.global_shape)
             config.compressed_all_reduce = should_compress_all_reduce(
                 global_shape=(m_global, n_global),
                 r_global=r_global,
@@ -248,7 +256,7 @@ def build_param_config(
                 local_n,
                 config,
                 tp_world_size=tp_world_size,
-                q_needs_tp_unshard=False,
+                use_q_unshard=False,
                 global_shape=(local_m, local_n),
                 rank_fraction=rank_fraction_default,
                 rank_multiple_of=rank_multiple_of_default,
@@ -256,9 +264,9 @@ def build_param_config(
             r_global = (
                 int(r_global_override)
                 if r_global_override is not None
-                else int(layout["r_global"])
+                else int(layout.r_global)
             )
-            m_global, n_global = layout["global_shape"]
+            m_global, n_global = local_m, local_n
             config.compressed_all_reduce = should_compress_all_reduce(
                 global_shape=(m_global, n_global),
                 r_global=r_global,
@@ -289,7 +297,7 @@ def has_fs_shard(config: DionParamConfig, dist_meta=None) -> bool:
     return bool(config.has_fs_shard and getattr(config, "use_fs_shard", False))
 
 
-def q_needs_tp_unshard(config: DionParamConfig) -> bool:
+def use_q_unshard(config: DionParamConfig) -> bool:
     """Return whether STEP 2 must all-gather Q across TP ranks."""
     return has_tp_shard(config)
 
@@ -338,7 +346,7 @@ def materialize_q_state(
     q_init_seed: Optional[int],
     tp_world_size: int,
     tp_rank: int,
-    q_needs_tp_unshard: bool,
+    use_q_unshard: bool,
 ) -> Tensor:
     """Materialize one local Q state shard from explicit adapter-authored Q layout metadata."""
     if q_init_seed is None:
@@ -378,7 +386,7 @@ def materialize_q_state(
     else:
         fs_rank = 0
 
-    logical_tp_rank = int(tp_rank) if q_needs_tp_unshard and int(tp_world_size) > 1 else 0
+    logical_tp_rank = int(tp_rank) if use_q_unshard and int(tp_world_size) > 1 else 0
     fs_start = fs_rank * q_base_local
     fs_end = fs_start + q_local_shape[0]
     tp_start = logical_tp_rank * r_local
@@ -443,7 +451,7 @@ def init_param_state(
         )
     tp_world_size = int(q_init.tp_world_size)
     tp_rank = int(q_init.tp_rank)
-    q_needs_tp_unshard = bool(q_init.q_needs_tp_unshard)
+    use_q_unshard = bool(q_init.use_q_unshard)
     q_init_seed = q_init.q_init_seed
     broadcast_q_fn = q_init.broadcast_q_fn
     q_layout = q_init.q_layout
@@ -482,7 +490,7 @@ def init_param_state(
             f"param_uid={getattr(dist_meta, 'param_uid', None)} "
             f"param_name={getattr(dist_meta, 'param_name', '') if dist_meta is not None else ''}"
         )
-    if q_needs_tp_unshard and q_gathered_layout[1] != "replicate":
+    if use_q_unshard and q_gathered_layout[1] != "replicate":
         raise RuntimeError(
             "[DION_INVALID_Q_INNER_UNSHARDED_LAYOUT] "
             f"param_uid={getattr(dist_meta, 'param_uid', None)} "
@@ -499,7 +507,7 @@ def init_param_state(
         q_init_seed=q_init_seed,
         tp_world_size=tp_world_size,
         tp_rank=tp_rank,
-        q_needs_tp_unshard=q_needs_tp_unshard,
+        use_q_unshard=use_q_unshard,
     )
     if tuple(q_state.shape) != q_local_shape:
         raise RuntimeError(

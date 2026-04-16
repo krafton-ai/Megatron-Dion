@@ -1,4 +1,5 @@
 """Dion optimizer main class for Megatron-LM."""
+import math
 from typing import Dict, Generator, List, Optional, Tuple
 
 import torch
@@ -6,59 +7,194 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from .async_runtime import AsyncRuntime
-from .batch_runtime import (
-    apply_error_feedback_to_momentum as apply_error_feedback_to_momentum_,
-    apply_batch_updates as apply_batch_updates_,
-    batch_dion_update_async as batch_dion_update_async_,
-    orthogonalize_dense_replicate_batch_async as orthogonalize_dense_replicate_batch_async_,
-    orthogonalize_p_batch as orthogonalize_p_batch_,
-    sanitize_dion_batch_for_update as sanitize_dion_batch_for_update_,
-    run_compressed_comm_async as run_compressed_comm_async_,
-)
-from .constants import (
-    DEFAULT_LR,
-    DEFAULT_MU,
-    DEFAULT_WEIGHT_DECAY,
-)
+from .kernels import orthogonalize_fs_only_batch
 from .ortho import (
+    distributed_orthogonalize,
+    make_local_sketch_for_update,
+    make_seeded_sketch_for_update,
     orthogonalize,
+    orthogonalize_local_matrix_batch,
+    orthogonalize_local_slice,
     reshard_q_along_tp,
+    sketch_keys_for_update,
 )
-from .ortho_runtime import (
-    distributed_orthogonalize as distributed_orthogonalize_,
-    make_local_sketch_for_update as make_local_sketch_for_update_,
-    make_seeded_sketch_for_update as make_seeded_sketch_for_update_,
-    orthogonalize_local_matrix_batch as orthogonalize_local_matrix_batch_,
-    orthogonalize_local_slice as orthogonalize_local_slice_,
-    sketch_keys_for_update as sketch_keys_for_update_,
-)
-from .reference_kernels import orthogonalize_fs_only_batch_
 from .runtime import (
-    collapse_batch_across_replicas as collapse_batch_across_replicas_,
-    collapse_batch_over_replicate_subset as collapse_batch_over_replicate_subset_,
-    collapse_grads_across_replicas as collapse_grads_across_replicas_,
-    enable_distributed_mode as enable_distributed_mode_,
-    normalize_cols_async as normalize_cols_async_,
-    iter_dist_tasks as iter_dist_tasks_,
-    replicate_reduce_op as replicate_reduce_op_,
-    reduce_p_across_fs_groups as reduce_p_across_fs_groups_,
-    reduce_r_across_tp as reduce_r_across_tp_,
-    resolve_async_task_limit as resolve_async_task_limit_,
-    unshard_q_batch as unshard_q_batch_,
+    apply_error_feedback_to_momentum,
+    apply_batch_updates,
+    batch_dion_update_async,
+    collapse_batch_across_replicas,
+    collapse_grads_across_replicas,
+    enable_distributed_mode,
+    normalize_cols_async,
+    iter_dist_tasks,
+    orthogonalize_dense_replicate_batch_async,
+    orthogonalize_p_batch,
+    replicate_reduce_op,
+    reduce_p_across_fs_groups,
+    reduce_r_across_tp,
+    run_compressed_comm_async,
+    sanitize_dion_batch_for_update,
+    resolve_async_task_limit,
+    AsyncRuntime,
+    unshard_q_batch,
 )
-from .scalar import apply_scalar_update
 from .state import (
-    has_fs_shard as has_fs_shard_,
-    has_tp_shard as has_tp_shard_,
-    is_fs_only_config as is_fs_only_config_,
-    q_needs_tp_unshard as q_needs_tp_unshard_,
+    has_fs_shard,
+    has_tp_shard,
+    is_fs_only_config,
+    use_q_unshard,
 )
 from .types import (
     DionMixedPrecisionConfig,
     DionParamConfig,
     ScalarStepParam,
 )
+
+DEFAULT_LR = 0.01
+DEFAULT_MU = 0.95
+DEFAULT_WEIGHT_DECAY = 0.01
+
+
+def _adam_update(
+    p: Tensor,
+    grad: Tensor,
+    state: dict,
+    betas: tuple,
+    eps: float,
+    lr: float,
+    weight_decay: float,
+    *,
+    decoupled_weight_decay: bool = True,
+    step_override: int | None = None,
+    store_step_in_state: bool = True,
+) -> None:
+    """Adam/AdamW update."""
+    beta1, beta2 = betas
+
+    if 'exp_avg' not in state:
+        state['exp_avg'] = torch.zeros_like(grad, dtype=torch.float32)
+        state['exp_avg_sq'] = torch.zeros_like(grad, dtype=torch.float32)
+        if store_step_in_state:
+            state['step'] = 0
+
+    exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+
+    if step_override is None:
+        if 'step' not in state:
+            state['step'] = 0
+        state['step'] += 1
+        step = int(state['step'])
+    else:
+        step = int(step_override)
+        if step <= 0:
+            raise RuntimeError(
+                f"[DION_INVALID_ADAM_STEP] step_override must be positive, got {step}"
+            )
+        if store_step_in_state:
+            state['step'] = step
+        elif 'step' in state:
+            state.pop('step', None)
+
+    grad_fp32 = grad.float() if grad.dtype != torch.float32 else grad
+    if not decoupled_weight_decay and weight_decay != 0.0:
+        grad_fp32 = grad_fp32.add(p.detach().float(), alpha=weight_decay)
+
+    exp_avg.mul_(beta1).add_(grad_fp32, alpha=1 - beta1)
+    exp_avg_sq.mul_(beta2).addcmul_(grad_fp32, grad_fp32, value=1 - beta2)
+
+    bias_correction1 = 1 - beta1 ** step
+    bias_correction2 = 1 - beta2 ** step
+
+    if decoupled_weight_decay and weight_decay != 0.0:
+        p.mul_(1 - lr * weight_decay)
+
+    denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+    step_size = lr / bias_correction1
+    p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+
+def _adamw_update(
+    p: Tensor,
+    grad: Tensor,
+    state: dict,
+    betas: tuple,
+    eps: float,
+    lr: float,
+    weight_decay: float,
+) -> None:
+    """AdamW update for non-Dion parameters."""
+    _adam_update(
+        p,
+        grad,
+        state,
+        betas,
+        eps,
+        lr,
+        weight_decay,
+        decoupled_weight_decay=True,
+    )
+
+
+def _lion_update(
+    p: Tensor,
+    grad: Tensor,
+    state: dict,
+    betas: tuple,
+    lr: float,
+    weight_decay: float,
+) -> None:
+    """Lion optimizer update (sign-based, momentum-only)."""
+    beta1, beta2 = betas
+
+    if 'momentum' not in state:
+        state['momentum'] = torch.zeros_like(grad, dtype=torch.float32)
+
+    if 'step' not in state:
+        state['step'] = 0
+
+    momentum = state['momentum']
+    state['step'] += 1
+    grad_fp32 = grad.float() if grad.dtype != torch.float32 else grad
+    update = momentum.mul(beta1).add_(grad_fp32, alpha=1 - beta1)
+    update_sign = update.sign()
+    momentum.mul_(beta2).add_(grad_fp32, alpha=1 - beta2)
+    p.mul_(1 - lr * weight_decay)
+    p.add_(update_sign.to(p.dtype), alpha=-lr)
+
+
+def _apply_scalar_update(
+    *,
+    optimizer_name: str,
+    p: Tensor,
+    grad: Tensor,
+    state: dict,
+    optim_group: dict,
+    default_betas: tuple,
+    default_eps: float,
+    lr: float,
+    weight_decay: float,
+) -> None:
+    """Apply the configured scalar optimizer without Megatron runtime branching."""
+    if optimizer_name == "lion":
+        _lion_update(
+            p,
+            grad,
+            state,
+            default_betas,
+            lr,
+            weight_decay,
+        )
+        return
+
+    _adamw_update(
+        p,
+        grad,
+        state,
+        default_betas,
+        optim_group.get("eps", default_eps),
+        lr,
+        weight_decay,
+    )
 
 class MegatronDion(Optimizer):
     """
@@ -94,7 +230,7 @@ class MegatronDion(Optimizer):
         enable_async: bool = True,  # Enable async execution where possible
         use_compressed_comm: bool = True,  # Enable compressed communication
         scalar_optimizer: str = "adamw",  # Scalar optimizer for non-Dion params ("adamw" or "lion")
-        lr_scaling_rule: str = "moonlight",  # 2D Dion LR scaling rule ("moonlight" or "dion")
+        lr_scaling_rule: str = "dion",  # 2D Dion LR scaling rule ("moonlight" or "dion")
         max_concurrent_tasks: Optional[int] = None,  # Optional async concurrency hint
     ):
         defaults = dict(
@@ -160,13 +296,6 @@ class MegatronDion(Optimizer):
         self._step_count = 0
 
         self._buffer_cache: Dict[str, torch.Tensor] = {}
-        self._ortho_sanity_enabled = False
-        self._ortho_sanity_every = 1
-        self._ortho_sanity_p_tol = 5e-3
-        self._ortho_sanity_q_tol = 5e-3
-        self._ortho_sanity_mode = "fail"
-        self._ortho_sanity_log = False
-        self._ortho_sanity_trace = False
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -190,7 +319,7 @@ class MegatronDion(Optimizer):
                 "[DION_STEP_REQUIRES_DISTRIBUTED_MODE] "
                 f"step={self._step_count} rank={self._global_rank}"
             )
-        dion_tasks = iter_dist_tasks_(self)
+        dion_tasks = iter_dist_tasks(self)
 
         # Execute all tasks with the explicit runtime width from config.
         task_count = 0
@@ -198,7 +327,7 @@ class MegatronDion(Optimizer):
             dion_tasks_list = list(dion_tasks)
             task_count = len(dion_tasks_list)
             if task_count > 0:
-                max_tasks = resolve_async_task_limit_(
+                max_tasks = resolve_async_task_limit(
                     max_concurrent_tasks=self.max_concurrent_tasks,
                     task_count=task_count,
                 )
@@ -258,7 +387,7 @@ class MegatronDion(Optimizer):
                     self.defaults['weight_decay'] * wd_mult,
                 )
 
-            apply_scalar_update(
+            _apply_scalar_update(
                 optimizer_name=scalar_opt,
                 p=p,
                 grad=grad,
@@ -272,33 +401,32 @@ class MegatronDion(Optimizer):
         if False:
             yield
 
-    enable_distributed_mode = enable_distributed_mode_
-    _replicate_reduce_op = replicate_reduce_op_
-    _collapse_grads_across_replicas = collapse_grads_across_replicas_
-    _collapse_batch_across_replicas = collapse_batch_across_replicas_
-    _collapse_batch_over_replicate_subset = collapse_batch_over_replicate_subset_
-    _unshard_q_batch = unshard_q_batch_
-    _reduce_p_across_fs_groups = reduce_p_across_fs_groups_
-    _reduce_r_across_tp = reduce_r_across_tp_
-    _normalize_cols_async = normalize_cols_async_
+    enable_distributed_mode = enable_distributed_mode
+    _replicate_reduce_op = replicate_reduce_op
+    _collapse_grads_across_replicas = collapse_grads_across_replicas
+    _collapse_batch_across_replicas = collapse_batch_across_replicas
+    _unshard_q_batch = unshard_q_batch
+    _reduce_p_across_fs_groups = reduce_p_across_fs_groups
+    _reduce_r_across_tp = reduce_r_across_tp
+    _normalize_cols_async = normalize_cols_async
     _orthogonalize = staticmethod(orthogonalize)
     _reshard_q_along_tp = staticmethod(reshard_q_along_tp)
 
-    _has_tp_shard = staticmethod(has_tp_shard_)
-    _has_fs_shard = staticmethod(has_fs_shard_)
-    _q_needs_tp_unshard = staticmethod(q_needs_tp_unshard_)
-    _is_fs_only_config = staticmethod(is_fs_only_config_)
-    _make_seeded_sketch = make_seeded_sketch_for_update_
-    _sketch_keys = sketch_keys_for_update_
-    _make_local_sketch = make_local_sketch_for_update_
-    _distributed_orthogonalize = distributed_orthogonalize_
-    _orthogonalize_local_slice = orthogonalize_local_slice_
-    _orthogonalize_local_matrix_batch = orthogonalize_local_matrix_batch_
-    _orthogonalize_p_batch = orthogonalize_p_batch_
-    _orthogonalize_dense_replicate_batch_async = orthogonalize_dense_replicate_batch_async_
-    _orthogonalize_fs_only_batch = orthogonalize_fs_only_batch_
-    _apply_batch_updates = apply_batch_updates_
-    _sanitize_dion_batch = sanitize_dion_batch_for_update_
-    _apply_error_feedback = apply_error_feedback_to_momentum_
-    _batch_dion_update_async = batch_dion_update_async_
-    _run_compressed_comm_async = run_compressed_comm_async_
+    _has_tp_shard = staticmethod(has_tp_shard)
+    _has_fs_shard = staticmethod(has_fs_shard)
+    _use_q_unshard = staticmethod(use_q_unshard)
+    _is_fs_only_config = staticmethod(is_fs_only_config)
+    _make_seeded_sketch = make_seeded_sketch_for_update
+    _sketch_keys = sketch_keys_for_update
+    _make_local_sketch = make_local_sketch_for_update
+    _distributed_orthogonalize = distributed_orthogonalize
+    _orthogonalize_local_slice = orthogonalize_local_slice
+    _orthogonalize_local_matrix_batch = orthogonalize_local_matrix_batch
+    _orthogonalize_p_batch = orthogonalize_p_batch
+    _orthogonalize_dense_replicate_batch_async = orthogonalize_dense_replicate_batch_async
+    _orthogonalize_fs_only_batch = orthogonalize_fs_only_batch
+    _apply_batch_updates = apply_batch_updates
+    _sanitize_dion_batch = sanitize_dion_batch_for_update
+    _apply_error_feedback = apply_error_feedback_to_momentum
+    _batch_dion_update_async = batch_dion_update_async
+    _run_compressed_comm_async = run_compressed_comm_async

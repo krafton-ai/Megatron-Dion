@@ -5,6 +5,7 @@
 import copy
 import logging
 import math
+import os
 import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
@@ -1268,25 +1269,100 @@ class ChainedOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def get_grad_norm(self):
+        debug_chain = os.getenv("DION_DEBUG_CHAINED_GRAD_NORM", "0") == "1"
         if len(self.chained_optimizers) == 1:
-            return self.chained_optimizers[0].get_grad_norm()
+            grad_norm = self.chained_optimizers[0].get_grad_norm()
+            if debug_chain:
+                grads_for_norm = self.chained_optimizers[0].get_main_grads_for_grad_norm()
+                manual_sq = torch.zeros(1, dtype=torch.float64, device=torch.cuda.current_device())
+                for grad in grads_for_norm:
+                    manual_sq += grad.detach().float().pow(2).sum().to(dtype=torch.float64)
+                torch.distributed.all_reduce(
+                    manual_sq,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.chained_optimizers[0].get_grad_stats_parallel_group(),
+                )
+                if torch.distributed.get_rank() == 0:
+                    logger.warning(
+                        "[DION_CHAINED_GRAD_NORM] num_optimizers=1 shared_group=True "
+                        "optimizer_0=%s param_count=%s grad_count=%s grad_norm=%s manual_grad_norm=%s",
+                        type(self.chained_optimizers[0]).__name__,
+                        len(self.chained_optimizers[0].get_parameters()),
+                        len(grads_for_norm),
+                        grad_norm,
+                        float(manual_sq.sqrt().item()),
+                    )
+            return grad_norm
         requires_individual_norm = any(
             bool(getattr(optimizer, 'requires_individual_grad_norm_in_chain', lambda: False)())
             for optimizer in self.chained_optimizers
         )
         if requires_individual_norm:
             grad_norms = []
+            manual_sq = None
+            grad_counts = None
+            if debug_chain:
+                manual_sq = torch.zeros(1, dtype=torch.float64, device=torch.cuda.current_device())
+                grad_counts = []
             for optimizer in self.chained_optimizers:
                 _grad_norm = optimizer.get_grad_norm()
                 grad_norms += [_grad_norm if _grad_norm else 0.0]
-            return math.sqrt(sum([x**2 for x in grad_norms]))
+                if debug_chain:
+                    optimizer_grads = optimizer.get_main_grads_for_grad_norm()
+                    grad_counts.append(len(optimizer_grads))
+                    for grad in optimizer_grads:
+                        manual_sq += grad.detach().float().pow(2).sum().to(dtype=torch.float64)
+            grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+            if debug_chain:
+                torch.distributed.all_reduce(
+                    manual_sq,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.get_grad_stats_parallel_group(),
+                )
+                if torch.distributed.get_rank() == 0:
+                    logger.warning(
+                        "[DION_CHAINED_GRAD_NORM] num_optimizers=%s shared_group=False "
+                        "optimizer_types=%s param_counts=%s grad_counts=%s sub_grad_norms=%s "
+                        "grad_norm=%s manual_grad_norm=%s",
+                        len(self.chained_optimizers),
+                        [type(optimizer).__name__ for optimizer in self.chained_optimizers],
+                        [len(optimizer.get_parameters()) for optimizer in self.chained_optimizers],
+                        grad_counts,
+                        grad_norms,
+                        grad_norm,
+                        float(manual_sq.sqrt().item()),
+                    )
+            return grad_norm
         if self.grads_states_parallel_group_is_shared():
             grads_for_norm = []
+            grad_counts = []
             for optimizer in self.chained_optimizers:
-                grads_for_norm += optimizer.get_main_grads_for_grad_norm()
+                optimizer_grads = optimizer.get_main_grads_for_grad_norm()
+                grads_for_norm += optimizer_grads
+                grad_counts.append(len(optimizer_grads))
             grad_norm = get_grad_norm_fp32(
                 grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
+            if debug_chain:
+                manual_sq = torch.zeros(1, dtype=torch.float64, device=torch.cuda.current_device())
+                for grad in grads_for_norm:
+                    manual_sq += grad.detach().float().pow(2).sum().to(dtype=torch.float64)
+                torch.distributed.all_reduce(
+                    manual_sq,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.get_grad_stats_parallel_group(),
+                )
+                if torch.distributed.get_rank() == 0:
+                    logger.warning(
+                        "[DION_CHAINED_GRAD_NORM] num_optimizers=%s shared_group=True "
+                        "optimizer_types=%s param_counts=%s grad_counts=%s grad_norm=%s manual_grad_norm=%s",
+                        len(self.chained_optimizers),
+                        [type(optimizer).__name__ for optimizer in self.chained_optimizers],
+                        [len(optimizer.get_parameters()) for optimizer in self.chained_optimizers],
+                        grad_counts,
+                        grad_norm,
+                        float(manual_sq.sqrt().item()),
+                    )
         else:
             grad_norms = []
             for optimizer in self.chained_optimizers:
