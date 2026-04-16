@@ -1,4 +1,5 @@
 import hashlib
+import os
 from contextlib import contextmanager
 from typing import Callable
 
@@ -84,4 +85,41 @@ def reinitialize_partitioned_expert_weight_(
             rank=int(tp_rank),
             world_size=int(tp_world_size),
             skip_set_tensor_parallel_attributes=True,
+        )
+
+    if (
+        os.getenv("VLM_DEBUG_EXPERT_INIT", "0") == "1"
+        and int(layer_number) == 1
+        and int(global_expert_idx) == 0
+        and linear_tag in ("fc1", "fc2")
+    ):
+        rank = -1
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        flat = weight.detach().float().contiguous().flatten()
+        preview_limit = min(int(os.getenv("VLM_DEBUG_EXPERT_INIT_PREVIEW", "8")), flat.numel())
+        preview = ",".join(f"{float(x):.8f}" for x in flat[:preview_limit].tolist())
+        weighted = 0.0
+        if flat.numel() > 0:
+            weights = torch.arange(1, flat.numel() + 1, dtype=flat.dtype, device=flat.device)
+            weighted = float((flat * weights).sum().item())
+        print(
+            "VLM_EXPERT_INIT "
+            f"rank={rank} "
+            f"layer={int(layer_number)} "
+            f"linear={linear_tag} "
+            f"expert={int(global_expert_idx)} "
+            f"shape={tuple(weight.shape)} "
+            f"partition_dim={int(partition_dim)} "
+            f"full_rows={int(full_rows)} "
+            f"full_cols={int(full_cols)} "
+            f"tp_rank={int(tp_rank)} "
+            f"tp_world={int(tp_world_size)} "
+            f"seed={int(seed)} "
+            f"sum={float(flat.sum().item()):.8f} "
+            f"abs={float(flat.abs().sum().item()):.8f} "
+            f"norm={float(torch.linalg.vector_norm(flat).item()):.8f} "
+            f"weighted_sum={weighted:.8f} "
+            f"preview=[{preview}]",
+            flush=True,
         )

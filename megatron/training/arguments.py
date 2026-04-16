@@ -1832,8 +1832,8 @@ def _add_regularization_args(parser):
                        help='Weight decay coefficient for L2 regularization.')
     group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
                        help='Apply weight decay to qk layernorm as a special case.')
-    group.add_argument('--clip-grad', type=float, default=1.0,
-                       help='Gradient clipping based on global L2 norm.')
+    group.add_argument('--clip-grad', type=float, default=0.0,
+                       help='Gradient clipping based on global L2 norm. Set to 0 to disable clipping.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
                        help='First coefficient for computing running averages '
                        'of gradient and its square')
@@ -2085,7 +2085,7 @@ def _add_training_args(parser):
     group.add_argument('--dion-scalar-optimizer', type=str, default='adamw',
                        choices=['lion', 'adamw'],
                        help='Scalar optimizer used for non-2D Dion parameters.')
-    group.add_argument('--dion-lr-scaling', type=str, default='moonlight',
+    group.add_argument('--dion-lr-scaling', type=str, default='dion',
                        choices=['moonlight', 'dion'],
                        help='2D Dion learning-rate scaling rule.')
     group.add_argument('--dion-beta1', type=float, default=0.9,

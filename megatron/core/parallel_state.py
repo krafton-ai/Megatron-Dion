@@ -134,6 +134,11 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # Paralel group of all GPUs in a distributed optimizer instance
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+# CP-excluded data-parallel subgroup within the current distributed optimizer instance.
+_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_DATA_PARALLEL_GROUP = None
+
+# Parallel group creation order used during model-parallel initialization.
+_PARALLEL_GROUP_ORDER = None
 
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
@@ -772,6 +777,9 @@ def initialize_model_parallel(
     for pg_name in high_priority_stream_groups:
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
+    global _PARALLEL_GROUP_ORDER
+    _PARALLEL_GROUP_ORDER = order
+
     decoder_rank_generator = RankGenerator(
         tp=tensor_model_parallel_size,
         ep=1,
@@ -828,6 +836,7 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_DATA_PARALLEL_GROUP
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
 
     assert (
@@ -910,6 +919,49 @@ def initialize_model_parallel(
         else:
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+
+    assert (
+        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_DATA_PARALLEL_GROUP is None
+    ), "Intra distributed optimizer instance data parallel group is already initialized"
+    if context_parallel_size <= 1:
+        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_DATA_PARALLEL_GROUP = (
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+        )
+    else:
+        for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
+            if num_distributed_optimizer_instances > 1:
+                intra_rank_sets = [
+                    ranks_with_cp[
+                        (i * intra_partial_data_parallel_size) : (
+                            (i + 1) * intra_partial_data_parallel_size
+                        )
+                    ]
+                    for i in range(num_distributed_optimizer_instances)
+                ]
+            else:
+                intra_rank_sets = [ranks_with_cp]
+
+            for intra_ranks in intra_rank_sets:
+                if len(intra_ranks) % context_parallel_size != 0:
+                    raise RuntimeError(
+                        "Intra distributed optimizer instance ranks are incompatible with "
+                        "context parallel partitioning. "
+                        f"intra_ranks={intra_ranks} cp={context_parallel_size}"
+                    )
+                logical_dp_size = len(intra_ranks) // context_parallel_size
+                hierarchical_groups, _ = create_hierarchical_groups(
+                    rank,
+                    intra_ranks,
+                    [context_parallel_size, logical_dp_size],
+                    create_gloo_process_groups=False,
+                    pg_options=[None, None],
+                    timeout=timeout,
+                    group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_DATA_PARALLEL_GROUP",
+                )
+                if rank in intra_ranks:
+                    _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_DATA_PARALLEL_GROUP = (
+                        hierarchical_groups[1]
+                    )
 
     # Apply SHARP to the dp group.
     if sharp_enabled_group == "dp":
@@ -1583,6 +1635,13 @@ def get_tensor_model_parallel_world_size():
     return get_tensor_model_parallel_group().size()
 
 
+def get_parallel_group_order(check_initialized=True):
+    """Return the model-parallel group creation order used at initialization."""
+    if check_initialized:
+        assert _PARALLEL_GROUP_ORDER is not None, "parallel group order is not initialized"
+    return _PARALLEL_GROUP_ORDER
+
+
 def get_pipeline_model_parallel_world_size():
     """Return world size for the pipeline-model-parallel group."""
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
@@ -2009,6 +2068,15 @@ def get_intra_distributed_optimizer_instance_group(check_initialized=True):
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
+def get_intra_distributed_optimizer_instance_data_parallel_group(check_initialized=True):
+    """Get the CP-excluded data-parallel subgroup within the optimizer instance."""
+    if check_initialized:
+        assert (
+            _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_DATA_PARALLEL_GROUP is not None
+        ), "Intra distributed optimizer instance data parallel group is not initialized"
+    return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_DATA_PARALLEL_GROUP
+
+
 def get_inter_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group spanning the different distributed optimizer instances.
     Attention and MLP/Expert share same inter-instance group, so only built
@@ -2229,6 +2297,8 @@ def destroy_model_parallel():
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+    global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_DATA_PARALLEL_GROUP
+    _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_DATA_PARALLEL_GROUP = None
 
     global _global_process_group_list
     _global_process_group_list = None

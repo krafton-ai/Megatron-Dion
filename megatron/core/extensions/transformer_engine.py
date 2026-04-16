@@ -1671,6 +1671,49 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     if partition_dim == 1
                     else int(weight.shape[1])
                 )
+                should_debug_reinit = (
+                    os.getenv("VLM_DEBUG_TE_EXPERT_REINIT", "0") == "1"
+                    and int(self.layer_number) == 1
+                    and int(global_expert_idx) == 0
+                    and self._dion_expert_linear_tag in ("fc1", "fc2")
+                )
+                if should_debug_reinit:
+                    rank = -1
+                    if torch.distributed.is_initialized():
+                        rank = torch.distributed.get_rank()
+                    before = weight.detach().float().contiguous().flatten()
+                    preview_limit = min(
+                        int(os.getenv("VLM_DEBUG_TE_EXPERT_REINIT_PREVIEW", "8")), before.numel()
+                    )
+                    before_preview = ",".join(
+                        f"{float(x):.8f}" for x in before[:preview_limit].tolist()
+                    )
+                    before_weighted_sum = 0.0
+                    if before.numel() > 0:
+                        before_weights = torch.arange(
+                            1, before.numel() + 1, dtype=before.dtype, device=before.device
+                        )
+                        before_weighted_sum = float((before * before_weights).sum().item())
+                    print(
+                        "VLM_TE_EXPERT_REINIT_BEFORE "
+                        f"rank={rank} "
+                        f"layer={int(self.layer_number)} "
+                        f"linear={self._dion_expert_linear_tag} "
+                        f"expert={int(global_expert_idx)} "
+                        f"gemm={int(gemm_idx)} "
+                        f"shape={tuple(weight.shape)} "
+                        f"partition_dim={int(partition_dim)} "
+                        f"full_rows={int(full_rows)} "
+                        f"full_cols={int(full_cols)} "
+                        f"tp_rank={int(tp_rank)} "
+                        f"tp_world={int(tp_world_size)} "
+                        f"sum={float(before.sum().item()):.8f} "
+                        f"abs={float(before.abs().sum().item()):.8f} "
+                        f"norm={float(torch.linalg.vector_norm(before).item()):.8f} "
+                        f"weighted_sum={before_weighted_sum:.8f} "
+                        f"preview=[{before_preview}]",
+                        flush=True,
+                    )
                 reinitialize_partitioned_expert_weight_(
                     weight=weight,
                     full_rows=full_rows,
@@ -1684,6 +1727,43 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     linear_tag=self._dion_expert_linear_tag,
                     global_expert_idx=int(global_expert_idx),
                 )
+                if should_debug_reinit:
+                    rank = -1
+                    if torch.distributed.is_initialized():
+                        rank = torch.distributed.get_rank()
+                    after = weight.detach().float().contiguous().flatten()
+                    preview_limit = min(
+                        int(os.getenv("VLM_DEBUG_TE_EXPERT_REINIT_PREVIEW", "8")), after.numel()
+                    )
+                    after_preview = ",".join(
+                        f"{float(x):.8f}" for x in after[:preview_limit].tolist()
+                    )
+                    after_weighted_sum = 0.0
+                    if after.numel() > 0:
+                        after_weights = torch.arange(
+                            1, after.numel() + 1, dtype=after.dtype, device=after.device
+                        )
+                        after_weighted_sum = float((after * after_weights).sum().item())
+                    print(
+                        "VLM_TE_EXPERT_REINIT_AFTER "
+                        f"rank={rank} "
+                        f"layer={int(self.layer_number)} "
+                        f"linear={self._dion_expert_linear_tag} "
+                        f"expert={int(global_expert_idx)} "
+                        f"gemm={int(gemm_idx)} "
+                        f"shape={tuple(weight.shape)} "
+                        f"partition_dim={int(partition_dim)} "
+                        f"full_rows={int(full_rows)} "
+                        f"full_cols={int(full_cols)} "
+                        f"tp_rank={int(tp_rank)} "
+                        f"tp_world={int(tp_world_size)} "
+                        f"sum={float(after.sum().item()):.8f} "
+                        f"abs={float(after.abs().sum().item()):.8f} "
+                        f"norm={float(torch.linalg.vector_norm(after).item()):.8f} "
+                        f"weighted_sum={after_weighted_sum:.8f} "
+                        f"preview=[{after_preview}]",
+                        flush=True,
+                    )
                 bias = getattr(self, f"bias{gemm_idx}", None)
                 if bias is not None:
                     bias.zero_()

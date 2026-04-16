@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import functools
-import hashlib
 import logging
 import math
 import os
@@ -357,521 +356,6 @@ class _ParamAndGradBucketGroup:
                     fatal=False,
                 )
 
-    @staticmethod
-    def _precomm_debug_name_matches(param_name: str, target_name: str) -> bool:
-        """Allow exact or suffix matching so one logical weight can be targeted across PP layouts."""
-        if not target_name:
-            return True
-        if not param_name:
-            return False
-        return param_name == target_name or param_name.endswith(target_name)
-
-    def _maybe_log_dion_bucket_lifecycle(
-        self,
-        *,
-        phase: str,
-        bucket=None,
-        param: Optional[torch.nn.Parameter] = None,
-        ready_count: Optional[int] = None,
-    ) -> None:
-        """Debug-only lifecycle log for one targeted Dion param through bucket sync."""
-        target_name = os.getenv("DION_DEBUG_TRACE_INTER_INSTANCE_DION_LOCAL_GRAD_PARAM", "").strip()
-        target_uid = os.getenv("DION_DEBUG_TRACE_INTER_INSTANCE_DION_LOCAL_GRAD_PARAM_UID", "").strip()
-        if not target_name and not target_uid:
-            return
-
-        matched_param = None
-        if param is not None:
-            param_name = getattr(param, "_param_name", "") or ""
-            param_uid = getattr(param, "_dion_param_uid", None)
-            if (not target_uid or str(param_uid) == target_uid) and self._precomm_debug_name_matches(
-                param_name, target_name
-            ):
-                matched_param = param
-        elif bucket is not None:
-            for bucket_param in getattr(bucket, "params_list", ()) or ():
-                param_name = getattr(bucket_param, "_param_name", "") or ""
-                param_uid = getattr(bucket_param, "_dion_param_uid", None)
-                if (not target_uid or str(param_uid) == target_uid) and self._precomm_debug_name_matches(
-                    param_name, target_name
-                ):
-                    matched_param = bucket_param
-                    break
-
-        if matched_param is None:
-            return
-
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        pp_rank = (
-            parallel_state.get_pipeline_model_parallel_rank() if parallel_state.is_initialized() else 0
-        )
-        tp_rank = (
-            parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-        )
-        dp_rank = (
-            parallel_state.get_data_parallel_rank(with_context_parallel=True)
-            if parallel_state.is_initialized()
-            else 0
-        )
-        logger.warning(
-            "[DION_BUCKET_LIFECYCLE] rank=%s pp_rank=%s tp_rank=%s dp_rank=%s "
-            "phase=%s bucket_group=%s bucket=%s param=%s ready_count=%s "
-            "is_first_batch=%s is_last_microbatch=%s golden_ready=%s current_ready=%s",
-            rank,
-            pp_rank,
-            tp_rank,
-            dp_rank,
-            phase,
-            hex(id(self)),
-            getattr(bucket, "bucket_id", -1) if bucket is not None else -1,
-            getattr(matched_param, "_param_name", "") or f"id_{id(matched_param)}",
-            ready_count if ready_count is not None else -1,
-            bool(getattr(self, "is_first_batch", False)),
-            bool(getattr(self, "is_last_microbatch", False)),
-            len(getattr(self, "golden_per_param_grad_ready_counts", {})),
-            len(getattr(self, "per_param_grad_ready_counts", {})),
-        )
-
-    def _maybe_dump_precomm_main_grad_surface(self) -> None:
-        """Debug-only raw model main_grad dump before any grad scaling or communication."""
-        if os.getenv("DION_DEBUG_DUMP_PRECOMM_MAIN_GRAD", "0") != "1":
-            return
-
-        dump_dir = os.getenv("DION_DEBUG_PRECOMM_MAIN_GRAD_DIR", "").strip()
-        target_name = os.getenv("DION_DEBUG_PRECOMM_MAIN_GRAD_PARAM", "").strip()
-        target_uid = os.getenv("DION_DEBUG_PRECOMM_MAIN_GRAD_PARAM_UID", "").strip()
-
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        pp_rank = (
-            parallel_state.get_pipeline_model_parallel_rank() if parallel_state.is_initialized() else 0
-        )
-        tp_rank = (
-            parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-        )
-        dp_rank = (
-            parallel_state.get_data_parallel_rank(with_context_parallel=True)
-            if parallel_state.is_initialized()
-            else 0
-        )
-        call_idx = int(getattr(self, "_dion_precomm_main_grad_call_idx", 0))
-        self._dion_precomm_main_grad_call_idx = call_idx + 1
-        dump_count = 0
-
-        for bucket in self.buckets:
-            if not getattr(bucket, "has_dion_params", False):
-                continue
-            for param in bucket.params_list:
-                if not getattr(param, "is_dion_param", False):
-                    continue
-
-                param_name = getattr(param, "_param_name", "") or ""
-                param_uid = getattr(param, "_dion_param_uid", None)
-                if target_uid and str(param_uid) != target_uid:
-                    continue
-                if not self._precomm_debug_name_matches(param_name, target_name):
-                    continue
-
-                main_grad = getattr(param, "main_grad", None)
-                if not isinstance(main_grad, torch.Tensor):
-                    raise RuntimeError(
-                        "[DION_DEBUG_PRECOMM_MAIN_GRAD_MISSING] "
-                        f"rank={rank} pp_rank={pp_rank} tp_rank={tp_rank} "
-                        f"param={param_name or f'id_{id(param)}'}"
-                    )
-                if param not in bucket.param_to_index:
-                    raise RuntimeError(
-                        "[DION_DEBUG_PRECOMM_BUCKET_SPAN_MISSING] "
-                        f"rank={rank} bucket={getattr(bucket, 'bucket_id', -1)} "
-                        f"param={param_name or f'id_{id(param)}'}"
-                    )
-
-                bucket_start, bucket_end = bucket.param_to_index[param]
-                bucket_grad = (
-                    bucket.grad_data.view(-1)[int(bucket_start) : int(bucket_end)]
-                    .view(main_grad.shape)
-                    .detach()
-                    .float()
-                    .cpu()
-                    .contiguous()
-                )
-
-                grad_cpu = main_grad.detach().float().cpu().contiguous()
-                alias_diff = (grad_cpu - bucket_grad).abs()
-                logger.warning(
-                    "[DION_PRECOMM_MAIN_GRAD] rank=%s pp_rank=%s tp_rank=%s dp_rank=%s "
-                    "call=%s bucket=%s has_dion=%s has_non_dion=%s bucket_param_count=%s "
-                    "dion_entry_count=%s param=%s param_uid=%s shape=%s "
-                    "main_norm=%.9e main_sum=%.9e bucket_norm=%.9e bucket_sum=%.9e alias_max=%.9e",
-                    rank,
-                    pp_rank,
-                    tp_rank,
-                    dp_rank,
-                    call_idx,
-                    getattr(bucket, "bucket_id", -1),
-                    bool(getattr(bucket, "has_dion_params", False)),
-                    bool(getattr(bucket, "has_non_dion_params", False)),
-                    len(getattr(bucket, "params_list", ()) or ()),
-                    int(getattr(getattr(bucket, "dion_layout", None), "entry_count", 0) or 0),
-                    param_name or f"id_{id(param)}",
-                    param_uid,
-                    tuple(int(dim) for dim in main_grad.shape),
-                    float(grad_cpu.norm().item()),
-                    float(grad_cpu.sum().item()),
-                    float(bucket_grad.norm().item()),
-                    float(bucket_grad.sum().item()),
-                    float(alias_diff.max().item()),
-                )
-                if dump_dir:
-                    os.makedirs(dump_dir, exist_ok=True)
-                    safe_name = (param_name or f"id_{id(param)}").replace(".", "_").replace("/", "_")
-                    dump_path = os.path.join(
-                        dump_dir,
-                        f"precomm_main_grad_rank{rank:03d}_pp{pp_rank:02d}_tp{tp_rank:02d}_"
-                        f"call{call_idx:04d}_bucket{int(getattr(bucket, 'bucket_id', -1)):03d}_{safe_name}.pt",
-                    )
-                    torch.save(
-                        {
-                            "rank": rank,
-                            "pp_rank": pp_rank,
-                            "tp_rank": tp_rank,
-                            "dp_rank": dp_rank,
-                            "call_idx": call_idx,
-                            "bucket_id": int(getattr(bucket, "bucket_id", -1)),
-                            "param_name": param_name,
-                            "param_uid": param_uid,
-                            "shape": tuple(int(dim) for dim in main_grad.shape),
-                            "main_grad": grad_cpu,
-                            "bucket_param_grad": bucket_grad,
-                            "alias_max_abs": float(alias_diff.max().item()),
-                        },
-                        dump_path,
-                    )
-                dump_count += 1
-
-        if dump_count == 0:
-            logger.warning(
-                "[DION_PRECOMM_MAIN_GRAD_MISS] rank=%s pp_rank=%s tp_rank=%s target_name=%s target_uid=%s",
-                rank,
-                pp_rank,
-                tp_rank,
-                target_name,
-                target_uid,
-            )
-
-    def _maybe_trace_inter_instance_standard_local_grad_surface(
-        self,
-        *,
-        bucket: _ParamAndGradBucket,
-        local_data_view: torch.Tensor,
-        phase: str,
-        call_idx: int,
-    ) -> None:
-        """Debug-only trace for one mixed-bucket standard inter-instance local-grad surface."""
-        if os.getenv("DION_DEBUG_TRACE_INTER_INSTANCE_STANDARD_LOCAL_GRAD", "0") != "1":
-            return
-
-        target_name = os.getenv("DION_DEBUG_TRACE_INTER_INSTANCE_STANDARD_LOCAL_GRAD_PARAM", "").strip()
-        target_uid = os.getenv("DION_DEBUG_TRACE_INTER_INSTANCE_STANDARD_LOCAL_GRAD_PARAM_UID", "").strip()
-        dump_dir = os.getenv("DION_DEBUG_TRACE_INTER_INSTANCE_STANDARD_LOCAL_GRAD_DIR", "").strip()
-
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        pp_rank = (
-            parallel_state.get_pipeline_model_parallel_rank() if parallel_state.is_initialized() else 0
-        )
-        tp_rank = (
-            parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-        )
-        dp_rank = (
-            parallel_state.get_data_parallel_rank(with_context_parallel=True)
-            if parallel_state.is_initialized()
-            else 0
-        )
-
-        bucket_flat = bucket.grad_data.view(-1)
-        local_flat = local_data_view.view(-1)
-        local_start = int(local_flat.storage_offset() - bucket_flat.storage_offset())
-        local_end = local_start + int(local_flat.numel())
-
-        def _sha1(tensor: Optional[torch.Tensor]) -> str:
-            if tensor is None:
-                return ""
-            return hashlib.sha1(
-                tensor.detach().float().cpu().contiguous().numpy().tobytes()
-            ).hexdigest()
-
-        dump_count = 0
-        for param in bucket.params_list:
-            if not getattr(param, "is_dion_param", False):
-                continue
-
-            param_name = getattr(param, "_param_name", "") or ""
-            param_uid = getattr(param, "_dion_param_uid", None)
-            if target_uid and str(param_uid) != target_uid:
-                continue
-            if not self._precomm_debug_name_matches(param_name, target_name):
-                continue
-            if param not in bucket.param_to_index:
-                raise RuntimeError(
-                    "[DION_DEBUG_INTER_INSTANCE_BUCKET_SPAN_MISSING] "
-                    f"rank={rank} bucket={getattr(bucket, 'bucket_id', -1)} "
-                    f"param={param_name or f'id_{id(param)}'}"
-                )
-
-            main_grad = getattr(param, "main_grad", None)
-            if not isinstance(main_grad, torch.Tensor):
-                raise RuntimeError(
-                    "[DION_DEBUG_INTER_INSTANCE_MAIN_GRAD_MISSING] "
-                    f"rank={rank} bucket={getattr(bucket, 'bucket_id', -1)} "
-                    f"param={param_name or f'id_{id(param)}'}"
-                )
-
-            bucket_start, bucket_end = bucket.param_to_index[param]
-            bucket_start = int(bucket_start)
-            bucket_end = int(bucket_end)
-            bucket_grad = (
-                bucket_flat[bucket_start:bucket_end].view(main_grad.shape).detach().float().cpu().contiguous()
-            )
-            main_grad_cpu = main_grad.detach().float().cpu().contiguous()
-            alias_diff = (main_grad_cpu - bucket_grad).abs()
-
-            overlap_start = max(bucket_start, local_start)
-            overlap_end = min(bucket_end, local_end)
-            local_overlap = None
-            bucket_overlap = None
-            overlap_alias_max = 0.0
-            if overlap_start < overlap_end:
-                local_overlap = (
-                    local_flat[(overlap_start - local_start) : (overlap_end - local_start)]
-                    .detach()
-                    .float()
-                    .cpu()
-                    .contiguous()
-                )
-                bucket_overlap = (
-                    bucket_flat[overlap_start:overlap_end].detach().float().cpu().contiguous()
-                )
-                overlap_alias_max = float((local_overlap - bucket_overlap).abs().max().item())
-
-            logger.warning(
-                "[DION_INTER_INSTANCE_STANDARD_LOCAL_GRAD] rank=%s pp_rank=%s tp_rank=%s dp_rank=%s "
-                "call=%s phase=%s bucket=%s has_dion=%s has_non_dion=%s param=%s param_uid=%s "
-                "bucket_range=[%s,%s) local_range=[%s,%s) overlap=[%s,%s) "
-                "main_norm=%.9e main_sum=%.9e main_sha1=%s "
-                "bucket_norm=%.9e bucket_sum=%.9e bucket_sha1=%s alias_max=%.9e "
-                "local_overlap_norm=%.9e local_overlap_sum=%.9e local_overlap_sha1=%s "
-                "bucket_overlap_norm=%.9e bucket_overlap_sum=%.9e bucket_overlap_sha1=%s "
-                "overlap_alias_max=%.9e",
-                rank,
-                pp_rank,
-                tp_rank,
-                dp_rank,
-                call_idx,
-                phase,
-                getattr(bucket, "bucket_id", -1),
-                bool(getattr(bucket, "has_dion_params", False)),
-                bool(getattr(bucket, "has_non_dion_params", False)),
-                param_name or f"id_{id(param)}",
-                param_uid,
-                bucket_start,
-                bucket_end,
-                local_start,
-                local_end,
-                overlap_start,
-                overlap_end,
-                float(main_grad_cpu.norm().item()),
-                float(main_grad_cpu.sum().item()),
-                _sha1(main_grad_cpu),
-                float(bucket_grad.norm().item()),
-                float(bucket_grad.sum().item()),
-                _sha1(bucket_grad),
-                float(alias_diff.max().item()),
-                float(local_overlap.norm().item()) if local_overlap is not None else 0.0,
-                float(local_overlap.sum().item()) if local_overlap is not None else 0.0,
-                _sha1(local_overlap),
-                float(bucket_overlap.norm().item()) if bucket_overlap is not None else 0.0,
-                float(bucket_overlap.sum().item()) if bucket_overlap is not None else 0.0,
-                _sha1(bucket_overlap),
-                overlap_alias_max,
-            )
-
-            if dump_dir:
-                os.makedirs(dump_dir, exist_ok=True)
-                safe_name = (param_name or f"id_{id(param)}").replace(".", "_").replace("/", "_")
-                dump_path = os.path.join(
-                    dump_dir,
-                    f"inter_instance_standard_local_grad_rank{rank:03d}_pp{pp_rank:02d}_tp{tp_rank:02d}_"
-                    f"call{call_idx:04d}_{phase}_bucket{int(getattr(bucket, 'bucket_id', -1)):03d}_{safe_name}.pt",
-                )
-                torch.save(
-                    {
-                        "rank": rank,
-                        "pp_rank": pp_rank,
-                        "tp_rank": tp_rank,
-                        "dp_rank": dp_rank,
-                        "call_idx": call_idx,
-                        "phase": phase,
-                        "bucket_id": int(getattr(bucket, "bucket_id", -1)),
-                        "param_name": param_name,
-                        "param_uid": param_uid,
-                        "bucket_range": (bucket_start, bucket_end),
-                        "local_range": (local_start, local_end),
-                        "overlap_range": (overlap_start, overlap_end),
-                        "main_grad": main_grad_cpu,
-                        "bucket_param_grad": bucket_grad,
-                        "local_overlap": local_overlap,
-                        "bucket_overlap": bucket_overlap,
-                        "alias_max_abs": float(alias_diff.max().item()),
-                        "overlap_alias_max_abs": overlap_alias_max,
-                    },
-                    dump_path,
-                )
-            dump_count += 1
-
-        if dump_count == 0:
-            logger.warning(
-                "[DION_INTER_INSTANCE_STANDARD_LOCAL_GRAD_MISS] rank=%s pp_rank=%s tp_rank=%s "
-                "call=%s phase=%s target_name=%s target_uid=%s bucket=%s",
-                rank,
-                pp_rank,
-                tp_rank,
-                call_idx,
-                phase,
-                target_name,
-                target_uid,
-                getattr(bucket, "bucket_id", -1),
-            )
-
-    def _maybe_trace_inter_instance_dion_local_grad_surface(
-        self,
-        *,
-        bucket: _ParamAndGradBucket,
-        local_grad_shard: torch.Tensor,
-        phase: str,
-        call_idx: int,
-    ) -> None:
-        """Debug-only trace for one Dion local-shard surface around inter-instance AR."""
-        if os.getenv("DION_DEBUG_TRACE_INTER_INSTANCE_DION_LOCAL_GRAD", "0") != "1":
-            return
-
-        dion_layout = getattr(bucket, "dion_layout", None)
-        if dion_layout is None or not dion_layout.has_params:
-            return
-
-        target_name = os.getenv("DION_DEBUG_TRACE_INTER_INSTANCE_DION_LOCAL_GRAD_PARAM", "").strip()
-        target_uid = os.getenv("DION_DEBUG_TRACE_INTER_INSTANCE_DION_LOCAL_GRAD_PARAM_UID", "").strip()
-        dump_dir = os.getenv("DION_DEBUG_TRACE_INTER_INSTANCE_DION_LOCAL_GRAD_DIR", "").strip()
-
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        pp_rank = (
-            parallel_state.get_pipeline_model_parallel_rank() if parallel_state.is_initialized() else 0
-        )
-        tp_rank = (
-            parallel_state.get_tensor_model_parallel_rank() if parallel_state.is_initialized() else 0
-        )
-        dp_rank = (
-            parallel_state.get_data_parallel_rank(with_context_parallel=True)
-            if parallel_state.is_initialized()
-            else 0
-        )
-
-        def _sha1(tensor: Optional[torch.Tensor]) -> str:
-            if tensor is None:
-                return ""
-            return hashlib.sha1(
-                tensor.detach().float().cpu().contiguous().numpy().tobytes()
-            ).hexdigest()
-
-        dump_count = 0
-        for entry in dion_layout.entries:
-            param = entry.param
-            param_name = getattr(param, "_param_name", "") or ""
-            param_uid = getattr(param, "_dion_param_uid", None)
-            if target_uid and str(param_uid) != target_uid:
-                continue
-            if not self._precomm_debug_name_matches(param_name, target_name):
-                continue
-
-            shard_start = int(entry.shard_offset)
-            local_numel = int(entry.local_numel)
-            shard_end = shard_start + local_numel
-            local_shard = (
-                local_grad_shard[shard_start:shard_end]
-                .view(entry.local_shape)
-                .detach()
-                .float()
-                .cpu()
-                .contiguous()
-            )
-
-            logger.warning(
-                "[DION_INTER_INSTANCE_DION_LOCAL_GRAD] rank=%s pp_rank=%s tp_rank=%s dp_rank=%s "
-                "call=%s phase=%s bucket=%s param=%s param_uid=%s shard_offset=%s local_numel=%s "
-                "fs_shard_dim=%s start=%s end=%s "
-                "local_norm=%.9e local_sum=%.9e local_sha1=%s",
-                rank,
-                pp_rank,
-                tp_rank,
-                dp_rank,
-                call_idx,
-                phase,
-                getattr(bucket, "bucket_id", -1),
-                param_name or f"id_{id(param)}",
-                param_uid,
-                shard_start,
-                local_numel,
-                int(entry.fs_shard_dim),
-                int(entry.start_idx),
-                int(entry.end_idx),
-                float(local_shard.norm().item()),
-                float(local_shard.sum().item()),
-                _sha1(local_shard),
-            )
-
-            if dump_dir:
-                os.makedirs(dump_dir, exist_ok=True)
-                safe_name = (param_name or f"id_{id(param)}").replace(".", "_").replace("/", "_")
-                dump_path = os.path.join(
-                    dump_dir,
-                    f"inter_instance_dion_local_grad_rank{rank:03d}_pp{pp_rank:02d}_tp{tp_rank:02d}_"
-                    f"call{call_idx:04d}_{phase}_bucket{int(getattr(bucket, 'bucket_id', -1)):03d}_{safe_name}.pt",
-                )
-                torch.save(
-                    {
-                        "rank": rank,
-                        "pp_rank": pp_rank,
-                        "tp_rank": tp_rank,
-                        "dp_rank": dp_rank,
-                        "call_idx": call_idx,
-                        "phase": phase,
-                        "bucket_id": int(getattr(bucket, "bucket_id", -1)),
-                        "param_name": param_name,
-                        "param_uid": param_uid,
-                        "shard_offset": shard_start,
-                        "local_numel": local_numel,
-                        "local_shape": tuple(int(dim) for dim in entry.local_shape),
-                        "fs_shard_dim": int(entry.fs_shard_dim),
-                        "start_idx": int(entry.start_idx),
-                        "end_idx": int(entry.end_idx),
-                        "local_shard": local_shard,
-                    },
-                    dump_path,
-                )
-            dump_count += 1
-
-        if dump_count == 0:
-            logger.warning(
-                "[DION_INTER_INSTANCE_DION_LOCAL_GRAD_MISS] rank=%s pp_rank=%s tp_rank=%s "
-                "call=%s phase=%s target_name=%s target_uid=%s bucket=%s",
-                rank,
-                pp_rank,
-                tp_rank,
-                call_idx,
-                phase,
-                target_name,
-                target_uid,
-                getattr(bucket, "bucket_id", -1),
-            )
-
     def start_param_sync(self, force_sync: bool = False):
         """
         Initiates all necessary param all-gathers for this bucket.
@@ -998,8 +482,6 @@ class _ParamAndGradBucketGroup:
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
 
-        self._maybe_dump_precomm_main_grad_surface()
-
         if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
             self.check_grads(
                 check_for_nan_or_inf=self.ddp_config.check_for_nan_in_grad,
@@ -1051,11 +533,12 @@ class _ParamAndGradBucketGroup:
         )
 
         grad_reduce_handle = None
+        call_idx = int(getattr(self, "_dion_standard_local_grad_metrics_call_idx", 0))
+        self._dion_standard_local_grad_metrics_call_idx = call_idx + 1
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
                     local_data_view = self._get_standard_local_grad_view(idx, bucket)
-                    self._maybe_log_dion_bucket_lifecycle(phase="start_grad_sync", bucket=bucket)
                     optimizer = getattr(bucket, "dion_optimizer", None)
                     if bucket.has_dion_params:
                         if optimizer is None or not hasattr(optimizer, "_start_dion_bucket_grad_sync"):
@@ -1101,70 +584,22 @@ class _ParamAndGradBucketGroup:
                 ) as cm,
             ):
                 for idx, bucket in enumerate(self.buckets):
-                    optimizer = getattr(bucket, "dion_optimizer", None)
-                    if bucket.has_dion_params:
-                        if optimizer is None or not hasattr(
-                            optimizer, "_get_dion_bucket_inter_instance_grad_buffer"
-                        ):
-                            raise RuntimeError(
-                                "[Dion] missing inter-instance grad buffer hook "
-                                f"for bucket={getattr(bucket, 'bucket_id', -1)}"
-                            )
-                        dion_local_data_view = optimizer._get_dion_bucket_inter_instance_grad_buffer(
-                            bucket
-                        )
-                        if dion_local_data_view is None or dion_local_data_view.numel() == 0:
-                            raise RuntimeError(
-                                "[Dion] missing packed Dion local grad buffer before inter-instance all-reduce "
-                                f"for bucket={getattr(bucket, 'bucket_id', -1)}"
-                            )
-                        trace_call_idx = int(
-                            getattr(self, "_dion_inter_instance_dion_local_grad_call_idx", 0)
-                        )
-                        self._dion_inter_instance_dion_local_grad_call_idx = trace_call_idx + 1
-                        self._maybe_trace_inter_instance_dion_local_grad_surface(
-                            bucket=bucket,
-                            local_grad_shard=dion_local_data_view,
-                            phase="before",
-                            call_idx=trace_call_idx,
-                        )
-                        torch.distributed.all_reduce(
-                            dion_local_data_view,
-                            op=reduce_op,
-                            group=self.inter_distributed_optimizer_instance_group,
-                            async_op=async_op,
-                        )
-                        self._maybe_trace_inter_instance_dion_local_grad_surface(
-                            bucket=bucket,
-                            local_grad_shard=dion_local_data_view,
-                            phase="after",
-                            call_idx=trace_call_idx,
-                        )
-                    if not bucket.has_dion_params or bucket.has_non_dion_params:
-                        local_data_view = self._get_standard_local_grad_view(idx, bucket)
-                        if local_data_view is None or local_data_view.numel() == 0:
-                            continue
-                        trace_call_idx = int(
-                            getattr(self, "_dion_inter_instance_standard_local_grad_call_idx", 0)
-                        )
-                        self._dion_inter_instance_standard_local_grad_call_idx = trace_call_idx + 1
-                        self._maybe_trace_inter_instance_standard_local_grad_surface(
-                            bucket=bucket,
-                            local_data_view=local_data_view,
-                            phase="before",
-                            call_idx=trace_call_idx,
-                        )
+                    local_data_view = self._get_standard_local_grad_view(idx, bucket)
+                    # Stock DO semantics require the post-RS standard local shard to be
+                    # replica-collapsed for every bucket, not just mixed/non-Dion ones.
+                    # Dion-specific local-grad reinterpretation happens later from this
+                    # canonical stock surface.
+                    has_standard_local_grad = (
+                        local_data_view is not None and local_data_view.numel() > 0
+                    )
+                    if not has_standard_local_grad:
+                        continue
+                    if has_standard_local_grad:
                         torch.distributed.all_reduce(
                             local_data_view,
                             op=reduce_op,
                             group=self.inter_distributed_optimizer_instance_group,
                             async_op=async_op,
-                        )
-                        self._maybe_trace_inter_instance_standard_local_grad_surface(
-                            bucket=bucket,
-                            local_data_view=local_data_view,
-                            phase="after",
-                            call_idx=trace_call_idx,
                         )
         if async_op:
             if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
@@ -1206,7 +641,6 @@ class _ParamAndGradBucketGroup:
             local_data_view = self._get_standard_local_grad_view(idx, bucket)
             if local_data_view is None or local_data_view.numel() == 0:
                 continue
-
             optimizer._apply_bucket_grads(
                 bucket=bucket,
                 local_data_view=local_data_view,
@@ -1230,30 +664,12 @@ class _ParamAndGradBucketGroup:
             self._dispatch_custom_bucket_grad_transports()
             return
         if self.is_first_batch:
-            for bucket in self.buckets:
-                self._maybe_log_dion_bucket_lifecycle(phase="finish_grad_sync_pre_start", bucket=bucket)
             self.start_grad_sync(force_all_reduce=force_all_reduce)
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             if self.communication_stream is not None:
                 torch.cuda.default_stream().wait_stream(self.communication_stream)
-            finish_wait_call_idx = int(
-                getattr(self, "_dion_inter_instance_standard_local_grad_finish_wait_call_idx", 0)
-            )
-            self._dion_inter_instance_standard_local_grad_finish_wait_call_idx = (
-                finish_wait_call_idx + 1
-            )
-            for idx, bucket in enumerate(self.buckets):
-                local_data_view = self._get_standard_local_grad_view(idx, bucket)
-                if local_data_view is None or local_data_view.numel() == 0:
-                    continue
-                self._maybe_trace_inter_instance_standard_local_grad_surface(
-                    bucket=bucket,
-                    local_data_view=local_data_view,
-                    phase="finish_wait",
-                    call_idx=finish_wait_call_idx,
-                )
             self._dispatch_custom_bucket_grad_transports()
             return
         assert self.grad_reduce_handle is not None, (
@@ -1283,12 +699,6 @@ class _ParamAndGradBucketGroup:
             if param not in self.per_param_grad_ready_counts:
                 self.per_param_grad_ready_counts[param] = 0
             self.per_param_grad_ready_counts[param] += 1
-            self._maybe_log_dion_bucket_lifecycle(
-                phase="register_grad_ready",
-                bucket=self.param_to_bucket[param],
-                param=param,
-                ready_count=self.per_param_grad_ready_counts[param],
-            )
             # If all params in bucket group have grads available, issue communication call.
             if not self.is_first_batch:
                 if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
@@ -1362,6 +772,9 @@ class _ParamAndGradBuffer:
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
         self.param_to_name = param_to_name  # Store for Dion optimizer's _build_model_gbuf_range
+        for param in self.params:
+            if not getattr(param, "_param_name", ""):
+                param._param_name = self.param_to_name.get(param, "")
 
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []

@@ -44,6 +44,13 @@ def _resolve_dion_fs_rp_topology(args):
     dense_dp_cp_domain = args.world_size // (
         args.tensor_model_parallel_size * args.pipeline_model_parallel_size
     )
+    context_parallel_size = getattr(args, "context_parallel_size", 1) or 1
+    if dense_dp_cp_domain % context_parallel_size != 0:
+        raise RuntimeError(
+            "Dion topology is incompatible with context parallel partitioning. "
+            f"dense_dp_cp_domain={dense_dp_cp_domain} context_parallel_size={context_parallel_size}"
+        )
+    dense_dp_domain = dense_dp_cp_domain // context_parallel_size
 
     fs_explicit = requested_fs != 1
     rp_explicit = requested_rp != 1
@@ -53,39 +60,39 @@ def _resolve_dion_fs_rp_topology(args):
         resolved_rp = requested_rp
     elif fs_explicit:
         resolved_fs = requested_fs
-        if dense_dp_cp_domain % resolved_fs != 0:
+        if dense_dp_domain % resolved_fs != 0:
             raise RuntimeError(
                 "Dion FS topology is incompatible with the standard Megatron-Core "
                 "distributed-optimizer shard domain. "
-                f"dense_dp_cp_domain={dense_dp_cp_domain} requested_fs={resolved_fs}"
+                f"dense_dp_domain={dense_dp_domain} requested_fs={resolved_fs}"
             )
-        resolved_rp = dense_dp_cp_domain // resolved_fs
+        resolved_rp = dense_dp_domain // resolved_fs
     elif rp_explicit:
         resolved_rp = requested_rp
-        if dense_dp_cp_domain % resolved_rp != 0:
+        if dense_dp_domain % resolved_rp != 0:
             raise RuntimeError(
                 "Dion RP topology is incompatible with the standard Megatron-Core "
                 "distributed-optimizer shard domain. "
-                f"dense_dp_cp_domain={dense_dp_cp_domain} requested_rp={resolved_rp}"
+                f"dense_dp_domain={dense_dp_domain} requested_rp={resolved_rp}"
             )
-        resolved_fs = dense_dp_cp_domain // resolved_rp
+        resolved_fs = dense_dp_domain // resolved_rp
     else:
-        resolved_fs = dense_dp_cp_domain
+        resolved_fs = dense_dp_domain
         resolved_rp = 1
 
-    if dense_dp_cp_domain % resolved_fs != 0:
+    if dense_dp_domain % resolved_fs != 0:
         raise RuntimeError(
             "Dion FS topology is incompatible with the standard Megatron-Core "
             "distributed-optimizer shard domain. "
-            f"dense_dp_cp_domain={dense_dp_cp_domain} requested_fs={resolved_fs}"
+            f"dense_dp_domain={dense_dp_domain} requested_fs={resolved_fs}"
         )
 
-    expected_rp = dense_dp_cp_domain // resolved_fs
+    expected_rp = dense_dp_domain // resolved_fs
     if resolved_rp != expected_rp:
         raise RuntimeError(
             "Dion RP/FS topology is incompatible with the standard Megatron-Core "
             "distributed-optimizer instance topology. "
-            f"dense_dp_cp_domain={dense_dp_cp_domain} requested_fs={resolved_fs} "
+            f"dense_dp_domain={dense_dp_domain} requested_fs={resolved_fs} "
             f"requested_rp={resolved_rp} expected_rp={expected_rp}"
         )
 
@@ -306,15 +313,24 @@ def _compile_dependencies():
         start_time = time.time()
         print("> compiling and loading fused kernels ...", flush=True)
         fused_kernels.load(args)
-        torch.distributed.barrier()
+        if torch.cuda.is_available():
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            torch.distributed.barrier()
     else:
-        torch.distributed.barrier()
+        if torch.cuda.is_available():
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            torch.distributed.barrier()
         fused_kernels.load(args)
     # Simple barrier to make sure all ranks have passed the
     # compilation phase successfully before moving on to the
     # rest of the program. We think this might ensure that
     # the lock is released.
-    torch.distributed.barrier()
+    if torch.cuda.is_available():
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        torch.distributed.barrier()
     if torch.distributed.get_rank() == 0:
         print(
             ">>> done with compiling and loading fused kernels. "
@@ -444,22 +460,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     if device_count > 0:
         if args.optimizer == "dion" and args.use_distributed_optimizer:
             resolved_fs, resolved_rp = _resolve_dion_fs_rp_topology(args)
-            dist_opt_instances_explicit = (
-                (getattr(args, "num_distributed_optimizer_instances", 1) or 1) != 1
-            )
-            if (
-                dist_opt_instances_explicit
-                and args.num_distributed_optimizer_instances != resolved_rp
-            ):
-                raise RuntimeError(
-                    "Explicit --num-distributed-optimizer-instances is incompatible with "
-                    "the standard Megatron-Core Dion topology. "
-                    f"requested_num_distributed_optimizer_instances="
-                    f"{args.num_distributed_optimizer_instances} "
-                    f"expected_num_distributed_optimizer_instances={resolved_rp}"
-                )
             args.fully_shard_model_parallel_size = resolved_fs
             args.replicate_model_parallel_size = resolved_rp
+            # MCore intra/inter DistOpt groups must preserve Dion's logical RP axis so that
+            # dense and expert params both expose the intended FS/RP topology.
             args.num_distributed_optimizer_instances = resolved_rp
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")

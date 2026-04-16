@@ -339,10 +339,13 @@ class GPTModel(LanguageModule):
                     for suffix in (
                         "self_attention.linear_qkv.layer_norm_weight",
                         "mlp.linear_fc1.layer_norm_weight",
+                        "mlp.router.weight",
                         "self_attention.linear_qkv.weight",
                         "self_attention.linear_proj.weight",
                         "mlp.linear_fc1.weight",
                         "mlp.linear_fc2.weight",
+                        "mlp.experts.linear_fc1.weight0",
+                        "mlp.experts.linear_fc2.weight0",
                     ):
                         name = f"decoder.layers.{layer_idx}.{suffix}"
                         _debug_print_gpt_global_param_fingerprint(

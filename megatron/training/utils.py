@@ -44,6 +44,58 @@ from megatron.core.utils import (
 )
 from megatron.legacy.model.module import param_is_not_shared
 
+_DION_INPUT_BATCH_TRACE_DONE = False
+
+
+def _maybe_trace_input_batch(batch) -> None:
+    """Log one global first-batch fingerprint for topology-span debugging."""
+    global _DION_INPUT_BATCH_TRACE_DONE
+    if os.getenv("DION_TRACE_INPUT_BATCH", "0") != "1":
+        return
+    if _DION_INPUT_BATCH_TRACE_DONE:
+        return
+    if not mpu.is_pipeline_first_stage():
+        return
+    if mpu.get_tensor_model_parallel_rank() != 0:
+        return
+
+    dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+    if dp_group is None:
+        return
+
+    def _stats(tensor: torch.Tensor) -> tuple[int, float, float]:
+        flat = tensor.detach().reshape(-1)
+        f32 = flat.float()
+        return int(flat.numel()), float(f32.sum().item()), float(f32.square().sum().item())
+
+    payload = torch.tensor(
+        [
+            *_stats(batch["tokens"]),
+            *_stats(batch["labels"]),
+            *_stats(batch["loss_mask"]),
+        ],
+        device=batch["tokens"].device,
+        dtype=torch.float64,
+    )
+    torch.distributed.all_reduce(payload, group=dp_group)
+
+    if torch.distributed.get_rank(group=dp_group) == 0:
+        dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
+        print(
+            "[DION_INPUT_BATCH] "
+            f"global_rank={torch.distributed.get_rank()} "
+            f"dp_ranks={dp_ranks} "
+            f"tokens_numel={int(payload[0].item())} tokens_sum={payload[1].item():.9e} "
+            f"tokens_sq={payload[2].item():.9e} "
+            f"labels_numel={int(payload[3].item())} labels_sum={payload[4].item():.9e} "
+            f"labels_sq={payload[5].item():.9e} "
+            f"loss_mask_numel={int(payload[6].item())} loss_mask_sum={payload[7].item():.9e} "
+            f"loss_mask_sq={payload[8].item():.9e}",
+            flush=True,
+        )
+
+    _DION_INPUT_BATCH_TRACE_DONE = True
+
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
     """Calculate l2 norm of parameters"""
@@ -556,6 +608,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 else data["local_cp_size"].cuda(non_blocking=True)
             ),
         }
+        _maybe_trace_input_batch(batch)
 
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
