@@ -35,6 +35,54 @@ def _dion_math_precision_context():
         torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
 
 
+@torch.compile(fullgraph=True)
+def _orthogonalize_qr_local(P: Tensor) -> Tensor:
+    return torch.linalg.qr(P, mode="reduced")[0]
+
+
+@torch.compile(fullgraph=True)
+def _orthogonalize_rcqr_local(P: Tensor, S: Tensor) -> Tensor:
+    SP = (S @ P).to(dtype=torch.float32)
+    R = torch.linalg.qr(SP, mode="r")[1].to(dtype=torch.float32)
+    P_local = torch.linalg.solve_triangular(
+        R,
+        P.to(dtype=torch.float32),
+        upper=True,
+        left=False,
+    )
+    PP = P_local.to(dtype=torch.float32).mT @ P_local.to(dtype=torch.float32)
+    R = torch.linalg.cholesky_ex(PP, upper=True)[0].to(dtype=torch.float32)
+    return torch.linalg.solve_triangular(
+        R,
+        P_local.to(dtype=torch.float32),
+        upper=True,
+        left=False,
+    )
+
+
+@torch.compile(fullgraph=True)
+def _qr_r_factor(X: Tensor) -> Tensor:
+    return torch.linalg.qr(X, mode="r")[1].to(dtype=torch.float32)
+
+
+@torch.compile(fullgraph=True)
+def _solve_triangular_right(R: Tensor, X: Tensor) -> Tensor:
+    return torch.linalg.solve_triangular(
+        R.to(dtype=torch.float32),
+        X.to(dtype=torch.float32),
+        upper=True,
+        left=False,
+    ).to(dtype=torch.float32)
+
+
+@torch.compile(fullgraph=True)
+def _cholesky_upper_factor(X: Tensor) -> Tensor:
+    return torch.linalg.cholesky_ex(
+        X.to(dtype=torch.float32),
+        upper=True,
+    )[0].to(dtype=torch.float32)
+
+
 def orthogonalize(
     P: Tensor,
     rcqr_oversample: float = 1.25,
@@ -62,7 +110,7 @@ def orthogonalize(
 
         # Case 1: Square or wide matrix - use standard QR
         if m <= r:
-            Q, _ = torch.linalg.qr(P.to(dtype=torch.float32))
+            Q = _orthogonalize_qr_local(P.to(dtype=torch.float32))
             return Q.to(original_dtype).contiguous()
 
         # Case 2: Tall matrix - use Randomized Cholesky QR
@@ -72,36 +120,8 @@ def orthogonalize(
                 S = sketch_fn(P, rcqr_oversample)
             else:
                 S = _default_sketch_matrix(P, rcqr_oversample)
-
-            # Step 2: Compute sketch
-            SP = S @ P
-
-            # Step 3: QR decomposition of sketch
-            SP = SP.to(dtype=torch.float32)
-            R = torch.linalg.qr(SP, mode='r')[1]
-
-            # Match the reference RCQR contract: float32 triangular solve.
-            R = R.to(dtype=torch.float32)
-            P = torch.linalg.solve_triangular(
-                R,
-                P.to(dtype=torch.float32),
-                upper=True,
-                left=False,
-            )
-
-            # Match the reference RCQR contract: float32 Cholesky QR.
-            PP = P.to(dtype=torch.float32).mT @ P.to(dtype=torch.float32)
-            R = torch.linalg.cholesky_ex(PP, upper=True)[0]
-            R = R.to(dtype=torch.float32)
-
-            P = torch.linalg.solve_triangular(
-                R,
-                P.to(dtype=torch.float32),
-                upper=True,
-                left=False,
-            )
-
-            return P.to(original_dtype).contiguous()
+            P_ortho = _orthogonalize_rcqr_local(P, S)
+            return P_ortho.to(original_dtype).contiguous()
 
 def _logical_sketch_seed(seed_key: object) -> int:
     """Map one logical sketch key to a deterministic per-slot RNG seed."""
@@ -455,6 +475,7 @@ def _all_gather_batch_shards(
     group: torch.distributed.ProcessGroup,
 ) -> Tensor:
     """All-gather a batch-sharded tensor with variable batch counts."""
+    world_size = dist.get_world_size(group)
     max_batch = max(int(size) for size in batch_sizes)
     padded_shape = (max_batch, *tuple(local_tensor.shape[1:]))
     padded = torch.zeros(
@@ -465,11 +486,16 @@ def _all_gather_batch_shards(
     local_batch = int(local_tensor.size(0))
     if local_batch > 0:
         padded[:local_batch].copy_(local_tensor)
-    gathered = [torch.empty_like(padded) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, padded, group=group)
+    gathered = torch.empty(
+        (world_size * max_batch, *tuple(local_tensor.shape[1:])),
+        device=local_tensor.device,
+        dtype=local_tensor.dtype,
+    )
+    dist.all_gather_into_tensor(gathered, padded.contiguous(), group=group)
+    gathered = gathered.view(world_size, max_batch, *tuple(local_tensor.shape[1:]))
     parts = [
         shard[: int(batch_size)]
-        for shard, batch_size in zip(gathered, batch_sizes)
+        for shard, batch_size in zip(gathered.unbind(dim=0), batch_sizes)
         if int(batch_size) > 0
     ]
     if not parts:
@@ -488,6 +514,7 @@ def _all_gather_row_shards(
     group: torch.distributed.ProcessGroup,
 ) -> Tensor:
     """All-gather a row-sharded tensor with variable local row counts."""
+    world_size = dist.get_world_size(group)
     max_rows = max(int(size) for size in row_sizes)
     padded_shape = (int(local_tensor.size(0)), max_rows, int(local_tensor.size(2)))
     padded = torch.zeros(
@@ -498,11 +525,21 @@ def _all_gather_row_shards(
     local_rows = int(local_tensor.size(1))
     if local_rows > 0:
         padded[:, :local_rows].copy_(local_tensor)
-    gathered = [torch.empty_like(padded) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, padded, group=group)
+    gathered = torch.empty(
+        (world_size * int(local_tensor.size(0)), max_rows, int(local_tensor.size(2))),
+        device=local_tensor.device,
+        dtype=local_tensor.dtype,
+    )
+    dist.all_gather_into_tensor(gathered, padded.contiguous(), group=group)
+    gathered = gathered.view(
+        world_size,
+        int(local_tensor.size(0)),
+        max_rows,
+        int(local_tensor.size(2)),
+    )
     parts = [
         shard[:, : int(row_size)]
-        for shard, row_size in zip(gathered, row_sizes)
+        for shard, row_size in zip(gathered.unbind(dim=0), row_sizes)
         if int(row_size) > 0
     ]
     if not parts:
@@ -526,30 +563,33 @@ def _row_to_batch(
     rank = dist.get_rank(group)
     local_batch = int(batch_sizes[rank])
     r = int(local_tensor.size(2))
-    inputs = []
-    for dst_rank, batch_size in enumerate(batch_sizes):
-        batch_size = int(batch_size)
-        if batch_size > 0:
-            batch_start, batch_end = _split_range(int(local_tensor.size(0)), world_size, dst_rank)
-            inputs.append(local_tensor[batch_start:batch_end].contiguous())
-        else:
-            inputs.append(
-                torch.empty(
-                    (0, int(local_tensor.size(1)), r),
-                    device=local_tensor.device,
-                    dtype=local_tensor.dtype,
-                )
-            )
-    outputs = [
-        torch.empty(
-            (local_batch, int(row_size), r),
-            device=local_tensor.device,
-            dtype=local_tensor.dtype,
-        )
-        for row_size in row_sizes
+    max_rows = max(int(row_size) for row_size in row_sizes)
+    padded = torch.zeros(
+        (int(local_tensor.size(0)), max_rows, r),
+        device=local_tensor.device,
+        dtype=local_tensor.dtype,
+    )
+    local_rows = int(local_tensor.size(1))
+    if local_rows > 0:
+        padded[:, :local_rows].copy_(local_tensor)
+    exchanged = torch.empty(
+        (world_size * local_batch, max_rows, r),
+        device=local_tensor.device,
+        dtype=local_tensor.dtype,
+    )
+    dist.all_to_all_single(
+        exchanged,
+        padded.contiguous(),
+        output_split_sizes=[local_batch] * world_size,
+        input_split_sizes=[int(batch_size) for batch_size in batch_sizes],
+        group=group,
+    )
+    exchanged = exchanged.view(world_size, local_batch, max_rows, r)
+    parts = [
+        shard[:, : int(row_size)]
+        for shard, row_size in zip(exchanged.unbind(dim=0), row_sizes)
+        if int(row_size) > 0
     ]
-    dist.all_to_all(outputs, inputs, group=group)
-    parts = [part for part in outputs if int(part.size(1)) > 0]
     if not parts:
         return torch.empty(
             (local_batch, 0, r),
@@ -571,23 +611,44 @@ def _batch_to_row(
     rank = dist.get_rank(group)
     local_rows = int(row_sizes[rank])
     r = int(local_tensor.size(2))
-    inputs = []
+    max_rows = max(int(row_size) for row_size in row_sizes)
+    local_batch = int(local_tensor.size(0))
+    input_padded = torch.zeros(
+        (world_size * local_batch, max_rows, r),
+        device=local_tensor.device,
+        dtype=local_tensor.dtype,
+    )
     row_cursor = 0
-    for row_size in row_sizes:
+    for dst_rank, row_size in enumerate(row_sizes):
         row_size = int(row_size)
         next_cursor = row_cursor + row_size
-        inputs.append(local_tensor[:, row_cursor:next_cursor].contiguous())
+        if row_size > 0 and local_batch > 0:
+            dst_start = dst_rank * local_batch
+            dst_end = dst_start + local_batch
+            input_padded[dst_start:dst_end, :row_size].copy_(
+                local_tensor[:, row_cursor:next_cursor]
+            )
         row_cursor = next_cursor
-    outputs = [
-        torch.empty(
-            (int(batch_size), local_rows, r),
-            device=local_tensor.device,
-            dtype=local_tensor.dtype,
-        )
-        for batch_size in batch_sizes
-    ]
-    dist.all_to_all(outputs, inputs, group=group)
-    parts = [part for part in outputs if int(part.size(0)) > 0]
+    exchanged = torch.empty(
+        (sum(int(batch_size) for batch_size in batch_sizes), max_rows, r),
+        device=local_tensor.device,
+        dtype=local_tensor.dtype,
+    )
+    dist.all_to_all_single(
+        exchanged,
+        input_padded.contiguous(),
+        output_split_sizes=[int(batch_size) for batch_size in batch_sizes],
+        input_split_sizes=[local_batch] * world_size,
+        group=group,
+    )
+    parts = []
+    cursor = 0
+    for batch_size in batch_sizes:
+        batch_size = int(batch_size)
+        next_cursor = cursor + batch_size
+        if batch_size > 0:
+            parts.append(exchanged[cursor:next_cursor, :local_rows])
+        cursor = next_cursor
     if not parts:
         return torch.empty(
             (0, local_rows, r),
@@ -595,6 +656,52 @@ def _batch_to_row(
             dtype=local_tensor.dtype,
         )
     return torch.cat(parts, dim=0).contiguous()
+
+
+def _reduce_scatter_batch_shards(
+    local_tensor: Tensor,
+    *,
+    batch_sizes: Sequence[int],
+    group: torch.distributed.ProcessGroup,
+) -> Tensor:
+    """Reduce-scatter a logical batch tensor to one owned batch shard."""
+    world_size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    batch_sizes = [int(size) for size in batch_sizes]
+    max_batch = max(batch_sizes)
+    total_padded = max_batch * world_size
+    padded = torch.zeros(
+        (total_padded, *tuple(local_tensor.shape[1:])),
+        device=local_tensor.device,
+        dtype=local_tensor.dtype,
+    )
+    batch_size = int(local_tensor.size(0))
+    if batch_size != sum(batch_sizes):
+        raise RuntimeError(
+            "[DION_BATCH_PARTITION_MISMATCH] "
+            f"batch_size={batch_size} batch_sizes={tuple(batch_sizes)}"
+        )
+    cursor = 0
+    for shard_rank, shard_batch in enumerate(batch_sizes):
+        next_cursor = cursor + shard_batch
+        if shard_batch > 0:
+            shard_start = shard_rank * max_batch
+            shard_end = shard_start + shard_batch
+            padded[shard_start:shard_end].copy_(local_tensor[cursor:next_cursor])
+        cursor = next_cursor
+    reduced = torch.empty(
+        (max_batch, *tuple(local_tensor.shape[1:])),
+        device=local_tensor.device,
+        dtype=local_tensor.dtype,
+    )
+    dist.reduce_scatter_tensor(
+        reduced,
+        padded.contiguous(),
+        op=dist.ReduceOp.SUM,
+        group=group,
+    )
+    local_batch = int(batch_sizes[rank])
+    return reduced[:local_batch].contiguous()
 
 
 def _make_sharded_sketch(
@@ -709,8 +816,6 @@ def distributed_orthogonalize(
         - _split_range(batch_size, ortho_world_size, rank)[0]
         for rank in range(ortho_world_size)
     ]
-    local_batch_start, local_batch_end = _split_range(batch_size, ortho_world_size, ortho_rank)
-
     with _dion_math_precision_context():
         P_local = P_batch.to(dtype=torch.float32)
 
@@ -722,11 +827,7 @@ def distributed_orthogonalize(
                 group=ortho_group,
             )
             if int(P_owned.size(0)) > 0:
-                Q_owned, _ = torch.linalg.qr(
-                    P_owned.to(dtype=torch.float32),
-                    mode="reduced",
-                )
-                P_owned = Q_owned
+                P_owned = _orthogonalize_qr_local(P_owned.to(dtype=torch.float32))
             P_local = _batch_to_row(
                 P_owned.to(dtype=torch.float32),
                 row_sizes=row_sizes,
@@ -745,11 +846,13 @@ def distributed_orthogonalize(
             r=r,
         )
         SP_local = S_local @ P_local
-        dist.all_reduce(SP_local, op=dist.ReduceOp.SUM, group=ortho_group)
-        SP_owned = SP_local[local_batch_start:local_batch_end]
+        SP_owned = _reduce_scatter_batch_shards(
+            SP_local,
+            batch_sizes=batch_sizes,
+            group=ortho_group,
+        )
         if int(SP_owned.size(0)) > 0:
-            SP_owned = SP_owned.to(dtype=torch.float32)
-            R_local = torch.linalg.qr(SP_owned, mode="r")[1]
+            R_local = _qr_r_factor(SP_owned.to(dtype=torch.float32))
         else:
             R_local = torch.empty(
                 (0, r, r),
@@ -757,21 +860,17 @@ def distributed_orthogonalize(
                 dtype=torch.float32,
             )
         R = _all_gather_batch_shards(R_local, batch_sizes=batch_sizes, group=ortho_group)
-        R32 = R.to(dtype=torch.float32)
-        P_local32 = P_local.to(dtype=torch.float32)
-        P_local = torch.linalg.solve_triangular(
-            R32,
-            P_local32,
-            upper=True,
-            left=False,
-        ).to(dtype=torch.float32)
+        P_local = _solve_triangular_right(R, P_local)
 
         P_local32 = P_local.to(dtype=torch.float32)
         PP_local = P_local32.mT @ P_local32
-        dist.all_reduce(PP_local, op=dist.ReduceOp.SUM, group=ortho_group)
-        PP_owned = PP_local[local_batch_start:local_batch_end]
+        PP_owned = _reduce_scatter_batch_shards(
+            PP_local,
+            batch_sizes=batch_sizes,
+            group=ortho_group,
+        )
         if int(PP_owned.size(0)) > 0:
-            R_local = torch.linalg.cholesky_ex(PP_owned, upper=True)[0]
+            R_local = _cholesky_upper_factor(PP_owned)
         else:
             R_local = torch.empty(
                 (0, r, r),
@@ -779,12 +878,7 @@ def distributed_orthogonalize(
                 dtype=torch.float32,
             )
         R = _all_gather_batch_shards(R_local, batch_sizes=batch_sizes, group=ortho_group)
-        P_local = torch.linalg.solve_triangular(
-            R.to(dtype=torch.float32),
-            P_local32,
-            upper=True,
-            left=False,
-        ).to(dtype=torch.float32)
+        P_local = _solve_triangular_right(R, P_local32)
         return P_local.to(original_dtype).contiguous()
 def orthogonalize_local_slice(
     optimizer,

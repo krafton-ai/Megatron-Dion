@@ -869,7 +869,11 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
     def _all_gather_bucket_params(self, bucket, async_op=False):
         """Gather all custom bucket params that do not follow the pure standard DO path."""
-        return all_gather_bucket_params(self, bucket, async_op=async_op)
+        return all_gather_bucket_params(
+            self,
+            bucket,
+            async_op=async_op,
+        )
 
     def _bucket_dion_full_view(self, bucket, entry: DionBucketEntry) -> torch.Tensor:
         """Return the canonical full-param view for one Dion entry."""

@@ -10,11 +10,11 @@ from torch import Tensor
 from .kernels import (
     apply_error_feedback,
     compute_update_batch,
+    sanitize_zero_or_nan_dion_batch,
     local_column_sum_sq,
     normalize_columns,
     orthogonalize_dense_replicate_batch_async,
     orthogonalize_fs_only_batch,
-    sanitize_dion_intermediate_batch,
     scaled_lr_for_shape,
 )
 from .ortho import (
@@ -127,8 +127,8 @@ def iter_dist_tasks(optimizer) -> Generator[AsyncTask, None, None]:
     optimizer._dion_update_count += sum(int(batch.real_batch_size) for batch in dion_batches)
     optimizer._adamw_update_count += len(scalar_params)
 
-    if dion_batches:
-        yield AsyncTask(run_dion_batch_async(optimizer, dion_batches))
+    for dion_batch in dion_batches:
+        yield AsyncTask(run_dion_batch_async(optimizer, dion_batch))
 
     if scalar_params:
         yield AsyncTask(optimizer._run_scalar_bucket_async(scalar_params))
@@ -136,44 +136,43 @@ def iter_dist_tasks(optimizer) -> Generator[AsyncTask, None, None]:
 
 def run_dion_batch_async(
     optimizer,
-    dion_batches: List[DionBatch],
+    dion_batch: DionBatch,
 ) -> Generator[None, None, None]:
-    """Process adapter-authored Dion batches with async operations."""
-    if not dion_batches:
+    """Process one adapter-authored Dion batch with async operations."""
+    if dion_batch is None:
         return
 
-    for dion_batch in dion_batches:
-        batch_group = dion_batch.batch_group
+    batch_group = dion_batch.batch_group
 
-        params = list(dion_batch.params or [])
-        momentums = list(dion_batch.momentums or [])
-        q_tensors = list(dion_batch.q_tensors or [])
-        configs = list(dion_batch.configs or [])
-        dist_metas = list(dion_batch.dist_metas or [])
-        optim_groups = list(dion_batch.optim_groups or [])
-        grads_to_process = list(dion_batch.grads or [])
-        optimizer_states = list(dion_batch.optimizer_states or [])
-        param_shapes = list(dion_batch.param_shapes)
-        real_batch_size = int(dion_batch.real_batch_size)
-        batch_collectives = dion_batch.batch_collectives
-        global_param_offset = int(dion_batch.global_param_offset)
+    params = list(dion_batch.params or [])
+    momentums = list(dion_batch.momentums or [])
+    q_tensors = list(dion_batch.q_tensors or [])
+    configs = list(dion_batch.configs or [])
+    dist_metas = list(dion_batch.dist_metas or [])
+    optim_groups = list(dion_batch.optim_groups or [])
+    grads_to_process = list(dion_batch.grads or [])
+    optimizer_states = list(dion_batch.optimizer_states or [])
+    param_shapes = list(dion_batch.param_shapes)
+    real_batch_size = int(dion_batch.real_batch_size)
+    batch_collectives = dion_batch.batch_collectives
+    global_param_offset = int(dion_batch.global_param_offset)
 
-        if params:
-            yield from optimizer._batch_dion_update_async(
-                params,
-                momentums,
-                q_tensors,
-                configs,
-                dist_metas,
-                optim_groups,
-                grads_to_process,
-                optimizer_states,
-                param_shapes,
-                real_batch_size,
-                global_param_offset,
-                batch_group,
-                batch_collectives,
-            )
+    if params:
+        yield from optimizer._batch_dion_update_async(
+            params,
+            momentums,
+            q_tensors,
+            configs,
+            dist_metas,
+            optim_groups,
+            grads_to_process,
+            optimizer_states,
+            param_shapes,
+            real_batch_size,
+            global_param_offset,
+            batch_group,
+            batch_collectives,
+        )
 
 
 def replicate_reduce_op(optimizer):
@@ -224,7 +223,13 @@ def collapse_batch_across_replicas(
     if replicate_group is None:
         return
 
-    dist.all_reduce(batch, op=replicate_reduce_op(optimizer), group=replicate_group)
+    reduced_batch = funcol.all_reduce(
+        batch,
+        reduceOp="avg" if replicate_reduce_op(optimizer) == dist.ReduceOp.AVG else "sum",
+        group=replicate_group,
+    )
+    yield
+    batch.copy_(reduced_batch)
     yield
 
 
@@ -249,6 +254,7 @@ def unshard_q_batch(
     configs: List[DionParamConfig],
     dist_metas: Optional[List] = None,
     batch_collectives: Optional[DionBatchCollectives] = None,
+    cache_scope: Optional[int] = None,
 ) -> Generator[List[Tensor], None, None]:
     """All-gather TP-sharded Q blocks needed for local matmul."""
     batch_size = len(Qs)
@@ -268,6 +274,7 @@ def unshard_q_batch(
 
     if batch_collectives.tp_q_gathers:
         pending = []
+        scope = "global" if cache_scope is None else str(int(cache_scope))
         for group_seq, collective in enumerate(batch_collectives.tp_q_gathers):
             indices = list(collective.indices)
             tp_group = collective.process_group
@@ -299,7 +306,7 @@ def unshard_q_batch(
                     )
             tp_size = collective.world_size
             local_batch = optimizer._cached_buffer(
-                f"q_local_batch_{group_seq}",
+                f"q_local_batch_{scope}_{group_seq}",
                 (len(indices), n, r_local),
                 dtype,
                 device,
@@ -308,7 +315,7 @@ def unshard_q_batch(
                 local_batch[slot].copy_(Qs[idx])
 
             gathered_batch = optimizer._cached_buffer(
-                f"q_gather_batch_{group_seq}",
+                f"q_gather_batch_{scope}_{group_seq}",
                 (tp_size, len(indices), n, r_local),
                 dtype,
                 device,
@@ -364,19 +371,26 @@ def reduce_p_across_fs_groups(
         indices = list(collective.indices)
         if process_group and collective.world_size > 1:
             if len(indices) == batch_size and len(batch_collectives.fs_p_collectives) == 1:
-                dist.all_reduce(P_batch, op=dist.ReduceOp.SUM, group=process_group)
+                handle = dist.all_reduce(
+                    P_batch,
+                    op=dist.ReduceOp.SUM,
+                    group=process_group,
+                    async_op=True,
+                )
+                yield
+                handle.wait()
             else:
                 tensors = [P_batch[idx] for idx in indices]
-                reduced = funcol.all_reduce_coalesced(
+                handle = dist.all_reduce_coalesced(
                     tensors,
-                    reduceOp="sum",
+                    op=dist.ReduceOp.SUM,
                     group=process_group,
+                    async_op=True,
                 )
-                for idx, tensor in zip(indices, reduced):
-                    P_batch[idx].copy_(tensor)
-                del tensors, reduced
-            if not did_yield:
                 yield
+                handle.wait()
+                del tensors
+            if not did_yield:
                 did_yield = True
 
     if not did_yield:
@@ -404,13 +418,25 @@ def reduce_r_across_tp(
         tp_group = collective.process_group
         need_tp_r = list(collective.indices)
         if len(need_tp_r) == R_batch.size(0) and len(batch_collectives.tp_r_collectives) == 1:
-            dist.all_reduce(R_batch, op=dist.ReduceOp.SUM, group=tp_group)
+            handle = dist.all_reduce(
+                R_batch,
+                op=dist.ReduceOp.SUM,
+                group=tp_group,
+                async_op=True,
+            )
+            yield
+            handle.wait()
         else:
             tensors = [R_batch[i] for i in need_tp_r]
-            reduced = funcol.all_reduce_coalesced(tensors, reduceOp="sum", group=tp_group)
-            for i, tensor in zip(need_tp_r, reduced):
-                R_batch[i].copy_(tensor)
-            del tensors, reduced
+            handle = dist.all_reduce_coalesced(
+                tensors,
+                op=dist.ReduceOp.SUM,
+                group=tp_group,
+                async_op=True,
+            )
+            yield
+            handle.wait()
+            del tensors
 
     yield
 
@@ -445,7 +471,11 @@ def normalize_cols_async(
     q_norm_group = batch_group.q_norm_group
 
     if q_norm_group is not None:
-        dist.all_reduce(col_sum_sq_real, op=dist.ReduceOp.SUM, group=q_norm_group)
+        col_sum_sq_real = funcol.all_reduce(
+            col_sum_sq_real,
+            reduceOp="sum",
+            group=q_norm_group,
+        )
         yield
 
     q_new_real, _ = normalize_columns(
@@ -685,7 +715,10 @@ def sanitize_dion_batch_for_update(
     """Apply reference-aligned NaN/zero sanitization and optimizer-local warning logs."""
     raw_p_nan_mask = torch.isnan(P_batch).view(P_batch.size(0), -1).any(dim=1)
     raw_r_nan_mask = torch.isnan(R_batch).view(R_batch.size(0), -1).any(dim=1)
-    P_batch, R_batch, unexpected_nan, _ = sanitize_dion_intermediate_batch(
+    is_all_zero = (M_batch == 0).view(M_batch.size(0), -1).all(dim=1)
+    has_nan = raw_p_nan_mask | raw_r_nan_mask
+    unexpected_nan = has_nan & (~is_all_zero)
+    P_batch, R_batch = sanitize_zero_or_nan_dion_batch(
         P_batch,
         R_batch,
         Q_batch,
@@ -871,7 +904,6 @@ def run_compressed_comm_async(
             batch_collectives=batch_collectives,
         )
         yield from collapse_batch_across_replicas(optimizer, R_batch, replicate_group=comm_group)
-
         return P_ortho, R_batch
 
     original_batch_size = batch_size
@@ -934,6 +966,7 @@ def run_compressed_comm_async(
             P_batch,
             dist_metas,
             comm_group=comm_group,
+            cache_scope=global_param_offset,
         )
     else:
         P_ortho_full = yield from orthogonalize_p_batch(
@@ -1030,6 +1063,7 @@ def batch_dion_update_async(
         configs,
         dist_metas,
         batch_collectives=batch_collectives,
+        cache_scope=global_param_offset,
     )
 
     M_for_matmul = [
@@ -1075,6 +1109,7 @@ def batch_dion_update_async(
                 P_batch,
                 dist_metas,
                 comm_group=replicate_group,
+                cache_scope=global_param_offset,
             )
         else:
             P_batch = yield from orthogonalize_p_batch(

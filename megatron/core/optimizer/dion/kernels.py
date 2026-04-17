@@ -38,7 +38,39 @@ def scaled_lr_for_shape(
     raise RuntimeError(f"[DION_INVALID_LR_SCALING_RULE] rule={rule!r}")
 
 
-def apply_batched_matmul_(
+@torch.compile(fullgraph=True)
+def _apply_batched_matmul_regular(
+    X: List[Tensor],
+    A: Tensor,
+    B: Tensor,
+    *,
+    alpha: float,
+    beta: float,
+) -> None:
+    update = A @ B.mT
+    update = update.unbind(dim=0)
+    update = torch._foreach_mul(update, alpha)
+    torch._foreach_mul_(X, beta)
+    torch._foreach_add_(X, update)
+
+
+@torch.compile(fullgraph=True)
+def _apply_batched_matmul_transposed(
+    X: List[Tensor],
+    A: Tensor,
+    B: Tensor,
+    *,
+    alpha: float,
+    beta: float,
+) -> None:
+    update = B @ A.mT
+    update = update.unbind(dim=0)
+    update = torch._foreach_mul(update, alpha)
+    torch._foreach_mul_(X, beta)
+    torch._foreach_add_(X, update)
+
+
+def apply_batched_matmul(
     X: List[Tensor],
     A: Tensor,
     B: Tensor,
@@ -56,16 +88,9 @@ def apply_batched_matmul_(
 
     with _dion_math_precision_context():
         if not transpose:
-            update = A @ B.mT
+            _apply_batched_matmul_regular(X, A, B, alpha=alpha, beta=beta)
         else:
-            update = B @ A.mT
-
-    update = update.unbind(dim=0)
-    update = torch._foreach_mul(update, alpha)
-    torch._foreach_mul_(X, beta)
-    torch._foreach_add_(X, update)
-
-    del update
+            _apply_batched_matmul_transposed(X, A, B, alpha=alpha, beta=beta)
 
 
 def apply_error_feedback(
@@ -82,7 +107,7 @@ def apply_error_feedback(
 
     is_transposed = configs[0].is_transposed
     if all(c.is_transposed == is_transposed for c in configs):
-        apply_batched_matmul_(
+        apply_batched_matmul(
             momentums,
             P_batch,
             R_batch,
@@ -103,18 +128,14 @@ def apply_error_feedback(
         del update
 
 
-def sanitize_dion_intermediate_batch(
+def sanitize_zero_or_nan_dion_batch(
     P_batch: Tensor,
     R_batch: Tensor,
     Q_batch: Tensor,
     M_batch: Tensor,
 ):
-    """Apply reference-aligned NaN/zero sanitization for batched Dion intermediates."""
+    """Reference-aligned NaN/zero fix for batched Dion intermediates."""
     is_all_zero = (M_batch == 0).all(dim=(-2, -1), keepdim=True)
-    has_nan = torch.isnan(P_batch).any(dim=(-2, -1), keepdim=True) | torch.isnan(R_batch).any(
-        dim=(-2, -1), keepdim=True
-    )
-    unexpected_nan = has_nan & (~is_all_zero)
     not_all_zero = ~is_all_zero
 
     fixed_p = P_batch.nan_to_num() * not_all_zero
@@ -127,12 +148,29 @@ def sanitize_dion_intermediate_batch(
         )
     fixed_r = R_batch.nan_to_num() * not_all_zero + q_clean * is_all_zero
 
-    return fixed_p, fixed_r, unexpected_nan, is_all_zero
+    return fixed_p, fixed_r
 
 
+@torch.compile(fullgraph=True)
 def local_column_sum_sq(X: Tensor) -> Tensor:
     """Return float32 per-column squared sums for one local tensor batch."""
     return X.to(dtype=torch.float32).square().sum(dim=-2, keepdim=True)
+
+
+@torch.compile(fullgraph=True)
+def _compute_update_batch_regular(
+    q_new_f32: Tensor,
+    p_for_delta: Tensor,
+) -> Tensor:
+    return torch.bmm(p_for_delta, q_new_f32.transpose(1, 2))
+
+
+@torch.compile(fullgraph=True)
+def _compute_update_batch_transposed(
+    q_new_f32: Tensor,
+    p_for_delta: Tensor,
+) -> Tensor:
+    return torch.bmm(q_new_f32, p_for_delta.transpose(1, 2))
 
 
 def compute_update_batch(
@@ -150,10 +188,8 @@ def compute_update_batch(
     with _dion_math_precision_context():
         if all(c.is_transposed == is_transposed for c in configs[:real_batch_size]):
             if is_transposed:
-                delta_batch = torch.bmm(q_new_f32, p_for_delta.transpose(1, 2))
-            else:
-                delta_batch = torch.bmm(p_for_delta, q_new_f32.transpose(1, 2))
-            return delta_batch
+                return _compute_update_batch_transposed(q_new_f32, p_for_delta)
+            return _compute_update_batch_regular(q_new_f32, p_for_delta)
 
         delta_batch = torch.empty(
             (real_batch_size, *delta_shape),
@@ -187,6 +223,7 @@ def compute_update_batch(
         return delta_batch
 
 
+@torch.compile(fullgraph=True)
 def normalize_columns(
     R_batch: Tensor,
     col_sum_sq: Tensor,
@@ -300,6 +337,7 @@ def orthogonalize_dense_replicate_batch_async(
     dist_metas: List,
     *,
     comm_group: torch.distributed.ProcessGroup,
+    cache_scope: Optional[int] = None,
 ) -> Generator[torch.Tensor, None, None]:
     """Match `dion_reference.py::dion_update_ddp()` for dense replicate orthogonalization."""
     comm_world_size = dist.get_world_size(comm_group)
@@ -314,11 +352,12 @@ def orthogonalize_dense_replicate_batch_async(
 
     batch_size = P_batch.size(0)
     original_batch_size = batch_size
+    scope = "global" if cache_scope is None else str(int(cache_scope))
     if batch_size % comm_world_size != 0:
         pad = comm_world_size - (batch_size % comm_world_size)
         padded_batch_size = batch_size + pad
         P_padded = optimizer._cached_buffer(
-            "dense_replicate_p_padded",
+            f"dense_replicate_p_padded_{scope}",
             (padded_batch_size, P_batch.size(1), P_batch.size(2)),
             P_batch.dtype,
             P_batch.device,
@@ -331,7 +370,7 @@ def orthogonalize_dense_replicate_batch_async(
 
     comm_rank = dist.get_rank(comm_group)
     P_ortho_full = optimizer._cached_buffer(
-        "dense_replicate_p_ortho_full",
+        f"dense_replicate_p_ortho_full_{scope}",
         P_batch.shape,
         P_batch.dtype,
         P_batch.device,

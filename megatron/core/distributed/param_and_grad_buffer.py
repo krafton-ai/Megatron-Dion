@@ -3,7 +3,6 @@
 import functools
 import logging
 import math
-import os
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -218,7 +217,6 @@ class _ParamAndGradBucketGroup:
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
         self.is_first_batch = True
-
         self.reset()
         self.param_gather_handle = None
         self.param_gather_dispatched = False
@@ -282,7 +280,10 @@ class _ParamAndGradBucketGroup:
                         "[Dion] missing bucket-wise Dion param-gather helper "
                         f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                     )
-                handle = optimizer._all_gather_bucket_params(bucket, async_op=async_op)
+                handle = optimizer._all_gather_bucket_params(
+                    bucket,
+                    async_op=async_op,
+                )
                 if handle is not None:
                     custom_handles.append(handle)
                 continue
@@ -381,7 +382,9 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
         self._mark_dion_param_sync_ready(False)
-        pure_non_dion_indices, custom_handles = self._collect_param_gather_launches(async_op=async_op)
+        pure_non_dion_indices, custom_handles = self._collect_param_gather_launches(
+            async_op=async_op,
+        )
         standard_handle = None
         if pure_non_dion_indices:
             with _coalescing_manager(

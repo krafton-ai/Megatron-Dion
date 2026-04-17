@@ -381,24 +381,26 @@ def _restore_dion_bucket(
         )
 
     for entry, full_view_2d in prepared_entries:
-        full_flat = full_view_2d.view(-1)
+        m, n = (int(dim) for dim in full_view_2d.shape)
+        fs_shard_dim = int(entry.fs_shard_dim)
         shard_start = int(entry.shard_offset)
         shard_end = shard_start + int(entry.shard_capacity)
-
-        for rank_i, rank_segments in enumerate(entry.canonical_rank_flat_segments):
+        for rank_i, (rank_start, rank_end) in enumerate(entry.rank_split_ranges):
             rank_source = gathered_buffer[rank_i, shard_start:shard_end]
-            source_offset = 0
-            for seg_start, seg_end in rank_segments:
-                seg_len = int(seg_end) - int(seg_start)
-                if seg_len <= 0:
-                    continue
-                local_start = int(seg_start) - int(entry.canonical_bucket_start)
-                local_end = int(seg_end) - int(entry.canonical_bucket_start)
-                full_flat[local_start:local_end].copy_(
-                    rank_source[source_offset : source_offset + seg_len]
-                )
-                source_offset += seg_len
+            rank_start = int(rank_start)
+            rank_end = int(rank_end)
+            local_split_size = rank_end - rank_start
+            if local_split_size <= 0:
+                continue
 
+            if fs_shard_dim == 0:
+                local_numel = local_split_size * n
+                local_source = rank_source[:local_numel].view(local_split_size, n)
+                full_view_2d[rank_start:rank_end, :].copy_(local_source)
+            else:
+                local_numel = m * local_split_size
+                local_source = rank_source[:local_numel].view(m, local_split_size)
+                full_view_2d[:, rank_start:rank_end].copy_(local_source)
         set_dion_local_shard_(
             entry=entry,
             full_view_2d=full_view_2d,
@@ -1005,7 +1007,12 @@ def all_gather_non_dion_bucket(optimizer, bucket, async_op=False):
     )
 
 
-def all_gather_dion_bucket(optimizer, bucket, async_op=False, prepared_gather=None):
+def all_gather_dion_bucket(
+    optimizer,
+    bucket,
+    async_op=False,
+    prepared_gather=None,
+):
     """Gather one bucket-local Dion shard buffer back into canonical bucket.param_data."""
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not dion_layout.has_params:
@@ -1124,7 +1131,11 @@ def all_gather_bucket_params(optimizer, bucket, async_op=False):
         return None
 
     handles = []
-    dion_handle = all_gather_dion_bucket(optimizer, bucket, async_op=async_op)
+    dion_handle = all_gather_dion_bucket(
+        optimizer,
+        bucket,
+        async_op=async_op,
+    )
     if dion_handle is not None:
         handles.append(dion_handle)
     mixed_non_dion_handle = all_gather_non_dion_bucket(optimizer, bucket, async_op=async_op)
