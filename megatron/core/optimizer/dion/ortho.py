@@ -122,10 +122,12 @@ def _sketch_seed(seed_key: object) -> int:
     ) & ((1 << 63) - 1)
 
 
+@torch.compiler.disable
 def _seeded_normal_tensor(
     shape: tuple[int, ...],
     *,
     seed_key: object,
+    offset: int = 0,
     device: torch.device,
     dtype: torch.dtype,
     std: float,
@@ -133,6 +135,10 @@ def _seeded_normal_tensor(
     """Generate one topology-invariant sketch tensor from one sketch key."""
     gen = torch.Generator(device=str(device))
     gen.manual_seed(_sketch_seed(seed_key))
+    if offset != 0:
+        state = gen.get_state().to("cpu")
+        state[8:] = torch.tensor([offset], dtype=torch.uint64, device="cpu").view(torch.uint8)
+        gen.set_state(state)
     tensor = torch.empty(shape, device=device, dtype=dtype)
     tensor.normal_(mean=0.0, std=std, generator=gen)
     return tensor
@@ -180,6 +186,7 @@ def make_sketch(
         step_count=step_count,
     )
 
+    @torch.compiler.disable
     def build_sketch(P: Tensor, oversample: float) -> Tensor:
         batch_shape = P.shape[:-2]
         if len(batch_shape) == 0:
@@ -585,28 +592,30 @@ def _make_sharded_sketch(
 ) -> Tensor:
     """Return the local row shard of one distributed sketch batch."""
     local_rows = int(row_sizes[row_rank])
-    row_offset = sum(int(size) for size in row_sizes[:row_rank])
-    global_rows = sum(int(size) for size in row_sizes)
     k = math.ceil(oversample * r / 128.0) * 128
     if k <= 0:
         raise RuntimeError(
             f"[DION_INVALID_SKETCH_RANK] r={r} oversample={oversample} k={k}"
         )
     std = math.sqrt(1.0 / k)
+    rank0_rows = int(row_sizes[0])
+    shard_offset = ((row_rank * k * rank0_rows) + 3) // 4 * 4
     sketch = torch.empty(
         (len(sketch_keys), k, local_rows),
         device=device,
         dtype=dtype,
     )
     for index, seed_key in enumerate(sketch_keys):
-        full_sketch = _seeded_normal_tensor(
-            (k, global_rows),
+        sketch[index].copy_(
+            _seeded_normal_tensor(
+                (k, local_rows),
             seed_key=seed_key,
+                offset=shard_offset,
             device=device,
             dtype=dtype,
             std=std,
         )
-        sketch[index].copy_(full_sketch[:, row_offset : row_offset + local_rows])
+        )
     return sketch
 
 
@@ -661,16 +670,16 @@ def distributed_orthogonalize(
             ).to(torch.float32)
         return P_ortho.to(original_dtype).contiguous()
 
-    sketch_keys = sketch_keys(
+    batch_sketch_keys = sketch_keys(
         dist_metas=dist_metas[:batch_size] if dist_metas is not None else None,
         contract="distributed",
         step_count=optimizer._step_count,
     )
-    if sketch_keys is None or len(sketch_keys) != batch_size:
+    if batch_sketch_keys is None or len(batch_sketch_keys) != batch_size:
         raise RuntimeError(
             "[DION_MISSING_DISTRIBUTED_SKETCH_KEYS] "
             f"batch_size={batch_size} sketch_keys="
-            f"{0 if sketch_keys is None else len(sketch_keys)}"
+            f"{0 if batch_sketch_keys is None else len(batch_sketch_keys)}"
         )
 
     local_rows = int(P_batch.size(1))
@@ -712,7 +721,7 @@ def distributed_orthogonalize(
 
         R_local = _reduce_scatter_batch_shards(
             _make_sharded_sketch(
-                sketch_keys=sketch_keys,
+                sketch_keys=batch_sketch_keys,
                 oversample=oversample,
                 row_sizes=row_sizes,
                 row_rank=ortho_rank,
