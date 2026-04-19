@@ -11,9 +11,11 @@ def get_global_shape(
     local_m: int,
     local_n: int,
 ) -> Tuple[int, int]:
-    """Get fully global shape (FS and TP restored) for rank calculation.
+    """Get the global shape used by Dion math.
 
-    dist_meta.global_shape is already fully global when set by DistributedOptimizer.
+    For expert parameters, `per_expert_global_shape` is the matrix shape
+    that defines the Dion object. For non-expert parameters, this falls back to
+    the full global shape.
 
     Args:
         dist_meta: Distribution metadata for the parameter
@@ -21,19 +23,48 @@ def get_global_shape(
         local_n: Local n dimension
 
     Returns:
-        Tuple of (global_m, global_n)
+        Tuple `(global_m, global_n)`
     """
     if dist_meta is not None:
+        if getattr(dist_meta, 'per_expert_global_shape', None) is not None:
+            return tuple(dist_meta.per_expert_global_shape)
         if getattr(dist_meta, 'global_shape', None) is not None:
             return tuple(dist_meta.global_shape)
         if getattr(dist_meta, 'is_dion_param', False):
             raise RuntimeError(
-                "Dion distributed param is missing global_shape required for "
+                "Dion distributed param is missing global_shape needed to compute "
                 f"LR/rank scaling: local_shape=({local_m}, {local_n}) "
                 f"param={getattr(dist_meta, 'param_name', '')}"
             )
     # Local non-distributed case.
     return (local_m, local_n)
+
+
+def get_local_shape(
+    dist_meta: Optional[DionDistMeta],
+    local_m: int,
+    local_n: int,
+) -> Tuple[int, int]:
+    """Return the Dion-object local matrix shape.
+
+    For combined expert tensors, the physical shard may contain multiple local
+    experts while the Dion object is one expert matrix. When available,
+    `dist_meta.local_shape` is the authoritative object-local shape.
+    """
+    if dist_meta is not None and getattr(dist_meta, "local_shape", None) is not None:
+        return tuple(int(dim) for dim in dist_meta.local_shape)
+    return (local_m, local_n)
+
+
+def has_multiple_local_experts(dist_meta: Optional[DionDistMeta]) -> bool:
+    """Return whether one local tensor holds multiple expert Dion objects."""
+    if dist_meta is None:
+        return False
+    return (
+        int(getattr(dist_meta, "expert_axis", -1)) in (0, 1)
+        and int(getattr(dist_meta, "num_local_experts", 1)) > 1
+        and int(getattr(dist_meta, "local_expert_index", -1)) >= 0
+    )
 
 
 def str_to_dtype(dtype_val) -> Optional[torch.dtype]:
@@ -71,7 +102,7 @@ def str_to_dtype(dtype_val) -> Optional[torch.dtype]:
 
 
 def format_meta_id(dist_meta: Optional[DionDistMeta]) -> dict[str, object]:
-    """Return a compact logical parameter identifier for reporting."""
+    """Return a compact parameter identifier for reporting."""
     if dist_meta is None:
         return {"param_uid": None, "param_name": ""}
     return {

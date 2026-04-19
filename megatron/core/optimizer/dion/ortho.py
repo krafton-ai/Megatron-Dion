@@ -3,13 +3,13 @@
 import contextlib
 import hashlib
 import math
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from .utils import format_meta_id
+from .utils import format_meta_id, get_global_shape
 
 
 @contextlib.contextmanager
@@ -36,31 +36,6 @@ def _dion_math_precision_context():
 
 
 @torch.compile(fullgraph=True)
-def _orthogonalize_qr_local(P: Tensor) -> Tensor:
-    return torch.linalg.qr(P, mode="reduced")[0]
-
-
-@torch.compile(fullgraph=True)
-def _orthogonalize_rcqr_local(P: Tensor, S: Tensor) -> Tensor:
-    SP = (S @ P).to(dtype=torch.float32)
-    R = torch.linalg.qr(SP, mode="r")[1].to(dtype=torch.float32)
-    P_local = torch.linalg.solve_triangular(
-        R,
-        P.to(dtype=torch.float32),
-        upper=True,
-        left=False,
-    )
-    PP = P_local.to(dtype=torch.float32).mT @ P_local.to(dtype=torch.float32)
-    R = torch.linalg.cholesky_ex(PP, upper=True)[0].to(dtype=torch.float32)
-    return torch.linalg.solve_triangular(
-        R,
-        P_local.to(dtype=torch.float32),
-        upper=True,
-        left=False,
-    )
-
-
-@torch.compile(fullgraph=True)
 def _qr_r_factor(X: Tensor) -> Tensor:
     return torch.linalg.qr(X, mode="r")[1].to(dtype=torch.float32)
 
@@ -83,10 +58,11 @@ def _cholesky_upper_factor(X: Tensor) -> Tensor:
     )[0].to(dtype=torch.float32)
 
 
+@torch.compile()
 def orthogonalize(
     P: Tensor,
     rcqr_oversample: float = 1.25,
-    sketch_fn: Optional[Callable[[Tensor, float], Tensor]] = None,
+    make_sketch=None,
 ) -> Tensor:
     """
     Local orthogonalization with Randomized Cholesky QR.
@@ -96,35 +72,50 @@ def orthogonalize(
     Args:
         P: Matrix to orthogonalize, shape (..., m, r)
         rcqr_oversample: Oversampling factor for RCQR (default 1.25)
-        sketch_fn: Function to generate random sketch matrix.
-                   Signature: sketch_fn(P, oversample) -> S
-                   If None, uses default random sketch.
-
+        make_sketch: Optional explicit sketch generator for the tall-matrix path
     Returns:
         Orthogonalized matrix Q, same shape as P
     """
-    with _dion_math_precision_context():
-        assert P.ndim >= 2
-        original_dtype = P.dtype
-        m, r = P.shape[-2:]
+    assert P.ndim >= 3, "Expected P to have batch dimension"
+    original_dtype = P.dtype
+    P_local = P.to(dtype=torch.float32)
 
-        # Case 1: Square or wide matrix - use standard QR
-        if m <= r:
-            Q = _orthogonalize_qr_local(P.to(dtype=torch.float32))
-            return Q.to(original_dtype).contiguous()
+    if P.size(-2) <= P.size(-1):
+        P_local = torch.linalg.qr(P_local, mode="reduced")[0]
+    else:
+        R = torch.linalg.qr(
+            (
+                generate_random_sketch_matrix(
+                    P,
+                    oversample=rcqr_oversample,
+                    make_sketch=make_sketch,
+                ).to(dtype=torch.float32)
+                if make_sketch is not None
+                else _default_sketch_matrix(P, rcqr_oversample)
+            )
+            @ P_local,
+            mode="r",
+        )[1].to(dtype=torch.float32)
+        P_local = torch.linalg.solve_triangular(
+            R,
+            P_local,
+            upper=True,
+            left=False,
+        )
 
-        # Case 2: Tall matrix - use Randomized Cholesky QR
-        else:
-            # Step 1: Generate random sketch matrix
-            if sketch_fn is not None:
-                S = sketch_fn(P, rcqr_oversample)
-            else:
-                S = _default_sketch_matrix(P, rcqr_oversample)
-            P_ortho = _orthogonalize_rcqr_local(P, S)
-            return P_ortho.to(original_dtype).contiguous()
+        R = torch.linalg.cholesky_ex(P_local.mT @ P_local, upper=True)[0].to(dtype=torch.float32)
+        P_local = torch.linalg.solve_triangular(
+            R,
+            P_local,
+            upper=True,
+            left=False,
+        )
 
-def _logical_sketch_seed(seed_key: object) -> int:
-    """Map one logical sketch key to a deterministic per-slot RNG seed."""
+    return P_local.to(original_dtype).contiguous()
+
+
+def _sketch_seed(seed_key: object) -> int:
+    """Map one sketch key to a deterministic per-matrix RNG seed."""
     return int.from_bytes(
         hashlib.blake2b(repr(seed_key).encode("utf-8"), digest_size=8).digest(),
         "little",
@@ -139,58 +130,57 @@ def _seeded_normal_tensor(
     dtype: torch.dtype,
     std: float,
 ) -> Tensor:
-    """Generate one topology-invariant logical sketch tensor from a logical seed."""
+    """Generate one topology-invariant sketch tensor from one sketch key."""
     gen = torch.Generator(device=str(device))
-    gen.manual_seed(_logical_sketch_seed(seed_key))
+    gen.manual_seed(_sketch_seed(seed_key))
     tensor = torch.empty(shape, device=device, dtype=dtype)
     tensor.normal_(mean=0.0, std=std, generator=gen)
     return tensor
 
 
-def logical_sketch_keys(
+def sketch_keys(
     *,
     dist_metas: Optional[List],
-    tag: str,
+    contract: str,
     step_count: int,
 ) -> Optional[List[object]]:
-    """Return topology-invariant logical sketch ids for one Dion update batch."""
+    """Return topology-invariant sketch keys for one Dion update batch."""
     if not dist_metas:
         return None
 
-    logical_ids: List[object] = []
+    keys: List[object] = []
     for dist_meta in dist_metas:
         if dist_meta is None:
-            logical_ids.append((tag, step_count, None))
+            keys.append((contract, step_count, None))
             continue
-        logical_ids.append(
+        keys.append(
             (
-                tag,
+                contract,
                 step_count,
                 getattr(dist_meta, "param_uid", None),
                 getattr(dist_meta, "param_name", ""),
             )
         )
-    return logical_ids
+    return keys
 
 
-def make_seeded_sketch(
+def make_sketch(
     *,
     dist_metas: Optional[List],
-    tag: str,
+    contract: str,
     step_count: int,
-    format_meta_id: Callable[[object], Dict[str, Any]],
 ):
-    """Build a topology-independent sketch generator for one logical Dion update batch."""
+    """Build a topology-independent sketch generator for one Dion update batch."""
     if not dist_metas:
         return None
 
-    logical_ids = logical_sketch_keys(
+    keys = sketch_keys(
         dist_metas=dist_metas,
-        tag=tag,
+        contract=contract,
         step_count=step_count,
     )
 
-    def _make_sketch(P: Tensor, oversample: float) -> Tensor:
+    def build_sketch(P: Tensor, oversample: float) -> Tensor:
         batch_shape = P.shape[:-2]
         if len(batch_shape) == 0:
             batch = 1
@@ -199,37 +189,37 @@ def make_seeded_sketch(
         else:
             raise RuntimeError(
                 "[DION_INVALID_SKETCH_BATCH] "
-                f"tag={tag} expected batched 3D tensor, got shape={tuple(P.shape)}"
+                f"contract={contract} expected batched 3D tensor, got shape={tuple(P.shape)}"
             )
-        if batch != len(logical_ids):
+        if batch != len(keys):
             raise RuntimeError(
                 "[DION_SKETCH_META_MISMATCH] "
-                f"tag={tag} batch={batch} logical_ids={len(logical_ids)}"
+                f"contract={contract} batch={batch} sketch_keys={len(keys)}"
             )
         m = P.size(-2)
         r = P.size(-1)
         k = math.ceil(oversample * r / 128.0) * 128
         if k <= 0:
             raise RuntimeError(
-                f"[DION_INVALID_SKETCH_RANK] tag={tag} r={r} oversample={oversample} k={k}"
+                f"[DION_INVALID_SKETCH_RANK] contract={contract} r={r} oversample={oversample} k={k}"
             )
         std = math.sqrt(1.0 / k)
         if batch == 1 and len(batch_shape) == 0:
-            logical_id = logical_ids[0]
+            seed_key = keys[0]
             sketch = _seeded_normal_tensor(
                 (k, m),
-                seed_key=logical_id,
+                seed_key=seed_key,
                 device=P.device,
                 dtype=P.dtype,
                 std=std,
             )
             return sketch
         sketch = torch.empty((batch, k, m), device=P.device, dtype=P.dtype)
-        for idx, logical_id in enumerate(logical_ids):
+        for idx, seed_key in enumerate(keys):
             sketch[idx].copy_(
                 _seeded_normal_tensor(
                     (k, m),
-                    seed_key=logical_id,
+                    seed_key=seed_key,
                     device=P.device,
                     dtype=P.dtype,
                     std=std,
@@ -237,128 +227,7 @@ def make_seeded_sketch(
             )
         return sketch
 
-    setattr(_make_sketch, "_dion_sketch_tag", tag)
-    setattr(_make_sketch, "_dion_logical_seed_keys", tuple(logical_ids))
-    setattr(
-        _make_sketch,
-        "_dion_batch_meta_ids",
-        tuple(format_meta_id(dist_meta) for dist_meta in dist_metas),
-    )
-
-    return _make_sketch
-
-
-def make_local_sketch(
-    *,
-    dist_metas: Optional[List],
-    step_count: int,
-    format_meta_id: Callable[[object], Dict[str, Any]],
-):
-    """Return the topology-invariant local sketch contract."""
-    return make_seeded_sketch(
-        dist_metas=dist_metas,
-        tag="logical_local",
-        step_count=step_count,
-        format_meta_id=format_meta_id,
-    )
-
-
-def make_seeded_sketch_for_update(
-    optimizer,
-    *,
-    dist_metas: Optional[List],
-    tag: str,
-):
-    """Bind logical sketch generation to one optimizer step."""
-    return make_seeded_sketch(
-        dist_metas=dist_metas,
-        tag=tag,
-        step_count=optimizer._step_count,
-        format_meta_id=format_meta_id,
-    )
-
-
-def sketch_keys_for_update(
-    optimizer,
-    *,
-    dist_metas: Optional[List],
-    tag: str,
-) -> Optional[List[object]]:
-    """Bind logical sketch ids to one optimizer step."""
-    return logical_sketch_keys(
-        dist_metas=dist_metas,
-        tag=tag,
-        step_count=optimizer._step_count,
-    )
-
-
-def make_local_sketch_for_update(
-    optimizer,
-    *,
-    dist_metas: Optional[List],
-):
-    """Bind the local sketch contract to one optimizer step."""
-    return make_local_sketch(
-        dist_metas=dist_metas,
-        step_count=optimizer._step_count,
-        format_meta_id=format_meta_id,
-    )
-
-
-def make_fs_only_sketch(
-    *,
-    fs_group: torch.distributed.ProcessGroup,
-    fs_rank: int,
-    broadcast_replicate_domain: Callable[[Tensor], None],
-):
-    """Reproduce the fs-only local sketch RNG contract."""
-    fs_group_ranks = dist.get_process_group_ranks(fs_group)
-    broadcast_src = fs_group_ranks[0]
-
-    def _make_sketch(P: Tensor, oversample: float) -> Tensor:
-        if P.ndim != 3:
-            raise RuntimeError(
-                "[DION_FSONLY_SKETCH_INVALID_RANK] "
-                f"expected batched 3D tensor, got shape={tuple(P.shape)}"
-            )
-        if P.size(0) != 1:
-            raise RuntimeError(
-                "[DION_FSONLY_SKETCH_INVALID_BATCH] "
-                f"expected local fs-only batch size 1, got shape={tuple(P.shape)}"
-            )
-
-        m = P.size(-2)
-        r = P.size(-1)
-        k = math.ceil(oversample * r / 128.0) * 128
-        if k <= 0:
-            raise RuntimeError(
-                f"[DION_INVALID_SKETCH_RANK] r={r} oversample={oversample} k={k}"
-            )
-
-        std = math.sqrt(1.0 / k)
-        seed_tensor = torch.zeros((), device=P.device, dtype=torch.int64)
-        if dist.get_rank() == broadcast_src:
-            seed_tensor.random_()
-        dist.broadcast(seed_tensor, src=broadcast_src, group=fs_group)
-        broadcast_replicate_domain(seed_tensor)
-
-        gen = torch.Generator(device=P.device)
-        gen.manual_seed(int(seed_tensor.item()))
-
-        for _ in range(fs_rank):
-            torch.empty((1, k, m), device=P.device, dtype=P.dtype).normal_(
-                mean=0.0,
-                std=std,
-                generator=gen,
-            )
-
-        local_sketch = torch.empty((1, k, m), device=P.device, dtype=P.dtype)
-        local_sketch.normal_(mean=0.0, std=std, generator=gen)
-        return local_sketch
-
-    setattr(_make_sketch, "_dion_sketch_tag", "fs_only")
-
-    return _make_sketch
+    return build_sketch
 
 
 def _split_range(size: int, world_size: int, rank: int) -> tuple[int, int]:
@@ -368,16 +237,16 @@ def _split_range(size: int, world_size: int, rank: int) -> tuple[int, int]:
     if rank < 0 or rank >= world_size:
         raise RuntimeError(
             f"[DION_INVALID_RANK] rank={rank} world_size={world_size}"
-        )
+    )
     base = size // world_size
     remainder = size % world_size
     start = rank * base + min(rank, remainder)
-    local = base + (1 if rank < remainder else 0)
-    return start, start + local
+    shard_size = base + (1 if rank < remainder else 0)
+    return start, start + shard_size
 
 
 def _canonical_shard_sizes(size: int, world_size: int) -> list[int]:
-    """Return the canonical contiguous shard sizes for one logical axis."""
+    """Return the canonical contiguous shard sizes for one axis."""
     return [
         _split_range(size, world_size, rank)[1] - _split_range(size, world_size, rank)[0]
         for rank in range(world_size)
@@ -392,7 +261,7 @@ def _resolve_row_sizes_from_dist_meta(
     ortho_rank: int,
     local_rows: int,
 ) -> tuple[list[int], int]:
-    """Reconstruct distributed P row sizes from logical metadata only."""
+    """Reconstruct distributed P row sizes from metadata only."""
     if dist_metas is None:
         raise RuntimeError(
             "[DION_MISSING_ORTHO_DIST_META] distributed orthogonalize requires dist_metas"
@@ -407,7 +276,7 @@ def _resolve_row_sizes_from_dist_meta(
 
     first_meta = active_metas[0]
     meta_id = format_meta_id(first_meta)
-    global_shape = getattr(first_meta, "global_shape", None)
+    global_shape = get_global_shape(first_meta, 0, 0)
     if global_shape is None or len(global_shape) != 2:
         raise RuntimeError(
             "[DION_MISSING_ORTHO_GLOBAL_SHAPE] distributed orthogonalize requires exact "
@@ -431,7 +300,7 @@ def _resolve_row_sizes_from_dist_meta(
         )
 
     for index, dist_meta in enumerate(active_metas[1:], start=1):
-        other_shape = getattr(dist_meta, "global_shape", None)
+        other_shape = get_global_shape(dist_meta, 0, 0)
         other_config = getattr(dist_meta, "param_config", None)
         if other_shape is None or len(other_shape) != 2:
             raise RuntimeError(
@@ -445,8 +314,8 @@ def _resolve_row_sizes_from_dist_meta(
         if other_shape != (m_global, n_global) or other_is_transposed != is_transposed:
             raise RuntimeError(
                 "[DION_INCONSISTENT_ORTHO_ROW_META] all batch entries routed into one "
-                "distributed orthogonalize call must share the same logical Dion row axis "
-                f"slot={index} first_meta_id={meta_id} meta_id={format_meta_id(dist_meta)} "
+                "distributed orthogonalize call must share the same Dion row axis "
+                f"batch_index={index} first_meta_id={meta_id} meta_id={format_meta_id(dist_meta)} "
                 f"first_global_shape={(m_global, n_global)} other_global_shape={other_shape} "
                 f"first_is_transposed={int(is_transposed)} "
                 f"other_is_transposed={int(other_is_transposed)}"
@@ -457,7 +326,7 @@ def _resolve_row_sizes_from_dist_meta(
     if expected_local_rows != int(local_rows):
         raise RuntimeError(
             "[DION_ORTHO_ROW_LAYOUT_MISMATCH] local P row shard does not match the canonical "
-            "logical split reconstructed from global Dion metadata "
+            "split reconstructed from global Dion metadata "
             f"meta_id={meta_id} global_shape={(m_global, n_global)} "
             f"is_transposed={int(is_transposed)} global_rows={global_rows} "
             f"ortho_world_size={ortho_world_size} ortho_rank={ortho_rank} "
@@ -664,7 +533,7 @@ def _reduce_scatter_batch_shards(
     batch_sizes: Sequence[int],
     group: torch.distributed.ProcessGroup,
 ) -> Tensor:
-    """Reduce-scatter a logical batch tensor to one owned batch shard."""
+    """Reduce-scatter a batch tensor to one rank-local batch shard."""
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
     batch_sizes = [int(size) for size in batch_sizes]
@@ -706,7 +575,7 @@ def _reduce_scatter_batch_shards(
 
 def _make_sharded_sketch(
     *,
-    logical_seed_keys: Sequence[object],
+    sketch_keys: Sequence[object],
     oversample: float,
     row_sizes: Sequence[int],
     row_rank: int,
@@ -714,7 +583,7 @@ def _make_sharded_sketch(
     dtype: torch.dtype,
     r: int,
 ) -> Tensor:
-    """Return the local row shard of one logical distributed sketch batch."""
+    """Return the local row shard of one distributed sketch batch."""
     local_rows = int(row_sizes[row_rank])
     row_offset = sum(int(size) for size in row_sizes[:row_rank])
     global_rows = sum(int(size) for size in row_sizes)
@@ -725,40 +594,40 @@ def _make_sharded_sketch(
         )
     std = math.sqrt(1.0 / k)
     sketch = torch.empty(
-        (len(logical_seed_keys), k, local_rows),
+        (len(sketch_keys), k, local_rows),
         device=device,
         dtype=dtype,
     )
-    for index, seed_key in enumerate(logical_seed_keys):
-        global_slot = _seeded_normal_tensor(
+    for index, seed_key in enumerate(sketch_keys):
+        full_sketch = _seeded_normal_tensor(
             (k, global_rows),
             seed_key=seed_key,
             device=device,
             dtype=dtype,
             std=std,
         )
-        sketch[index].copy_(global_slot[:, row_offset : row_offset + local_rows])
+        sketch[index].copy_(full_sketch[:, row_offset : row_offset + local_rows])
     return sketch
 
 
 def generate_random_sketch_matrix(
     P: Tensor,
     oversample: float = 1.25,
-    sketch_fn=None,
+    make_sketch=None,
 ) -> Tensor:
     """Local sketch generation contract for regular-tensor orthogonalization."""
     assert P.ndim >= 3, "P must have batch dimension"
 
-    batch_size = P.shape[:-2]
+    batch_shape = P.shape[:-2]
     m = P.size(-2)
     r = P.size(-1)
     k = math.ceil(oversample * r / 128.0) * 128
     std = math.sqrt(1.0 / k)
 
-    if sketch_fn is not None:
-        return sketch_fn(P, oversample)
+    if make_sketch is not None:
+        return make_sketch(P, oversample)
 
-    S = torch.empty((*batch_size, k, m), device=P.device, dtype=P.dtype)
+    S = torch.empty((*batch_shape, k, m), device=P.device, dtype=P.dtype)
     S.normal_(std=std)
     return S
 
@@ -785,21 +654,23 @@ def distributed_orthogonalize(
         ortho_rank = 0
 
     if ortho_group is None or ortho_world_size <= 1:
-        result = torch.empty_like(P_batch)
-        for index in range(batch_size):
-            result[index] = optimizer._orthogonalize(P_batch[index], rcqr_oversample=oversample)
-        return result
+        with _dion_math_precision_context():
+            P_ortho = orthogonalize(
+                P_batch,
+                rcqr_oversample=optimizer.defaults["rcqr_oversample"],
+            ).to(torch.float32)
+        return P_ortho.to(original_dtype).contiguous()
 
-    logical_seed_keys = sketch_keys_for_update(
-        optimizer,
+    sketch_keys = sketch_keys(
         dist_metas=dist_metas[:batch_size] if dist_metas is not None else None,
-        tag="logical_local",
+        contract="distributed",
+        step_count=optimizer._step_count,
     )
-    if logical_seed_keys is None or len(logical_seed_keys) != batch_size:
+    if sketch_keys is None or len(sketch_keys) != batch_size:
         raise RuntimeError(
             "[DION_MISSING_DISTRIBUTED_SKETCH_KEYS] "
-            f"batch_size={batch_size} logical_seed_keys="
-            f"{0 if logical_seed_keys is None else len(logical_seed_keys)}"
+            f"batch_size={batch_size} sketch_keys="
+            f"{0 if sketch_keys is None else len(sketch_keys)}"
         )
 
     local_rows = int(P_batch.size(1))
@@ -820,116 +691,84 @@ def distributed_orthogonalize(
         P_local = P_batch.to(dtype=torch.float32)
 
         if global_rows <= r:
-            P_owned = _row_to_batch(
+            P_local = _row_to_batch(
                 P_local,
                 row_sizes=row_sizes,
                 batch_sizes=batch_sizes,
                 group=ortho_group,
             )
-            if int(P_owned.size(0)) > 0:
-                P_owned = _orthogonalize_qr_local(P_owned.to(dtype=torch.float32))
+            if int(P_local.size(0)) > 0:
+                P_local = torch.linalg.qr(
+                    P_local.to(dtype=torch.float32),
+                    mode="reduced",
+                )[0].to(dtype=torch.float32)
             P_local = _batch_to_row(
-                P_owned.to(dtype=torch.float32),
+                P_local.to(dtype=torch.float32),
                 row_sizes=row_sizes,
                 batch_sizes=batch_sizes,
                 group=ortho_group,
             )
             return P_local.to(original_dtype).contiguous()
 
-        S_local = _make_sharded_sketch(
-            logical_seed_keys=logical_seed_keys,
-            oversample=oversample,
-            row_sizes=row_sizes,
-            row_rank=ortho_rank,
-            device=P_local.device,
-            dtype=P_local.dtype,
-            r=r,
-        )
-        SP_local = S_local @ P_local
-        SP_owned = _reduce_scatter_batch_shards(
-            SP_local,
+        R_local = _reduce_scatter_batch_shards(
+            _make_sharded_sketch(
+                sketch_keys=sketch_keys,
+                oversample=oversample,
+                row_sizes=row_sizes,
+                row_rank=ortho_rank,
+                device=P_local.device,
+                dtype=P_local.dtype,
+                r=r,
+            )
+            @ P_local,
             batch_sizes=batch_sizes,
             group=ortho_group,
         )
-        if int(SP_owned.size(0)) > 0:
-            R_local = _qr_r_factor(SP_owned.to(dtype=torch.float32))
+        if int(R_local.size(0)) > 0:
+            R_local = _qr_r_factor(R_local.to(dtype=torch.float32))
         else:
             R_local = torch.empty(
                 (0, r, r),
                 device=P_local.device,
                 dtype=torch.float32,
             )
-        R = _all_gather_batch_shards(R_local, batch_sizes=batch_sizes, group=ortho_group)
-        P_local = _solve_triangular_right(R, P_local)
+        P_local = _solve_triangular_right(
+            _all_gather_batch_shards(
+                R_local,
+                batch_sizes=batch_sizes,
+                group=ortho_group,
+            ),
+            P_local,
+        )
 
-        P_local32 = P_local.to(dtype=torch.float32)
-        PP_local = P_local32.mT @ P_local32
-        PP_owned = _reduce_scatter_batch_shards(
-            PP_local,
+        R_local = _reduce_scatter_batch_shards(
+            P_local.mT @ P_local,
             batch_sizes=batch_sizes,
             group=ortho_group,
         )
-        if int(PP_owned.size(0)) > 0:
-            R_local = _cholesky_upper_factor(PP_owned)
+        if int(R_local.size(0)) > 0:
+            R_local = _cholesky_upper_factor(R_local)
         else:
             R_local = torch.empty(
                 (0, r, r),
                 device=P_local.device,
                 dtype=torch.float32,
             )
-        R = _all_gather_batch_shards(R_local, batch_sizes=batch_sizes, group=ortho_group)
-        P_local = _solve_triangular_right(R, P_local32)
+        P_local = _solve_triangular_right(
+            _all_gather_batch_shards(
+                R_local,
+                batch_sizes=batch_sizes,
+                group=ortho_group,
+            ),
+            P_local,
+        )
         return P_local.to(original_dtype).contiguous()
-def orthogonalize_local_slice(
-    optimizer,
-    P_slice: torch.Tensor,
-    dist_metas: Optional[List] = None,
-    *,
-    tag: str = "local",
-    sketch_tag: Optional[str] = None,
-    sketch_fn=None,
-    use_seeded_sketch: bool = True,
-) -> torch.Tensor:
-    """Local orthogonalization path for a batched slice."""
-    if P_slice.size(0) == 0:
-        return P_slice
-
-    if use_seeded_sketch and sketch_fn is None and dist_metas is not None:
-        sketch_fn = make_seeded_sketch_for_update(
-            optimizer,
-            dist_metas=dist_metas,
-            tag=sketch_tag if sketch_tag is not None else tag,
-        )
-
-    P_ortho_slice = orthogonalize(
-        P_slice,
-        rcqr_oversample=optimizer.defaults['rcqr_oversample'],
-        sketch_fn=sketch_fn,
-    ).to(torch.float32)
-    return P_ortho_slice.to(P_slice.dtype)
-
-
-def orthogonalize_local_matrix_batch(
-    optimizer,
-    P_slice: torch.Tensor,
-    dist_metas: Optional[List] = None,
-    *,
-    tag: str = "local_matrix",
-) -> torch.Tensor:
-    """Regular-Tensor local orthogonalization for one logical full matrix."""
-    return orthogonalize_local_slice(
-        optimizer,
-        P_slice,
-        dist_metas=dist_metas,
-        tag=tag,
-        sketch_tag="logical_local",
-    )
 
 
 def _default_sketch_matrix(P: Tensor, oversample: float) -> Tensor:
     """Generate default random sketch matrix without synchronization.
 
-    Used when no sketch_fn is provided (single-rank case).
+    Used when no explicit sketch generator is provided (single-rank case).
 
     Args:
         P: Matrix being orthogonalized, shape (..., m, r)

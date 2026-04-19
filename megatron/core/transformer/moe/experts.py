@@ -218,7 +218,6 @@ class GroupedMLP(MegatronModule):
                     incompatible_keys.unexpected_keys.remove(key)
 
         self.register_load_state_dict_post_hook(remove_extra_states_check)
-
     @torch.no_grad()
     def set_layer_number(self, layer_number: int):
         """Reinitialize expert weights from topology-invariant logical seeds."""
@@ -664,7 +663,6 @@ class TEGroupedMLP(MegatronModule):
             assert HAVE_TE, "FP8 and FP4 requires TE."
             self.quantization_padding = Fp8Padding(self.num_local_experts)
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
-
     @torch.no_grad()
     def set_layer_number(self, layer_number: int):
         self.layer_number = int(layer_number)

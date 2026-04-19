@@ -184,6 +184,14 @@ def validate_yaml(args, defaults={}):
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_iters == 0, \
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
+            assert 0.0 <= args.lr_warmup_fraction < 1.0, \
+                'expected iteration-based lr-warmup-fraction to be in [0, 1)'
+        else:
+            effective_lr_decay_iters = (
+                args.lr_decay_iters if args.lr_decay_iters is not None else args.train_iters
+            )
+            assert args.lr_warmup_iters < effective_lr_decay_iters, \
+                'expected iteration-based lr-warmup-iters to be smaller than effective lr-decay-iters'
 
     # Sample-based training.
     if args.train_samples:
@@ -199,6 +207,14 @@ def validate_yaml(args, defaults={}):
             assert args.lr_warmup_samples == 0, \
                 'can only specify one of lr-warmup-fraction ' \
                 'and lr-warmup-samples'
+            assert 0.0 <= args.lr_warmup_fraction < 1.0, \
+                'expected sample-based lr-warmup-fraction to be in [0, 1)'
+        else:
+            effective_lr_decay_samples = (
+                args.lr_decay_samples if args.lr_decay_samples is not None else args.train_samples
+            )
+            assert args.lr_warmup_samples < effective_lr_decay_samples, \
+                'expected sample-based lr-warmup-samples to be smaller than effective lr-decay-samples'
 
     # How to handle this better
     if args.language_model.num_layers is not None:
@@ -431,4 +447,3 @@ def load_yaml(yaml_path):
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
         return config_namespace
-

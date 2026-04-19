@@ -70,7 +70,6 @@ def get_grad_norm_fp32(
     Returns:
         Total norm of the parameters (viewed as a single vector).
     """
-
     if isinstance(grads_for_norm, torch.Tensor):
         grads_for_norm = [grads_for_norm]
 
@@ -131,7 +130,6 @@ def get_grad_norm_fp32(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
         total_norm = total_norm.item() ** (1.0 / norm_type)
-
     return total_norm
 
 

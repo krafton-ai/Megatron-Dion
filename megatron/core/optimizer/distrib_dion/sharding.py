@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DionShardLayout:
-    """Minimal Dion shard layout for one logical model parameter."""
+    """Minimal Dion shard layout for one model parameter."""
 
     local_shape: Tuple[int, int]
     global_shape: Tuple[int, int]
@@ -84,26 +84,26 @@ def compute_local_shape(
     return (m, local_split_size)
 
 
-def slice_fs_shard_2d(
+def fs_shard_view_2d(
     tensor2d: torch.Tensor,
     fs_shard_dim: int,
     start_idx: int,
     end_idx: int,
 ) -> torch.Tensor:
-    """Return a view for the FS shard slice of a 2D tensor."""
+    """Return a view for one FS shard of a 2D tensor."""
     if fs_shard_dim == 0:
         return tensor2d[start_idx:end_idx, :]
     return tensor2d[:, start_idx:end_idx]
 
 
-def write_fs_shard_2d(
+def set_fs_shard_view_2d(
     dst2d: torch.Tensor,
     fs_shard_dim: int,
     start_idx: int,
     end_idx: int,
     src2d: torch.Tensor,
 ) -> None:
-    """In-place write `src2d` into `dst2d` at the FS shard slice."""
+    """In-place write `src2d` into one FS shard view of `dst2d`."""
     if fs_shard_dim == 0:
         dst2d[start_idx:end_idx, :].copy_(src2d)
     else:
@@ -136,10 +136,10 @@ def compute_fs_flat_segments(
 def resolve_tp_group(
     dist_meta,
     *,
-    require_in_distributed: bool,
-    group_size_fn: Callable,
+    expect_group: bool,
+    group_size: Callable,
 ) -> Optional[torch.distributed.ProcessGroup]:
-    """Return the authoritative TP group from adapter-owned metadata."""
+    """Return the authoritative TP group from adapter metadata."""
     param_name = getattr(dist_meta, "param_name", "") if dist_meta is not None else ""
     param_uid = getattr(dist_meta, "param_uid", None) if dist_meta is not None else None
     tp_group = getattr(dist_meta, "tp_group", None) if dist_meta is not None else None
@@ -147,7 +147,7 @@ def resolve_tp_group(
     meta_tp_rank = int(getattr(dist_meta, "tp_rank", -1)) if dist_meta is not None else -1
 
     if tp_group is None:
-        if require_in_distributed and meta_tp_world_size > 1:
+        if expect_group and meta_tp_world_size > 1:
             raise RuntimeError(
                 "[DION_MISSING_TP_GROUP_META] "
                 f"rank={dist.get_rank()} param={param_name} param_uid={param_uid} "
@@ -155,7 +155,7 @@ def resolve_tp_group(
             )
         return None
 
-    actual_tp_world_size = group_size_fn(tp_group)
+    actual_tp_world_size = group_size(tp_group)
     actual_tp_rank = dist.get_rank(tp_group)
     if actual_tp_world_size != meta_tp_world_size or actual_tp_rank != meta_tp_rank:
         raise RuntimeError(
@@ -172,10 +172,10 @@ def resolve_tp_group(
 def resolve_fs_group(
     dist_meta,
     *,
-    require_in_distributed: bool,
-    group_size_fn: Callable,
+    expect_group: bool,
+    group_size: Callable,
 ) -> Optional[torch.distributed.ProcessGroup]:
-    """Return the authoritative FS group from adapter-owned metadata."""
+    """Return the authoritative FS group from adapter metadata."""
     param_name = getattr(dist_meta, "param_name", "") if dist_meta is not None else ""
     param_uid = getattr(dist_meta, "param_uid", None) if dist_meta is not None else None
     fs_group = getattr(dist_meta, "fs_group", None) if dist_meta is not None else None
@@ -183,7 +183,7 @@ def resolve_fs_group(
     meta_fs_rank = int(getattr(dist_meta, "fs_rank", -1)) if dist_meta is not None else -1
 
     if fs_group is None:
-        if require_in_distributed and meta_fs_world_size > 1:
+        if expect_group and meta_fs_world_size > 1:
             raise RuntimeError(
                 "[DION_MISSING_FS_GROUP_META] "
                 f"rank={dist.get_rank()} param={param_name} param_uid={param_uid} "
@@ -191,7 +191,7 @@ def resolve_fs_group(
             )
         return None
 
-    actual_fs_world_size = group_size_fn(fs_group)
+    actual_fs_world_size = group_size(fs_group)
     actual_fs_rank = dist.get_rank(fs_group)
     if actual_fs_world_size != meta_fs_world_size or actual_fs_rank != meta_fs_rank:
         raise RuntimeError(
@@ -210,16 +210,16 @@ def resolve_ortho_group(
     dist_meta,
     *,
     use_fs_collectives: bool,
-    resolve_tp_group_fn: Callable,
-    resolve_fs_group_fn: Callable,
+    resolve_tp_group: Callable,
+    resolve_fs_group: Callable,
 ):
     """Return the authoritative orthogonalization group from adapter metadata."""
     use_tp_shard = bool(getattr(config, "use_tp_shard", False))
 
     if p_is_tp_sharded(config, use_tp_shard=use_tp_shard):
-        return resolve_tp_group_fn(dist_meta, require_in_distributed=True)
+        return resolve_tp_group(dist_meta, expect_group=True)
     if use_fs_collectives and p_is_fs_sharded(config):
-        return resolve_fs_group_fn(dist_meta, require_in_distributed=True)
+        return resolve_fs_group(dist_meta, expect_group=True)
     return None
 
 
@@ -229,7 +229,7 @@ def create_fs_shard(optimizer, model_param, shard_layout: DionShardLayout):
     end_idx = int(shard_layout.end_idx)
     fs_shard_dim = int(shard_layout.fs_shard_dim)
 
-    shard = slice_fs_shard_2d(model_param.detach(), fs_shard_dim, start_idx, end_idx)
+    shard = fs_shard_view_2d(model_param.detach(), fs_shard_dim, start_idx, end_idx)
     shard._model_param = model_param
     return shard
 
@@ -238,7 +238,7 @@ def prepare_fs_shard(optimizer, model_param, shard):
     """Attach FS shard to model_param for optimizer state."""
     shard_layout = optimizer._param_shard_layout(model_param)
     if shard_layout is not None:
-        expected_view = slice_fs_shard_2d(
+        expected_view = fs_shard_view_2d(
             model_param.data,
             int(shard_layout.fs_shard_dim),
             int(shard_layout.start_idx),

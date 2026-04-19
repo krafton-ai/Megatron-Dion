@@ -51,7 +51,7 @@ def _validate_exact_replica_group(
 
 
 def _get_or_create_cached_group(ranks: tuple[int, ...]) -> Optional[torch.distributed.ProcessGroup]:
-    """Return a cached process group for one deterministic dense-Dion mesh slice."""
+    """Return a cached process group for one deterministic dense-Dion mesh group."""
     if len(ranks) <= 1:
         return None
     cached_group = _DENSE_DION_GROUP_CACHE.get(ranks)
@@ -158,12 +158,12 @@ def _resolve_dense_mesh_groups(
     )
 
 
-def get_dion_scalar_param_override(
+def get_dion_param_override(
     config: OptimizerConfig,
     param: torch.nn.Parameter,
     param_override: Optional[ParamGroupOverride],
 ) -> Optional[ParamGroupOverride]:
-    """Return Dion scalar-path override for embedding/lm-head surfaces."""
+    """Return the Dion param override for scalar embedding/lm-head params."""
     if not isinstance(config, DionOptimizerConfig):
         return None
 
@@ -175,7 +175,12 @@ def get_dion_scalar_param_override(
     if not is_text_embedding and not is_lm_head:
         return None
 
-    scalar_override: ParamGroupOverride = {"wd_mult": 0.0}
+    dion_param_override: ParamGroupOverride = {"wd_mult": 0.0}
+    lr_scaling_rule = getattr(config, "dion_lr_scaling", None)
+
+    # Moonlight keeps scalar surfaces on the shared base-lr schedule.
+    if lr_scaling_rule == "moonlight":
+        return dion_param_override
 
     if is_lm_head and not is_tied_embedding_output:
         if param.ndim < 2:
@@ -198,11 +203,11 @@ def get_dion_scalar_param_override(
             if param_override is not None and "min_lr" in param_override
             else config.min_lr
         )
-        scalar_override["max_lr"] = current_max_lr / scale
+        dion_param_override["max_lr"] = current_max_lr / scale
         if current_min_lr is not None:
-            scalar_override["min_lr"] = current_min_lr / scale
+            dion_param_override["min_lr"] = current_min_lr / scale
 
-    return scalar_override
+    return dion_param_override
 
 
 def _get_dion_replica_group(
@@ -262,13 +267,13 @@ def _get_dion_replica_group(
             )
 
     raise RuntimeError(
-        "Dion RP>1 requires a logical replica group, but none could be resolved. "
+        "Dion RP>1 requires a replica group, but none could be resolved. "
         f"requested_fs={requested_fs_world_size} requested_rp={requested_rp_world_size} "
         f"is_expert_parallel={int(bool(is_expert_parallel))}"
     )
 
 
-def _get_dense_dion_logical_fs_group(
+def _get_dense_dion_fs_group(
     *,
     pure_dp_group: Optional[torch.distributed.ProcessGroup],
     requested_fs_world_size: int,
@@ -277,36 +282,36 @@ def _get_dense_dion_logical_fs_group(
     if requested_fs_world_size <= 1:
         return None
     try:
-        logical_fs_group = (
+        dion_fs_group = (
             parallel_state.get_intra_distributed_optimizer_instance_data_parallel_group(
                 check_initialized=False
             )
         )
     except Exception:
-        logical_fs_group = None
-    if logical_fs_group is not None:
-        logical_fs_world_size = dist.get_world_size(logical_fs_group)
-        if logical_fs_world_size == requested_fs_world_size:
-            return logical_fs_group
-    logical_fs_group, _ = _resolve_dense_mesh_groups(
+        dion_fs_group = None
+    if dion_fs_group is not None:
+        dion_fs_world_size = dist.get_world_size(dion_fs_group)
+        if dion_fs_world_size == requested_fs_world_size:
+            return dion_fs_group
+    dion_fs_group, _ = _resolve_dense_mesh_groups(
         pure_dp_group=pure_dp_group,
         requested_fs_world_size=requested_fs_world_size,
         requested_rp_world_size=requested_rp_world_size,
     )
-    return logical_fs_group
+    return dion_fs_group
 
 
 def _resolve_dion_fs_group(
     *,
-    logical_data_parallel_group: Optional[torch.distributed.ProcessGroup],
+    pure_data_parallel_group: Optional[torch.distributed.ProcessGroup],
     is_expert_parallel: bool,
     requested_fs_world_size: int,
     requested_rp_world_size: int,
 ) -> Optional[torch.distributed.ProcessGroup]:
     if is_expert_parallel:
         return parallel_state.get_expert_data_parallel_group(partial_expert_data_parallel=True)
-    return _get_dense_dion_logical_fs_group(
-        pure_dp_group=logical_data_parallel_group,
+    return _get_dense_dion_fs_group(
+        pure_dp_group=pure_data_parallel_group,
         requested_fs_world_size=requested_fs_world_size,
         requested_rp_world_size=requested_rp_world_size,
     )
@@ -317,7 +322,7 @@ def build_megatron_dion(
     config: DionOptimizerConfig,
     param_groups,
     data_parallel_group: Optional[torch.distributed.ProcessGroup],
-    logical_data_parallel_group: Optional[torch.distributed.ProcessGroup],
+    pure_data_parallel_group: Optional[torch.distributed.ProcessGroup],
     pg_collection: Optional[ProcessGroupCollection],
     is_expert_parallel: bool,
 ):
@@ -332,7 +337,7 @@ def build_megatron_dion(
     user_rp_world_size = getattr(config, 'replicate_model_parallel_size', 1) or 1
 
     fs_group = _resolve_dion_fs_group(
-        logical_data_parallel_group=logical_data_parallel_group,
+        pure_data_parallel_group=pure_data_parallel_group,
         is_expert_parallel=is_expert_parallel,
         requested_fs_world_size=user_fs_world_size,
         requested_rp_world_size=user_rp_world_size,
@@ -352,7 +357,7 @@ def build_megatron_dion(
 
     replica_group = _get_dion_replica_group(
         pg_collection,
-        logical_data_parallel_group,
+        pure_data_parallel_group,
         user_fs_world_size,
         user_rp_world_size,
         is_expert_parallel,
@@ -424,7 +429,7 @@ def build_distributed_optimizer_for_dion(
     model_chunks,
     per_model_buffers,
     data_parallel_group: Optional[torch.distributed.ProcessGroup],
-    logical_data_parallel_group: Optional[torch.distributed.ProcessGroup],
+    pure_data_parallel_group: Optional[torch.distributed.ProcessGroup],
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup],
     data_parallel_group_idx: Optional[int],
     distributed_optimizer_instance_id: int,
@@ -436,7 +441,7 @@ def build_distributed_optimizer_for_dion(
     requested_fs_size = getattr(config, 'fully_shard_model_parallel_size', None) or 1
     requested_rp_size = getattr(config, 'replicate_model_parallel_size', None) or 1
     fs_group = _resolve_dion_fs_group(
-        logical_data_parallel_group=logical_data_parallel_group,
+        pure_data_parallel_group=pure_data_parallel_group,
         is_expert_parallel=is_expert_parallel,
         requested_fs_world_size=requested_fs_size,
         requested_rp_world_size=requested_rp_size,
@@ -458,11 +463,11 @@ def build_distributed_optimizer_for_dion(
         model_chunks=model_chunks,
         per_model_buffers=per_model_buffers,
         data_parallel_group=data_parallel_group,
-        logical_data_parallel_group=logical_data_parallel_group,
-        logical_fs_group=fs_group,
+        pure_data_parallel_group=pure_data_parallel_group,
+        dion_fs_group=fs_group,
         replica_group=_get_dion_replica_group(
             pg_collection,
-            logical_data_parallel_group,
+            pure_data_parallel_group,
             requested_fs_size,
             requested_rp_size,
             is_expert_parallel,

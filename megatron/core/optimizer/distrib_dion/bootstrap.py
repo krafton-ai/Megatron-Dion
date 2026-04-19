@@ -9,15 +9,20 @@ import torch
 import torch.distributed as dist
 
 from ... import parallel_state
-from ..dion.state import q_init_seed_from_logical_id, resolve_q_state_layout
+from ..dion.state import (
+    get_global_shape,
+    q_seed_from_param_key,
+    resolve_q_state_layout,
+)
+from ..dion.utils import get_local_shape
 from ..dion.types import DionQInit, DionStepParam, ScalarStepParam
 
 
-def make_group_broadcast(process_group, *, group_size_fn: Callable):
+def make_group_broadcast(process_group, *, group_size: Callable):
     """Build a no-op or process-group broadcast callback."""
     if process_group is None:
         return lambda tensor: None
-    if group_size_fn(process_group) <= 1:
+    if group_size(process_group) <= 1:
         return lambda tensor: None
 
     group_ranks = dist.get_process_group_ranks(process_group)
@@ -30,7 +35,7 @@ def make_group_broadcast(process_group, *, group_size_fn: Callable):
 
 
 def resolve_base_training_seed() -> int:
-    """Return the topology-invariant base training seed used for logical Q init."""
+    """Return the topology-invariant base training seed used for Dion Q init."""
     try:
         from megatron.training.global_vars import get_args
 
@@ -49,10 +54,10 @@ def build_q_init(
     rank_fraction_default: float,
     rank_multiple_of_default: int,
     base_training_seed: int,
-    get_replicate_group_fn: Callable,
-    make_group_broadcast_fn: Callable,
+    get_replicate_group: Callable,
+    make_group_broadcast: Callable,
 ) -> DionQInit:
-    """Return the adapter-authored Q-init contract for one logical Dion param."""
+    """Return the adapter-authored Q-init contract for one Dion param."""
     if dist_meta is None:
         raise RuntimeError(
             "[DION_MISSING_STATE_INIT_META] "
@@ -67,7 +72,12 @@ def build_q_init(
             f"param_uid={getattr(dist_meta, 'param_uid', None)}"
         )
 
-    local_shape = tuple(int(dim) for dim in getattr(dist_meta, "shape", ()))
+    physical_local_shape = tuple(int(dim) for dim in getattr(dist_meta, "shape", ()))
+    local_shape = get_local_shape(
+        dist_meta,
+        int(physical_local_shape[0]) if len(physical_local_shape) >= 1 else 0,
+        int(physical_local_shape[1]) if len(physical_local_shape) >= 2 else 0,
+    )
     if len(local_shape) != 2:
         raise RuntimeError(
             "[DION_INVALID_STATE_INIT_LOCAL_SHAPE] "
@@ -87,24 +97,24 @@ def build_q_init(
         config,
         tp_world_size=tp_world_size,
         use_q_unshard=use_q_unshard,
-        global_shape=tuple(dist_meta.global_shape),
+        global_shape=get_global_shape(dist_meta, local_shape[0], local_shape[1]),
         rank_fraction=rank_fraction,
         rank_multiple_of=rank_multiple_of,
     )
-    q_init_seed = q_init_seed_from_logical_id(
+    q_seed = q_seed_from_param_key(
         base_seed=base_training_seed,
         dist_meta=dist_meta,
         q_global_shape=tuple(int(dim) for dim in q_layout.q_global_shape),
         is_transposed=config.is_transposed,
     )
-    replicate_group = get_replicate_group_fn()
+    replicate_group = get_replicate_group()
     return DionQInit(
         tp_world_size=tp_world_size,
         tp_rank=tp_rank,
         use_q_unshard=use_q_unshard,
-        q_init_seed=int(q_init_seed),
+        q_seed=int(q_seed),
         q_layout=q_layout,
-        broadcast_q_fn=make_group_broadcast_fn(replicate_group),
+        broadcast_q=make_group_broadcast(replicate_group),
     )
 
 
@@ -112,14 +122,14 @@ def sync_q_replicas(
     *,
     dion_params: List[DionStepParam],
     state_replica_group,
-    group_size_fn: Callable,
-    make_group_broadcast_fn: Callable,
+    group_size: Callable,
+    make_group_broadcast: Callable,
 ) -> None:
     """Synchronize freshly initialized Q across standard DO state replicas."""
-    if state_replica_group is None or group_size_fn(state_replica_group) <= 1:
+    if state_replica_group is None or group_size(state_replica_group) <= 1:
         return
 
-    broadcast_q = make_group_broadcast_fn(state_replica_group)
+    broadcast_q = make_group_broadcast(state_replica_group)
     for step_param in dion_params:
         state = step_param.optimizer_state
         dist_meta = step_param.dist_meta
@@ -148,7 +158,7 @@ def use_distributed_dion_update(
     dist_meta,
     global_rank: int,
 ) -> bool:
-    """Return the adapter-owned distributed Dion routing decision."""
+    """Return whether this param should use the distributed Dion update."""
     if dist_meta is None:
         raise RuntimeError(
             "[DION_MISSING_DIST_META_FOR_UPDATE_ROUTING] "
@@ -182,7 +192,7 @@ def get_or_initialize_optimizer_state(
     optim_group,
     dion_state_param_by_uid,
     dion_dist_meta_by_uid,
-    init_optimizer_state_fn,
+    init_optimizer_state,
 ):
     """Own distributed state remap and metadata recovery at the adapter boundary."""
     dist_meta = optimizer.dist_metas.get(param, None)
@@ -205,7 +215,7 @@ def get_or_initialize_optimizer_state(
 
     state = optimizer.state[param]
     if len(state) == 0:
-        init_optimizer_state_fn(param, state, optim_group)
+        init_optimizer_state(param, state, optim_group)
     return state
 
 
@@ -216,9 +226,9 @@ def validate_step_groups_(
     rp_group,
     fs_group,
     state_replica_group,
-    route_step_params_fn: Callable,
-    group_size_fn: Callable,
-    group_rank_fn: Callable,
+    route_step_params: Callable,
+    group_size: Callable,
+    group_rank: Callable,
     use_compressed_comm: bool,
     use_fs_collectives: bool,
 ) -> Callable:
@@ -264,8 +274,8 @@ def validate_step_groups_(
     def _validate_group_membership(group, label):
         if group is None:
             return 1, 0
-        world_size = group_size_fn(group)
-        rank = group_rank_fn(group)
+        world_size = group_size(group)
+        rank = group_rank(group)
         group_ranks = dist.get_process_group_ranks(group)
         if len(group_ranks) != world_size or dist.get_rank() not in group_ranks:
             raise RuntimeError(
@@ -290,7 +300,7 @@ def validate_step_groups_(
             }
             del local_config
 
-    return route_step_params_fn
+    return route_step_params
 
 
 def validate_uniform_fs_topology_(
@@ -328,7 +338,7 @@ def validate_enabled_rp_topology(
     data_parallel_group,
     global_rank: int,
     dist_metas_sharded,
-    logger_error_fn,
+    log_error,
 ) -> None:
     """Fail fast unless RP topology and Dion eligibility are uniform across RP groups."""
     if expected_rp_size <= 1:
@@ -388,48 +398,48 @@ def enable_distributed_dion(
     fs_group,
     state_replica_group,
     expected_rp_size: int,
-    build_dist_metas_fn: Callable,
-    route_step_params_fn: Callable,
-    group_size_fn: Callable,
-    group_rank_fn: Callable,
+    build_dist_metas: Callable,
+    route_step_params: Callable,
+    group_size: Callable,
+    group_rank: Callable,
     use_compressed_comm: bool,
     use_fs_collectives: bool,
-    validate_enabled_rp_topology_fn: Callable,
-    logger_error_fn: Callable,
+    validate_enabled_rp_topology: Callable,
+    log_error: Callable,
 ):
     """Enable distributed Dion mode and return the final distributed metadata."""
     if dist.is_initialized() and dist.get_world_size() == 1:
         return None
 
     try:
-        dist_metas_sharded = build_dist_metas_fn()
+        dist_metas_sharded = build_dist_metas()
     except Exception as exc:
-        logger_error_fn("[Dion] Global rank %s: Failed in _build_dist_metas: %s", global_rank, exc)
-        logger_error_fn(traceback.format_exc())
+        log_error("[Dion] Global rank %s: Failed in _build_dist_metas: %s", global_rank, exc)
+        log_error(traceback.format_exc())
         raise
 
     replica_group = replica_group or data_parallel_group
     optimizer.enable_distributed_mode(
-        route_step_params_fn=validate_step_groups_(
+        route_step_params=validate_step_groups_(
             replica_group=replica_group,
             tp_group=tp_group,
             rp_group=rp_group,
             fs_group=fs_group,
             state_replica_group=state_replica_group,
-            route_step_params_fn=route_step_params_fn,
-            group_size_fn=group_size_fn,
-            group_rank_fn=group_rank_fn,
+            route_step_params=route_step_params,
+            group_size=group_size,
+            group_rank=group_rank,
             use_compressed_comm=use_compressed_comm,
             use_fs_collectives=use_fs_collectives,
         ),
     )
-    validate_enabled_rp_topology_fn(
+    validate_enabled_rp_topology(
         expected_rp_size=expected_rp_size,
         rp_group=rp_group,
         data_parallel_group=data_parallel_group,
         global_rank=global_rank,
         dist_metas_sharded=dist_metas_sharded,
-        logger_error_fn=logger_error_fn,
+        log_error=log_error,
     )
     return dist_metas_sharded
 
@@ -438,12 +448,12 @@ def route_step_params(
     *,
     param_groups,
     dist_metas,
-    get_step_param_grad_fn: Callable,
-    get_or_initialize_optimizer_state_fn: Callable,
-    require_param_config_fn: Callable,
-    use_distributed_dion_update_fn: Callable,
-    sync_q_replicas_fn: Callable,
-    build_dion_batches_fn: Callable,
+    get_step_param_grad: Callable,
+    get_or_initialize_optimizer_state: Callable,
+    require_param_config: Callable,
+    use_distributed_dion_update: Callable,
+    sync_q_replicas: Callable,
+    build_dion_batches: Callable,
 ):
     """Route one optimizer step into Dion batches and scalar updates."""
     scalar_params: list[ScalarStepParam] = []
@@ -451,15 +461,15 @@ def route_step_params(
 
     for optim_group in param_groups:
         for param in optim_group["params"]:
-            grad = get_step_param_grad_fn(param)
+            grad = get_step_param_grad(param)
             if grad is None:
                 continue
 
-            optimizer_state = get_or_initialize_optimizer_state_fn(param, optim_group)
+            optimizer_state = get_or_initialize_optimizer_state(param, optim_group)
             dist_meta = dist_metas.get(param, None)
-            config = require_param_config_fn(param, dist_meta)
+            config = require_param_config(param, dist_meta)
 
-            if use_distributed_dion_update_fn(param, optimizer_state, optim_group, dist_meta):
+            if use_distributed_dion_update(param, optimizer_state, optim_group, dist_meta):
                 dion_params.append(
                     DionStepParam(
                         param=param,
@@ -497,7 +507,7 @@ def route_step_params(
             ordered_dion_params.append((param_uid, step_param))
         ordered_dion_params.sort(key=lambda entry: entry[0])
         dion_params = [step_param for _, step_param in ordered_dion_params]
-        sync_q_replicas_fn(dion_params)
-        dion_batches = build_dion_batches_fn(dion_params)
+        sync_q_replicas(dion_params)
+        dion_batches = build_dion_batches(dion_params)
 
     return dion_batches, scalar_params

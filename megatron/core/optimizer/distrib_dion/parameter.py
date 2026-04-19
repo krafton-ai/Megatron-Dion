@@ -19,7 +19,7 @@ from .sharding import (
     get_fs_split_dim,
     get_tp_split_dim,
     is_tp_enabled,
-    slice_fs_shard_2d,
+    fs_shard_view_2d,
 )
 
 
@@ -102,7 +102,7 @@ class DionBucketEntry:
 
 @dataclass(frozen=True)
 class DionBucketLayout:
-    """Bucket-local Dion transport layout under stock DO ownership."""
+    """Bucket-local Dion transport layout under stock DO control."""
 
     entries: Tuple[DionBucketEntry, ...]
     shard_size: int
@@ -139,7 +139,7 @@ def build_dion_entries(
         )
     if grad_shard_group_size % fs_size != 0:
         raise RuntimeError(
-            "[Dion] Dion grad shard group is incompatible with logical FS topology "
+            "[Dion] Dion grad shard group is incompatible with FS topology "
             f"(grad_group={grad_shard_group_size}, fs_size={fs_size})"
         )
     grad_ranks_per_fs_rank = grad_shard_group_size // fs_size
@@ -199,8 +199,8 @@ def build_dion_entries(
             )
         grad_rank_flat_segments = []
         for grad_rank in range(grad_shard_group_size):
-            logical_fs_rank = int(grad_rank // grad_ranks_per_fs_rank)
-            grad_rank_flat_segments.append(canonical_rank_flat_segments[logical_fs_rank])
+            grad_fs_rank = int(grad_rank // grad_ranks_per_fs_rank)
+            grad_rank_flat_segments.append(canonical_rank_flat_segments[grad_fs_rank])
 
         shard_layout = DionShardLayout(
             local_shape=tuple(int(dim) for dim in local_shape),
@@ -319,11 +319,11 @@ def set_dion_local_shard_(
     *,
     entry,
     full_view_2d: torch.Tensor,
-    update_data_shard_fn: Callable[[torch.nn.Parameter, torch.Tensor], None],
-    param_name_fn: Callable[[torch.nn.Parameter], str],
+    update_data_shard: Callable[[torch.nn.Parameter, torch.Tensor], None],
+    param_name: Callable[[torch.nn.Parameter], str],
 ) -> None:
     """Set one Dion param's canonical local shard view from a full bucket view."""
-    local_target = slice_fs_shard_2d(
+    local_target = fs_shard_view_2d(
         full_view_2d,
         int(entry.fs_shard_dim),
         int(entry.start_idx),
@@ -333,19 +333,19 @@ def set_dion_local_shard_(
     if local_numel != local_target.numel():
         raise RuntimeError(
             "[Dion] local restore shard size mismatch "
-            f"param={param_name_fn(entry.param)} "
+            f"param={param_name(entry.param)} "
             f"source={local_numel} target={int(local_target.numel())}"
         )
-    update_data_shard_fn(entry.param, local_target)
+    update_data_shard(entry.param, local_target)
     entry.param._fs_shard = local_target
 
 
 def restore_dion_local_shards_from_bucket(
     *,
     dion_layout: DionBucketLayout | None,
-    get_full_view_2d_fn: Callable[[object], torch.Tensor],
-    update_data_shard_fn: Callable[[torch.nn.Parameter, torch.Tensor], None],
-    param_name_fn: Callable[[torch.nn.Parameter], str],
+    get_full_view_2d: Callable[[object], torch.Tensor],
+    update_data_shard: Callable[[torch.nn.Parameter, torch.Tensor], None],
+    param_name: Callable[[torch.nn.Parameter], str],
 ) -> None:
     """Restore all Dion local shard aliases from canonical bucket.param_data views."""
     if dion_layout is None or not dion_layout.has_params:
@@ -353,9 +353,9 @@ def restore_dion_local_shards_from_bucket(
     for entry in dion_layout.entries:
         set_dion_local_shard_(
             entry=entry,
-            full_view_2d=get_full_view_2d_fn(entry),
-            update_data_shard_fn=update_data_shard_fn,
-            param_name_fn=param_name_fn,
+            full_view_2d=get_full_view_2d(entry),
+            update_data_shard=update_data_shard,
+            param_name=param_name,
         )
 
 
@@ -365,10 +365,10 @@ def _restore_dion_bucket(
     prepared_entries: Iterable[object],
     gathered_buffer: torch.Tensor,
     shard_group_size: int,
-    update_data_shard_fn: Callable[[torch.nn.Parameter, torch.Tensor], None],
-    param_name_fn: Callable[[torch.nn.Parameter], str],
+    update_data_shard: Callable[[torch.nn.Parameter, torch.Tensor], None],
+    param_name: Callable[[torch.nn.Parameter], str],
 ) -> None:
-    """Restore canonical bucket storage from one packed gathered Dion shard buffer."""
+    """Restore canonical bucket storage from one gathered Dion shard buffer."""
     if gathered_buffer.dim() != 2:
         raise RuntimeError(
             f"[Dion] gathered Dion bucket buffer must be 2D, got shape={tuple(gathered_buffer.shape)}"
@@ -404,8 +404,8 @@ def _restore_dion_bucket(
         set_dion_local_shard_(
             entry=entry,
             full_view_2d=full_view_2d,
-            update_data_shard_fn=update_data_shard_fn,
-            param_name_fn=param_name_fn,
+            update_data_shard=update_data_shard,
+            param_name=param_name,
         )
 
 
@@ -656,7 +656,7 @@ def bucket_full_param_view_2d(bucket, param, entry) -> Optional[torch.Tensor]:
         raise RuntimeError(
             "[Dion] canonical full-param view size mismatch "
             f"for param={getattr(param, 'shape', None)} bucket={getattr(bucket, 'bucket_id', -1)} "
-            f"slice_numel={int(full_flat.numel())} expected_numel={expected_numel} "
+            f"view_numel={int(full_flat.numel())} expected_numel={expected_numel} "
             f"full_shape={full_shape}"
         )
     return full_flat.view(full_shape)
@@ -748,7 +748,7 @@ def attach_dion_bucket_layout(
     bucket,
     dion_bucket_layout: DionBucketLayout,
 ) -> None:
-    """Validate that planned Dion entries already target the current runtime bucket."""
+    """Validate that stored Dion entries already target the current runtime bucket."""
     if not hasattr(bucket, "param_to_index") or bucket.param_to_index is None:
         raise RuntimeError(
             f"[Dion] buffer={gbuf_idx} bucket={bucket.bucket_id} missing bucket.param_to_index"
@@ -760,7 +760,7 @@ def attach_dion_bucket_layout(
             buffer_name_map = getattr(buffer, "param_to_name", None)
             param_name = optimizer._lookup_param_name(buffer_name_map, entry_param)
             raise RuntimeError(
-                f"[Dion] buffer={gbuf_idx} bucket={bucket.bucket_id} planned param "
+                f"[Dion] buffer={gbuf_idx} bucket={bucket.bucket_id} stored param "
                 f"{param_name or f'id_{id(entry_param)}'} "
                 "is not present in the current runtime bucket"
             )
@@ -824,7 +824,7 @@ def bucket_dion_full_view(optimizer, bucket, entry: DionBucketEntry) -> torch.Te
     if full_view_2d is None:
         raise RuntimeError(
             "[Dion] canonical FS gather requires bucket.param_data view "
-            f"for param={optimizer._canonical_param_name(entry.param) or f'id_{id(entry.param)}'} "
+            f"for param={optimizer._param_name(entry.param) or f'id_{id(entry.param)}'} "
             f"bucket={getattr(bucket, 'bucket_id', -1)}"
         )
     return full_view_2d
@@ -838,7 +838,7 @@ def fill_dion_shard_buffer(
     shard_buffer: torch.Tensor,
 ) -> None:
     """Pack one Dion local shard into a gather input buffer."""
-    canonical_local_source = slice_fs_shard_2d(
+    canonical_local_source = fs_shard_view_2d(
         full_view_2d,
         int(entry.fs_shard_dim),
         int(entry.start_idx),
@@ -849,20 +849,20 @@ def fill_dion_shard_buffer(
         if bound_data_shard.numel() != canonical_local_source.numel():
             raise RuntimeError(
                 "[Dion] canonical FS gather source size mismatch "
-                f"param={optimizer._canonical_param_name(entry.param) or f'id_{id(entry.param)}'} "
+                f"param={optimizer._param_name(entry.param) or f'id_{id(entry.param)}'} "
                 f"bound={int(bound_data_shard.numel())} canonical={int(canonical_local_source.numel())}"
             )
         if bound_data_shard.data_ptr() != canonical_local_source.data_ptr():
             raise RuntimeError(
                 "[Dion] canonical FS gather source mismatch "
-                f"for param={optimizer._canonical_param_name(entry.param) or f'id_{id(entry.param)}'}: "
-                "registered data_shard no longer aliases bucket.param_data canonical FS slice"
+                f"for param={optimizer._param_name(entry.param) or f'id_{id(entry.param)}'}: "
+                "registered data_shard no longer aliases bucket.param_data canonical FS view"
             )
     local_numel = int(entry.local_numel)
     if canonical_local_source.numel() != local_numel:
         raise RuntimeError(
             "[Dion] local gather source size mismatch "
-            f"param={optimizer._canonical_param_name(entry.param) or f'id_{id(entry.param)}'} "
+            f"param={optimizer._param_name(entry.param) or f'id_{id(entry.param)}'} "
             f"source={int(canonical_local_source.numel())} expected={local_numel}"
         )
     shard_buffer.zero_()
@@ -870,7 +870,7 @@ def fill_dion_shard_buffer(
 
 
 def prepare_dion_bucket_gather(optimizer, bucket) -> Tuple[torch.Tensor, List[Tuple[DionBucketEntry, torch.Tensor]]]:
-    """Prepack one bucket-local Dion shard buffer in canonical entry order."""
+    """Build one bucket-local Dion shard buffer in canonical entry order."""
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not dion_layout.has_params:
         return (
@@ -916,8 +916,8 @@ def restore_bucket(
         prepared_entries=prepared_entries,
         gathered_buffer=gathered_buffer,
         shard_group_size=shard_group_size,
-        update_data_shard_fn=optimizer._update_data_shard,
-        param_name_fn=lambda param: optimizer._canonical_param_name(param) or f'id_{id(param)}',
+        update_data_shard=optimizer._update_data_shard,
+        param_name=lambda param: optimizer._param_name(param) or f'id_{id(param)}',
     )
 
 
@@ -990,7 +990,7 @@ def all_gather_non_dion_bucket(optimizer, bucket, async_op=False):
 
         full_view = bucket_param_view(bucket, param)
         if full_view is None:
-            param_name = optimizer._canonical_param_name(param)
+            param_name = optimizer._param_name(param)
             raise RuntimeError(
                 "[Dion] mixed non-Dion all-gather requires canonical bucket.param_data view "
                 f"for param={param_name or f'id_{id(param)}'} "

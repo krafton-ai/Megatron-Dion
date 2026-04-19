@@ -1,9 +1,9 @@
 """Dion state helpers matching the dion_reference.py contract.
 
-This module isolates Dion-local state-init semantics from Megatron runtime
-ownership. The caller remains responsible for:
+This module isolates Dion-local state-init semantics from Megatron runtime.
+The caller remains responsible for:
 
-- local shard / metadata ownership
+- local shard / metadata routing
 - process-group discovery
 - topology validation
 - runtime ordering
@@ -141,19 +141,19 @@ def should_compress_all_reduce(
     return (m_global + n_global) * int(r_global) < m_global * n_global
 
 
-def q_init_seed_from_logical_id(
+def q_seed_from_param_key(
     *,
     base_seed: int,
     dist_meta: Optional[DionDistMeta],
     q_global_shape: Tuple[int, int],
     is_transposed: bool,
 ) -> int:
-    """Return the topology-invariant Q-init seed for one logical Dion parameter."""
+    """Return the topology-invariant Q-init seed for one Dion parameter."""
     param_uid = getattr(dist_meta, "param_uid", None) if dist_meta is not None else None
     param_name = getattr(dist_meta, "param_name", "") if dist_meta is not None else ""
     if param_uid is None and not param_name:
         raise RuntimeError(
-            "[DION_Q_INIT_SEED_ID_MISSING] logical Dion Q init requires param_uid or param_name"
+            "[DION_Q_INIT_SEED_ID_MISSING] Dion Q init requires param_uid or param_name"
         )
 
     seed_key = repr(
@@ -221,13 +221,14 @@ def build_param_config(
             config.is_transposed = True
 
         if use_compressed_comm:
+            global_shape = get_global_shape(dist_meta, local_m, local_n)
             layout = resolve_q_state_layout(
                 local_m,
                 local_n,
                 config,
                 tp_world_size=tp_world_size,
                 use_q_unshard=bool(config.has_tp_shard and use_tp_shard),
-                global_shape=tuple(dist_meta.global_shape),
+                global_shape=global_shape,
                 rank_fraction=dist_meta.rank_fraction,
                 rank_multiple_of=rank_multiple_of_default,
             )
@@ -236,7 +237,7 @@ def build_param_config(
                 if r_global_override is not None
                 else int(layout.r_global)
             )
-            m_global, n_global = tuple(int(dim) for dim in dist_meta.global_shape)
+            m_global, n_global = global_shape
             config.compressed_all_reduce = should_compress_all_reduce(
                 global_shape=(m_global, n_global),
                 r_global=r_global,
@@ -287,12 +288,12 @@ def p_is_fs_sharded(config: DionParamConfig) -> bool:
 
 
 def has_tp_shard(config: DionParamConfig) -> bool:
-    """Return whether TP sharding is logically present and physically active."""
+    """Return whether TP sharding is configured and active."""
     return bool(getattr(config, "use_tp_shard", False))
 
 
 def has_fs_shard(config: DionParamConfig, dist_meta=None) -> bool:
-    """Return whether FS sharding is logically present and physically active."""
+    """Return whether FS sharding is configured and active."""
     del dist_meta
     return bool(config.has_fs_shard and getattr(config, "use_fs_shard", False))
 
@@ -336,20 +337,20 @@ def needs_tp_r_reduce(
     return p_is_tp_sharded(config, use_tp_shard=use_tp_shard)
 
 
-def materialize_q_state(
+def init_q_state(
     *,
     param: Tensor,
     mixed_precision_config: DionMixedPrecisionConfig,
     config: DionParamConfig,
     dist_meta: Optional[DionDistMeta],
     q_layout,
-    q_init_seed: Optional[int],
+    q_seed: Optional[int],
     tp_world_size: int,
     tp_rank: int,
     use_q_unshard: bool,
 ) -> Tensor:
-    """Materialize one local Q state shard from explicit adapter-authored Q layout metadata."""
-    if q_init_seed is None:
+    """Initialize one local Q state shard from explicit Q layout metadata."""
+    if q_seed is None:
         raise RuntimeError(
             "[DION_MISSING_Q_INIT_SEED] "
             f"param_uid={getattr(dist_meta, 'param_uid', None)} "
@@ -386,10 +387,10 @@ def materialize_q_state(
     else:
         fs_rank = 0
 
-    logical_tp_rank = int(tp_rank) if use_q_unshard and int(tp_world_size) > 1 else 0
+    q_tp_rank = int(tp_rank) if use_q_unshard and int(tp_world_size) > 1 else 0
     fs_start = fs_rank * q_base_local
     fs_end = fs_start + q_local_shape[0]
-    tp_start = logical_tp_rank * r_local
+    tp_start = q_tp_rank * r_local
     tp_end = tp_start + q_local_shape[1]
 
     q_dtype = str_to_dtype(mixed_precision_config.q_dtype)
@@ -397,7 +398,7 @@ def materialize_q_state(
         q_dtype = param.dtype
 
     q_gen = torch.Generator(device=param.device)
-    q_gen.manual_seed(int(q_init_seed))
+    q_gen.manual_seed(int(q_seed))
     q_global_full = torch.randn(
         q_global_shape,
         device=param.device,
@@ -452,10 +453,10 @@ def init_param_state(
     tp_world_size = int(q_init.tp_world_size)
     tp_rank = int(q_init.tp_rank)
     use_q_unshard = bool(q_init.use_q_unshard)
-    q_init_seed = q_init.q_init_seed
-    broadcast_q_fn = q_init.broadcast_q_fn
+    q_seed = q_init.q_seed
+    broadcast_q = q_init.broadcast_q
     q_layout = q_init.q_layout
-    if broadcast_q_fn is None:
+    if broadcast_q is None:
         raise RuntimeError(
             "[DION_MISSING_Q_INIT_BROADCAST] "
             f"param_uid={getattr(dist_meta, 'param_uid', None)} "
@@ -474,9 +475,9 @@ def init_param_state(
         int(dim) for dim in (q_layout.q_gathered_shape or ())
     )
     q_global_shape = tuple(int(dim) for dim in (q_layout.q_global_shape or ()))
-    q_local_layout = tuple(str(tag) for tag in q_layout.q_local_layout)
+    q_local_layout = tuple(str(axis_name) for axis_name in q_layout.q_local_layout)
     q_gathered_layout = tuple(
-        str(tag) for tag in q_layout.q_gathered_layout
+        str(axis_name) for axis_name in q_layout.q_gathered_layout
     )
     if (
         len(q_local_shape) != 2
@@ -498,13 +499,13 @@ def init_param_state(
             f"placements={q_gathered_layout}"
         )
 
-    q_state = materialize_q_state(
+    q_state = init_q_state(
         param=param,
         mixed_precision_config=mixed_precision_config,
         config=config,
         dist_meta=dist_meta,
         q_layout=q_layout,
-        q_init_seed=q_init_seed,
+        q_seed=q_seed,
         tp_world_size=tp_world_size,
         tp_rank=tp_rank,
         use_q_unshard=use_q_unshard,
@@ -515,7 +516,7 @@ def init_param_state(
             f"expected {q_local_shape}, got {tuple(q_state.shape)}"
         )
 
-    broadcast_q_fn(q_state)
+    broadcast_q(q_state)
 
     state["Q"] = q_state
     state["_needs_state_replica_q_sync"] = True

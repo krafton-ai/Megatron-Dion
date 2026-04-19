@@ -7,7 +7,7 @@ from typing import Callable
 
 import torch
 
-from .sharding import slice_fs_shard_2d
+from .sharding import fs_shard_view_2d
 
 
 @dataclass
@@ -21,7 +21,7 @@ class DionBucketGradSync:
     reduce_scatter_handle: object | None = None
 
 def _build_model_grad(*, bucket) -> torch.Tensor:
-    """Pack this rank's canonical Dion local grad shard directly from model_param.main_grad."""
+    """Build this rank's canonical Dion local grad shard directly from model_param.main_grad."""
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not dion_layout.has_params:
         raise RuntimeError(
@@ -42,7 +42,7 @@ def _build_model_grad(*, bucket) -> torch.Tensor:
                 f"bucket={getattr(bucket, 'bucket_id', -1)} "
                 f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')}"
             )
-        canonical_local = slice_fs_shard_2d(
+        canonical_local = fs_shard_view_2d(
             model_grad,
             int(entry.fs_shard_dim),
             int(entry.start_idx),
@@ -72,10 +72,10 @@ def _launch_dion_bucket_grad_sync(
     reduce_group,
     reduce_op,
     async_op: bool,
-    reduce_scatter_fn,
-    stash_grad_sync_fn: Callable[[object, DionBucketGradSync], None],
+    reduce_scatter,
+    stash_grad_sync: Callable[[object, DionBucketGradSync], None],
 ):
-    """Publish Dion local grad shards for one bucket."""
+    """Set Dion local grad shards for one bucket."""
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not dion_layout.has_params:
         return None
@@ -92,8 +92,8 @@ def _launch_dion_bucket_grad_sync(
             async_op=async_op,
         )
 
-    del reduce_scatter_fn, layout_group_size, reduce_group_size
-    stash_grad_sync_fn(
+    del reduce_scatter, layout_group_size, reduce_group_size
+    stash_grad_sync(
         bucket,
         DionBucketGradSync(
             local_grad_shard=local_grad_shard,
@@ -104,24 +104,24 @@ def _launch_dion_bucket_grad_sync(
 def _set_bucket_local_grads(
     *,
     bucket,
-    set_local_grad_fn: Callable[[torch.nn.Parameter, torch.Tensor], None],
+    set_local_grad: Callable[[torch.nn.Parameter, torch.Tensor], None],
     grad_sync: DionBucketGradSync | None,
 ) -> None:
-    """Publish Dion local-grad views from packed RS output without full-bucket reconstruction."""
+    """Set Dion local grads from the reduced bucket tensor without full-bucket reconstruction."""
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not dion_layout.has_params:
         return
 
     if grad_sync is None:
         raise RuntimeError(
-            "[Dion] missing packed Dion bucket grad sync "
+            "[Dion] missing Dion bucket grad sync "
             f"for bucket={getattr(bucket, 'bucket_id', -1)}"
         )
     local_grad_shard = grad_sync.local_grad_shard
     expected_shard_size = int(dion_layout.shard_size)
     if local_grad_shard.ndim != 1 or local_grad_shard.numel() != expected_shard_size:
         raise RuntimeError(
-            "[Dion] invalid packed Dion bucket grad sync output "
+            "[Dion] invalid Dion bucket grad sync output "
             f"bucket={getattr(bucket, 'bucket_id', -1)} "
             f"shape={tuple(local_grad_shard.shape)} expected_numel={expected_shard_size}"
         )
@@ -130,7 +130,7 @@ def _set_bucket_local_grads(
         shard_capacity = int(entry.shard_capacity)
         if local_numel <= 0 or local_numel > shard_capacity:
             raise RuntimeError(
-                "[Dion] invalid packed Dion grad shard metadata "
+                "[Dion] invalid Dion grad shard metadata "
                 f"bucket={getattr(bucket, 'bucket_id', -1)} "
                 f"param={getattr(entry.param, '_param_name', id(entry.param))} "
                 f"local_numel={local_numel} shard_capacity={shard_capacity}"
@@ -139,7 +139,7 @@ def _set_bucket_local_grads(
         local_shard = local_grad_shard[shard_start : shard_start + local_numel].view(
             entry.local_shape
         )
-        set_local_grad_fn(entry.param, local_shard)
+        set_local_grad(entry.param, local_shard)
 
 
 def validate_dion_local_shard_grad_(
@@ -147,11 +147,11 @@ def validate_dion_local_shard_grad_(
     model_param: torch.nn.Parameter,
     shard_param: torch.nn.Parameter,
     shard_view: torch.Tensor | None,
-    log_grad_issue_fn: Callable,
+    log_grad_issue: Callable,
 ) -> torch.Tensor:
     """Validate one adapter-stored Dion local grad shard before optimizer use."""
     if shard_view is None:
-        log_grad_issue_fn("DION_LOCAL_GRAD_NONE", model_param, shard_param)
+        log_grad_issue("DION_LOCAL_GRAD_NONE", model_param, shard_param)
         raise RuntimeError(
             "[Dion] Dion grad set requires stored local grad shard "
             f"param_shape={tuple(model_param.shape)} shard_shape={tuple(shard_param.shape)}"
@@ -164,7 +164,7 @@ def validate_dion_local_shard_grad_(
         )
 
     if shard_view.nelement() != shard_param.nelement():
-        log_grad_issue_fn(
+        log_grad_issue(
             "DION_MAIN_GRAD_NUMEL_MISMATCH",
             model_param,
             shard_param,
@@ -176,7 +176,7 @@ def validate_dion_local_shard_grad_(
             f"shard_view_numel={int(shard_view.nelement())} shard_param_numel={int(shard_param.nelement())}"
         )
     if tuple(shard_view.shape) != tuple(shard_param.shape):
-        log_grad_issue_fn(
+        log_grad_issue(
             "DION_MAIN_GRAD_SHAPE_MISMATCH",
             model_param,
             shard_param,
@@ -190,17 +190,17 @@ def validate_dion_local_shard_grad_(
     return shard_view
 
 
-def slice_optimizer_shard_grad_(
+def optimizer_shard_grad_view_(
     *,
     model_param: torch.nn.Parameter,
     shard_main_param: torch.nn.Parameter,
     param_range,
-    log_grad_issue_fn: Callable,
+    log_grad_issue: Callable,
 ) -> torch.Tensor:
-    """Slice one optimizer shard grad from canonical `model_param.main_grad`."""
+    """Return one optimizer shard grad view from canonical `model_param.main_grad`."""
     model_grad = model_param.main_grad
     if model_grad is None:
-        log_grad_issue_fn("NON_DION_MODEL_MAIN_GRAD_NONE", model_param, shard_main_param)
+        log_grad_issue("NON_DION_MODEL_MAIN_GRAD_NONE", model_param, shard_main_param)
         raise RuntimeError(
             "[Dion] optimizer shard grad requires canonical model_param.main_grad "
             f"param_shape={tuple(model_param.shape)} shard_shape={tuple(shard_main_param.shape)}"
@@ -210,7 +210,7 @@ def slice_optimizer_shard_grad_(
     start = int(param_range.start)
     end = int(param_range.end)
     if end > flat_grad.numel():
-        log_grad_issue_fn(
+        log_grad_issue(
             "NON_DION_STOCK_SLICE_OOB",
             model_param,
             shard_main_param,
@@ -219,12 +219,12 @@ def slice_optimizer_shard_grad_(
             end=int(end),
         )
         raise RuntimeError(
-            "[Dion] optimizer shard grad slice exceeded canonical main_grad "
+            "[Dion] optimizer shard grad view exceeded canonical main_grad "
             f"grad_numel={int(flat_grad.numel())} start={int(start)} end={int(end)}"
         )
     shard_view = flat_grad[start:end]
     if shard_view.numel() != shard_main_param.nelement():
-        log_grad_issue_fn(
+        log_grad_issue(
             "NON_DION_STOCK_SLICE_SIZE_MISMATCH",
             model_param,
             shard_main_param,
@@ -244,16 +244,16 @@ def set_dion_shard_grad_(
     *,
     model_param: torch.nn.Parameter,
     shard_param: torch.nn.Parameter,
-    get_local_grad_fn: Callable[[torch.nn.Parameter, torch.nn.Parameter], torch.Tensor],
-    log_grad_issue_fn: Callable,
+    get_local_grad: Callable[[torch.nn.Parameter, torch.nn.Parameter], torch.Tensor],
+    log_grad_issue: Callable,
     use_precision_aware_optimizer: bool,
 ) -> None:
     """Set one Dion optimizer shard grad onto an optimizer shard param."""
     optimizer_shard_grad = validate_dion_local_shard_grad_(
         model_param=model_param,
         shard_param=shard_param,
-        shard_view=get_local_grad_fn(model_param, shard_param),
-        log_grad_issue_fn=log_grad_issue_fn,
+        shard_view=get_local_grad(model_param, shard_param),
+        log_grad_issue=log_grad_issue,
     )
 
     shard_param.is_dion_param = True
@@ -270,12 +270,12 @@ def set_non_dion_shard_grad_(
     *,
     model_param: torch.nn.Parameter,
     shard_param: torch.nn.Parameter,
-    get_param_range_fn: Callable[[torch.nn.Parameter], object],
-    log_grad_issue_fn: Callable,
+    get_param_range: Callable[[torch.nn.Parameter], object],
+    log_grad_issue: Callable,
     use_precision_aware_optimizer: bool,
 ) -> None:
     """Set one non-Dion grad shard onto an optimizer shard param."""
-    param_range = get_param_range_fn(model_param)["param"]
+    param_range = get_param_range(model_param)["param"]
 
     model_grad = getattr(model_param, "main_grad", None)
     if model_grad is None:
@@ -285,11 +285,11 @@ def set_non_dion_shard_grad_(
             f"shard_shape={tuple(shard_param.shape)}"
         )
 
-    shard_grad = slice_optimizer_shard_grad_(
+    shard_grad = optimizer_shard_grad_view_(
         model_param=model_param,
         shard_main_param=shard_param,
         param_range=param_range,
-        log_grad_issue_fn=log_grad_issue_fn,
+        log_grad_issue=log_grad_issue,
     )
 
     if use_precision_aware_optimizer:
@@ -309,8 +309,8 @@ def set_non_dion_optimizer_shard_grads_(
     *,
     model_groups,
     shard_groups,
-    get_param_range_fn: Callable[[torch.nn.Parameter], object],
-    log_grad_issue_fn: Callable,
+    get_param_range: Callable[[torch.nn.Parameter], object],
+    log_grad_issue: Callable,
     use_precision_aware_optimizer: bool,
 ) -> None:
     """Project canonical model-side non-Dion grads onto optimizer shards."""
@@ -326,8 +326,8 @@ def set_non_dion_optimizer_shard_grads_(
             set_non_dion_shard_grad_(
                 model_param=model_param,
                 shard_param=shard_param,
-                get_param_range_fn=get_param_range_fn,
-                log_grad_issue_fn=log_grad_issue_fn,
+                get_param_range=get_param_range,
+                log_grad_issue=log_grad_issue,
                 use_precision_aware_optimizer=use_precision_aware_optimizer,
             )
 
@@ -336,8 +336,8 @@ def set_dion_optimizer_shard_grads_(
     *,
     model_groups,
     shard_groups,
-    get_local_grad_fn: Callable[[torch.nn.Parameter, torch.nn.Parameter], torch.Tensor],
-    log_grad_issue_fn: Callable,
+    get_local_grad: Callable[[torch.nn.Parameter, torch.nn.Parameter], torch.Tensor],
+    log_grad_issue: Callable,
     use_precision_aware_optimizer: bool,
 ) -> None:
     """Set Dion local shard grads onto optimizer shard params for one or more param groups."""
@@ -353,8 +353,8 @@ def set_dion_optimizer_shard_grads_(
             set_dion_shard_grad_(
                 model_param=model_param,
                 shard_param=shard_param,
-                get_local_grad_fn=get_local_grad_fn,
-                log_grad_issue_fn=log_grad_issue_fn,
+                get_local_grad=get_local_grad,
+                log_grad_issue=log_grad_issue,
                 use_precision_aware_optimizer=use_precision_aware_optimizer,
             )
 
@@ -375,7 +375,7 @@ def gather_fs_grad(
     shard_layout,
     fs_group,
 ) -> torch.Tensor:
-    """Rebuild one FS-sharded 2D grad into the same logical local tensor across FS configs."""
+    """Rebuild one FS-sharded 2D grad into the same local tensor across FS configs."""
     if (
         shard_layout is None
         or fs_group is None
@@ -409,18 +409,18 @@ def gather_fs_grad(
 
 
 def set_local_grad(optimizer, model_param: torch.nn.Parameter, local_grad: torch.Tensor) -> None:
-    """Store one Dion-local grad shard in stable adapter-owned storage."""
+    """Store one Dion-local grad shard in stable adapter storage."""
     shard_layout = optimizer._param_shard_layout(model_param)
     if shard_layout is None:
         raise RuntimeError(
             "[Dion] cannot store Dion local grad without shard layout "
-            f"param={optimizer._canonical_param_name(model_param) or f'id_{id(model_param)}'}"
+            f"param={optimizer._param_name(model_param) or f'id_{id(model_param)}'}"
         )
     expected_shape = tuple(int(dim) for dim in shard_layout.local_shape)
     if tuple(local_grad.shape) != expected_shape:
         raise RuntimeError(
             "[Dion] stored Dion local grad shape mismatch "
-            f"param={optimizer._canonical_param_name(model_param) or f'id_{id(model_param)}'} "
+            f"param={optimizer._param_name(model_param) or f'id_{id(model_param)}'} "
             f"stored_shape={tuple(local_grad.shape)} expected_shape={expected_shape}"
         )
     stored_local_grad = optimizer._dion_local_grads.get(model_param)
@@ -445,7 +445,7 @@ def get_local_grad(
     if local_grad is None:
         raise RuntimeError(
             "[Dion] missing stored Dion local grad shard "
-            f"param={optimizer._canonical_param_name(model_param) or f'id_{id(model_param)}'} "
+            f"param={optimizer._param_name(model_param) or f'id_{id(model_param)}'} "
             f"shard_shape={tuple(shard_param.shape)}"
         )
     return local_grad
@@ -465,10 +465,10 @@ def get_main_grad_local(
     if shard_layout is None:
         raise RuntimeError(
             "[Dion] missing shard layout while reading main_grad "
-            f"param={optimizer._canonical_param_name(model_param) or f'id_{id(model_param)}'}"
+            f"param={optimizer._param_name(model_param) or f'id_{id(model_param)}'}"
         )
 
-    local_grad = slice_fs_shard_2d(
+    local_grad = fs_shard_view_2d(
         model_grad,
         int(shard_layout.fs_shard_dim),
         int(shard_layout.start_idx),
@@ -477,7 +477,7 @@ def get_main_grad_local(
     if tuple(local_grad.shape) != tuple(shard_param.shape):
         raise RuntimeError(
             "[Dion] main_grad local shape mismatch "
-            f"param={optimizer._canonical_param_name(model_param) or f'id_{id(model_param)}'} "
+            f"param={optimizer._param_name(model_param) or f'id_{id(model_param)}'} "
             f"main_grad_shape={tuple(model_grad.shape)} "
             f"local_shape={tuple(local_grad.shape)} shard_shape={tuple(shard_param.shape)}"
         )
@@ -491,26 +491,26 @@ def apply_bucket_grads(
     local_data_view: torch.Tensor,
     communication_group,
 ) -> None:
-    """Publish Dion local-grad views from the canonical model_param.main_grad surface."""
+    """Set Dion local grads from the canonical model_param.main_grad surface."""
     del communication_group
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not dion_layout.has_params:
         return
     if local_data_view is None or local_data_view.numel() == 0:
         raise RuntimeError(
-            "[Dion] missing synchronized stock local shard while publishing Dion bucket grads "
+            "[Dion] missing synchronized stock local shard while setting Dion bucket grads "
             f"bucket={getattr(bucket, 'bucket_id', -1)}"
         )
     local_grad_shard = _build_model_grad(bucket=bucket)
     _set_bucket_local_grads(
         bucket=bucket,
-        set_local_grad_fn=optimizer._set_local_grad,
+        set_local_grad=optimizer._set_local_grad,
         grad_sync=DionBucketGradSync(local_grad_shard=local_grad_shard),
     )
 
 
 def stash_bucket_grad_sync(optimizer, bucket, grad_sync: DionBucketGradSync) -> None:
-    """Keep one Dion grad sync payload alive until local-grad publish."""
+    """Keep one Dion grad sync payload alive until local grads are set."""
     del optimizer
     bucket._dion_grad_sync = grad_sync
 
@@ -535,7 +535,7 @@ def pop_bucket_grad_sync(bucket) -> DionBucketGradSync | None:
 
 
 def get_dion_bucket_inter_instance_grad_buffer(bucket) -> torch.Tensor | None:
-    """Return the packed Dion local-shard buffer that must follow stock inter-instance reduction."""
+    """Return the Dion local-shard buffer that must follow stock inter-instance reduction."""
     grad_sync = wait_bucket_grad_sync(bucket)
     if grad_sync is None:
         return None
@@ -555,14 +555,14 @@ def start_dion_bucket_grad_sync(
     communication_group,
     reduce_op,
     async_op: bool,
-    reduce_scatter_fn,
+    reduce_scatter,
 ):
     """Launch the stock bucket reduce-scatter for Dion buckets too."""
     del optimizer
     clear_bucket_grad_sync(bucket)
     if local_data_view is None or local_data_view.numel() == 0:
         return None
-    return reduce_scatter_fn(
+    return reduce_scatter(
         local_data_view,
         bucket.grad_data,
         op=reduce_op,
@@ -579,7 +579,7 @@ def build_grad_route_(
     model_fp32_groups,
     shard_fp32_groups,
     shard_fp32_from_float16_groups,
-    log_grad_issue_fn: Callable,
+    log_grad_issue: Callable,
 ) -> dict:
     """Build the model-surface to optimizer-shard grad route."""
     if use_precision_aware_optimizer:
@@ -595,7 +595,7 @@ def build_grad_route_(
     return {
         "use_precision_aware_optimizer": use_precision_aware_optimizer,
         "grad_group_pairs": grad_group_pairs,
-        "log_grad_issue": log_grad_issue_fn,
+        "log_grad_issue": log_grad_issue,
     }
 
 
@@ -609,10 +609,10 @@ def set_optimizer_shard_grads(
     model_fp32_groups,
     shard_fp32_groups,
     shard_fp32_from_float16_groups,
-    get_param_range_fn: Callable[[torch.nn.Parameter], object],
-    get_local_grad_fn: Callable[[torch.nn.Parameter, torch.nn.Parameter], torch.Tensor],
-    log_grad_issue_fn: Callable,
-    release_rs_buffers_fn: Callable,
+    get_param_range: Callable[[torch.nn.Parameter], object],
+    get_local_grad: Callable[[torch.nn.Parameter, torch.nn.Parameter], torch.Tensor],
+    log_grad_issue: Callable,
+    release_rs_buffers: Callable,
 ) -> None:
     """Set model-side grad surfaces onto optimizer shards and release RS buffers."""
     if is_stub_optimizer or use_megatron_fsdp:
@@ -625,7 +625,7 @@ def set_optimizer_shard_grads(
         model_fp32_groups=model_fp32_groups,
         shard_fp32_groups=shard_fp32_groups,
         shard_fp32_from_float16_groups=shard_fp32_from_float16_groups,
-        log_grad_issue_fn=log_grad_issue_fn,
+        log_grad_issue=log_grad_issue,
     )
     use_precision_aware_optimizer = grad_route["use_precision_aware_optimizer"]
     log_grad_issue = grad_route["log_grad_issue"]
@@ -635,19 +635,19 @@ def set_optimizer_shard_grads(
         set_non_dion_optimizer_shard_grads_(
             model_groups=model_groups,
             shard_groups=shard_groups,
-            get_param_range_fn=get_param_range_fn,
-            log_grad_issue_fn=log_grad_issue,
+            get_param_range=get_param_range,
+            log_grad_issue=log_grad_issue,
             use_precision_aware_optimizer=use_precision_aware_optimizer,
         )
         set_dion_optimizer_shard_grads_(
             model_groups=model_groups,
             shard_groups=shard_groups,
-            get_local_grad_fn=get_local_grad_fn,
-            log_grad_issue_fn=log_grad_issue,
+            get_local_grad=get_local_grad,
+            log_grad_issue=log_grad_issue,
             use_precision_aware_optimizer=use_precision_aware_optimizer,
         )
 
-    release_rs_buffers_fn()
+    release_rs_buffers()
 
 
 def wait_for_pending_grad_reduce_handles_(model_chunks) -> None:

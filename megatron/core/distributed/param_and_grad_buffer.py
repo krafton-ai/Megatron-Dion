@@ -555,7 +555,7 @@ class _ParamAndGradBucketGroup:
                             communication_group=communication_group,
                             reduce_op=reduce_op,
                             async_op=async_op,
-                            reduce_scatter_fn=dist_reduce_scatter_func,
+                            reduce_scatter=dist_reduce_scatter_func,
                         )
                     else:
                         grad_reduce_handle = dist_reduce_scatter_func(

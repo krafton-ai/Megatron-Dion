@@ -1,4 +1,4 @@
-"""Public Dion optimizer package surface."""
+"""Public Dion optimizer module exports."""
 
 from .algorithm import MegatronDion
 from .runtime import AsyncRuntime, AsyncTask

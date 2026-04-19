@@ -1,49 +1,18 @@
 """Dion optimizer main class for Megatron-LM."""
-import math
+from collections import OrderedDict
 from typing import Dict, Generator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from .kernels import orthogonalize_fs_only_batch
-from .ortho import (
-    distributed_orthogonalize,
-    make_local_sketch_for_update,
-    make_seeded_sketch_for_update,
-    orthogonalize,
-    orthogonalize_local_matrix_batch,
-    orthogonalize_local_slice,
-    reshard_q_along_tp,
-    sketch_keys_for_update,
-)
 from .runtime import (
-    apply_error_feedback_to_momentum,
-    apply_batch_updates,
-    batch_dion_update_async,
-    collapse_batch_across_replicas,
-    collapse_grads_across_replicas,
     enable_distributed_mode,
-    normalize_cols_async,
     iter_dist_tasks,
-    orthogonalize_dense_replicate_batch_async,
-    orthogonalize_p_batch,
-    replicate_reduce_op,
-    reduce_p_across_fs_groups,
-    reduce_r_across_tp,
-    run_compressed_comm_async,
-    sanitize_dion_batch_for_update,
     resolve_async_task_limit,
     AsyncRuntime,
-    unshard_q_batch,
 )
-from .state import (
-    has_fs_shard,
-    has_tp_shard,
-    is_fs_only_config,
-    use_q_unshard,
-)
+from .scalar_opts import adamw_update_foreach, lion_update_foreach
 from .types import (
     DionMixedPrecisionConfig,
     DionParamConfig,
@@ -54,147 +23,6 @@ DEFAULT_LR = 0.01
 DEFAULT_MU = 0.95
 DEFAULT_WEIGHT_DECAY = 0.01
 
-
-def _adam_update(
-    p: Tensor,
-    grad: Tensor,
-    state: dict,
-    betas: tuple,
-    eps: float,
-    lr: float,
-    weight_decay: float,
-    *,
-    decoupled_weight_decay: bool = True,
-    step_override: int | None = None,
-    store_step_in_state: bool = True,
-) -> None:
-    """Adam/AdamW update."""
-    beta1, beta2 = betas
-
-    if 'exp_avg' not in state:
-        state['exp_avg'] = torch.zeros_like(grad, dtype=torch.float32)
-        state['exp_avg_sq'] = torch.zeros_like(grad, dtype=torch.float32)
-        if store_step_in_state:
-            state['step'] = 0
-
-    exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-
-    if step_override is None:
-        if 'step' not in state:
-            state['step'] = 0
-        state['step'] += 1
-        step = int(state['step'])
-    else:
-        step = int(step_override)
-        if step <= 0:
-            raise RuntimeError(
-                f"[DION_INVALID_ADAM_STEP] step_override must be positive, got {step}"
-            )
-        if store_step_in_state:
-            state['step'] = step
-        elif 'step' in state:
-            state.pop('step', None)
-
-    grad_fp32 = grad.float() if grad.dtype != torch.float32 else grad
-    if not decoupled_weight_decay and weight_decay != 0.0:
-        grad_fp32 = grad_fp32.add(p.detach().float(), alpha=weight_decay)
-
-    exp_avg.mul_(beta1).add_(grad_fp32, alpha=1 - beta1)
-    exp_avg_sq.mul_(beta2).addcmul_(grad_fp32, grad_fp32, value=1 - beta2)
-
-    bias_correction1 = 1 - beta1 ** step
-    bias_correction2 = 1 - beta2 ** step
-
-    if decoupled_weight_decay and weight_decay != 0.0:
-        p.mul_(1 - lr * weight_decay)
-
-    denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
-    step_size = lr / bias_correction1
-    p.data.addcdiv_(exp_avg, denom, value=-step_size)
-
-
-def _adamw_update(
-    p: Tensor,
-    grad: Tensor,
-    state: dict,
-    betas: tuple,
-    eps: float,
-    lr: float,
-    weight_decay: float,
-) -> None:
-    """AdamW update for non-Dion parameters."""
-    _adam_update(
-        p,
-        grad,
-        state,
-        betas,
-        eps,
-        lr,
-        weight_decay,
-        decoupled_weight_decay=True,
-    )
-
-
-def _lion_update(
-    p: Tensor,
-    grad: Tensor,
-    state: dict,
-    betas: tuple,
-    lr: float,
-    weight_decay: float,
-) -> None:
-    """Lion optimizer update (sign-based, momentum-only)."""
-    beta1, beta2 = betas
-
-    if 'momentum' not in state:
-        state['momentum'] = torch.zeros_like(grad, dtype=torch.float32)
-
-    if 'step' not in state:
-        state['step'] = 0
-
-    momentum = state['momentum']
-    state['step'] += 1
-    grad_fp32 = grad.float() if grad.dtype != torch.float32 else grad
-    update = momentum.mul(beta1).add_(grad_fp32, alpha=1 - beta1)
-    update_sign = update.sign()
-    momentum.mul_(beta2).add_(grad_fp32, alpha=1 - beta2)
-    p.mul_(1 - lr * weight_decay)
-    p.add_(update_sign.to(p.dtype), alpha=-lr)
-
-
-def _apply_scalar_update(
-    *,
-    optimizer_name: str,
-    p: Tensor,
-    grad: Tensor,
-    state: dict,
-    optim_group: dict,
-    default_betas: tuple,
-    default_eps: float,
-    lr: float,
-    weight_decay: float,
-) -> None:
-    """Apply the configured scalar optimizer without Megatron runtime branching."""
-    if optimizer_name == "lion":
-        _lion_update(
-            p,
-            grad,
-            state,
-            default_betas,
-            lr,
-            weight_decay,
-        )
-        return
-
-    _adamw_update(
-        p,
-        grad,
-        state,
-        default_betas,
-        optim_group.get("eps", default_eps),
-        lr,
-        weight_decay,
-    )
 
 class MegatronDion(Optimizer):
     """
@@ -264,11 +92,11 @@ class MegatronDion(Optimizer):
         self._global_rank = dist.get_rank() if dist.is_initialized() else 0
 
         # Configuration storage
-        self._param_config: Dict[Tensor, DionParamConfig] = {}
+        self._param_config: Dict[torch.Tensor, DionParamConfig] = {}
         self.is_distributed_mode = False
         self.use_fs_collectives = use_fs_collectives
 
-        self._route_step_params_fn = None
+        self._route_step_params = None
         self.dist_metas = {}
 
         # Compressed communication support
@@ -292,7 +120,7 @@ class MegatronDion(Optimizer):
 
         # Update counters
         self._dion_update_count = 0
-        self._adamw_update_count = 0
+        self._scalar_update_count = 0
         self._step_count = 0
 
         self._buffer_cache: Dict[str, torch.Tensor] = {}
@@ -307,7 +135,7 @@ class MegatronDion(Optimizer):
 
         # Reset counters at the beginning of each step
         self._dion_update_count = 0
-        self._adamw_update_count = 0
+        self._scalar_update_count = 0
 
         # Increment per-group step counters
         for optim_group in self.param_groups:
@@ -322,21 +150,13 @@ class MegatronDion(Optimizer):
         dion_tasks = iter_dist_tasks(self)
 
         # Execute all tasks with the explicit runtime width from config.
-        task_count = 0
-        if dion_tasks:
-            dion_tasks_list = list(dion_tasks)
-            task_count = len(dion_tasks_list)
-            if task_count > 0:
-                max_tasks = resolve_async_task_limit(
-                    max_concurrent_tasks=self.max_concurrent_tasks,
-                    task_count=task_count,
-                )
-                runtime = AsyncRuntime((t for t in dion_tasks_list), max_concurrent_tasks=max_tasks)
-                runtime.run()
-
-                del runtime
-            # Always delete dion_tasks_list if it was created
-            del dion_tasks_list
+        max_tasks = resolve_async_task_limit(
+            max_concurrent_tasks=self.max_concurrent_tasks,
+            task_count=None,
+        )
+        runtime = AsyncRuntime(dion_tasks, max_concurrent_tasks=max_tasks)
+        runtime.run()
+        del runtime
 
         return loss
 
@@ -364,69 +184,171 @@ class MegatronDion(Optimizer):
             buffer.zero_()
         return buffer
 
-    def _run_scalar_bucket_async(
+    def _apply_scalar_buckets(
         self,
         scalar_params: List[ScalarStepParam],
     ) -> Generator[None, None, None]:
-        """Process only non-Dion params while preserving standard DO bucket ownership."""
-        scalar_opt = self.defaults.get('scalar_optimizer', 'adamw')
+        """Process non-Dion params with grouped foreach-style scalar updates."""
+        default_scalar_opt = self.defaults.get('scalar_optimizer', 'adamw')
         default_betas = self.defaults.get('betas', (0.9, 0.95))
         default_eps = self.defaults.get('eps', 1e-8)
+        scalar_contract_order: list[tuple] = []
+        scalar_buckets = OrderedDict()
+
+        def _effective_weight_decay(param, optim_group) -> float:
+            wd_mult = optim_group.get('wd_mult', 1.0)
+            return float(
+                optim_group.get(
+                    'weight_decay',
+                    self.defaults['weight_decay'] * wd_mult,
+                )
+            )
+
+        def _resolve_scalar_algorithm(optim_group) -> str:
+            group_algorithm = optim_group.get('algorithm', None)
+            if group_algorithm is None or group_algorithm == "dion":
+                scalar_opt = optim_group.get('scalar_optimizer', default_scalar_opt)
+            else:
+                scalar_opt = group_algorithm
+            if scalar_opt == "adam":
+                return "adamw"
+            if scalar_opt not in {"adamw", "lion"}:
+                raise RuntimeError(
+                    "[DION_INVALID_SCALAR_OPT] "
+                    f"scalar_optimizer={scalar_opt}"
+                )
+            return str(scalar_opt)
+
+        def _effective_betas(optim_group) -> tuple[float, float]:
+            if 'betas' in optim_group:
+                beta1, beta2 = optim_group['betas']
+                return float(beta1), float(beta2)
+            if 'beta1' in optim_group or 'beta2' in optim_group:
+                return (
+                    float(optim_group.get('beta1', default_betas[0])),
+                    float(optim_group.get('beta2', default_betas[1])),
+                )
+            return float(default_betas[0]), float(default_betas[1])
+
+        def _state_tensor_dtype(state_tensor, default_dtype: torch.dtype) -> torch.dtype:
+            return state_tensor.dtype if state_tensor is not None else default_dtype
+
+        def _ensure_scalar_first_moment_state(param, state) -> torch.Tensor:
+            if 'first_moment' in state and 'exp_avg' in state:
+                raise RuntimeError(
+                    "[DION_SCALAR_STATE_LAYOUT_CONFLICT] found both first_moment and exp_avg"
+                )
+            if 'first_moment' not in state:
+                if 'exp_avg' in state:
+                    state['first_moment'] = state.pop('exp_avg')
+                elif 'momentum' in state:
+                    state['first_moment'] = state.pop('momentum')
+                else:
+                    state['first_moment'] = torch.zeros_like(param, dtype=torch.float32)
+            return state['first_moment']
+
+        def _ensure_scalar_second_moment_state(param, state) -> torch.Tensor:
+            if 'second_moment' in state and 'exp_avg_sq' in state:
+                raise RuntimeError(
+                    "[DION_SCALAR_STATE_LAYOUT_CONFLICT] found both second_moment and exp_avg_sq"
+                )
+            if 'second_moment' not in state:
+                if 'exp_avg_sq' in state:
+                    state['second_moment'] = state.pop('exp_avg_sq')
+                elif 'variance' in state:
+                    state['second_moment'] = state.pop('variance')
+                else:
+                    variance_dtype = (
+                        self._mixed_precision_config.variance_dtype
+                        if self._mixed_precision_config.variance_dtype is not None
+                        else torch.float32
+                    )
+                    state['second_moment'] = torch.zeros_like(param, dtype=variance_dtype)
+            return state['second_moment']
+
         for scalar_param in scalar_params:
             p = scalar_param.param
             grad = scalar_param.grad
             state = scalar_param.optimizer_state
             optim_group = scalar_param.optim_group
-            lr = optim_group.get('lr', self.defaults['lr'])
-            if p.ndim == 1:
-                weight_decay = 0.0
-            else:
-                wd_mult = optim_group.get('wd_mult', 1.0)
-                weight_decay = optim_group.get(
-                    'weight_decay',
-                    self.defaults['weight_decay'] * wd_mult,
-                )
+            scalar_opt = _resolve_scalar_algorithm(optim_group)
+            lr = float(optim_group.get('lr', self.defaults['lr']))
+            weight_decay = _effective_weight_decay(p, optim_group)
+            step = int(optim_group.get('step', 0))
+            eps = float(optim_group.get('eps', optim_group.get('epsilon', default_eps)))
+            beta1, beta2 = _effective_betas(optim_group)
+            if step <= 0:
+                raise RuntimeError(f"[DION_INVALID_SCALAR_STEP] step={step}")
 
-            _apply_scalar_update(
-                optimizer_name=scalar_opt,
-                p=p,
-                grad=grad,
-                state=state,
-                optim_group=optim_group,
-                default_betas=default_betas,
-                default_eps=default_eps,
-                lr=lr,
-                weight_decay=weight_decay,
+            first_moment = _ensure_scalar_first_moment_state(p, state)
+            state['step'] = step
+            second_moment = None
+            if scalar_opt == "adamw":
+                second_moment = _ensure_scalar_second_moment_state(p, state)
+
+            scalar_contract_key = (
+                scalar_opt,
+                id(optim_group),
+                str(p.device),
+                str(p.dtype),
+                str(first_moment.dtype),
+                str(_state_tensor_dtype(second_moment, torch.float32)),
+                float(lr),
+                float(weight_decay),
+                float(eps),
+                float(beta1),
+                float(beta2),
+                int(step),
+            )
+            if scalar_contract_key not in scalar_buckets:
+                scalar_buckets[scalar_contract_key] = {
+                    "scalar_optimizer": scalar_opt,
+                    "params": [],
+                    "grads": [],
+                    "first_moments": [],
+                    "second_moments": [],
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                    "eps": eps,
+                    "step": step,
+                    "beta1": beta1,
+                    "beta2": beta2,
+                }
+                scalar_contract_order.append(scalar_contract_key)
+            scalar_bucket = scalar_buckets[scalar_contract_key]
+            scalar_bucket["params"].append(p)
+            scalar_bucket["grads"].append(grad)
+            scalar_bucket["first_moments"].append(first_moment)
+            if second_moment is not None:
+                scalar_bucket["second_moments"].append(second_moment)
+
+        for scalar_contract_key in scalar_contract_order:
+            scalar_bucket = scalar_buckets[scalar_contract_key]
+            if scalar_bucket["scalar_optimizer"] == "lion":
+                lion_update_foreach(
+                    scalar_bucket["params"],
+                    scalar_bucket["grads"],
+                    scalar_bucket["first_moments"],
+                    lr=scalar_bucket["lr"],
+                    beta1=scalar_bucket["beta1"],
+                    beta2=scalar_bucket["beta2"],
+                    weight_decay=scalar_bucket["weight_decay"],
+                )
+                continue
+
+            adamw_update_foreach(
+                scalar_bucket["params"],
+                scalar_bucket["grads"],
+                scalar_bucket["first_moments"],
+                scalar_bucket["second_moments"],
+                lr=scalar_bucket["lr"],
+                beta1=scalar_bucket["beta1"],
+                beta2=scalar_bucket["beta2"],
+                weight_decay=scalar_bucket["weight_decay"],
+                step=scalar_bucket["step"],
+                epsilon=scalar_bucket["eps"],
             )
         if False:
             yield
 
     enable_distributed_mode = enable_distributed_mode
-    _replicate_reduce_op = replicate_reduce_op
-    _collapse_grads_across_replicas = collapse_grads_across_replicas
-    _collapse_batch_across_replicas = collapse_batch_across_replicas
-    _unshard_q_batch = unshard_q_batch
-    _reduce_p_across_fs_groups = reduce_p_across_fs_groups
-    _reduce_r_across_tp = reduce_r_across_tp
-    _normalize_cols_async = normalize_cols_async
-    _orthogonalize = staticmethod(orthogonalize)
-    _reshard_q_along_tp = staticmethod(reshard_q_along_tp)
-
-    _has_tp_shard = staticmethod(has_tp_shard)
-    _has_fs_shard = staticmethod(has_fs_shard)
-    _use_q_unshard = staticmethod(use_q_unshard)
-    _is_fs_only_config = staticmethod(is_fs_only_config)
-    _make_seeded_sketch = make_seeded_sketch_for_update
-    _sketch_keys = sketch_keys_for_update
-    _make_local_sketch = make_local_sketch_for_update
-    _distributed_orthogonalize = distributed_orthogonalize
-    _orthogonalize_local_slice = orthogonalize_local_slice
-    _orthogonalize_local_matrix_batch = orthogonalize_local_matrix_batch
-    _orthogonalize_p_batch = orthogonalize_p_batch
-    _orthogonalize_dense_replicate_batch_async = orthogonalize_dense_replicate_batch_async
-    _orthogonalize_fs_only_batch = orthogonalize_fs_only_batch
-    _apply_batch_updates = apply_batch_updates
-    _sanitize_dion_batch = sanitize_dion_batch_for_update
-    _apply_error_feedback = apply_error_feedback_to_momentum
-    _batch_dion_update_async = batch_dion_update_async
-    _run_compressed_comm_async = run_compressed_comm_async

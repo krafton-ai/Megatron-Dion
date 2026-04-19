@@ -15,12 +15,13 @@ from ..dion.state import (
     needs_tp_r_reduce,
     p_is_tp_sharded,
 )
+from ..dion.utils import get_local_shape, has_multiple_local_experts
 from ..dion.types import (
     DionAxisCollective,
     DionBatch,
+    DionBatchEntry,
     DionBatchCollectives,
     DionBatchGroup,
-    DionBatchSlot,
     DionStepParam,
 )
 
@@ -46,6 +47,26 @@ def _normalize_shape(shape) -> tuple:
     if shape is None:
         return ()
     return tuple(int(dim) for dim in shape)
+
+
+def _build_update_contract_key(
+    optim_group: Dict[str, Any] | None,
+    optimizer_state: Dict[str, Any] | None,
+) -> tuple:
+    if optim_group is None:
+        lr = None
+        weight_decay = None
+        wd_mult = None
+        mu = None
+    else:
+        lr = float(optim_group["lr"]) if "lr" in optim_group else None
+        weight_decay = (
+            float(optim_group["weight_decay"]) if "weight_decay" in optim_group else None
+        )
+        wd_mult = float(optim_group["wd_mult"]) if "wd_mult" in optim_group else None
+        mu = float(optim_group["mu"]) if "mu" in optim_group else None
+    r = int(optimizer_state.get("r", -1)) if optimizer_state is not None else -1
+    return (lr, weight_decay, wd_mult, mu, r)
 
 
 def build_batch_key(
@@ -106,6 +127,115 @@ def pad_batch(batch: List[torch.Tensor], batch_size: int) -> List[torch.Tensor]:
     return batch
 
 
+def _local_expert_tensor_view(
+    tensor: torch.Tensor,
+    *,
+    axis: int,
+    num_local_experts: int,
+    local_expert_index: int,
+    local_shape: Tuple[int, int],
+) -> torch.Tensor:
+    if axis not in (0, 1):
+        raise RuntimeError(f"[DION_INVALID_EXPERT_AXIS] axis={axis}")
+    if num_local_experts <= 1:
+        return tensor
+    if local_expert_index < 0 or local_expert_index >= num_local_experts:
+        raise RuntimeError(
+            "[DION_INVALID_EXPERT_LOCAL_INDEX] "
+            f"axis={axis} num_local_experts={num_local_experts} local_expert_index={local_expert_index}"
+        )
+
+    expected_axis_size = int(local_shape[axis]) * int(num_local_experts)
+    current_axis = int(tensor.size(axis))
+    if current_axis == int(local_shape[axis]):
+        return tensor
+    if current_axis != expected_axis_size:
+        raise RuntimeError(
+            "[DION_EXPERT_TENSOR_SHAPE_MISMATCH] "
+            f"axis={axis} tensor_shape={tuple(int(dim) for dim in tensor.shape)} "
+            f"local_shape={local_shape} num_local_experts={num_local_experts}"
+        )
+
+    local_extent = int(local_shape[axis])
+    start = int(local_expert_index) * local_extent
+    end = start + local_extent
+    if axis == 0:
+        return tensor[start:end, :]
+    return tensor[:, start:end]
+
+
+def _local_expert_q_view(
+    q_tensor: torch.Tensor,
+    *,
+    config,
+    dist_meta,
+    local_shape: Tuple[int, int],
+) -> torch.Tensor:
+    if not has_multiple_local_experts(dist_meta):
+        return q_tensor
+
+    expert_axis = int(getattr(dist_meta, "expert_axis", -1))
+    num_local_experts = int(getattr(dist_meta, "num_local_experts", 1))
+    local_expert_index = int(getattr(dist_meta, "local_expert_index", -1))
+    q_base_axis = 0 if bool(getattr(config, "is_transposed", False)) else 1
+    expected_q_rows = int(local_shape[0] if q_base_axis == 0 else local_shape[1])
+
+    if int(q_tensor.size(0)) == expected_q_rows:
+        return q_tensor
+    if expert_axis != q_base_axis:
+        raise RuntimeError(
+            "[DION_EXPERT_Q_SHAPE_MISMATCH] "
+            f"q_shape={tuple(int(dim) for dim in q_tensor.shape)} local_shape={local_shape} "
+            f"expert_axis={expert_axis} q_base_axis={q_base_axis}"
+        )
+    return _local_expert_tensor_view(
+        q_tensor,
+        axis=0,
+        num_local_experts=num_local_experts,
+        local_expert_index=local_expert_index,
+        local_shape=(expected_q_rows, int(q_tensor.size(1))),
+    )
+
+
+def _local_expert_views(*, param, grad, optimizer_state, config, dist_meta):
+    physical_shape = tuple(int(dim) for dim in optimizer_state["momentum"].shape)
+    local_shape = get_local_shape(dist_meta, physical_shape[0], physical_shape[1])
+    if not has_multiple_local_experts(dist_meta):
+        return param, grad, optimizer_state["momentum"], optimizer_state["Q"], local_shape
+
+    expert_axis = int(getattr(dist_meta, "expert_axis", -1))
+    num_local_experts = int(getattr(dist_meta, "num_local_experts", 1))
+    local_expert_index = int(getattr(dist_meta, "local_expert_index", -1))
+    param_view = _local_expert_tensor_view(
+        param,
+        axis=expert_axis,
+        num_local_experts=num_local_experts,
+        local_expert_index=local_expert_index,
+        local_shape=local_shape,
+    )
+    grad_view = _local_expert_tensor_view(
+        grad.view(*physical_shape),
+        axis=expert_axis,
+        num_local_experts=num_local_experts,
+        local_expert_index=local_expert_index,
+        local_shape=local_shape,
+    )
+    momentum_view = _local_expert_tensor_view(
+        optimizer_state["momentum"].view(*physical_shape),
+        axis=expert_axis,
+        num_local_experts=num_local_experts,
+        local_expert_index=local_expert_index,
+        local_shape=local_shape,
+    )
+    q_view = _local_expert_q_view(
+        optimizer_state["Q"],
+        config=config,
+        dist_meta=dist_meta,
+        local_shape=local_shape,
+    )
+    return param_view, grad_view, momentum_view, q_view, local_shape
+
+
 def _validate_exact_replicate_group(*, replicate_group, validation_group) -> None:
     """Fail fast unless the adapter already resolved the exact Dion replica group."""
     if replicate_group is None:
@@ -136,18 +266,18 @@ def resolve_batch_group(
     use_fs_collectives: bool,
     state_replica_group,
     replica_validation_group,
-    group_size_fn: Callable,
-    get_replicate_group_fn: Callable,
-    resolve_ortho_group_fn: Callable,
+    group_size: Callable,
+    get_replicate_group: Callable,
+    resolve_ortho_group: Callable,
 ) -> DionBatchGroup:
     """Return the batch execution groups from adapter runtime state."""
-    replicate_group = get_replicate_group_fn()
-    if replicate_group is not None and group_size_fn(replicate_group) > 1:
+    replicate_group = get_replicate_group()
+    if replicate_group is not None and group_size(replicate_group) > 1:
         _validate_exact_replicate_group(
             replicate_group=replicate_group,
             validation_group=replica_validation_group,
         )
-    ortho_group = resolve_ortho_group_fn(config, dist_meta)
+    ortho_group = resolve_ortho_group(config, dist_meta)
     fs_group = getattr(dist_meta, "fs_group", None) if dist_meta is not None else None
     tp_group = getattr(dist_meta, "tp_group", None) if dist_meta is not None else None
     use_tp_shard = bool(getattr(config, "use_tp_shard", False))
@@ -156,13 +286,13 @@ def resolve_batch_group(
     if (
         config.compressed_all_reduce
         and replicate_group is not None
-        and group_size_fn(replicate_group) > 1
+        and group_size(replicate_group) > 1
     ):
         sync_groups.append(replicate_group)
 
     if (
         state_replica_group is not None
-        and group_size_fn(state_replica_group) > 1
+        and group_size(state_replica_group) > 1
         and all(id(state_replica_group) != id(existing) for existing in sync_groups)
     ):
         sync_groups.append(state_replica_group)
@@ -174,7 +304,7 @@ def resolve_batch_group(
                 f"rank={dist.get_rank()} param={getattr(dist_meta, 'param_name', '')} "
                 f"param_uid={getattr(dist_meta, 'param_uid', None)}"
             )
-        if group_size_fn(tp_group) > 1 and all(id(tp_group) != id(existing) for existing in sync_groups):
+        if group_size(tp_group) > 1 and all(id(tp_group) != id(existing) for existing in sync_groups):
             sync_groups.append(tp_group)
     if bool(getattr(config, "use_fs_shard", False)):
         if fs_group is None:
@@ -183,24 +313,24 @@ def resolve_batch_group(
                 f"rank={dist.get_rank()} param={getattr(dist_meta, 'param_name', '')} "
                 f"param_uid={getattr(dist_meta, 'param_uid', None)}"
             )
-        if group_size_fn(fs_group) > 1 and all(id(fs_group) != id(existing) for existing in sync_groups):
+        if group_size(fs_group) > 1 and all(id(fs_group) != id(existing) for existing in sync_groups):
             sync_groups.append(fs_group)
 
     if use_tp_shard:
-        batch_world_size = group_size_fn(tp_group)
+        batch_world_size = group_size(tp_group)
     elif bool(getattr(config, "use_fs_shard", False)):
-        batch_world_size = group_size_fn(fs_group)
+        batch_world_size = group_size(fs_group)
     elif config.compressed_all_reduce and replicate_group is not None:
-        batch_world_size = group_size_fn(replicate_group)
+        batch_world_size = group_size(replicate_group)
     else:
-        batch_world_size = group_size_fn(replicate_group) if replicate_group is not None else 1
+        batch_world_size = group_size(replicate_group) if replicate_group is not None else 1
 
     q_norm_group = None
     if (
         use_fs_collectives
         and bool(getattr(config, "use_fs_shard", False))
         and fs_group is not None
-        and group_size_fn(fs_group) > 1
+        and group_size(fs_group) > 1
     ):
         q_norm_group = fs_group
 
@@ -208,14 +338,14 @@ def resolve_batch_group(
     if (
         p_is_tp_sharded(config, use_tp_shard=use_tp_shard)
         and ortho_group is not None
-        and group_size_fn(ortho_group) > 1
+        and group_size(ortho_group) > 1
     ):
         kernel_kind = "fsdp_tp"
     elif (
         use_fs_collectives
         and is_fs_only_config(config)
         and fs_group is not None
-        and group_size_fn(fs_group) > 1
+        and group_size(fs_group) > 1
     ):
         kernel_kind = "fsdp"
 
@@ -224,7 +354,7 @@ def resolve_batch_group(
         config.compressed_all_reduce
         and kernel_kind == "fsdp"
         and replicate_group is not None
-        and group_size_fn(replicate_group) > 1
+        and group_size(replicate_group) > 1
     ):
         compressed_replicate_group = replicate_group
 
@@ -245,16 +375,16 @@ def build_batch_collectives(
     configs,
     dist_metas,
     use_fs_collectives: bool,
-    resolve_tp_group_fn: Callable,
-    resolve_fs_group_fn: Callable,
+    resolve_tp_group: Callable,
+    resolve_fs_group: Callable,
 ) -> DionBatchCollectives:
     """Return the TP/FS collectives for one concrete batch."""
     tp_q_gather_groups = {}
     fs_p_reduce_groups = {}
     tp_r_reduce_groups = {}
     tp_q_reshard_groups = {}
-    fs_orthogonalize_group = None
-    fs_orthogonalize_indices = []
+    fs_group_info = None
+    fs_indices = []
     ortho_group = None
 
     dist_metas = dist_metas or []
@@ -262,7 +392,7 @@ def build_batch_collectives(
     real_dist_meta_count = sum(1 for dist_meta in dist_metas if dist_meta is not None)
     template_dist_meta = next((dist_meta for dist_meta in dist_metas if dist_meta is not None), None)
 
-    def register_ortho_group(process_group, *, idx: int, tag: str) -> None:
+    def register_ortho_group(process_group, *, idx: int, axis: str) -> None:
         nonlocal ortho_group
         if process_group is None:
             return
@@ -282,7 +412,7 @@ def build_batch_collectives(
         if current_key != group_key:
             raise RuntimeError(
                 "[DION_ORTHO_GROUP_MISMATCH] "
-                f"rank={dist.get_rank()} idx={idx} tag={tag} "
+                f"rank={dist.get_rank()} idx={idx} axis={axis} "
                 f"expected={current_key} got={group_key}"
             )
 
@@ -291,14 +421,14 @@ def build_batch_collectives(
         if dist_meta is None:
             if idx < real_dist_meta_count:
                 raise RuntimeError(
-                    "[DION_UNEXPECTED_MISSING_DIST_META_IN_REAL_SLOT] "
+                    "[DION_UNEXPECTED_MISSING_DIST_META_IN_REAL_ENTRY] "
                     f"rank={dist.get_rank()} idx={idx} real_dist_meta_count={real_dist_meta_count}"
                 )
             dist_meta = template_dist_meta
         use_tp_shard = bool(getattr(config, "use_tp_shard", False))
 
         if use_tp_shard:
-            tp_group = resolve_tp_group_fn(dist_meta, require_in_distributed=True)
+            tp_group = resolve_tp_group(dist_meta, expect_group=True)
             if tp_group is None or dist.get_world_size(tp_group) <= 1:
                 raise RuntimeError(
                     "[DION_MISSING_TP_GROUP_FOR_BATCH_COLLECTIVES] "
@@ -328,10 +458,10 @@ def build_batch_collectives(
                 if tp_key not in tp_r_reduce_groups:
                     tp_r_reduce_groups[tp_key] = (tp_group, [])
                 tp_r_reduce_groups[tp_key][1].append(idx)
-            register_ortho_group(tp_group, idx=idx, tag="tp")
+            register_ortho_group(tp_group, idx=idx, axis="tp")
 
         if needs_fs_p_reduce(config):
-            fs_group = resolve_fs_group_fn(dist_meta, require_in_distributed=True)
+            fs_group = resolve_fs_group(dist_meta, expect_group=True)
             if fs_group is None or dist.get_world_size(fs_group) <= 1:
                 raise RuntimeError(
                     "[DION_MISSING_FS_GROUP_FOR_BATCH_COLLECTIVES] "
@@ -345,7 +475,7 @@ def build_batch_collectives(
             fs_p_reduce_groups[fs_key][1].append(idx)
 
         if use_fs_collectives and bool(getattr(config, "use_fs_shard", False)) and not use_tp_shard:
-            fs_group = resolve_fs_group_fn(dist_meta, require_in_distributed=True)
+            fs_group = resolve_fs_group(dist_meta, expect_group=True)
             if fs_group is None or dist.get_world_size(fs_group) <= 1:
                 raise RuntimeError(
                     "[DION_MISSING_FS_ONLY_ORTHO_GROUP] "
@@ -354,21 +484,21 @@ def build_batch_collectives(
                     f"param_uid={getattr(dist_meta, 'param_uid', None)}"
                 )
             fs_key = (id(fs_group), dist.get_world_size(fs_group), dist.get_rank(fs_group))
-            if fs_orthogonalize_group is None:
-                fs_orthogonalize_group = fs_group
+            if fs_group_info is None:
+                fs_group_info = fs_group
             else:
                 current_key = (
-                    id(fs_orthogonalize_group),
-                    dist.get_world_size(fs_orthogonalize_group),
-                    dist.get_rank(fs_orthogonalize_group),
+                    id(fs_group_info),
+                    dist.get_world_size(fs_group_info),
+                    dist.get_rank(fs_group_info),
                 )
                 if current_key != fs_key:
                     raise RuntimeError(
                         "[DION_FS_ONLY_ORTHO_GROUP_MISMATCH] "
                         f"rank={dist.get_rank()} idx={idx} expected={current_key} got={fs_key}"
                     )
-            fs_orthogonalize_indices.append(idx)
-            register_ortho_group(fs_group, idx=idx, tag="fs_only")
+            fs_indices.append(idx)
+            register_ortho_group(fs_group, idx=idx, axis="fs")
 
     def finalize(grouped_collectives):
         collectives = []
@@ -383,13 +513,13 @@ def build_batch_collectives(
             )
         return tuple(collectives)
 
-    fs_orthogonalize = None
-    if fs_orthogonalize_group is not None:
-        fs_orthogonalize = DionAxisCollective(
-            indices=tuple(fs_orthogonalize_indices),
-            process_group=fs_orthogonalize_group,
-            world_size=dist.get_world_size(fs_orthogonalize_group),
-            rank=dist.get_rank(fs_orthogonalize_group),
+    fs_collective = None
+    if fs_group_info is not None:
+        fs_collective = DionAxisCollective(
+            indices=tuple(fs_indices),
+            process_group=fs_group_info,
+            world_size=dist.get_world_size(fs_group_info),
+            rank=dist.get_rank(fs_group_info),
         )
 
     return DionBatchCollectives(
@@ -397,7 +527,7 @@ def build_batch_collectives(
         fs_p_collectives=finalize(fs_p_reduce_groups),
         tp_r_collectives=finalize(tp_r_reduce_groups),
         tp_q_reshards=finalize(tp_q_reshard_groups),
-        fs_orthogonalize=fs_orthogonalize,
+        fs_collective=fs_collective,
     )
 
 
@@ -409,9 +539,9 @@ def group_and_order_param_batches(
     state_replica_group,
     replica_validation_group,
     global_rank: int,
-    group_size_fn: Callable,
-    get_replicate_group_fn: Callable,
-    resolve_ortho_group_fn: Callable,
+    group_size: Callable,
+    get_replicate_group: Callable,
+    resolve_ortho_group: Callable,
 ):
     """Group Dion params by batch key, then canonicalize and validate cross-rank order."""
     batch_group_by_key = {}
@@ -434,12 +564,18 @@ def group_and_order_param_batches(
             per_expert_global_shape = getattr(dist_meta, "per_expert_global_shape", None)
         batch_items.append(routed_param)
         batch_keys.append(
-            build_batch_key(
-                local_shape,
-                config,
-                routed_param.grad.dtype,
-                true_global_shape=true_global_shape,
-                per_expert_global_shape=per_expert_global_shape,
+            (
+                build_batch_key(
+                    local_shape,
+                    config,
+                    routed_param.grad.dtype,
+                    true_global_shape=true_global_shape,
+                    per_expert_global_shape=per_expert_global_shape,
+                ),
+                _build_update_contract_key(
+                    routed_param.optim_group,
+                    routed_param.optimizer_state,
+                ),
             )
         )
 
@@ -463,9 +599,9 @@ def group_and_order_param_batches(
             use_fs_collectives=use_fs_collectives,
             state_replica_group=state_replica_group,
             replica_validation_group=replica_validation_group,
-            group_size_fn=group_size_fn,
-            get_replicate_group_fn=get_replicate_group_fn,
-            resolve_ortho_group_fn=resolve_ortho_group_fn,
+            group_size=group_size,
+            get_replicate_group=get_replicate_group,
+            resolve_ortho_group=resolve_ortho_group,
         )
         batch_group.sync_groups = resolved_group.sync_groups
         batch_group.kernel_kind = resolved_group.kernel_kind
@@ -502,58 +638,61 @@ def group_and_order_param_batches(
     return ordered_batches
 
 
-def _materialize_batch_slots(
+def _build_batch_entries(
     *,
-    slots: list[DionBatchSlot],
+    entries: list[DionBatchEntry],
     batch_size: int,
 ) -> dict:
-    """Materialize typed batch slots into the final DionBatch contract."""
-    real_batch_size = len(slots)
+    """Assemble typed batch entries into the final DionBatch contract."""
+    real_batch_size = len(entries)
     if real_batch_size <= 0:
-        raise RuntimeError("[DION_EMPTY_BATCH_SLOTS]")
+        raise RuntimeError("[DION_EMPTY_BATCH_ENTRIES]")
 
-    padded_slots = list(slots)
-    params = [slot.param for slot in slots]
-    grads = [slot.grad.view(*slot.param_shape) for slot in slots]
-    momentums = [slot.momentum.view(*slot.param_shape) for slot in slots]
-    q_tensors = [slot.q_tensor for slot in slots]
-    configs = [slot.config for slot in slots]
-    dist_metas = [slot.dist_meta for slot in slots]
-    optim_groups = [slot.optim_group for slot in slots]
-    optimizer_states = [slot.optimizer_state for slot in slots]
-    param_shapes = [slot.param_shape for slot in slots]
+    padded_entries = list(entries)
+    params = [entry.param for entry in entries]
+    grads = [entry.grad.view(*entry.param_shape) for entry in entries]
+    momentums = [entry.momentum.view(*entry.param_shape) for entry in entries]
+    q_tensors = [entry.q_tensor for entry in entries]
+    configs = [entry.config for entry in entries]
+    dist_metas = [entry.dist_meta for entry in entries]
+    optim_groups = [entry.optim_group for entry in entries]
+    optimizer_states = [entry.optimizer_state for entry in entries]
+    param_shapes = [entry.param_shape for entry in entries]
 
     params = pad_batch(params, batch_size)
     grads = pad_batch(grads, batch_size)
     momentums = pad_batch(momentums, batch_size)
     q_tensors = pad_batch(q_tensors, batch_size)
 
-    template = slots[0]
+    template = entries[0]
     while len(configs) < batch_size:
         configs.append(template.config)
     while len(dist_metas) < batch_size:
         dist_metas.append(None)
     while len(optim_groups) < batch_size:
         optim_groups.append(template.optim_group)
+    while len(optimizer_states) < batch_size:
+        optimizer_states.append(None)
     while len(param_shapes) < batch_size:
         param_shapes.append(template.param_shape)
-    while len(padded_slots) < batch_size:
-        padded_slots.append(
-            DionBatchSlot(
-                param=template.param,
-                grad=template.grad,
-                optimizer_state=template.optimizer_state,
+    while len(padded_entries) < batch_size:
+        padded_index = len(padded_entries)
+        padded_entries.append(
+            DionBatchEntry(
+                param=params[padded_index],
+                grad=grads[padded_index],
+                optimizer_state=None,
                 optim_group=template.optim_group,
                 config=template.config,
                 dist_meta=None,
-                momentum=template.momentum,
-                q_tensor=template.q_tensor,
+                momentum=momentums[padded_index],
+                q_tensor=q_tensors[padded_index],
                 param_shape=template.param_shape,
             )
         )
 
     return {
-        "slots": tuple(padded_slots),
+        "entries": tuple(padded_entries),
         "params": params,
         "grads": grads,
         "momentums": momentums,
@@ -575,11 +714,11 @@ def build_dion_batches(
     replica_validation_group,
     batch_key_cache: dict,
     global_rank: int,
-    group_size_fn: Callable,
-    get_replicate_group_fn: Callable,
-    resolve_ortho_group_fn: Callable,
-    resolve_tp_group_fn: Callable,
-    resolve_fs_group_fn: Callable,
+    group_size: Callable,
+    get_replicate_group: Callable,
+    resolve_ortho_group: Callable,
+    resolve_tp_group: Callable,
+    resolve_fs_group: Callable,
 ) -> List[DionBatch]:
     """Build Dion batches from explicit runtime state."""
     ordered_batches = group_and_order_param_batches(
@@ -589,9 +728,9 @@ def build_dion_batches(
         state_replica_group=state_replica_group,
         replica_validation_group=replica_validation_group,
         global_rank=global_rank,
-        group_size_fn=group_size_fn,
-        get_replicate_group_fn=get_replicate_group_fn,
-        resolve_ortho_group_fn=resolve_ortho_group_fn,
+        group_size=group_size,
+        get_replicate_group=get_replicate_group,
+        resolve_ortho_group=resolve_ortho_group,
     )
 
     dion_batches: List[DionBatch] = []
@@ -602,45 +741,53 @@ def build_dion_batches(
 
         for batch_start in range(0, local_num_params, batch_size):
             batch_end = min(batch_start + batch_size, local_num_params)
-            slots: list[DionBatchSlot] = []
+            entries: list[DionBatchEntry] = []
             for idx in range(batch_start, batch_end):
                 param = batch_group.params[idx]
                 optimizer_state = batch_group.optimizer_states[idx]
-                param_shape = tuple(int(dim) for dim in optimizer_state["momentum"].shape)
-                slots.append(
-                    DionBatchSlot(
-                        param=param,
-                        grad=batch_group.grads[idx],
+                config = batch_group.configs[idx]
+                dist_meta = batch_group.dist_metas[idx]
+                param_view, grad_view, momentum_view, q_view, param_shape = _local_expert_views(
+                    param=param,
+                    grad=batch_group.grads[idx],
+                    optimizer_state=optimizer_state,
+                    config=config,
+                    dist_meta=dist_meta,
+                )
+                entries.append(
+                    DionBatchEntry(
+                        param=param_view,
+                        grad=grad_view,
                         optimizer_state=optimizer_state,
                         optim_group=batch_group.optim_groups[idx],
-                        config=batch_group.configs[idx],
-                        dist_meta=batch_group.dist_metas[idx],
-                        momentum=optimizer_state["momentum"],
-                        q_tensor=optimizer_state["Q"],
+                        config=config,
+                        dist_meta=dist_meta,
+                        momentum=momentum_view,
+                        q_tensor=q_view,
                         param_shape=param_shape,
                     )
                 )
 
-            materialized = _materialize_batch_slots(slots=slots, batch_size=batch_size)
+            batch_data = _build_batch_entries(entries=entries, batch_size=batch_size)
             batch_collectives = build_batch_collectives(
-                q_tensors=materialized["q_tensors"],
-                configs=materialized["configs"],
-                dist_metas=materialized["dist_metas"],
+                q_tensors=batch_data["q_tensors"],
+                configs=batch_data["configs"],
+                dist_metas=batch_data["dist_metas"],
                 use_fs_collectives=use_fs_collectives,
-                resolve_tp_group_fn=resolve_tp_group_fn,
-                resolve_fs_group_fn=resolve_fs_group_fn,
+                resolve_tp_group=resolve_tp_group,
+                resolve_fs_group=resolve_fs_group,
             )
             dion_batches.append(
                 DionBatch(
                     batch_key=batch_key,
-                    slots=materialized["slots"],
-                    real_batch_size=materialized["real_batch_size"],
+                    entries=batch_data["entries"],
+                    real_batch_size=batch_data["real_batch_size"],
                     global_param_offset=global_param_offset,
                     batch_group=batch_group,
                     batch_collectives=batch_collectives,
                 )
             )
-            global_param_offset += materialized["real_batch_size"]
+            global_param_offset += batch_data["real_batch_size"]
 
         batch_group.params = []
         batch_group.grads = []

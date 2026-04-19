@@ -52,8 +52,8 @@ class DionStepParam:
 
 
 @dataclass
-class DionBatchSlot:
-    """One typed per-param slot used to assemble a Dion batch."""
+class DionBatchEntry:
+    """One typed per-parameter entry used to assemble a Dion batch."""
 
     param: torch.Tensor | None = None
     grad: torch.Tensor | None = None
@@ -68,7 +68,7 @@ class DionBatchSlot:
 
 @dataclass
 class DionBatchGroup:
-    """One grouped Dion batch carrier before fixed-size batch assembly."""
+    """One grouped Dion batch before fixed-size batch assembly."""
 
     params: list[torch.Tensor] | None = None
     grads: list[torch.Tensor] | None = None
@@ -105,6 +105,10 @@ class DionDistMeta:
     tp_world_size: int = 1
     tp_rank: int = -1
     per_expert_global_shape: Optional[Tuple[int, int]] = None
+    local_shape: Optional[Tuple[int, int]] = None
+    expert_axis: int = -1
+    num_local_experts: int = 1
+    local_expert_index: int = -1
     param_config: Optional[DionParamConfig] = None
 
 
@@ -120,21 +124,21 @@ class DionAxisCollective:
 
 @dataclass
 class DionBatchCollectives:
-    """Adapter-owned TP/FS collectives for one concrete Dion batch."""
+    """TP/FS collective state for one concrete Dion batch."""
 
     tp_q_gathers: Tuple[DionAxisCollective, ...] = ()
     fs_p_collectives: Tuple[DionAxisCollective, ...] = ()
     tp_r_collectives: Tuple[DionAxisCollective, ...] = ()
     tp_q_reshards: Tuple[DionAxisCollective, ...] = ()
-    fs_orthogonalize: Optional[DionAxisCollective] = None
+    fs_collective: Optional[DionAxisCollective] = None
 
 
 @dataclass
 class DionBatch:
-    """Adapter-owned ready-to-execute batch for one Dion kernel call."""
+    """Ready-to-execute batch for one Dion kernel call."""
 
     batch_key: tuple = ()
-    slots: Tuple[DionBatchSlot, ...] = ()
+    entries: Tuple[DionBatchEntry, ...] = ()
     real_batch_size: int = 0
     global_param_offset: int = 0
     batch_group: Optional["DionBatchGroup"] = None
@@ -150,15 +154,15 @@ class DionBatch:
     _param_shapes: Tuple[Tuple[int, int], ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._params = tuple(slot.param for slot in self.slots)
-        self._grads = tuple(slot.grad for slot in self.slots)
-        self._momentums = tuple(slot.momentum for slot in self.slots)
-        self._q_tensors = tuple(slot.q_tensor for slot in self.slots)
-        self._configs = tuple(slot.config for slot in self.slots)
-        self._dist_metas = tuple(slot.dist_meta for slot in self.slots)
-        self._optim_groups = tuple(slot.optim_group for slot in self.slots)
-        self._optimizer_states = tuple(slot.optimizer_state for slot in self.slots)
-        self._param_shapes = tuple(slot.param_shape for slot in self.slots)
+        self._params = tuple(entry.param for entry in self.entries)
+        self._grads = tuple(entry.grad for entry in self.entries)
+        self._momentums = tuple(entry.momentum for entry in self.entries)
+        self._q_tensors = tuple(entry.q_tensor for entry in self.entries)
+        self._configs = tuple(entry.config for entry in self.entries)
+        self._dist_metas = tuple(entry.dist_meta for entry in self.entries)
+        self._optim_groups = tuple(entry.optim_group for entry in self.entries)
+        self._optimizer_states = tuple(entry.optimizer_state for entry in self.entries)
+        self._param_shapes = tuple(entry.param_shape for entry in self.entries)
 
     @property
     def params(self) -> Tuple[torch.Tensor | None, ...]:
@@ -196,10 +200,9 @@ class DionBatch:
     def param_shapes(self) -> Tuple[Tuple[int, int], ...]:
         return self._param_shapes
 
-
 @dataclass
 class DionQLayout:
-    """Adapter-owned Q-state layout contract for one logical Dion parameter."""
+    """Q-state layout contract for one Dion parameter."""
 
     q_global_shape: Tuple[int, int] | None = None
     q_local_shape: Tuple[int, int] | None = None
@@ -214,11 +217,11 @@ class DionQLayout:
 
 @dataclass
 class DionQInit:
-    """Adapter-owned state-init contract for one logical Dion parameter."""
+    """State-init contract for one Dion parameter."""
 
     tp_world_size: int = 1
     tp_rank: int = 0
     use_q_unshard: bool = False
-    q_init_seed: Optional[int] = None
+    q_seed: Optional[int] = None
     q_layout: Optional[DionQLayout] = None
-    broadcast_q_fn: Optional[Callable[[torch.Tensor], None]] = None
+    broadcast_q: Optional[Callable[[torch.Tensor], None]] = None

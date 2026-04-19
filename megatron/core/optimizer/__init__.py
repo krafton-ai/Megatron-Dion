@@ -49,7 +49,7 @@ from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_versio
 from .distrib_dion.integration import (
     build_distributed_optimizer_for_dion,
     build_megatron_dion,
-    get_dion_scalar_param_override,
+    get_dion_param_override,
 )
 from .distrib_dion.parameter import annotate_dion_candidates
 from .distrib_optimizer import DistributedOptimizer
@@ -138,7 +138,7 @@ def _get_param_groups(
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel) to params.
+    # Map (param_override_tuple, is_expert_parallel) to params.
     params_map = {}
 
     if config_overrides is None:
@@ -154,28 +154,27 @@ def _get_param_groups(
             if not param.requires_grad:
                 continue
 
-            uses_default_config = False
             # Get optimizer config overrides for this parameter.
-            param_overrides_list: list[ParamGroupOverride] = []
+            matching_param_overrides: list[ParamGroupOverride] = []
             if config_overrides is not None:
                 for param_key, param_override in config_overrides.items():
                     if param_key.matches(param, name):
-                        param_overrides_list.append(param_override)
+                        matching_param_overrides.append(param_override)
 
-            if param_overrides_list:
+            if matching_param_overrides:
                 param_override: ParamGroupOverride | None = combine_param_group_overrides(
-                    param_overrides_list
+                    matching_param_overrides
                 )
             else:
                 param_override = None
 
-            dion_scalar_override = get_dion_scalar_param_override(config, param, param_override)
-            if dion_scalar_override is not None:
+            dion_param_override = get_dion_param_override(config, param, param_override)
+            if dion_param_override is not None:
                 if param_override is None:
-                    param_override = dion_scalar_override
+                    param_override = dion_param_override
                 else:
                     param_override = combine_param_group_overrides(
-                        [param_override, dion_scalar_override]
+                        [param_override, dion_param_override]
                     )
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
@@ -250,7 +249,7 @@ def _get_param_groups_and_buffers(
     model_chunk_offset: int,
     config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
-    filter_fn: Callable,
+    filter_param_group: Callable,
     buffer_name: str,
 ) -> Tuple[List[Dict], Dict[int, List[_ParamAndGradBuffer]]]:
     """Returns parameter groups and buffer for optimizer.
@@ -264,14 +263,14 @@ def _get_param_groups_and_buffers(
             overrides, specified on the basis of ParamKey matches with each parameter.
         lr (float): learning rate.
         min_lr (float): minimum learning rate.
-        filter_fn (callable): filtering function for param_groups.
+        filter_param_group (callable): filtering function for param_groups.
         buffer_name (str): name of buffer.
 
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
     param_groups = _get_param_groups(model_chunks, config, config_overrides)
-    param_groups = list(filter(filter_fn, param_groups))
+    param_groups = list(filter(filter_param_group, param_groups))
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
         if hasattr(model_chunk, buffer_name):
@@ -287,7 +286,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     per_model_buffers: Optional[Dict[int, List[_ParamAndGradBuffer]]] = None,
     model_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    logical_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    pure_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_idx: Optional[int] = None,
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -362,7 +361,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 param_update_in_fp32=True,
                 **optimizer_defaults,
             )
-            init_state_fn = None
+            init_state = None
         elif config.optimizer == 'adam':
             kwargs = {
                 "params": param_groups,
@@ -406,7 +405,7 @@ def _get_megatron_optimizer_based_on_param_groups(
 
             optimizer = adam_cls(**kwargs)
 
-            def init_state_fn(opt, config=None):
+            def init_state(opt, config=None):
                 for group in opt.param_groups:
                     for p in group['params']:
                         if len(opt.state[p]) == 0:
@@ -423,22 +422,22 @@ def _get_megatron_optimizer_based_on_param_groups(
                 weight_decay=config.weight_decay,
                 momentum=config.sgd_momentum,
             )
-            init_state_fn = None
+            init_state = None
         elif config.optimizer == 'dion':
             optimizer = build_megatron_dion(
                 config=config,
                 param_groups=param_groups,
                 data_parallel_group=data_parallel_group,
-                logical_data_parallel_group=logical_data_parallel_group,
+                pure_data_parallel_group=pure_data_parallel_group,
                 pg_collection=pg_collection,
                 is_expert_parallel=is_expert_parallel,
             )
-            init_state_fn = None
+            init_state = None
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:
         optimizer = None
-        init_state_fn = None
+        init_state = None
 
     # Mixed precision optimizer.
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
@@ -470,7 +469,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                     hysteresis=config.hysteresis,
                 )
 
-        optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
+        optimizer_args = [optimizer, config, grad_scaler, init_state]
         if config.use_distributed_optimizer:
             if config.optimizer == 'dion':
                 optimizer = build_distributed_optimizer_for_dion(
@@ -479,7 +478,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                     model_chunks=model_chunks,
                     per_model_buffers=per_model_buffers,
                     data_parallel_group=data_parallel_group,
-                    logical_data_parallel_group=logical_data_parallel_group,
+                    pure_data_parallel_group=pure_data_parallel_group,
                     data_parallel_group_gloo=data_parallel_group_gloo,
                     data_parallel_group_idx=data_parallel_group_idx,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
@@ -505,7 +504,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
-        optimizer = FP32Optimizer(optimizer, config, init_state_fn)
+        optimizer = FP32Optimizer(optimizer, config, init_state)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
     if pg_collection is None or not hasattr(pg_collection, 'tp'):
@@ -560,9 +559,8 @@ def get_megatron_optimizer(
     Args:
         config (OptimizerConfig): optimizer configuration object.
         model_chunks (List[MegatronModule]): model chunks to get optimizer for.
-        config_overrides (Optional[Dict[ParamKey, OptimizerConfig]]): optional dictionary of
-            optimizer configuration objects to override default optimizer behavior for different
-            subsets of parameters (identified by ParamKey).
+        config_overrides (Optional[Dict[ParamKey, ParamGroupOverride]]): optional dictionary of
+            param-group overrides to apply to different parameter subsets identified by ParamKey.
         use_gloo_process_groups (bool): if false, disable use of Gloo process groups
             in underlying Megatron optimizers.
         pg_collection: Optional unified process group for distributed training.
@@ -623,7 +621,7 @@ def get_megatron_optimizer(
                 model_chunk_offset=model_chunk_offset,
                 config=config,
                 config_overrides=config_overrides,
-                filter_fn=lambda g: True,
+                filter_param_group=lambda g: True,
                 buffer_name='buffers',
             )
 
@@ -635,7 +633,7 @@ def get_megatron_optimizer(
                     per_model_buffers=buffers,
                     model_parallel_group=mp_group,
                     data_parallel_group=dp_cp_group,
-                    logical_data_parallel_group=dp_group,
+                    pure_data_parallel_group=dp_group,
                     data_parallel_group_gloo=intra_dp_cp_group_gloo,
                     data_parallel_group_idx=model_parallel_rank,
                     intra_dist_opt_group=intra_dist_opt_group,
@@ -661,7 +659,7 @@ def get_megatron_optimizer(
             model_chunk_offset=model_chunk_offset,
             config=config,
             config_overrides=config_overrides,
-            filter_fn=lambda g: not g['is_expert_parallel'],
+            filter_param_group=lambda g: not g['is_expert_parallel'],
             buffer_name='buffers',
         )
         for model_chunk in dense_model_chunks:
@@ -684,7 +682,7 @@ def get_megatron_optimizer(
                 per_model_buffers=buffers,
                 model_parallel_group=mp_group,
                 data_parallel_group=intra_dp_cp_group,
-                logical_data_parallel_group=dp_group,
+                pure_data_parallel_group=dp_group,
                 data_parallel_group_gloo=intra_dp_cp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
@@ -699,7 +697,7 @@ def get_megatron_optimizer(
         model_chunk_offset=0,
         config=config,
         config_overrides=config_overrides,
-        filter_fn=lambda g: g['is_expert_parallel'],
+        filter_param_group=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
     )
     if dump_param_to_param_group_map is not None:
@@ -723,7 +721,7 @@ def get_megatron_optimizer(
                 per_model_buffers=moe_buffers,
                 model_parallel_group=expt_tp_pp_group,
                 data_parallel_group=intra_expt_dp_group,
-                logical_data_parallel_group=process_groups_dict['expt_dp_group'],
+                pure_data_parallel_group=process_groups_dict['expt_dp_group'],
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,

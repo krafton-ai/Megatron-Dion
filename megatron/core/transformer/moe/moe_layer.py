@@ -124,6 +124,8 @@ class BaseMoELayer(MegatronModule, ABC):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
+        if self.token_dispatcher is not None:
+            self.token_dispatcher.layer_number = layer_number
         if hasattr(self.experts, "set_layer_number"):
             self.experts.set_layer_number(layer_number)
         if self.shared_experts is not None and hasattr(self.shared_experts, "set_layer_number"):
@@ -222,6 +224,7 @@ class MoELayer(BaseMoELayer):
             raise ValueError(
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
             )
+        self.token_dispatcher.layer_number = layer_number
 
         # Initialize experts
         self.experts = build_module(
