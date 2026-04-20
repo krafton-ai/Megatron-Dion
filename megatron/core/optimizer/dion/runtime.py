@@ -381,6 +381,7 @@ def run_dion_batch_async(
             global_param_offset,
             batch_group,
             batch_collectives,
+            commit_updates=[entry.commit_update for entry in dion_batch.entries[:real_batch_size]],
         )
 
 
@@ -709,9 +710,10 @@ def apply_batch_updates(
     global_param_offset: int,
     batch_group: DionBatchGroup,
     batch_collectives: Optional[DionBatchCollectives] = None,
+    commit_updates: Optional[List[Callable[[Tensor, Tensor], None]]] = None,
 ) -> None:
     """Apply weight decay, Dion delta update, and TP re-sharding for Q."""
-    del global_param_offset, momentums, R_batch
+    del global_param_offset, R_batch
     if real_batch_size <= 0:
         return
     _validate_batch_update_contract(
@@ -795,6 +797,19 @@ def apply_batch_updates(
                 f"param_uid={getattr(dist_metas[index], 'param_uid', None) if dist_metas is not None else None}"
             )
         Qs[index].copy_(q_state)
+        if (
+            dist_metas is not None
+            and getattr(dist_metas[index], "is_qkv_child", False)
+            and (commit_updates is None or commit_updates[index] is None)
+        ):
+            raise RuntimeError(
+                "[DION_QKV_CHILD_MISSING_COMMIT_UPDATE] "
+                f"step={optimizer._step_count} rank={optimizer._global_rank} "
+                f"param_uid={getattr(dist_metas[index], 'param_uid', None)} "
+                f"param_name={getattr(dist_metas[index], 'param_name', '')}"
+            )
+        if commit_updates is not None and commit_updates[index] is not None:
+            commit_updates[index](param, momentums[index])
 
     del delta_batch
 
@@ -1145,6 +1160,7 @@ def batch_dion_update_async(
     global_param_offset: int = 0,
     batch_group: Optional[DionBatchGroup] = None,
     batch_collectives: Optional[DionBatchCollectives] = None,
+    commit_updates: Optional[List[Callable[[Tensor, Tensor], None]]] = None,
 ) -> Generator[None, None, None]:
     """Perform one adapter-authored batched Dion update with async communication."""
     batch_size = len(params)
@@ -1450,6 +1466,7 @@ def batch_dion_update_async(
         global_param_offset,
         batch_group,
         batch_collectives,
+        commit_updates,
     )
 
     del M_batch, Q_batch, P_batch, R_batch, Q_new_batch, Q_state_batch

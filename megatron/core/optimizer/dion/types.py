@@ -49,6 +49,7 @@ class DionStepParam:
     optim_group: dict | None = None
     config: Optional[DionParamConfig] = None
     dist_meta: Any = None
+    commit_update: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
 
 @dataclass
@@ -64,6 +65,7 @@ class DionBatchEntry:
     momentum: torch.Tensor | None = None
     q_tensor: torch.Tensor | None = None
     param_shape: Tuple[int, int] = ()
+    commit_update: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
 
 @dataclass
@@ -76,6 +78,7 @@ class DionBatchGroup:
     optim_groups: list[dict] | None = None
     configs: list[DionParamConfig] | None = None
     dist_metas: list[Any] | None = None
+    commit_updates: list[Callable[[torch.Tensor, torch.Tensor], None] | None] | None = None
     sync_groups: Tuple[torch.distributed.ProcessGroup, ...] = ()
     kernel_kind: str = "ddp"
     replicate_group: Optional[torch.distributed.ProcessGroup] = None
@@ -110,6 +113,11 @@ class DionDistMeta:
     num_local_experts: int = 1
     local_expert_index: int = -1
     param_config: Optional[DionParamConfig] = None
+    parent_param_uid: Tuple | None = None
+    parent_param_name: str = ""
+    is_qkv_child: bool = False
+    qkv_child_kind: str = ""
+    qkv_split_shapes: Optional[Tuple[int, int, int]] = None
 
 
 @dataclass

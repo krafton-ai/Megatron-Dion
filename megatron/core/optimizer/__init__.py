@@ -154,6 +154,17 @@ def _get_param_groups(
             if not param.requires_grad:
                 continue
 
+            if 'linear_qkv.weight' in name and len(param.shape) == 2:
+                num_attention_heads = int(model_chunk.config.num_attention_heads)
+                num_query_groups = int(model_chunk.config.num_query_groups)
+                kv_channels = int(model_chunk.config.kv_channels)
+                param.is_qkv = True
+                param.qkv_split_shapes = (
+                    num_attention_heads // num_query_groups * kv_channels,
+                    kv_channels,
+                    kv_channels,
+                )
+
             # Get optimizer config overrides for this parameter.
             matching_param_overrides: list[ParamGroupOverride] = []
             if config_overrides is not None:

@@ -12,6 +12,7 @@ from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 
+from ..dion.qkv import iter_qkv_child_kinds, qkv_state_key
 from .sharding import (
     DionShardLayout,
     compute_fs_shard_range,
@@ -114,6 +115,12 @@ def restore_persistent_dion_param_state_(
                     new_state[key] = value.to(device=param.device)
                 else:
                     new_state[key] = value
+
+            if bool(new_state.get("qkv_split_qkv", False)):
+                for child_kind in iter_qkv_child_kinds():
+                    q_key = qkv_state_key("Q", child_kind)
+                    if q_key in new_state:
+                        new_state[f"_qkv_{child_kind}_needs_state_replica_q_sync"] = True
 
             optimizer_state[param] = new_state
             summary["restored"] += 1

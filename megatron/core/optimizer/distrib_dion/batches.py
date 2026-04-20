@@ -587,6 +587,7 @@ def group_and_order_param_batches(
             optim_groups=[item.optim_group for item in grouped_items],
             configs=[item.config for item in grouped_items],
             dist_metas=[item.dist_meta for item in grouped_items],
+            commit_updates=[item.commit_update for item in grouped_items],
         )
 
     local_batch_keys = list(batch_group_by_key.keys())
@@ -765,6 +766,9 @@ def build_dion_batches(
                         momentum=momentum_view,
                         q_tensor=q_view,
                         param_shape=param_shape,
+                        commit_update=batch_group.commit_updates[idx]
+                        if batch_group.commit_updates is not None
+                        else None,
                     )
                 )
 
@@ -795,5 +799,7 @@ def build_dion_batches(
         batch_group.optim_groups = []
         batch_group.configs = []
         batch_group.dist_metas = []
+        if hasattr(batch_group, "commit_updates"):
+            batch_group.commit_updates = []
 
     return dion_batches

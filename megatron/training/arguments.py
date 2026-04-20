@@ -2110,6 +2110,8 @@ def _add_training_args(parser):
                        help='Beta2 for the Dion scalar optimizer.')
     group.add_argument('--dion-eps', type=float, default=1e-8,
                        help='Epsilon for the Dion scalar optimizer.')
+    group.add_argument('--dion-split-qkv', action='store_true',
+                       help='Treat fused QKV weights as optimizer-only Q/K/V children for Dion.')
     group.add_argument('--dion-momentum-dtype', type=str, default='float32',
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
                        help='Dtype for Dion momentum state.')

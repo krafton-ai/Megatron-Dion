@@ -127,6 +127,15 @@ def sync_q_replicas(
 ) -> None:
     """Synchronize freshly initialized Q across standard DO state replicas."""
     if state_replica_group is None or group_size(state_replica_group) <= 1:
+        for step_param in dion_params:
+            state = step_param.optimizer_state
+            if state is None:
+                continue
+            if state.get("_needs_state_replica_q_sync", False):
+                state["_needs_state_replica_q_sync"] = False
+            post_q_sync = state.get("_post_q_sync", None)
+            if callable(post_q_sync):
+                post_q_sync()
         return
 
     broadcast_q = make_group_broadcast(state_replica_group)
@@ -148,6 +157,9 @@ def sync_q_replicas(
             )
         broadcast_q(q_state)
         state["_needs_state_replica_q_sync"] = False
+        post_q_sync = state.get("_post_q_sync", None)
+        if callable(post_q_sync):
+            post_q_sync()
 
 
 def use_distributed_dion_update(
@@ -452,6 +464,7 @@ def route_step_params(
     get_or_initialize_optimizer_state: Callable,
     require_param_config: Callable,
     use_distributed_dion_update: Callable,
+    maybe_expand_split_qkv_params: Callable,
     sync_q_replicas: Callable,
     build_dion_batches: Callable,
 ):
@@ -468,6 +481,18 @@ def route_step_params(
             optimizer_state = get_or_initialize_optimizer_state(param, optim_group)
             dist_meta = dist_metas.get(param, None)
             config = require_param_config(param, dist_meta)
+
+            split_qkv_params = maybe_expand_split_qkv_params(
+                param=param,
+                grad=grad,
+                optimizer_state=optimizer_state,
+                optim_group=optim_group,
+                config=config,
+                dist_meta=dist_meta,
+            )
+            if split_qkv_params is not None:
+                dion_params.extend(split_qkv_params)
+                continue
 
             if use_distributed_dion_update(param, optimizer_state, optim_group, dist_meta):
                 dion_params.append(

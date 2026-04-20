@@ -59,6 +59,7 @@ class MegatronDion(Optimizer):
         use_compressed_comm: bool = True,  # Enable compressed communication
         scalar_optimizer: str = "adamw",  # Scalar optimizer for non-Dion params ("adamw" or "lion")
         lr_scaling_rule: str = "dion",  # 2D Dion LR scaling rule ("moonlight" or "dion")
+        split_qkv: bool = False,
         max_concurrent_tasks: Optional[int] = None,  # Optional async concurrency hint
     ):
         defaults = dict(
@@ -77,6 +78,7 @@ class MegatronDion(Optimizer):
             use_compressed_comm=use_compressed_comm,
             scalar_optimizer=scalar_optimizer,  # "adamw" or "lion"
             lr_scaling_rule=lr_scaling_rule,
+            split_qkv=bool(split_qkv),
             # Reference implementation uses only RCQR and standard scaling
             algorithm="dion",  # Default algorithm, same as original dion.py
             step=0,  # Per-group step counter

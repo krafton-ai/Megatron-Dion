@@ -501,6 +501,9 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_eps: float = 1e-8
     """Epsilon for Dion scalar optimizer states."""
 
+    dion_split_qkv: bool = False
+    """Whether Dion should treat fused QKV weights as optimizer-only Q/K/V children."""
+
     dion_momentum_dtype: Optional[torch.dtype] = torch.float32
     """Dtype for Dion momentum state."""
 

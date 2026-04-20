@@ -7,6 +7,7 @@ from typing import Callable
 import torch.distributed as dist
 
 from ... import parallel_state
+from ..dion.qkv import get_qkv_split_shapes, is_qkv_param
 from ..dion.state import build_param_config
 from ..dion.types import DionDistMeta
 from ..dion.utils import get_local_shape
@@ -240,6 +241,11 @@ def build_dist_meta(
         local_expert_index=(
             int(expert_layout["local_expert_index"]) if expert_layout is not None else -1
         ),
+        qkv_split_shapes=(
+            get_qkv_split_shapes(model_param)
+            if is_qkv_param(model_param)
+            else None
+        ),
     )
 
     config_local_shape = get_local_shape(
@@ -311,6 +317,11 @@ def add_non_dion_metas(
                 tp_group=tp_group,
                 tp_world_size=tp_world_size,
                 tp_rank=tp_rank,
+                qkv_split_shapes=(
+                    get_qkv_split_shapes(model_param)
+                    if is_qkv_param(model_param)
+                    else None
+                ),
             )
             dist_meta.param_config = build_param_config(
                 param_ndim=param.ndim,

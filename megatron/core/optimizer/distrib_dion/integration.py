@@ -415,6 +415,7 @@ def build_megatron_dion(
         eps=config.dion_eps,
         scalar_optimizer=config.dion_scalar_optimizer,
         lr_scaling_rule=config.dion_lr_scaling,
+        split_qkv=config.dion_split_qkv,
         mixed_precision_config=mixed_precision_config,
         use_fs_collectives=config.dion_use_fs_collectives,
         use_compressed_comm=config.dion_use_compressed_comm,
