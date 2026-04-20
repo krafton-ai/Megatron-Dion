@@ -84,9 +84,13 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
         try:
             if MultiStorageClientFeature.is_enabled():
                 msc = MultiStorageClientFeature.import_package()
-                return msc.torch.load(load_path, map_location='cpu')
+                return msc.torch.load(load_path, map_location='cpu', weights_only=False)
             else:
-                return torch.load(load_path, map_location='cpu')
+                # ms-swift 체크포인트는 `swift.llm.model.utils.ModelInfo` 같은 커스텀
+                # 클래스를 common state에 저장. torch 2.6 부터 `torch.load` 기본값이
+                # `weights_only=True` 로 바뀌어 UnpicklingError 발생. 우리가 직접 만든
+                # 체크포인트만 로드하므로 trusted 소스로 간주하고 명시적으로 끔.
+                return torch.load(load_path, map_location='cpu', weights_only=False)
         except FileNotFoundError as e:
             err_msg = f'Common file {load_path} does not exist'
             if MultiStorageClientFeature.is_enabled():
