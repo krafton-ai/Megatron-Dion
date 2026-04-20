@@ -889,11 +889,10 @@ def run_compressed_comm_async(
         rank_index = batch_indices[fs_rank]
         rank_meta = dist_metas[rank_index]
         if rank_meta is None:
-            if torch.count_nonzero(P_single.to(dtype=torch.float32)).item() != 0:
-                raise RuntimeError(
-                    "[DION_NONZERO_FSONLY_PADDED_MATRIX] "
-                    f"shape={tuple(P_single.shape)}"
-                )
+            torch._assert_async(
+                torch.count_nonzero(P_single) == 0,
+                f"[DION_NONZERO_FSONLY_PADDED_MATRIX] shape={tuple(P_single.shape)}",
+            )
             P_single = torch.zeros_like(P_single).contiguous()
         else:
             sketch = make_sketch(
@@ -1345,11 +1344,10 @@ def batch_dion_update_async(
                     rank_index = batch_indices[fs_rank]
                     rank_meta = dist_metas[rank_index]
                     if rank_meta is None:
-                        if torch.count_nonzero(P_single.to(dtype=torch.float32)).item() != 0:
-                            raise RuntimeError(
-                                "[DION_NONZERO_FSONLY_PADDED_MATRIX] "
-                                f"shape={tuple(P_single.shape)}"
-                            )
+                        torch._assert_async(
+                            torch.count_nonzero(P_single) == 0,
+                            f"[DION_NONZERO_FSONLY_PADDED_MATRIX] shape={tuple(P_single.shape)}",
+                        )
                         P_single = torch.zeros_like(P_single).contiguous()
                     else:
                         sketch = make_sketch(

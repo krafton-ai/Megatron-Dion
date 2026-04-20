@@ -30,7 +30,7 @@ def scaled_lr_for_shape(
                 "[DION_INVALID_LR_SCALING_SHAPE] "
                 f"m_for_lr={m_for_lr} n_for_lr={n_for_lr}"
             )
-        return lr * math.sqrt(float(n_for_lr) / float(m_for_lr))
+        return lr * math.sqrt(float(m_for_lr) / float(n_for_lr))
     raise RuntimeError(f"[DION_INVALID_LR_SCALING_RULE] rule={rule!r}")
 
 
@@ -227,10 +227,7 @@ def normalize_columns(
     epsilon: float,
 ):
     """Return column-normalized Q_new and its local post-normalize squared sums."""
-    col_norms = col_sum_sq.sqrt()
-    del epsilon
-    zero_norm_fallback = torch.full_like(col_norms, 1e-16)
-    safe_denominator = torch.where(col_norms == 0, zero_norm_fallback, col_norms)
+    safe_denominator = col_sum_sq.sqrt().add_(epsilon)
     q_new = R_batch / safe_denominator
     post_col_sum_sq = q_new.to(torch.float32).square().sum(dim=1)
     return q_new, post_col_sum_sq

@@ -175,14 +175,14 @@ def get_dion_param_override(
     if not is_text_embedding and not is_lm_head:
         return None
 
-    dion_param_override: ParamGroupOverride = {"wd_mult": 0.0}
     lr_scaling_rule = getattr(config, "dion_lr_scaling", None)
 
-    # Moonlight keeps scalar surfaces on the shared base-lr schedule.
+    # Moonlight keeps scalar surfaces on the shared base-lr schedule and standard wd policy.
     if lr_scaling_rule == "moonlight":
-        return dion_param_override
+        return None
 
     if is_lm_head and not is_tied_embedding_output:
+        dion_param_override: ParamGroupOverride = {}
         if param.ndim < 2:
             raise RuntimeError(
                 f"[DION_LM_HEAD_INVALID_DIM] expected ndim>=2 for lm_head, got shape={tuple(param.shape)}"
@@ -206,8 +206,9 @@ def get_dion_param_override(
         dion_param_override["max_lr"] = current_max_lr / scale
         if current_min_lr is not None:
             dion_param_override["min_lr"] = current_min_lr / scale
+        return dion_param_override
 
-    return dion_param_override
+    return None
 
 
 def _get_dion_replica_group(

@@ -126,19 +126,17 @@ def _sketch_seed(seed_key: object) -> int:
 def _seeded_normal_tensor(
     shape: tuple[int, ...],
     *,
-    seed_key: object,
+    seed: int,
     offset: int = 0,
     device: torch.device,
     dtype: torch.dtype,
     std: float,
 ) -> Tensor:
-    """Generate one topology-invariant sketch tensor from one sketch key."""
+    """Generate one topology-invariant sketch tensor from one sketch seed."""
     gen = torch.Generator(device=str(device))
-    gen.manual_seed(_sketch_seed(seed_key))
+    gen.manual_seed(seed)
     if offset != 0:
-        state = gen.get_state().to("cpu")
-        state[8:] = torch.tensor([offset], dtype=torch.uint64, device="cpu").view(torch.uint8)
-        gen.set_state(state)
+        gen.set_offset(offset)
     tensor = torch.empty(shape, device=device, dtype=dtype)
     tensor.normal_(mean=0.0, std=std, generator=gen)
     return tensor
@@ -185,6 +183,7 @@ def make_sketch(
         contract=contract,
         step_count=step_count,
     )
+    seeds = [_sketch_seed(seed_key) for seed_key in keys]
 
     @torch.compiler.disable
     def build_sketch(P: Tensor, oversample: float) -> Tensor:
@@ -198,10 +197,10 @@ def make_sketch(
                 "[DION_INVALID_SKETCH_BATCH] "
                 f"contract={contract} expected batched 3D tensor, got shape={tuple(P.shape)}"
             )
-        if batch != len(keys):
+        if batch != len(seeds):
             raise RuntimeError(
                 "[DION_SKETCH_META_MISMATCH] "
-                f"contract={contract} batch={batch} sketch_keys={len(keys)}"
+                f"contract={contract} batch={batch} sketch_keys={len(seeds)}"
             )
         m = P.size(-2)
         r = P.size(-1)
@@ -212,21 +211,20 @@ def make_sketch(
             )
         std = math.sqrt(1.0 / k)
         if batch == 1 and len(batch_shape) == 0:
-            seed_key = keys[0]
             sketch = _seeded_normal_tensor(
                 (k, m),
-                seed_key=seed_key,
+                seed=seeds[0],
                 device=P.device,
                 dtype=P.dtype,
                 std=std,
             )
             return sketch
         sketch = torch.empty((batch, k, m), device=P.device, dtype=P.dtype)
-        for idx, seed_key in enumerate(keys):
+        for idx, seed in enumerate(seeds):
             sketch[idx].copy_(
                 _seeded_normal_tensor(
                     (k, m),
-                    seed_key=seed_key,
+                    seed=seed,
                     device=P.device,
                     dtype=P.dtype,
                     std=std,
@@ -582,7 +580,7 @@ def _reduce_scatter_batch_shards(
 
 def _make_sharded_sketch(
     *,
-    sketch_keys: Sequence[object],
+    sketch_seeds: Sequence[int],
     oversample: float,
     row_sizes: Sequence[int],
     row_rank: int,
@@ -601,20 +599,20 @@ def _make_sharded_sketch(
     rank0_rows = int(row_sizes[0])
     shard_offset = ((row_rank * k * rank0_rows) + 3) // 4 * 4
     sketch = torch.empty(
-        (len(sketch_keys), k, local_rows),
+        (len(sketch_seeds), k, local_rows),
         device=device,
         dtype=dtype,
     )
-    for index, seed_key in enumerate(sketch_keys):
+    for index, seed in enumerate(sketch_seeds):
         sketch[index].copy_(
             _seeded_normal_tensor(
                 (k, local_rows),
-            seed_key=seed_key,
+                seed=seed,
                 offset=shard_offset,
-            device=device,
-            dtype=dtype,
-            std=std,
-        )
+                device=device,
+                dtype=dtype,
+                std=std,
+            )
         )
     return sketch
 
@@ -681,6 +679,7 @@ def distributed_orthogonalize(
             f"batch_size={batch_size} sketch_keys="
             f"{0 if batch_sketch_keys is None else len(batch_sketch_keys)}"
         )
+    batch_sketch_seeds = [_sketch_seed(seed_key) for seed_key in batch_sketch_keys]
 
     local_rows = int(P_batch.size(1))
     r = int(P_batch.size(2))
@@ -721,7 +720,7 @@ def distributed_orthogonalize(
 
         R_local = _reduce_scatter_batch_shards(
             _make_sharded_sketch(
-                sketch_keys=batch_sketch_keys,
+                sketch_seeds=batch_sketch_seeds,
                 oversample=oversample,
                 row_sizes=row_sizes,
                 row_rank=ortho_rank,

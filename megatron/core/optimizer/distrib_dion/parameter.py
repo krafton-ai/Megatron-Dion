@@ -31,7 +31,7 @@ def annotate_dion_candidates(module: torch.nn.Module) -> None:
 
 def is_dion_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool:
     """Return True iff this parameter should use Dion FS sharding."""
-    del param_name
+    resolved_name = param_name or getattr(param, "_param_name", None)
     if getattr(param, "use_dion", None) is False:
         return False
     if not getattr(param, "dion_candidate", False):

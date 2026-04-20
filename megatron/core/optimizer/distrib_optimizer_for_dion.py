@@ -1035,6 +1035,11 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                             continue
 
                         unique_two_d_total += 1
+                        pname = ""
+                        try:
+                            pname = buffer.param_to_name.get(param, "")
+                        except Exception:
+                            pname = ""
                         if getattr(param, "use_dion", None) is False:
                             unique_two_d_manual_disabled += 1
                             continue
@@ -1054,11 +1059,6 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                             unique_two_d_fp8_skipped += 1
                             continue
 
-                        pname = ""
-                        try:
-                            pname = buffer.param_to_name.get(param, "")
-                        except Exception:
-                            pname = ""
                         unexpected_two_d_leftovers.append(pname or f"id_{id(param)}")
 
         expected_dion_two_d = (
