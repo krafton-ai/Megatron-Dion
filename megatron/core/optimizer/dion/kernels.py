@@ -19,10 +19,11 @@ def scaled_lr_for_shape(
     n_for_lr: int,
     rule: str,
     rank_fraction: float,
+    moonlight_scale_factor: float = 1.0,
 ) -> float:
     """Return the canonical 2D Dion learning-rate scaling."""
     if rule == "moonlight":
-        base_scale = 0.2 / (rank_fraction ** 0.5)
+        base_scale = moonlight_scale_factor / (rank_fraction ** 0.5)
         return base_scale * (max(m_for_lr, n_for_lr) ** 0.5) * lr
     if rule == "dion":
         if m_for_lr <= 0 or n_for_lr <= 0:
@@ -147,7 +148,7 @@ def fix_all_zero_or_nan(
     return fixed_p, fixed_r
 
 
-@torch.compile(fullgraph=True)
+@torch.compiler.disable
 def local_column_sum_sq(X: Tensor) -> Tensor:
     """Return float32 per-column squared sums for one local tensor batch."""
     return X.to(dtype=torch.float32).square().sum(dim=-2, keepdim=True)
@@ -219,7 +220,7 @@ def compute_update_batch(
         return delta_batch
 
 
-@torch.compile(fullgraph=True)
+@torch.compiler.disable
 def normalize_columns(
     R_batch: Tensor,
     col_sum_sq: Tensor,
@@ -227,7 +228,9 @@ def normalize_columns(
     epsilon: float,
 ):
     """Return column-normalized Q_new and its local post-normalize squared sums."""
+    original_dtype = R_batch.dtype
     safe_denominator = col_sum_sq.sqrt().add_(epsilon)
-    q_new = R_batch / safe_denominator
+    q_new = R_batch.to(dtype=torch.float32) / safe_denominator
+    q_new = q_new.to(dtype=original_dtype)
     post_col_sum_sq = q_new.to(torch.float32).square().sum(dim=1)
     return q_new, post_col_sum_sq

@@ -238,7 +238,7 @@ class OptimizerConfig:
     optimizer.
     """
 
-    adam_beta2: float = 0.999
+    adam_beta2: float = 0.95
     """Second coefficient for computing running averages of gradient and its square in Adam
     optimizer.
     """
@@ -438,7 +438,7 @@ class AdamOptimizerConfig(OptimizerConfig):
     optimizer.
     """
 
-    adam_beta2: float = 0.999
+    adam_beta2: float = 0.95
     """Second coefficient for computing running averages of gradient and its square in Adam
     optimizer.
     """
@@ -489,8 +489,11 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_scalar_optimizer: str = "adamw"
     """Scalar optimizer used for non-Dion parameter surfaces."""
 
-    dion_lr_scaling: str = "dion"
+    dion_lr_scaling: str = "moonlight"
     """Dion 2D learning-rate scaling rule."""
+
+    dion_moonlight_scale_factor: float = 1.0
+    """Additional multiplicative constant used by moonlight LR scaling."""
 
     dion_beta1: float = 0.9
     """Beta1 for Dion scalar optimizer states."""
@@ -501,13 +504,16 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_eps: float = 1e-8
     """Epsilon for Dion scalar optimizer states."""
 
-    dion_split_qkv: bool = False
+    dion_split_qkv: bool = True
     """Whether Dion should treat fused QKV weights as optimizer-only Q/K/V children."""
 
-    dion_momentum_dtype: Optional[torch.dtype] = torch.float32
+    dion_split_linear: bool = True
+    """Whether Dion should treat fused linear_fc1 weights as optimizer-only gate/up children."""
+
+    dion_momentum_dtype: Optional[torch.dtype] = None
     """Dtype for Dion momentum state."""
 
-    dion_q_dtype: Optional[torch.dtype] = torch.float32
+    dion_q_dtype: Optional[torch.dtype] = None
     """Dtype for Dion right-factor state."""
 
     """Optional Dion local batching hint."""

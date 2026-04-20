@@ -163,7 +163,7 @@ def get_dion_param_override(
     param: torch.nn.Parameter,
     param_override: Optional[ParamGroupOverride],
 ) -> Optional[ParamGroupOverride]:
-    """Return the Dion param override for scalar embedding/lm-head params."""
+    """Return Dion-specific scalar-surface LR overrides."""
     if not isinstance(config, DionOptimizerConfig):
         return None
 
@@ -177,12 +177,10 @@ def get_dion_param_override(
 
     lr_scaling_rule = getattr(config, "dion_lr_scaling", None)
 
-    # Moonlight keeps scalar surfaces on the shared base-lr schedule and standard wd policy.
     if lr_scaling_rule == "moonlight":
         return None
 
     if is_lm_head and not is_tied_embedding_output:
-        dion_param_override: ParamGroupOverride = {}
         if param.ndim < 2:
             raise RuntimeError(
                 f"[DION_LM_HEAD_INVALID_DIM] expected ndim>=2 for lm_head, got shape={tuple(param.shape)}"
@@ -203,6 +201,7 @@ def get_dion_param_override(
             if param_override is not None and "min_lr" in param_override
             else config.min_lr
         )
+        dion_param_override: ParamGroupOverride = {}
         dion_param_override["max_lr"] = current_max_lr / scale
         if current_min_lr is not None:
             dion_param_override["min_lr"] = current_min_lr / scale
@@ -415,7 +414,9 @@ def build_megatron_dion(
         eps=config.dion_eps,
         scalar_optimizer=config.dion_scalar_optimizer,
         lr_scaling_rule=config.dion_lr_scaling,
+        moonlight_scale_factor=config.dion_moonlight_scale_factor,
         split_qkv=config.dion_split_qkv,
+        split_linear=config.dion_split_linear,
         mixed_precision_config=mixed_precision_config,
         use_fs_collectives=config.dion_use_fs_collectives,
         use_compressed_comm=config.dion_use_compressed_comm,

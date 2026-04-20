@@ -12,6 +12,7 @@ from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 
+from ..dion.linear import iter_linear_child_kinds, linear_state_key
 from ..dion.qkv import iter_qkv_child_kinds, qkv_state_key
 from .sharding import (
     DionShardLayout,
@@ -121,6 +122,11 @@ def restore_persistent_dion_param_state_(
                     q_key = qkv_state_key("Q", child_kind)
                     if q_key in new_state:
                         new_state[f"_qkv_{child_kind}_needs_state_replica_q_sync"] = True
+            if bool(new_state.get("linear_split_linear", False)):
+                for child_kind in iter_linear_child_kinds():
+                    q_key = linear_state_key("Q", child_kind)
+                    if q_key in new_state:
+                        new_state[f"_linear_{child_kind}_needs_state_replica_q_sync"] = True
 
             optimizer_state[param] = new_state
             summary["restored"] += 1

@@ -51,11 +51,10 @@ def adamw_update_foreach(
     torch._foreach_div_(denom, bias_correction2_sqrt)
     torch._foreach_add_(denom, [epsilon] * batch_size)
 
-    if weight_decay != 0.0:
-        torch._foreach_mul_(params, 1.0 - lr * weight_decay)
-
     updates = torch._foreach_div(first_moments, denom)
     torch._foreach_mul_(updates, lr / bias_correction1)
+    if weight_decay != 0.0:
+        torch._foreach_mul_(params, 1.0 - lr * weight_decay)
     torch._foreach_sub_(params, updates)
 
 
@@ -86,8 +85,7 @@ def lion_update_foreach(
     torch._foreach_sign_(updates)
     torch._foreach_lerp_(first_moments, grads, [1.0 - beta2] * batch_size)
 
+    torch._foreach_mul_(updates, lr)
     if weight_decay != 0.0:
         torch._foreach_mul_(params, 1.0 - lr * weight_decay)
-
-    torch._foreach_mul_(updates, lr)
     torch._foreach_sub_(params, updates)

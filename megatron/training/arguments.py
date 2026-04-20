@@ -657,9 +657,9 @@ def validate_args(args, defaults={}):
     args.main_params_dtype = map_dtype(args.main_params_dtype)
     args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
-    if hasattr(args, "dion_momentum_dtype"):
+    if hasattr(args, "dion_momentum_dtype") and args.dion_momentum_dtype is not None:
         args.dion_momentum_dtype = map_dtype(args.dion_momentum_dtype)
-    if hasattr(args, "dion_q_dtype"):
+    if hasattr(args, "dion_q_dtype") and args.dion_q_dtype is not None:
         args.dion_q_dtype = map_dtype(args.dion_q_dtype)
 
     if args.fp8_param_gather:
@@ -2104,18 +2104,27 @@ def _add_training_args(parser):
     group.add_argument('--dion-lr-scaling', type=str, default='dion',
                        choices=['moonlight', 'dion'],
                        help='2D Dion learning-rate scaling rule.')
+    group.add_argument('--dion-moonlight-scale-factor', type=float, default=1.0,
+                       help='Additional multiplicative constant used by moonlight LR scaling.')
     group.add_argument('--dion-beta1', type=float, default=0.9,
                        help='Beta1 for the Dion scalar optimizer.')
     group.add_argument('--dion-beta2', type=float, default=0.95,
                        help='Beta2 for the Dion scalar optimizer.')
     group.add_argument('--dion-eps', type=float, default=1e-8,
                        help='Epsilon for the Dion scalar optimizer.')
-    group.add_argument('--dion-split-qkv', action='store_true',
+    group.add_argument('--dion-split-qkv', action='store_true', dest='dion_split_qkv',
                        help='Treat fused QKV weights as optimizer-only Q/K/V children for Dion.')
-    group.add_argument('--dion-momentum-dtype', type=str, default='float32',
+    group.add_argument('--no-dion-split-qkv', action='store_false', dest='dion_split_qkv',
+                       help='Do not split fused QKV weights for Dion.')
+    group.add_argument('--dion-split-linear', action='store_true', dest='dion_split_linear',
+                       help='Treat fused linear_fc1 weights as optimizer-only gate/up children for Dion.')
+    group.add_argument('--no-dion-split-linear', action='store_false', dest='dion_split_linear',
+                       help='Do not split fused linear_fc1 weights for Dion.')
+    group.set_defaults(dion_split_qkv=True, dion_split_linear=True)
+    group.add_argument('--dion-momentum-dtype', type=str, default=None,
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
                        help='Dtype for Dion momentum state.')
-    group.add_argument('--dion-q-dtype', type=str, default='float32',
+    group.add_argument('--dion-q-dtype', type=str, default=None,
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
                        help='Dtype for Dion Q state.')
     group.add_argument('--fully-shard-model-parallel-size', type=int, default=1,

@@ -464,7 +464,7 @@ def route_step_params(
     get_or_initialize_optimizer_state: Callable,
     require_param_config: Callable,
     use_distributed_dion_update: Callable,
-    maybe_expand_split_qkv_params: Callable,
+    maybe_expand_split_dion_params: Callable,
     sync_q_replicas: Callable,
     build_dion_batches: Callable,
 ):
@@ -482,7 +482,7 @@ def route_step_params(
             dist_meta = dist_metas.get(param, None)
             config = require_param_config(param, dist_meta)
 
-            split_qkv_params = maybe_expand_split_qkv_params(
+            split_child_params = maybe_expand_split_dion_params(
                 param=param,
                 grad=grad,
                 optimizer_state=optimizer_state,
@@ -490,8 +490,8 @@ def route_step_params(
                 config=config,
                 dist_meta=dist_meta,
             )
-            if split_qkv_params is not None:
-                dion_params.extend(split_qkv_params)
+            if split_child_params is not None:
+                dion_params.extend(split_child_params)
                 continue
 
             if use_distributed_dion_update(param, optimizer_state, optim_group, dist_meta):

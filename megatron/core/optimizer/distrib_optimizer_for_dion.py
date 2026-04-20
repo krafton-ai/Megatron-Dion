@@ -32,6 +32,17 @@ from .dion.state import (
     init_param_state,
     require_2d_local_shape,
 )
+from .dion.linear import (
+    iter_linear_child_kinds,
+    linear_child_global_shape,
+    linear_child_local_shape,
+    linear_child_name,
+    linear_child_param_uid,
+    linear_state_key,
+    read_linear_child,
+    resolve_linear_split_rows,
+    write_linear_child_,
+)
 from .dion.qkv import (
     copy_qkv_split_metadata,
     iter_qkv_child_kinds,
@@ -44,7 +55,7 @@ from .dion.qkv import (
     resolve_qkv_split_shapes,
     scatter_qkv_child_,
 )
-from .dion.utils import get_local_shape
+from .dion.utils import get_global_shape, get_local_shape
 from .distrib_dion.parameter import (
     all_gather_bucket_params,
     all_gather_dion_bucket,
@@ -1291,7 +1302,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         local_data_view: torch.Tensor,
         communication_group,
     ) -> None:
-        """Materialize Dion local-grad views from the canonical model_param.main_grad surface."""
+        """Build Dion local-grad views from the canonical model_param.main_grad surface."""
         return apply_bucket_grads(
             self,
             bucket=bucket,
@@ -1673,7 +1684,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         return config
 
     def _init_optimizer_state(self, param, state, optim_group) -> None:
-        """Materialize optimizer state at the adapter boundary."""
+        """Build optimizer state at the adapter boundary."""
         optimizer = self.optimizer
         dist_meta = optimizer.dist_metas.get(param, None)
         config = self._require_param_config(param, dist_meta)
@@ -1688,12 +1699,18 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         )
         q_init = None
         split_qkv_enabled = bool(self.optimizer.defaults.get("split_qkv", False))
+        split_linear_enabled = bool(self.optimizer.defaults.get("split_linear", False))
         split_qkv_shapes = (
             resolve_qkv_split_shapes(param=param, optimizer_state=state, dist_meta=dist_meta)
             if split_qkv_enabled
             else None
         )
-        if is_dion_eligible and split_qkv_shapes is None:
+        split_linear_rows = (
+            resolve_linear_split_rows(optimizer_state=state, dist_meta=dist_meta)
+            if split_linear_enabled
+            else None
+        )
+        if is_dion_eligible and split_qkv_shapes is None and split_linear_rows is None:
             q_init = build_q_init(
                 param=param,
                 optim_group=optim_group,
@@ -1719,6 +1736,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             rank_fraction_default=optimizer.defaults['rank_fraction'],
             rank_multiple_of_default=optimizer.defaults['rank_multiple_of'],
             split_qkv_default=split_qkv_enabled,
+            split_linear_default=split_linear_enabled,
             q_init=q_init,
         )
 
@@ -1731,7 +1749,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             get_or_initialize_optimizer_state=self._get_or_initialize_optimizer_state,
             require_param_config=self._require_param_config,
             use_distributed_dion_update=self._use_distributed_dion_update,
-            maybe_expand_split_qkv_params=self._maybe_expand_split_qkv_params,
+            maybe_expand_split_dion_params=self._maybe_expand_split_dion_params,
             sync_q_replicas=lambda dion_params: sync_q_replicas(
                 dion_params=dion_params,
                 state_replica_group=self.state_replica_group,
@@ -1826,7 +1844,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         optim_group: dict,
         child_dist_meta: DionDistMeta,
     ) -> None:
-        """Lazily materialize child-specific Q state for one fused QKV child."""
+        """Initialize child-specific Q state for one fused QKV child when needed."""
         child_kind = child_dist_meta.qkv_child_kind
         q_key = qkv_state_key("Q", child_kind)
         if q_key in parent_state:
@@ -1879,6 +1897,131 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             int(dim) for dim in child_dist_meta.global_shape
         )
         parent_state[f"_qkv_{child_kind}_needs_state_replica_q_sync"] = True
+
+    def _build_linear_child_dist_meta(
+        self,
+        *,
+        parent_dist_meta: DionDistMeta,
+        child_kind: str,
+        split_rows: tuple[int, int],
+        child_local_shape: tuple[int, int],
+        child_global_shape: tuple[int, int],
+    ) -> DionDistMeta:
+        """Build optimizer-only child metadata for one fused linear_fc1 child."""
+        child_uid = linear_child_param_uid(parent_dist_meta.param_uid, child_kind)
+        child_name = linear_child_name(parent_dist_meta.param_name, child_kind)
+        child_fs_start_idx = int(parent_dist_meta.fs_start_idx)
+        child_fs_end_idx = int(parent_dist_meta.fs_end_idx)
+        if int(parent_dist_meta.fs_shard_dim) == 0 and int(parent_dist_meta.fs_world_size) > 1:
+            if child_kind == "gate":
+                parent_child_start = 0
+                parent_child_rows = int(split_rows[0])
+            else:
+                parent_child_start = int(split_rows[0])
+                parent_child_rows = int(split_rows[1])
+            parent_child_end = parent_child_start + parent_child_rows
+            overlap_start = max(int(parent_dist_meta.fs_start_idx), parent_child_start)
+            overlap_end = min(int(parent_dist_meta.fs_end_idx), parent_child_end)
+            child_fs_start_idx = overlap_start - parent_child_start
+            child_fs_end_idx = overlap_end - parent_child_start
+
+        child_dist_meta = replace(
+            parent_dist_meta,
+            shape=tuple(int(dim) for dim in child_local_shape),
+            global_shape=tuple(int(dim) for dim in child_global_shape),
+            fs_start_idx=int(child_fs_start_idx),
+            fs_end_idx=int(child_fs_end_idx),
+            param_uid=child_uid,
+            param_name=child_name,
+            per_expert_global_shape=None,
+            local_shape=tuple(int(dim) for dim in child_local_shape),
+            expert_axis=-1,
+            num_local_experts=1,
+            local_expert_index=-1,
+            parent_param_uid=parent_dist_meta.param_uid,
+            parent_param_name=parent_dist_meta.param_name,
+            linear_split_rows=tuple(int(dim) for dim in split_rows),
+            is_linear_child=True,
+            linear_child_kind=child_kind,
+            param_config=None,
+        )
+        child_dist_meta.param_config = build_param_config(
+            param_ndim=2,
+            local_shape=child_local_shape,
+            dist_meta=child_dist_meta,
+            use_compressed_comm=bool(self.optimizer.use_compressed_comm),
+            r_global_override=None,
+            rank_fraction_default=self.optimizer.defaults["rank_fraction"],
+            rank_multiple_of_default=self.optimizer.defaults["rank_multiple_of"],
+            tp_world_size=int(getattr(child_dist_meta, "tp_world_size", 1)),
+            use_tp_shard=bool(
+                getattr(child_dist_meta, "tp_shard_dim", -1) in (0, 1)
+                and int(getattr(child_dist_meta, "tp_world_size", 1)) > 1
+            ),
+        )
+        return child_dist_meta
+
+    def _ensure_linear_child_state_(
+        self,
+        *,
+        parent_param,
+        parent_state: dict,
+        optim_group: dict,
+        child_dist_meta: DionDistMeta,
+    ) -> None:
+        """Initialize child-specific Q state for one fused linear_fc1 child when needed."""
+        child_kind = child_dist_meta.linear_child_kind
+        q_key = linear_state_key("Q", child_kind)
+        if q_key in parent_state:
+            return
+
+        child_q_init = build_q_init(
+            param=parent_param,
+            optim_group=optim_group,
+            dist_meta=child_dist_meta,
+            rank_fraction_default=self.optimizer.defaults["rank_fraction"],
+            rank_multiple_of_default=self.optimizer.defaults["rank_multiple_of"],
+            base_training_seed=resolve_base_training_seed(),
+            get_replicate_group=self._get_replicate_group,
+            make_group_broadcast=lambda process_group: make_group_broadcast(
+                process_group,
+                group_size=self._group_size,
+            ),
+        )
+        q_layout = child_q_init.q_layout
+        if q_layout is None:
+            raise RuntimeError(
+                "[DION_MISSING_LINEAR_CHILD_Q_LAYOUT] "
+                f"param_uid={child_dist_meta.param_uid} param_name={child_dist_meta.param_name}"
+            )
+        q_state = init_q_state(
+            param=parent_param,
+            mixed_precision_config=self.optimizer._mixed_precision_config,
+            config=child_dist_meta.param_config,
+            dist_meta=child_dist_meta,
+            q_layout=q_layout,
+            q_seed=child_q_init.q_seed,
+            tp_world_size=int(child_q_init.tp_world_size),
+            tp_rank=int(child_q_init.tp_rank),
+            use_q_unshard=bool(child_q_init.use_q_unshard),
+        )
+        broadcast_q = child_q_init.broadcast_q
+        if broadcast_q is None:
+            raise RuntimeError(
+                "[DION_MISSING_LINEAR_CHILD_BROADCAST] "
+                f"param_uid={child_dist_meta.param_uid} param_name={child_dist_meta.param_name}"
+            )
+        broadcast_q(q_state)
+
+        parent_state[q_key] = q_state
+        parent_state[linear_state_key("r", child_kind)] = int(q_layout.r_global)
+        parent_state[linear_state_key("local_shape", child_kind)] = tuple(
+            int(dim) for dim in child_dist_meta.local_shape
+        )
+        parent_state[linear_state_key("true_global_shape", child_kind)] = tuple(
+            int(dim) for dim in child_dist_meta.global_shape
+        )
+        parent_state[f"_linear_{child_kind}_needs_state_replica_q_sync"] = True
 
     def _maybe_expand_split_qkv_params(
         self,
@@ -1999,6 +2142,176 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             )
 
         return child_step_params
+
+    def _maybe_expand_split_linear_params(
+        self,
+        *,
+        param,
+        grad,
+        optimizer_state,
+        optim_group,
+        config,
+        dist_meta,
+    ):
+        """Expand one fused linear_fc1 parent into optimizer-only gate/up child Dion step params."""
+        del config
+        if not bool(self.optimizer.defaults.get("split_linear", False)):
+            return None
+        if optim_group.get("algorithm", "dion") != "dion":
+            return None
+        if dist_meta is None or not bool(getattr(dist_meta, "is_dion_param", False)):
+            return None
+        split_rows = resolve_linear_split_rows(
+            optimizer_state=optimizer_state,
+            dist_meta=dist_meta,
+        )
+        if split_rows is None:
+            return None
+
+        parent_local_shape = tuple(int(dim) for dim in require_2d_local_shape(param, dist_meta))
+        parent_global_shape = get_global_shape(
+            dist_meta,
+            int(parent_local_shape[0]),
+            int(parent_local_shape[1]),
+        )
+        momentum = optimizer_state.get("momentum", None)
+        if momentum is None:
+            raise RuntimeError(
+                "[DION_LINEAR_SPLIT_MISSING_MOMENTUM] "
+                f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+                f"param_name={getattr(dist_meta, 'param_name', '')}"
+            )
+
+        child_step_params: list[DionStepParam] = []
+        for child_kind in iter_linear_child_kinds():
+            child_local_shape = linear_child_local_shape(
+                parent_local_shape,
+                split_rows,
+                dist_meta,
+                child_kind,
+            )
+            child_global_shape = linear_child_global_shape(
+                tuple(int(dim) for dim in parent_global_shape),
+                split_rows,
+                child_kind,
+            )
+            child_dist_meta = self._build_linear_child_dist_meta(
+                parent_dist_meta=dist_meta,
+                child_kind=child_kind,
+                split_rows=split_rows,
+                child_local_shape=child_local_shape,
+                child_global_shape=child_global_shape,
+            )
+            self._ensure_linear_child_state_(
+                parent_param=param,
+                parent_state=optimizer_state,
+                optim_group=optim_group,
+                child_dist_meta=child_dist_meta,
+            )
+
+            child_param = read_linear_child(param, split_rows, dist_meta, child_kind)
+            child_grad = read_linear_child(
+                grad.reshape(*parent_local_shape),
+                split_rows,
+                dist_meta,
+                child_kind,
+            )
+            child_momentum = read_linear_child(
+                momentum.reshape(*parent_local_shape),
+                split_rows,
+                dist_meta,
+                child_kind,
+            )
+            q_key = linear_state_key("Q", child_kind)
+            r_key = linear_state_key("r", child_kind)
+            local_shape_key = linear_state_key("local_shape", child_kind)
+            true_global_shape_key = linear_state_key("true_global_shape", child_kind)
+            sync_key = f"_linear_{child_kind}_needs_state_replica_q_sync"
+
+            child_state = {
+                "momentum": child_momentum,
+                "Q": optimizer_state[q_key],
+                "r": int(optimizer_state[r_key]),
+                "local_shape": tuple(int(dim) for dim in optimizer_state[local_shape_key]),
+                "true_global_shape": tuple(
+                    int(dim) for dim in optimizer_state[true_global_shape_key]
+                ),
+                "_needs_state_replica_q_sync": bool(optimizer_state.get(sync_key, False)),
+                "_post_q_sync": (
+                    lambda *, parent_state=optimizer_state, sync_key=sync_key: parent_state.__setitem__(
+                        sync_key, False
+                    )
+                ),
+            }
+
+            def _commit_update(
+                updated_param,
+                updated_momentum,
+                *,
+                parent_param=param,
+                parent_state=optimizer_state,
+                parent_dist_meta=dist_meta,
+                split_rows=split_rows,
+                child_kind=child_kind,
+            ):
+                write_linear_child_(
+                    parent_param,
+                    updated_param,
+                    split_rows,
+                    parent_dist_meta,
+                    child_kind,
+                )
+                write_linear_child_(
+                    parent_state["momentum"],
+                    updated_momentum,
+                    split_rows,
+                    parent_dist_meta,
+                    child_kind,
+                )
+
+            child_step_params.append(
+                DionStepParam(
+                    param=child_param,
+                    grad=child_grad,
+                    optimizer_state=child_state,
+                    optim_group=optim_group,
+                    config=child_dist_meta.param_config,
+                    dist_meta=child_dist_meta,
+                    commit_update=_commit_update,
+                )
+            )
+
+        return child_step_params
+
+    def _maybe_expand_split_dion_params(
+        self,
+        *,
+        param,
+        grad,
+        optimizer_state,
+        optim_group,
+        config,
+        dist_meta,
+    ):
+        """Expand optimizer-only Dion children when one parent carries a fused update surface."""
+        qkv_children = self._maybe_expand_split_qkv_params(
+            param=param,
+            grad=grad,
+            optimizer_state=optimizer_state,
+            optim_group=optim_group,
+            config=config,
+            dist_meta=dist_meta,
+        )
+        if qkv_children is not None:
+            return qkv_children
+        return self._maybe_expand_split_linear_params(
+            param=param,
+            grad=grad,
+            optimizer_state=optimizer_state,
+            optim_group=optim_group,
+            config=config,
+            dist_meta=dist_meta,
+        )
 
     def _get_or_initialize_optimizer_state(self, param, optim_group):
         """Own distributed state remap and metadata recovery at the adapter boundary."""

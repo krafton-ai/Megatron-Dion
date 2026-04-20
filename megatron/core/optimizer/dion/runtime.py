@@ -695,6 +695,7 @@ def normalize_cols_async(
 def apply_batch_updates(
     optimizer,
     params: List[Tensor],
+    grads: List[Tensor],
     momentums: List[Tensor],
     Qs: List[Tensor],
     Q_new_batch: torch.Tensor,
@@ -754,6 +755,7 @@ def apply_batch_updates(
         n_for_lr=n_for_lr,
         rule=optimizer.defaults.get("lr_scaling_rule", "moonlight"),
         rank_fraction=optimizer.defaults.get("rank_fraction", 0.25),
+        moonlight_scale_factor=optimizer.defaults.get("moonlight_scale_factor", 1.0),
     )
 
     wd_mult = optim_groups[0].get("wd_mult", 1.0)
@@ -771,10 +773,10 @@ def apply_batch_updates(
 
     for index in range(real_batch_size):
         param = params[index]
+        grad = grads[index]
         delta = delta_batch[index]
         if delta.shape != param.shape:
             delta = delta.contiguous().view(param.shape)
-
         if weight_decay > 0:
             param.mul_(1 - lr * weight_decay)
         param.add_(delta.to(param.dtype), alpha=-scaled_lr)
@@ -799,11 +801,11 @@ def apply_batch_updates(
         Qs[index].copy_(q_state)
         if (
             dist_metas is not None
-            and getattr(dist_metas[index], "is_qkv_child", False)
+            and getattr(dist_metas[index], "parent_param_uid", None) is not None
             and (commit_updates is None or commit_updates[index] is None)
         ):
             raise RuntimeError(
-                "[DION_QKV_CHILD_MISSING_COMMIT_UPDATE] "
+                "[DION_CHILD_MISSING_COMMIT_UPDATE] "
                 f"step={optimizer._step_count} rank={optimizer._global_rank} "
                 f"param_uid={getattr(dist_metas[index], 'param_uid', None)} "
                 f"param_name={getattr(dist_metas[index], 'param_name', '')}"
@@ -920,7 +922,7 @@ def run_compressed_comm_async(
                     P_single,
                     rcqr_oversample=optimizer.defaults["rcqr_oversample"],
                     make_sketch=sketch,
-                ).to(torch.float32)
+                )
             P_single = P_single.to(P_batch.dtype).contiguous()
 
         P_batch = funcol.all_gather_tensor(
@@ -973,7 +975,7 @@ def run_compressed_comm_async(
                 P_batch = orthogonalize(
                     P_batch,
                     rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                ).to(torch.float32)
+                )
             P_batch = P_batch.to(M_batch.dtype).contiguous()
 
         R_batch = M_batch.mT @ P_batch
@@ -1021,7 +1023,7 @@ def run_compressed_comm_async(
                 P_batch = orthogonalize(
                     P_batch,
                     rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                ).to(torch.float32)
+                )
             P_batch = P_batch.to(M_batch.dtype).contiguous()
         with _dion_math_precision_context():
             R_batch = M_batch.mT @ P_batch
@@ -1040,18 +1042,18 @@ def run_compressed_comm_async(
             )
         return P_batch[:original_batch_size], R_batch[:original_batch_size]
 
-    if comm_group is not None and comm_world_size > 1:
+    use_replicated_orthogonalize = (
+        comm_world_size > 1
+        and ortho_group is None
+        and not (configs and all(is_fs_only_config(config) for config in configs))
+    )
+    if comm_group is not None and comm_world_size > 1 and not use_replicated_orthogonalize:
         P_batch = yield from collapse_batch_across_replicas(
             optimizer,
             P_batch,
             replicate_group=comm_group,
         )
 
-    use_replicated_orthogonalize = (
-        comm_world_size > 1
-        and ortho_group is None
-        and not (configs and all(is_fs_only_config(config) for config in configs))
-    )
     if use_replicated_orthogonalize:
         if comm_world_size <= 1:
             yield
@@ -1059,7 +1061,7 @@ def run_compressed_comm_async(
                 P_batch = orthogonalize(
                     P_batch,
                     rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                ).to(torch.float32)
+                )
             P_batch = P_batch.to(M_batch.dtype).contiguous()
         else:
             batch_size = P_batch.size(0)
@@ -1089,12 +1091,26 @@ def run_compressed_comm_async(
             for chunk_start in range(0, batch_size, comm_world_size):
                 chunk_end = chunk_start + comm_world_size
                 P_chunk = P_batch[chunk_start:chunk_end].contiguous()
-                P_single = P_chunk[comm_rank : comm_rank + 1].clone()
-                with _dion_math_precision_context():
-                    P_single = orthogonalize(
-                        P_single,
-                        rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                    ).to(torch.float32)
+                P_single = funcol.reduce_scatter_tensor(
+                    P_chunk.contiguous(),
+                    reduceOp="avg",
+                    scatter_dim=0,
+                    group=comm_group,
+                )
+                yield
+                batch_index = chunk_start + comm_rank
+                if batch_index >= real_batch_size:
+                    torch._assert_async(
+                        torch.count_nonzero(P_single) == 0,
+                        f"[DION_NONZERO_DDP_PADDED_MATRIX] shape={tuple(P_single.shape)}",
+                    )
+                    P_single = torch.zeros_like(P_single).contiguous()
+                else:
+                    with _dion_math_precision_context():
+                        P_single = orthogonalize(
+                            P_single,
+                            rcqr_oversample=optimizer.defaults["rcqr_oversample"],
+                        )
                 P_single = P_single.to(P_chunk.dtype).contiguous()
                 P_chunk = funcol.all_gather_tensor(
                     P_single.contiguous(),
@@ -1120,7 +1136,7 @@ def run_compressed_comm_async(
                 P_batch = orthogonalize(
                     P_batch,
                     rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                ).to(torch.float32)
+                )
             P_batch = P_batch.to(M_batch.dtype).contiguous()
 
     with _dion_math_precision_context():
@@ -1220,11 +1236,11 @@ def batch_dion_update_async(
     )
 
     M_for_matmul = [
-        (momentum.mT if config.is_transposed else momentum).to(torch.float32)
+        (momentum.mT if config.is_transposed else momentum)
         for momentum, config in zip(momentums, configs)
     ]
     M_batch = torch.stack(M_for_matmul, dim=0)
-    Q_batch = torch.stack([q_tensor.to(torch.float32) for q_tensor in Q_for_matmul], dim=0)
+    Q_batch = torch.stack(Q_for_matmul, dim=0)
     del Q_for_matmul
 
     with _dion_math_precision_context():
@@ -1263,7 +1279,7 @@ def batch_dion_update_async(
                     P_batch = orthogonalize(
                         P_batch,
                         rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                    ).to(torch.float32)
+                    )
                 P_batch = P_batch.to(dtype).contiguous()
             else:
                 batch_size = P_batch.size(0)
@@ -1299,7 +1315,7 @@ def batch_dion_update_async(
                         P_single = orthogonalize(
                             P_single,
                             rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                        ).to(torch.float32)
+                        )
                     P_single = P_single.to(P_chunk.dtype).contiguous()
                     P_chunk = funcol.all_gather_tensor(
                         P_single.contiguous(),
@@ -1329,7 +1345,7 @@ def batch_dion_update_async(
                         P_batch = orthogonalize(
                             P_batch,
                             rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                        ).to(torch.float32)
+                        )
                     P_batch = P_batch.to(original_dtype).contiguous()
                 else:
                     if batch_size != fs_world_size:
@@ -1376,7 +1392,7 @@ def batch_dion_update_async(
                                 P_single,
                                 rcqr_oversample=optimizer.defaults["rcqr_oversample"],
                                 make_sketch=sketch,
-                            ).to(torch.float32)
+                            )
                     P_single = P_single.to(P_batch.dtype).contiguous()
 
                     P_batch = funcol.all_gather_tensor(
@@ -1410,7 +1426,7 @@ def batch_dion_update_async(
                     P_batch = orthogonalize(
                         P_batch,
                         rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                    ).to(torch.float32)
+                    )
                 P_batch = P_batch.to(original_dtype).contiguous()
         with _dion_math_precision_context():
             R_batch = M_batch.mT @ P_batch
@@ -1451,6 +1467,7 @@ def batch_dion_update_async(
     apply_batch_updates(
         optimizer,
         params,
+        grads,
         momentums,
         Qs,
         Q_new_batch,

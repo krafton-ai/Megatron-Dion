@@ -94,6 +94,8 @@ class DionDistMeta:
 
     shape: Tuple[int, ...] | None = None
     global_shape: Tuple[int, int] | None = None
+    fs_start_idx: int = -1
+    fs_end_idx: int = -1
     tp_shard_dim: int = -1
     fs_shard_dim: int = -1
     rank_fraction: float = 0.25
@@ -118,6 +120,9 @@ class DionDistMeta:
     is_qkv_child: bool = False
     qkv_child_kind: str = ""
     qkv_split_shapes: Optional[Tuple[int, int, int]] = None
+    linear_split_rows: Optional[Tuple[int, int]] = None
+    is_linear_child: bool = False
+    linear_child_kind: str = ""
 
 
 @dataclass

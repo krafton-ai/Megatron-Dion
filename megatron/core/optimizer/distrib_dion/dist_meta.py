@@ -7,6 +7,7 @@ from typing import Callable
 import torch.distributed as dist
 
 from ... import parallel_state
+from ..dion.linear import is_linear_fc1_param
 from ..dion.qkv import get_qkv_split_shapes, is_qkv_param
 from ..dion.state import build_param_config
 from ..dion.types import DionDistMeta
@@ -207,6 +208,8 @@ def build_dist_meta(
     dist_meta = DionDistMeta(
         shape=shard_param.shape,
         global_shape=dion_shard_layout.global_shape,
+        fs_start_idx=int(dion_shard_layout.start_idx),
+        fs_end_idx=int(dion_shard_layout.end_idx),
         tp_shard_dim=tp_shard_dim,
         fs_shard_dim=dion_shard_layout.fs_shard_dim,
         rank_fraction=rank_fraction_default,
@@ -244,6 +247,14 @@ def build_dist_meta(
         qkv_split_shapes=(
             get_qkv_split_shapes(model_param)
             if is_qkv_param(model_param)
+            else None
+        ),
+        linear_split_rows=(
+            (
+                int(dion_shard_layout.global_shape[0]) // 2,
+                int(dion_shard_layout.global_shape[0]) // 2,
+            )
+            if is_linear_fc1_param(model_param)
             else None
         ),
     )
@@ -308,6 +319,8 @@ def add_non_dion_metas(
             dist_meta = DionDistMeta(
                 shape=param.shape,
                 global_shape=tuple(model_param.shape) if model_param.ndim == 2 else None,
+                fs_start_idx=-1,
+                fs_end_idx=-1,
                 tp_shard_dim=-1,
                 rank_fraction=rank_fraction_default,
                 is_dion_param=getattr(model_param, 'is_dion_param', False),
@@ -320,6 +333,14 @@ def add_non_dion_metas(
                 qkv_split_shapes=(
                     get_qkv_split_shapes(model_param)
                     if is_qkv_param(model_param)
+                    else None
+                ),
+                linear_split_rows=(
+                    (
+                        int(model_param.shape[0]) // 2,
+                        int(model_param.shape[0]) // 2,
+                    )
+                    if is_linear_fc1_param(model_param) and model_param.ndim == 2
                     else None
                 ),
             )

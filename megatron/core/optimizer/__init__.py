@@ -165,6 +165,13 @@ def _get_param_groups(
                     kv_channels,
                 )
 
+            if (
+                '.linear_fc1.weight' in name
+                and len(param.shape) == 2
+                and int(getattr(param, 'partition_stride', 1)) == 2
+            ):
+                param.is_linear_fc1 = True
+
             # Get optimizer config overrides for this parameter.
             matching_param_overrides: list[ParamGroupOverride] = []
             if config_overrides is not None:

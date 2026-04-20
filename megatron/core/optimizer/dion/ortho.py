@@ -78,32 +78,28 @@ def orthogonalize(
     """
     assert P.ndim >= 3, "Expected P to have batch dimension"
     original_dtype = P.dtype
-    P_local = P.to(dtype=torch.float32)
+    P_local = P
 
     if P.size(-2) <= P.size(-1):
-        P_local = torch.linalg.qr(P_local, mode="reduced")[0]
+        P_local = torch.linalg.qr(P_local.to(dtype=torch.float32), mode="reduced")[0]
     else:
+        S = generate_random_sketch_matrix(
+            P,
+            oversample=rcqr_oversample,
+            make_sketch=make_sketch,
+        )
         R = torch.linalg.qr(
-            (
-                generate_random_sketch_matrix(
-                    P,
-                    oversample=rcqr_oversample,
-                    make_sketch=make_sketch,
-                ).to(dtype=torch.float32)
-                if make_sketch is not None
-                else _default_sketch_matrix(P, rcqr_oversample)
-            )
-            @ P_local,
+            S @ P_local,
             mode="r",
         )[1].to(dtype=torch.float32)
         P_local = torch.linalg.solve_triangular(
             R,
-            P_local,
+            P_local.to(dtype=torch.float32),
             upper=True,
             left=False,
         )
 
-        R = torch.linalg.cholesky_ex(P_local.mT @ P_local, upper=True)[0].to(dtype=torch.float32)
+        R = torch.linalg.cholesky_ex(P_local.mT @ P_local, upper=True)[0]
         P_local = torch.linalg.solve_triangular(
             R,
             P_local,

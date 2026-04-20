@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch import Tensor
 
+from .linear import get_linear_split_rows_from_dist_meta
 from .qkv import get_qkv_split_shapes_from_dist_meta
 from .types import (
     DionMixedPrecisionConfig,
@@ -432,6 +433,7 @@ def init_param_state(
     rank_fraction_default: float,
     rank_multiple_of_default: int,
     split_qkv_default: bool = False,
+    split_linear_default: bool = False,
     q_init: Optional[DionQInit] = None,
 ) -> None:
     """Initialize optimizer state for one param using adapter-authored metadata."""
@@ -447,6 +449,11 @@ def init_param_state(
     if bool(split_qkv_default) and split_shapes is not None:
         state["qkv_split_qkv"] = True
         state["qkv_split_shapes"] = split_shapes
+        return
+    linear_split_rows = get_linear_split_rows_from_dist_meta(dist_meta)
+    if bool(split_linear_default) and linear_split_rows is not None:
+        state["linear_split_linear"] = True
+        state["linear_split_rows"] = linear_split_rows
         return
 
     m, n = local_shape

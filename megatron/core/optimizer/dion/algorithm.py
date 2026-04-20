@@ -59,7 +59,9 @@ class MegatronDion(Optimizer):
         use_compressed_comm: bool = True,  # Enable compressed communication
         scalar_optimizer: str = "adamw",  # Scalar optimizer for non-Dion params ("adamw" or "lion")
         lr_scaling_rule: str = "dion",  # 2D Dion LR scaling rule ("moonlight" or "dion")
+        moonlight_scale_factor: float = 1.0,
         split_qkv: bool = False,
+        split_linear: bool = False,
         max_concurrent_tasks: Optional[int] = None,  # Optional async concurrency hint
     ):
         defaults = dict(
@@ -78,7 +80,9 @@ class MegatronDion(Optimizer):
             use_compressed_comm=use_compressed_comm,
             scalar_optimizer=scalar_optimizer,  # "adamw" or "lion"
             lr_scaling_rule=lr_scaling_rule,
+            moonlight_scale_factor=moonlight_scale_factor,
             split_qkv=bool(split_qkv),
+            split_linear=bool(split_linear),
             # Reference implementation uses only RCQR and standard scaling
             algorithm="dion",  # Default algorithm, same as original dion.py
             step=0,  # Per-group step counter
@@ -112,13 +116,6 @@ class MegatronDion(Optimizer):
         if mixed_precision_config is None:
             mixed_precision_config = DionMixedPrecisionConfig()
         self._mixed_precision_config = mixed_precision_config
-
-        if mixed_precision_config.momentum_dtype is None or mixed_precision_config.q_dtype is None:
-            raise RuntimeError(
-                "[Dion] momentum_dtype and q_dtype must be explicit. "
-                f"got momentum={mixed_precision_config.momentum_dtype} "
-                f"Q={mixed_precision_config.q_dtype}"
-            )
 
         # Update counters
         self._dion_update_count = 0
