@@ -474,8 +474,8 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_rank_multiple_of: int = 1
     """Round the effective rank to a multiple of this value."""
 
-    dion_epsilon: float = 1e-8
-    """Numerical epsilon for Dion updates."""
+    dion_normalize_eps: float = 1e-8
+    """Numerical epsilon used when normalizing Dion right factors."""
 
     dion_oversample: float = 1.25
     """Oversampling factor used by Dion orthogonalization."""
@@ -483,7 +483,7 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_use_fs_collectives: bool = True
     """Enable Dion FS-aware communication when distributed optimizer is active."""
 
-    dion_use_compressed_comm: bool = False
+    dion_use_compressed_comm: bool = True
     """Enable Dion compressed P/R communication."""
 
     dion_scalar_optimizer: str = "adamw"
@@ -501,13 +501,13 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_beta2: float = 0.95
     """Beta2 for Dion scalar optimizer states."""
 
-    dion_eps: float = 1e-8
-    """Epsilon for Dion scalar optimizer states."""
+    dion_scalar_eps: float = 1e-8
+    """Epsilon for Dion scalar optimizer updates."""
 
-    dion_split_qkv: bool = True
+    dion_split_qkv: bool = False
     """Whether Dion should treat fused QKV weights as optimizer-only Q/K/V children."""
 
-    dion_split_linear: bool = True
+    dion_split_linear: bool = False
     """Whether Dion should treat fused linear_fc1 weights as optimizer-only gate/up children."""
 
     dion_momentum_dtype: Optional[torch.dtype] = None

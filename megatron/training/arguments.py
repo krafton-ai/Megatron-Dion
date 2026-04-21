@@ -2088,20 +2088,20 @@ def _add_training_args(parser):
                        help='Dion low-rank approximation fraction.')
     group.add_argument('--dion-rank-multiple-of', type=int, default=1,
                        help='Round the Dion rank up to a multiple of this value.')
-    group.add_argument('--dion-epsilon', type=float, default=1e-8,
-                       help='Dion epsilon for numerical stability.')
+    group.add_argument('--dion-normalize-eps', type=float, default=1e-8,
+                       help='Dion epsilon used when normalizing right factors.')
     group.add_argument('--dion-oversample', type=float, default=1.25,
                        help='Oversampling factor for Dion RCQR.')
     group.add_argument('--dion-use-fs-collectives', action=argparse.BooleanOptionalAction,
                        default=True,
                        help='Use Dion FS collectives when distributed Dion runs on sharded layouts.')
     group.add_argument('--dion-use-compressed-comm', action=argparse.BooleanOptionalAction,
-                       default=False,
+                       default=True,
                        help='Use Dion compressed P/R communication when the logical compression contract applies.')
     group.add_argument('--dion-scalar-optimizer', type=str, default='adamw',
                        choices=['lion', 'adamw'],
                        help='Scalar optimizer used for non-2D Dion parameters.')
-    group.add_argument('--dion-lr-scaling', type=str, default='dion',
+    group.add_argument('--dion-lr-scaling', type=str, default='moonlight',
                        choices=['moonlight', 'dion'],
                        help='2D Dion learning-rate scaling rule.')
     group.add_argument('--dion-moonlight-scale-factor', type=float, default=1.0,
@@ -2110,7 +2110,7 @@ def _add_training_args(parser):
                        help='Beta1 for the Dion scalar optimizer.')
     group.add_argument('--dion-beta2', type=float, default=0.95,
                        help='Beta2 for the Dion scalar optimizer.')
-    group.add_argument('--dion-eps', type=float, default=1e-8,
+    group.add_argument('--dion-scalar-eps', type=float, default=1e-8,
                        help='Epsilon for the Dion scalar optimizer.')
     group.add_argument('--dion-split-qkv', action='store_true', dest='dion_split_qkv',
                        help='Treat fused QKV weights as optimizer-only Q/K/V children for Dion.')
@@ -2120,7 +2120,7 @@ def _add_training_args(parser):
                        help='Treat fused linear_fc1 weights as optimizer-only gate/up children for Dion.')
     group.add_argument('--no-dion-split-linear', action='store_false', dest='dion_split_linear',
                        help='Do not split fused linear_fc1 weights for Dion.')
-    group.set_defaults(dion_split_qkv=True, dion_split_linear=True)
+    group.set_defaults(dion_split_qkv=False, dion_split_linear=False)
     group.add_argument('--dion-momentum-dtype', type=str, default=None,
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
                        help='Dtype for Dion momentum state.')

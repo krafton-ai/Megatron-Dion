@@ -749,6 +749,17 @@ def apply_batch_updates(
         m_for_lr, n_for_lr = optimizer_state0["per_expert_global_shape"]
 
     lr = optim_groups[0].get("lr", optimizer.defaults["lr"])
+    if dist_metas is None or dist_metas[0] is None:
+        raise RuntimeError(
+            "[DION_MISSING_BATCH_DIST_META_FOR_LR_SCALING] "
+            f"step={optimizer._step_count} rank={optimizer._global_rank}"
+        )
+    if float(getattr(dist_metas[0], "rank_fraction", 0.0)) <= 0.0:
+        raise RuntimeError(
+            "[DION_INVALID_BATCH_RANK_FRACTION] "
+            f"step={optimizer._step_count} rank={optimizer._global_rank} "
+            f"rank_fraction={getattr(dist_metas[0], 'rank_fraction', None)}"
+        )
     scaled_lr = scaled_lr_for_shape(
         lr=lr,
         m_for_lr=m_for_lr,
