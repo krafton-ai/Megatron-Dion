@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
+import torch.distributed as dist
 
 from .sharding import fs_shard_view_2d
 
@@ -63,6 +64,127 @@ def _build_model_grad(*, bucket) -> torch.Tensor:
         )
 
     return local_grad_shard
+
+
+def _build_full_bucket_grad(*, bucket) -> torch.Tensor:
+    """Build this rank's Dion local grad shard from a synchronized full bucket grad."""
+    dion_layout = getattr(bucket, "dion_layout", None)
+    if dion_layout is None or not dion_layout.has_params:
+        raise RuntimeError(
+            f"[Dion] missing Dion layout for full-bucket grad bucket={getattr(bucket, 'bucket_id', -1)}"
+        )
+
+    local_grad_shard = torch.empty(
+        int(dion_layout.shard_size),
+        dtype=bucket.grad_data.dtype,
+        device=bucket.grad_data.device,
+    )
+
+    for entry in dion_layout.entries:
+        full_view_2d = bucket.grad_data[
+            int(entry.canonical_bucket_start) : int(entry.canonical_bucket_end)
+        ].view(tuple(entry.param.shape))
+        local_source = fs_shard_view_2d(
+            full_view_2d,
+            int(entry.fs_shard_dim),
+            int(entry.start_idx),
+            int(entry.end_idx),
+        )
+        local_numel = int(local_source.numel())
+        if local_numel <= 0 or local_numel > int(entry.shard_capacity):
+            raise RuntimeError(
+                "[Dion] invalid full-bucket Dion grad size "
+                f"bucket={getattr(bucket, 'bucket_id', -1)} "
+                f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')} "
+                f"local_numel={local_numel} shard_capacity={int(entry.shard_capacity)}"
+            )
+        shard_start = int(entry.shard_offset)
+        local_grad_shard[shard_start : shard_start + local_numel].copy_(
+            local_source.reshape(-1)
+        )
+        padding_start = shard_start + local_numel
+        padding_end = shard_start + int(entry.shard_capacity)
+        if padding_end > padding_start:
+            local_grad_shard[padding_start:padding_end].zero_()
+
+    return local_grad_shard
+
+
+def _build_grad_reduce_input(*, bucket, group_size: int) -> torch.Tensor:
+    """Build Dion reduce-scatter input from the MCore bucket grad buffer."""
+    dion_layout = getattr(bucket, "dion_layout", None)
+    if dion_layout is None or not dion_layout.has_params:
+        raise RuntimeError(
+            f"[Dion] missing Dion layout for bucket grad sync bucket={getattr(bucket, 'bucket_id', -1)}"
+        )
+    if group_size <= 0:
+        raise RuntimeError(
+            "[Dion] invalid Dion grad sync group size "
+            f"bucket={getattr(bucket, 'bucket_id', -1)} group_size={group_size}"
+        )
+
+    shard_size = int(dion_layout.shard_size)
+    reduce_input = torch.empty(
+        int(group_size) * shard_size,
+        dtype=bucket.grad_data.dtype,
+        device=bucket.grad_data.device,
+    )
+
+    for group_rank in range(int(group_size)):
+        group_rank_start = int(group_rank) * shard_size
+        for entry in dion_layout.entries:
+            if len(entry.grad_rank_flat_segments) != int(group_size):
+                raise RuntimeError(
+                    "[Dion] grad sync rank mapping size mismatch "
+                    f"bucket={getattr(bucket, 'bucket_id', -1)} "
+                    f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')} "
+                    f"group_size={int(group_size)} "
+                    f"mapping_size={len(entry.grad_rank_flat_segments)}"
+                )
+            target_start = group_rank_start + int(entry.shard_offset)
+            cursor = target_start
+            target_end = target_start + int(entry.shard_capacity)
+            for source_start, source_end in entry.grad_rank_flat_segments[group_rank]:
+                source_start = int(source_start)
+                source_end = int(source_end)
+                if (
+                    source_start < 0
+                    or source_end < source_start
+                    or source_end > int(bucket.grad_data.numel())
+                ):
+                    raise RuntimeError(
+                        "[Dion] invalid grad sync source segment "
+                        f"bucket={getattr(bucket, 'bucket_id', -1)} "
+                        f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')} "
+                        f"source_start={source_start} source_end={source_end} "
+                        f"grad_numel={int(bucket.grad_data.numel())}"
+                    )
+                source = bucket.grad_data[source_start:source_end]
+                next_cursor = cursor + int(source.numel())
+                if next_cursor > target_end:
+                    raise RuntimeError(
+                        "[Dion] grad sync source exceeds shard capacity "
+                        f"bucket={getattr(bucket, 'bucket_id', -1)} "
+                        f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')} "
+                        f"source_numel={next_cursor - target_start} "
+                        f"shard_capacity={int(entry.shard_capacity)}"
+                    )
+                reduce_input[cursor:next_cursor].copy_(source)
+                cursor = next_cursor
+
+            rank_numel = cursor - target_start
+            if rank_numel <= 0:
+                raise RuntimeError(
+                    "[Dion] empty Dion grad sync source "
+                    f"bucket={getattr(bucket, 'bucket_id', -1)} "
+                    f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')} "
+                    f"group_rank={group_rank}"
+                )
+            padding_start = target_start + rank_numel
+            if target_end > padding_start:
+                reduce_input[padding_start:target_end].zero_()
+
+    return reduce_input
 
 
 def _launch_dion_bucket_grad_sync(
@@ -368,6 +490,33 @@ def clear_dion_local_grads(optimizer, params: list[torch.nn.Parameter] | None = 
         optimizer._dion_local_grads.pop(param, None)
 
 
+def scale_dion_local_grads(
+    optimizer,
+    params: list[torch.nn.Parameter] | None,
+    scaling_factor: float,
+) -> None:
+    """Scale adapter-stored Dion grads by the same factor as MCore grad buffers."""
+    if params is None:
+        local_grads = tuple(optimizer._dion_local_grads.values())
+    else:
+        seen_param_ids = set()
+        local_grads = []
+        for param in params:
+            if id(param) in seen_param_ids:
+                continue
+            seen_param_ids.add(id(param))
+            local_grad = optimizer._dion_local_grads.get(param)
+            if local_grad is None:
+                raise RuntimeError(
+                    "[Dion] cannot scale missing Dion local grad "
+                    f"param={optimizer._param_name(param) or f'id_{id(param)}'}"
+                )
+            local_grads.append(local_grad)
+
+    for local_grad in local_grads:
+        local_grad.mul_(scaling_factor)
+
+
 def gather_fs_grad(
     optimizer,
     grad: torch.Tensor,
@@ -488,24 +637,23 @@ def apply_bucket_grads(
     optimizer,
     *,
     bucket,
-    local_data_view: torch.Tensor,
+    local_data_view: torch.Tensor | None,
     communication_group,
 ) -> None:
-    """Set Dion local grads from the canonical model_param.main_grad surface."""
+    """Set Dion local grads from the completed Dion bucket grad sync."""
     del communication_group
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not dion_layout.has_params:
         return
-    if local_data_view is None or local_data_view.numel() == 0:
-        raise RuntimeError(
-            "[Dion] missing synchronized stock local shard while setting Dion bucket grads "
-            f"bucket={getattr(bucket, 'bucket_id', -1)}"
-        )
-    local_grad_shard = _build_model_grad(bucket=bucket)
+    del local_data_view
+    grad_sync = pop_bucket_grad_sync(bucket)
+    if grad_sync is None and bool(getattr(bucket, "_dion_use_full_grad_after_sync", False)):
+        grad_sync = DionBucketGradSync(local_grad_shard=_build_full_bucket_grad(bucket=bucket))
+    bucket._dion_use_full_grad_after_sync = False
     _set_bucket_local_grads(
         bucket=bucket,
         set_local_grad=optimizer._set_local_grad,
-        grad_sync=DionBucketGradSync(local_grad_shard=local_grad_shard),
+        grad_sync=grad_sync,
     )
 
 
@@ -545,23 +693,46 @@ def get_dion_bucket_inter_instance_grad_buffer(bucket) -> torch.Tensor | None:
 def clear_bucket_grad_sync(bucket) -> None:
     """Drop any stale Dion grad-sync payload cached on a bucket."""
     bucket._dion_grad_sync = None
+    bucket._dion_use_full_grad_after_sync = False
 
 
 def start_dion_bucket_grad_sync(
     optimizer,
     *,
     bucket,
-    local_data_view: torch.Tensor,
+    local_data_view: torch.Tensor | None,
     communication_group,
     reduce_op,
     async_op: bool,
     reduce_scatter,
 ):
-    """Launch the stock bucket reduce-scatter for Dion buckets too."""
-    del optimizer
+    """Launch stock and Dion bucket grad sync from the MCore bucket grad buffer."""
     clear_bucket_grad_sync(bucket)
+    group_size = 1 if communication_group is None else int(dist.get_world_size(communication_group))
+    local_grad_shard = torch.empty(
+        int(bucket.dion_layout.shard_size),
+        dtype=bucket.grad_data.dtype,
+        device=bucket.grad_data.device,
+    )
+    reduce_input = _build_grad_reduce_input(bucket=bucket, group_size=group_size)
+    dion_handle = reduce_scatter(
+        local_grad_shard,
+        reduce_input,
+        op=reduce_op,
+        group=communication_group,
+        async_op=async_op,
+    )
+    stash_bucket_grad_sync(
+        optimizer,
+        bucket,
+        DionBucketGradSync(
+            local_grad_shard=local_grad_shard,
+            group_grad_shards=reduce_input,
+            reduce_scatter_handle=dion_handle,
+        ),
+    )
     if local_data_view is None or local_data_view.numel() == 0:
-        return None
+        return dion_handle
     return reduce_scatter(
         local_data_view,
         bucket.grad_data,

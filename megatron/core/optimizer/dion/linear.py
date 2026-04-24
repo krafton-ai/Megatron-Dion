@@ -157,6 +157,33 @@ def _row_shard_linear_rows(
     return overlap_start - parent_row_start, overlap_rows
 
 
+def linear_child_has_local_overlap(
+    split_rows: Tuple[int, int],
+    dist_meta,
+    child_kind: str,
+) -> bool:
+    """Return whether one gate/up child has a non-empty local shard on this rank."""
+    fs_shard_dim = int(getattr(dist_meta, "fs_shard_dim", -1)) if dist_meta is not None else -1
+    fs_world_size = int(getattr(dist_meta, "fs_world_size", 1)) if dist_meta is not None else 1
+    if fs_shard_dim != 0 or fs_world_size <= 1:
+        return True
+
+    parent_row_start = int(getattr(dist_meta, "fs_start_idx", -1))
+    parent_row_end = int(getattr(dist_meta, "fs_end_idx", -1))
+    if parent_row_start < 0 or parent_row_end < parent_row_start:
+        raise RuntimeError(
+            "[DION_LINEAR_MISSING_FS_RANGE] "
+            f"child_kind={child_kind} "
+            f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+            f"param_name={getattr(dist_meta, 'param_name', '')}"
+        )
+
+    child_index = _linear_child_index(child_kind)
+    child_row_start = 0 if child_index == 0 else int(split_rows[0])
+    child_row_end = child_row_start + int(split_rows[child_index])
+    return min(parent_row_end, child_row_end) > max(parent_row_start, child_row_start)
+
+
 def linear_child_local_shape(
     parent_local_shape: Tuple[int, int],
     split_rows: Tuple[int, int],

@@ -2088,7 +2088,7 @@ def _add_training_args(parser):
                        help='Dion low-rank approximation fraction.')
     group.add_argument('--dion-rank-multiple-of', type=int, default=1,
                        help='Round the Dion rank up to a multiple of this value.')
-    group.add_argument('--dion-normalize-eps', type=float, default=1e-8,
+    group.add_argument('--dion-normalize-eps', '--dion-epsilon', type=float, default=1e-8,
                        help='Dion epsilon used when normalizing right factors.')
     group.add_argument('--dion-oversample', type=float, default=1.25,
                        help='Oversampling factor for Dion RCQR.')
@@ -2104,13 +2104,13 @@ def _add_training_args(parser):
     group.add_argument('--dion-lr-scaling', type=str, default='moonlight',
                        choices=['moonlight', 'dion'],
                        help='2D Dion learning-rate scaling rule.')
-    group.add_argument('--dion-moonlight-scale-factor', type=float, default=1.0,
-                       help='Additional multiplicative constant used by moonlight LR scaling.')
+    group.add_argument('--dion-scaling-factor', type=float, default=1.0,
+                       help='Additional multiplicative constant used by Dion 2D LR scaling.')
     group.add_argument('--dion-beta1', type=float, default=0.9,
                        help='Beta1 for the Dion scalar optimizer.')
     group.add_argument('--dion-beta2', type=float, default=0.95,
                        help='Beta2 for the Dion scalar optimizer.')
-    group.add_argument('--dion-scalar-eps', type=float, default=1e-8,
+    group.add_argument('--dion-scalar-eps', '--dion-eps', type=float, default=1e-8,
                        help='Epsilon for the Dion scalar optimizer.')
     group.add_argument('--dion-split-qkv', action='store_true', dest='dion_split_qkv',
                        help='Treat fused QKV weights as optimizer-only Q/K/V children for Dion.')

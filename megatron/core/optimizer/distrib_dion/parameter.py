@@ -123,6 +123,94 @@ class DionBucketLayout:
         return max((int(entry.shard_capacity) for entry in self.entries), default=0)
 
 
+def _group_ranks(group) -> Tuple[int, ...]:
+    if group is None:
+        if not dist.is_initialized():
+            return (0,)
+        return tuple(int(rank) for rank in range(dist.get_world_size()))
+    return tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+
+
+def resolve_grad_rank_to_fs_rank(
+    *,
+    grad_group,
+    fs_group,
+    fs_size: int,
+    bucket_id: int,
+) -> Tuple[int, ...]:
+    """Return the FS rank selected by each grad reduce-scatter output rank."""
+    fs_size = int(fs_size)
+    if fs_size <= 0:
+        raise RuntimeError(f"[Dion] invalid FS size for bucket={bucket_id}: {fs_size}")
+
+    grad_group_ranks = _group_ranks(grad_group)
+    grad_group_size = len(grad_group_ranks)
+    if grad_group_size <= 0:
+        raise RuntimeError(f"[Dion] empty grad sync group for bucket={bucket_id}")
+    if grad_group_size % fs_size != 0:
+        raise RuntimeError(
+            "[Dion] grad sync group is incompatible with FS topology "
+            f"bucket={bucket_id} grad_group_size={grad_group_size} fs_size={fs_size} "
+            f"grad_group_ranks={grad_group_ranks}"
+        )
+    if fs_size == 1:
+        return tuple(0 for _ in grad_group_ranks)
+    if fs_group is None:
+        raise RuntimeError(
+            "[Dion] missing FS group for multi-rank Dion grad sync "
+            f"bucket={bucket_id} grad_group_ranks={grad_group_ranks} fs_size={fs_size}"
+        )
+
+    fs_group_ranks = _group_ranks(fs_group)
+    if len(fs_group_ranks) != fs_size:
+        raise RuntimeError(
+            "[Dion] FS group size mismatch for Dion grad sync "
+            f"bucket={bucket_id} fs_size={fs_size} fs_group_ranks={fs_group_ranks}"
+        )
+
+    grad_rank_by_global = {rank: rank_idx for rank_idx, rank in enumerate(grad_group_ranks)}
+    missing_fs_ranks = tuple(rank for rank in fs_group_ranks if rank not in grad_rank_by_global)
+    if missing_fs_ranks:
+        raise RuntimeError(
+            "[Dion] FS group must be contained in the grad sync group "
+            f"bucket={bucket_id} missing_fs_ranks={missing_fs_ranks} "
+            f"fs_group_ranks={fs_group_ranks} grad_group_ranks={grad_group_ranks}"
+        )
+
+    fs_rank_by_global = {rank: fs_rank for fs_rank, rank in enumerate(fs_group_ranks)}
+    if all(rank in fs_rank_by_global for rank in grad_group_ranks):
+        return tuple(int(fs_rank_by_global[rank]) for rank in grad_group_ranks)
+
+    blocks = tuple(
+        grad_group_ranks[start : start + fs_size]
+        for start in range(0, grad_group_size, fs_size)
+    )
+    if fs_group_ranks not in blocks:
+        raise RuntimeError(
+            "[Dion] cannot infer FS rank order for multi-replica grad sync "
+            f"bucket={bucket_id} fs_group_ranks={fs_group_ranks} "
+            f"grad_group_ranks={grad_group_ranks} fs_size={fs_size}"
+        )
+
+    grad_rank_to_fs_rank = [-1 for _ in grad_group_ranks]
+    for block in blocks:
+        if len(set(block)) != fs_size:
+            raise RuntimeError(
+                "[Dion] duplicate rank in Dion FS grad sync block "
+                f"bucket={bucket_id} block_ranks={block}"
+            )
+        for fs_rank, global_rank in enumerate(block):
+            grad_rank_to_fs_rank[grad_rank_by_global[global_rank]] = int(fs_rank)
+
+    if any(fs_rank < 0 for fs_rank in grad_rank_to_fs_rank):
+        raise RuntimeError(
+            "[Dion] incomplete FS rank mapping for Dion grad sync "
+            f"bucket={bucket_id} grad_rank_to_fs_rank={tuple(grad_rank_to_fs_rank)} "
+            f"grad_group_ranks={grad_group_ranks}"
+        )
+    return tuple(int(fs_rank) for fs_rank in grad_rank_to_fs_rank)
+
+
 def build_dion_entries(
     *,
     bucket,
@@ -131,6 +219,7 @@ def build_dion_entries(
     fs_size: int,
     fs_rank: int,
     grad_shard_group_size: int,
+    grad_rank_to_fs_rank: Tuple[int, ...],
 ) -> tuple[DionBucketLayout | None, dict, int]:
     """Build bucket-local Dion shard layouts without mutating parent `param_map`."""
     if grad_shard_group_size <= 0:
@@ -142,8 +231,17 @@ def build_dion_entries(
             "[Dion] Dion grad shard group is incompatible with FS topology "
             f"(grad_group={grad_shard_group_size}, fs_size={fs_size})"
         )
-    grad_ranks_per_fs_rank = grad_shard_group_size // fs_size
-
+    if len(grad_rank_to_fs_rank) != int(grad_shard_group_size):
+        raise RuntimeError(
+            "[Dion] Dion grad rank mapping size mismatch "
+            f"grad_group={grad_shard_group_size} mapping={tuple(grad_rank_to_fs_rank)}"
+        )
+    for grad_rank, grad_fs_rank in enumerate(grad_rank_to_fs_rank):
+        if int(grad_fs_rank) < 0 or int(grad_fs_rank) >= int(fs_size):
+            raise RuntimeError(
+                "[Dion] Dion grad rank maps outside FS range "
+                f"grad_rank={grad_rank} fs_rank={int(grad_fs_rank)} fs_size={fs_size}"
+            )
     entries: List[DionBucketEntry] = []
     dion_shard_layout_by_param = {}
     shard_offset = 0
@@ -199,7 +297,7 @@ def build_dion_entries(
             )
         grad_rank_flat_segments = []
         for grad_rank in range(grad_shard_group_size):
-            grad_fs_rank = int(grad_rank // grad_ranks_per_fs_rank)
+            grad_fs_rank = int(grad_rank_to_fs_rank[grad_rank])
             grad_rank_flat_segments.append(canonical_rank_flat_segments[grad_fs_rank])
 
         shard_layout = DionShardLayout(

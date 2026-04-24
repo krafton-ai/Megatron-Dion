@@ -190,7 +190,14 @@ def _qkv_child_slice_bounds(
     return start, end, child_rows
 
 
-def pack_qkv_child(
+def _shares_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    """Return whether two tensors are backed by the same storage."""
+    if lhs.numel() == 0 or rhs.numel() == 0:
+        return False
+    return lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr()
+
+
+def extract_qkv_child(
     tensor: torch.Tensor,
     split_shapes: Tuple[int, int, int],
     child_kind: str,
@@ -205,7 +212,7 @@ def pack_qkv_child(
     num_query_groups = _validate_qkv_layout_rows(
         rows=rows,
         split_shapes=split_shapes,
-        context=f"pack:{child_kind}",
+        context=f"extract:{child_kind}",
     )
     start, end, child_rows_per_group = _qkv_child_slice_bounds(split_shapes, child_kind)
     grouped = tensor.contiguous().view(num_query_groups, int(sum(split_shapes)), cols)
@@ -250,6 +257,10 @@ def scatter_qkv_child_(
         )
     grouped_dest = dest.view(num_query_groups, int(sum(split_shapes)), cols)
     grouped_child = child.contiguous().view(num_query_groups, child_rows_per_group, cols)
+    if _shares_storage(dest, child):
+        # Split-QKV can write a child tensor back into the same fused storage
+        # it was read from; clone first so values stay stable.
+        grouped_child = grouped_child.clone()
     grouped_dest[:, start:end, :].copy_(grouped_child)
 
 

@@ -541,8 +541,14 @@ class _ParamAndGradBucketGroup:
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
-                    local_data_view = self._get_standard_local_grad_view(idx, bucket)
                     optimizer = getattr(bucket, "dion_optimizer", None)
+                    has_dion = bucket.has_dion_params
+                    has_non_dion = bucket.has_non_dion_params
+                    local_data_view = (
+                        self._get_standard_local_grad_view(idx, bucket)
+                        if (not has_dion or has_non_dion)
+                        else None
+                    )
                     if bucket.has_dion_params:
                         if optimizer is None or not hasattr(optimizer, "_start_dion_bucket_grad_sync"):
                             raise RuntimeError(
@@ -557,7 +563,7 @@ class _ParamAndGradBucketGroup:
                             async_op=async_op,
                             reduce_scatter=dist_reduce_scatter_func,
                         )
-                    else:
+                    elif local_data_view is not None:
                         grad_reduce_handle = dist_reduce_scatter_func(
                             local_data_view,
                             bucket.grad_data,
@@ -570,6 +576,8 @@ class _ParamAndGradBucketGroup:
                         logger.info(
                             f"Performing reduction using all_reduce because {force_all_reduce=}"
                         )
+                    if bucket.has_dion_params:
+                        bucket._dion_use_full_grad_after_sync = True
                     torch.distributed.all_reduce(
                         bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                     )
@@ -587,23 +595,39 @@ class _ParamAndGradBucketGroup:
                 ) as cm,
             ):
                 for idx, bucket in enumerate(self.buckets):
-                    local_data_view = self._get_standard_local_grad_view(idx, bucket)
-                    # Stock DO semantics require the post-RS standard local shard to be
-                    # replica-collapsed for every bucket, not just mixed/non-Dion ones.
-                    # Dion-specific local-grad reinterpretation happens later from this
-                    # canonical stock surface.
-                    has_standard_local_grad = (
-                        local_data_view is not None and local_data_view.numel() > 0
-                    )
-                    if not has_standard_local_grad:
-                        continue
-                    if has_standard_local_grad:
-                        torch.distributed.all_reduce(
-                            local_data_view,
-                            op=reduce_op,
-                            group=self.inter_distributed_optimizer_instance_group,
-                            async_op=async_op,
+                    has_dion = bucket.has_dion_params
+                    has_non_dion = bucket.has_non_dion_params
+                    if not has_dion or has_non_dion:
+                        local_data_view = self._get_standard_local_grad_view(idx, bucket)
+                        has_standard_local_grad = (
+                            local_data_view is not None and local_data_view.numel() > 0
                         )
+                        if has_standard_local_grad:
+                            torch.distributed.all_reduce(
+                                local_data_view,
+                                op=reduce_op,
+                                group=self.inter_distributed_optimizer_instance_group,
+                                async_op=async_op,
+                            )
+                    if has_dion:
+                        optimizer = getattr(bucket, "dion_optimizer", None)
+                        if optimizer is None or not hasattr(
+                            optimizer, "_get_dion_bucket_inter_instance_grad_buffer"
+                        ):
+                            raise RuntimeError(
+                                "[Dion] missing adapter inter-instance grad hook "
+                                f"for bucket={getattr(bucket, 'bucket_id', -1)}"
+                            )
+                        dion_data_view = optimizer._get_dion_bucket_inter_instance_grad_buffer(
+                            bucket
+                        )
+                        if dion_data_view is not None and dion_data_view.numel() > 0:
+                            torch.distributed.all_reduce(
+                                dion_data_view,
+                                op=reduce_op,
+                                group=self.inter_distributed_optimizer_instance_group,
+                                async_op=async_op,
+                            )
         if async_op:
             if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
                 assert (
@@ -641,9 +665,11 @@ class _ParamAndGradBucketGroup:
                     f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                 )
 
-            local_data_view = self._get_standard_local_grad_view(idx, bucket)
-            if local_data_view is None or local_data_view.numel() == 0:
-                continue
+            local_data_view = (
+                self._get_standard_local_grad_view(idx, bucket)
+                if bucket.has_non_dion_params
+                else None
+            )
             optimizer._apply_bucket_grads(
                 bucket=bucket,
                 local_data_view=local_data_view,
@@ -1045,6 +1071,19 @@ class _ParamAndGradBuffer:
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
         self.grad_data *= scaling_factor
+        for bucket in self.buckets:
+            if not bucket.has_dion_params:
+                continue
+            optimizer = getattr(bucket, "dion_optimizer", None)
+            if optimizer is None or not hasattr(optimizer, "_scale_dion_local_grads"):
+                raise RuntimeError(
+                    "[Dion] missing adapter grad scaling hook "
+                    f"for bucket={getattr(bucket, 'bucket_id', -1)}"
+                )
+            optimizer._scale_dion_local_grads(
+                [entry.param for entry in bucket.dion_layout.entries],
+                scaling_factor,
+            )
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """

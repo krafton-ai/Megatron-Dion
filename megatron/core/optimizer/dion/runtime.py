@@ -766,7 +766,7 @@ def apply_batch_updates(
         n_for_lr=n_for_lr,
         rule=optimizer.defaults.get("lr_scaling_rule", "moonlight"),
         rank_fraction=optimizer.defaults.get("rank_fraction", 0.25),
-        moonlight_scale_factor=optimizer.defaults.get("moonlight_scale_factor", 1.0),
+        scaling_factor=optimizer.defaults.get("scaling_factor", 1.0),
     )
 
     wd_mult = optim_groups[0].get("wd_mult", 1.0)

@@ -380,18 +380,27 @@ def init_q_state(
 
     if config.has_fs_shard and getattr(dist_meta, "fs_world_size", 1) > 1:
         fs_rank = int(getattr(dist_meta, "fs_rank", -1))
+        fs_start = int(getattr(dist_meta, "fs_start_idx", -1))
+        fs_end = int(getattr(dist_meta, "fs_end_idx", -1))
         if fs_rank < 0:
             raise RuntimeError(
                 "[DION_MISSING_FS_RANK_FOR_Q_INIT] "
                 f"param_uid={getattr(dist_meta, 'param_uid', None)} "
                 f"param_name={getattr(dist_meta, 'param_name', '') if dist_meta is not None else ''}"
             )
+        if fs_start < 0 or fs_end < fs_start:
+            raise RuntimeError(
+                "[DION_MISSING_FS_RANGE_FOR_Q_INIT] "
+                f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+                f"param_name={getattr(dist_meta, 'param_name', '') if dist_meta is not None else ''} "
+                f"fs_start_idx={fs_start} fs_end_idx={fs_end}"
+            )
     else:
         fs_rank = 0
+        fs_start = 0
+        fs_end = int(q_local_shape[0])
 
     q_tp_rank = int(tp_rank) if use_q_unshard and int(tp_world_size) > 1 else 0
-    fs_start = fs_rank * q_base_local
-    fs_end = fs_start + q_local_shape[0]
     tp_start = q_tp_rank * r_local
     tp_end = tp_start + q_local_shape[1]
 

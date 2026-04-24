@@ -30,7 +30,7 @@ class MegatronDion(Optimizer):
 
     Implements the DIstributed OrthoNormalized updates (Dion) optimizer with low-rank approximation
     for efficient distributed training. Supports 2D parallelism model:
-    - DP (Data Parallel) = RP × FS
+    - DP (Data Parallel) = RP x FS
     - RP (Replicate Process): Multiple replicas with the same parameter shard (gradient averaging)
     - FS (Fully Shard): Different parameter shards within the same replica (reduce-scatter/all-gather)
     - TP (Tensor Parallel): Column-wise sharding of tensors
@@ -59,7 +59,7 @@ class MegatronDion(Optimizer):
         use_compressed_comm: bool = True,  # Enable compressed communication
         scalar_optimizer: str = "adamw",  # Scalar optimizer for non-Dion params ("adamw" or "lion")
         lr_scaling_rule: str = "dion",  # 2D Dion LR scaling rule ("moonlight" or "dion")
-        moonlight_scale_factor: float = 1.0,
+        scaling_factor: float = 1.0,
         split_qkv: bool = False,
         split_linear: bool = False,
         max_concurrent_tasks: Optional[int] = None,  # Optional async concurrency hint
@@ -80,7 +80,7 @@ class MegatronDion(Optimizer):
             use_compressed_comm=use_compressed_comm,
             scalar_optimizer=scalar_optimizer,  # "adamw" or "lion"
             lr_scaling_rule=lr_scaling_rule,
-            moonlight_scale_factor=moonlight_scale_factor,
+            scaling_factor=scaling_factor,
             split_qkv=bool(split_qkv),
             split_linear=bool(split_linear),
             # Reference implementation uses only RCQR and standard scaling

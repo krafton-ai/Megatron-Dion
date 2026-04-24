@@ -414,7 +414,7 @@ def build_megatron_dion(
         eps=config.dion_scalar_eps,
         scalar_optimizer=config.dion_scalar_optimizer,
         lr_scaling_rule=config.dion_lr_scaling,
-        moonlight_scale_factor=config.dion_moonlight_scale_factor,
+        scaling_factor=config.dion_scaling_factor,
         split_qkv=config.dion_split_qkv,
         split_linear=config.dion_split_linear,
         mixed_precision_config=mixed_precision_config,

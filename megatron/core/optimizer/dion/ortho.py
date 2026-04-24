@@ -20,8 +20,8 @@ def _dion_math_precision_context():
     update path. Keep the model forward/backward settings intact and fence off
     only the optimizer-side Dion math.
 
-    Duplex training enables TF32 globally for throughput, which is acceptable
-    for the model forward/backward but too aggressive for Dion matmuls and
+    Some training stacks enable TF32 globally for model throughput, which is
+    acceptable for forward/backward but too aggressive for Dion matmuls and
     RCQR/Cholesky.
     """
     prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32

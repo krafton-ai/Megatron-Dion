@@ -1,7 +1,7 @@
 """
 Distributed optimizer wrapper for Dion optimizer in Megatron-LM.
 
-Supports orthogonal TP × FS sharding:
+Supports orthogonal TP x FS sharding:
 - tp_shard_dim=0 (ColumnParallel): FS shards cols
 - tp_shard_dim=1 (RowParallel): FS shards rows
 """
@@ -35,6 +35,7 @@ from .dion.state import (
 from .dion.linear import (
     iter_linear_child_kinds,
     linear_child_global_shape,
+    linear_child_has_local_overlap,
     linear_child_local_shape,
     linear_child_name,
     linear_child_param_uid,
@@ -45,8 +46,8 @@ from .dion.linear import (
 )
 from .dion.qkv import (
     copy_qkv_split_metadata,
+    extract_qkv_child,
     iter_qkv_child_kinds,
-    pack_qkv_child,
     qkv_child_global_shape,
     qkv_child_local_shape,
     qkv_child_name,
@@ -79,6 +80,7 @@ from .distrib_dion.parameter import (
     prepare_dion_bucket_gather,
     restore_dion_local_shards_from_bucket,
     restore_bucket,
+    resolve_grad_rank_to_fs_rank,
     set_bucket_param_views,
     is_dion_param,
 )
@@ -97,6 +99,7 @@ from .distrib_dion.gradients import (
     apply_bucket_grads,
     clear_bucket_grad_sync,
     clear_dion_local_grads,
+    scale_dion_local_grads,
     set_optimizer_shard_grads,
     finish_bucket_group_grad_sync,
     gather_fs_grad,
@@ -131,6 +134,7 @@ from .distrib_dion.dist_meta import (
 )
 from .distrib_dion.sharding import (
     DionShardLayout,
+    compute_fs_shard_range,
     create_fs_shard,
     get_data_shard,
     get_opt_shard,
@@ -149,6 +153,23 @@ from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
 logger = logging.getLogger(__name__)
+
+
+_CHILD_FS_GROUP_CACHE: dict[tuple[int, ...], Optional[torch.distributed.ProcessGroup]] = {}
+
+
+def _get_or_create_child_fs_group(
+    ranks: tuple[int, ...],
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Return a cached child-specific FS subgroup for split optimizer-only children."""
+    if len(ranks) <= 1:
+        return None
+    cached_group = _CHILD_FS_GROUP_CACHE.get(ranks)
+    if cached_group is not None:
+        return cached_group
+    group = dist.new_group(ranks=list(ranks))
+    _CHILD_FS_GROUP_CACHE[ranks] = group
+    return group
 
 
 class DistributedOptimizerForDion(DistributedOptimizer):
@@ -669,7 +690,13 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             param_to_name=getattr(param_and_grad_buffer, "param_to_name", None),
         )
 
-        _, fs_size, fs_rank = cls._bucket_fs_group_info(param_and_grad_buffer, bucket)
+        fs_group, fs_size, fs_rank = cls._bucket_fs_group_info(param_and_grad_buffer, bucket)
+        grad_rank_to_fs_rank = resolve_grad_rank_to_fs_rank(
+            grad_group=dp_group,
+            fs_group=fs_group,
+            fs_size=fs_size,
+            bucket_id=bucket.bucket_id,
+        )
         dion_param_count, dion_static_info_by_param = cls._mark_bucket_dion_params(
             param_map=param_map,
             param_to_name=getattr(param_and_grad_buffer, "param_to_name", None),
@@ -693,7 +720,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 ),
             }
 
-        # STEP 3: Recalculate buffer ranges for FS × TP hybrid sharding
+        # STEP 3: Recalculate buffer ranges for FS x TP hybrid sharding
         # Dion params use FS shard, non-Dion params use DP shard
 
         (
@@ -708,6 +735,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 fs_size=fs_size,
                 fs_rank=fs_rank,
                 grad_shard_group_size=dp_world_size,
+                grad_rank_to_fs_rank=grad_rank_to_fs_rank,
             )
         )
         for param, snapshot in canonical_param_map_snapshot.items():
@@ -883,9 +911,9 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     buffer.dion_fs_size = int(dion_fs_size)
                     buffer.dion_fs_rank = int(dion_fs_rank)
 
-        # Call parent initialization with full DP group (RP × FS)
+        # Call parent initialization with full DP group (RP x FS)
         # DistributedOptimizer will do uniform sharding across all DP ranks
-        # Dion will handle 2D topology (RP × FS) at optimizer state level
+        # Dion will handle 2D topology (RP x FS) at optimizer state level
         super().__init__(*args, **kwargs)
 
         # Cache global rank for logging (avoid repeated dist.get_rank() calls)
@@ -1263,6 +1291,12 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         """Clear the active adapter-stored Dion local grad surface."""
         return clear_dion_local_grads(self, params)
 
+    def _scale_dion_local_grads(
+        self, params: Optional[List[torch.nn.Parameter]], scaling_factor: float
+    ) -> None:
+        """Scale the active adapter-stored Dion local grad surface."""
+        return scale_dion_local_grads(self, params, scaling_factor)
+
     def _gather_fs_grad(
         self,
         grad: torch.Tensor,
@@ -1299,7 +1333,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         self,
         *,
         bucket,
-        local_data_view: torch.Tensor,
+        local_data_view: Optional[torch.Tensor],
         communication_group,
     ) -> None:
         """Build Dion local-grad views from the canonical model_param.main_grad surface."""
@@ -1342,7 +1376,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         self,
         *,
         bucket,
-        local_data_view: torch.Tensor,
+        local_data_view: Optional[torch.Tensor],
         communication_group,
         reduce_op,
         async_op: bool,
@@ -1710,6 +1744,16 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             if split_linear_enabled
             else None
         )
+        if is_dion_eligible and split_linear_rows is not None and dist_meta is not None:
+            self._prepare_linear_child_fs_groups(
+                dist_meta=dist_meta,
+                split_rows=split_linear_rows,
+            )
+        if is_dion_eligible and split_qkv_shapes is not None and dist_meta is not None:
+            self._prepare_qkv_child_fs_groups(
+                dist_meta=dist_meta,
+                split_shapes=split_qkv_shapes,
+            )
         if is_dion_eligible and split_qkv_shapes is None and split_linear_rows is None:
             q_init = build_q_init(
                 param=param,
@@ -1801,10 +1845,27 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         """Build optimizer-only child metadata for one fused QKV child."""
         child_uid = qkv_child_param_uid(parent_dist_meta.param_uid, child_kind)
         child_name = qkv_child_name(parent_dist_meta.param_name, child_kind)
+        (
+            child_fs_group,
+            child_fs_world_size,
+            child_fs_rank,
+            child_fs_start_idx,
+            child_fs_end_idx,
+        ) = self._resolve_qkv_child_fs_layout(
+            parent_dist_meta=parent_dist_meta,
+            split_shapes=split_shapes,
+            child_kind=child_kind,
+            create_group=True,
+        )
         child_dist_meta = replace(
             parent_dist_meta,
             shape=tuple(int(dim) for dim in child_local_shape),
             global_shape=tuple(int(dim) for dim in child_global_shape),
+            fs_group=child_fs_group,
+            fs_world_size=int(child_fs_world_size),
+            fs_rank=int(child_fs_rank),
+            fs_start_idx=int(child_fs_start_idx),
+            fs_end_idx=int(child_fs_end_idx),
             is_transposed=False,
             param_uid=child_uid,
             param_name=child_name,
@@ -1835,6 +1896,140 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             ),
         )
         return child_dist_meta
+
+    def _resolve_qkv_child_fs_layout(
+        self,
+        *,
+        parent_dist_meta: DionDistMeta,
+        split_shapes: tuple[int, int, int],
+        child_kind: str,
+        create_group: bool,
+    ) -> tuple[
+        Optional[torch.distributed.ProcessGroup],
+        int,
+        int,
+        int,
+        int,
+    ]:
+        """Return child-local FS ownership for one split QKV child."""
+        parent_fs_world_size = int(getattr(parent_dist_meta, "fs_world_size", 1))
+        parent_fs_rank = int(getattr(parent_dist_meta, "fs_rank", -1))
+        parent_fs_shard_dim = int(getattr(parent_dist_meta, "fs_shard_dim", -1))
+        parent_fs_group = getattr(parent_dist_meta, "fs_group", None)
+
+        if parent_fs_shard_dim != 0 or parent_fs_world_size <= 1:
+            return (
+                parent_fs_group,
+                parent_fs_world_size,
+                parent_fs_rank,
+                int(parent_dist_meta.fs_start_idx),
+                int(parent_dist_meta.fs_end_idx),
+            )
+
+        if parent_fs_group is None:
+            raise RuntimeError(
+                "[DION_QKV_CHILD_MISSING_PARENT_FS_GROUP] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name}"
+            )
+        if parent_fs_rank < 0 or parent_fs_rank >= parent_fs_world_size:
+            raise RuntimeError(
+                "[DION_QKV_CHILD_INVALID_PARENT_FS_RANK] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"fs_rank={parent_fs_rank} fs_world_size={parent_fs_world_size}"
+            )
+
+        child_index = {"q": 0, "k": 1, "v": 2}.get(child_kind, None)
+        if child_index is None:
+            raise RuntimeError(
+                "[DION_INVALID_QKV_CHILD_KIND] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"child_kind={child_kind!r}"
+            )
+
+        parent_global_shape = tuple(int(dim) for dim in parent_dist_meta.global_shape)
+        parent_global_rows = int(parent_global_shape[0])
+        total_per_group = int(sum(int(dim) for dim in split_shapes))
+        if total_per_group <= 0 or parent_global_rows % total_per_group != 0:
+            raise RuntimeError(
+                "[DION_QKV_CHILD_INVALID_PARENT_GROUP_LAYOUT] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"parent_global_rows={parent_global_rows} split_shapes={split_shapes}"
+            )
+        child_rows_per_group = int(split_shapes[child_index])
+        child_global_rows = (
+            int(parent_global_rows // total_per_group) * int(child_rows_per_group)
+        )
+
+        parent_fs_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(parent_fs_group))
+        if len(parent_fs_ranks) != parent_fs_world_size:
+            raise RuntimeError(
+                "[DION_QKV_CHILD_PARENT_FS_GROUP_SIZE_MISMATCH] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"meta_fs_world_size={parent_fs_world_size} actual_group_size={len(parent_fs_ranks)}"
+            )
+
+        owner_global_ranks: list[int] = []
+        owner_parent_fs_ranks: list[int] = []
+        owner_child_ranges: list[tuple[int, int]] = []
+        child_prefix = 0
+        for rank_idx in range(parent_fs_world_size):
+            parent_rank_start, parent_rank_end = compute_fs_shard_range(
+                parent_global_rows,
+                parent_fs_world_size,
+                rank_idx,
+            )
+            parent_local_rows = int(parent_rank_end - parent_rank_start)
+            if parent_local_rows == 0:
+                continue
+            if parent_local_rows % total_per_group != 0:
+                raise RuntimeError(
+                    "[DION_QKV_CHILD_PARENT_FS_LAYOUT_MISMATCH] "
+                    f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                    f"child_kind={child_kind} fs_rank={rank_idx} "
+                    f"parent_local_rows={parent_local_rows} split_shapes={split_shapes}"
+                )
+            local_query_groups = int(parent_local_rows // total_per_group)
+            local_child_rows = int(local_query_groups * child_rows_per_group)
+            if local_child_rows <= 0:
+                continue
+            owner_parent_fs_ranks.append(int(rank_idx))
+            owner_global_ranks.append(int(parent_fs_ranks[rank_idx]))
+            owner_child_ranges.append((int(child_prefix), int(child_prefix + local_child_rows)))
+            child_prefix += int(local_child_rows)
+
+        if not owner_global_ranks:
+            raise RuntimeError(
+                "[DION_QKV_CHILD_NO_FS_OWNERS] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"child_kind={child_kind} split_shapes={split_shapes}"
+            )
+        if child_prefix != child_global_rows:
+            raise RuntimeError(
+                "[DION_QKV_CHILD_FS_COVERAGE_MISMATCH] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"child_kind={child_kind} child_global_rows={child_global_rows} "
+                f"covered_rows={child_prefix} owner_child_ranges={owner_child_ranges}"
+            )
+
+        child_fs_ranks = tuple(owner_global_ranks)
+        if child_fs_ranks == parent_fs_ranks:
+            child_fs_group = parent_fs_group
+        else:
+            child_fs_group = _get_or_create_child_fs_group(child_fs_ranks) if create_group else None
+        child_fs_world_size = len(owner_parent_fs_ranks)
+
+        if parent_fs_rank not in owner_parent_fs_ranks:
+            return (child_fs_group, child_fs_world_size, -1, -1, -1)
+
+        compact_rank = owner_parent_fs_ranks.index(parent_fs_rank)
+        compact_start, compact_end = owner_child_ranges[compact_rank]
+        return (
+            child_fs_group,
+            child_fs_world_size,
+            compact_rank,
+            int(compact_start),
+            int(compact_end),
+        )
 
     def _ensure_qkv_child_state_(
         self,
@@ -1910,25 +2105,26 @@ class DistributedOptimizerForDion(DistributedOptimizer):
         """Build optimizer-only child metadata for one fused linear_fc1 child."""
         child_uid = linear_child_param_uid(parent_dist_meta.param_uid, child_kind)
         child_name = linear_child_name(parent_dist_meta.param_name, child_kind)
-        child_fs_start_idx = int(parent_dist_meta.fs_start_idx)
-        child_fs_end_idx = int(parent_dist_meta.fs_end_idx)
-        if int(parent_dist_meta.fs_shard_dim) == 0 and int(parent_dist_meta.fs_world_size) > 1:
-            if child_kind == "gate":
-                parent_child_start = 0
-                parent_child_rows = int(split_rows[0])
-            else:
-                parent_child_start = int(split_rows[0])
-                parent_child_rows = int(split_rows[1])
-            parent_child_end = parent_child_start + parent_child_rows
-            overlap_start = max(int(parent_dist_meta.fs_start_idx), parent_child_start)
-            overlap_end = min(int(parent_dist_meta.fs_end_idx), parent_child_end)
-            child_fs_start_idx = overlap_start - parent_child_start
-            child_fs_end_idx = overlap_end - parent_child_start
+        (
+            child_fs_group,
+            child_fs_world_size,
+            child_fs_rank,
+            child_fs_start_idx,
+            child_fs_end_idx,
+        ) = self._resolve_linear_child_fs_layout(
+            parent_dist_meta=parent_dist_meta,
+            split_rows=split_rows,
+            child_kind=child_kind,
+            create_group=True,
+        )
 
         child_dist_meta = replace(
             parent_dist_meta,
             shape=tuple(int(dim) for dim in child_local_shape),
             global_shape=tuple(int(dim) for dim in child_global_shape),
+            fs_group=child_fs_group,
+            fs_world_size=int(child_fs_world_size),
+            fs_rank=int(child_fs_rank),
             fs_start_idx=int(child_fs_start_idx),
             fs_end_idx=int(child_fs_end_idx),
             param_uid=child_uid,
@@ -1960,6 +2156,152 @@ class DistributedOptimizerForDion(DistributedOptimizer):
             ),
         )
         return child_dist_meta
+
+    def _resolve_linear_child_fs_layout(
+        self,
+        *,
+        parent_dist_meta: DionDistMeta,
+        split_rows: tuple[int, int],
+        child_kind: str,
+        create_group: bool,
+    ) -> tuple[
+        Optional[torch.distributed.ProcessGroup],
+        int,
+        int,
+        int,
+        int,
+    ]:
+        """Return child-local FS ownership for one split linear child."""
+        parent_fs_world_size = int(getattr(parent_dist_meta, "fs_world_size", 1))
+        parent_fs_rank = int(getattr(parent_dist_meta, "fs_rank", -1))
+        parent_fs_shard_dim = int(getattr(parent_dist_meta, "fs_shard_dim", -1))
+        parent_fs_group = getattr(parent_dist_meta, "fs_group", None)
+
+        if parent_fs_shard_dim != 0 or parent_fs_world_size <= 1:
+            return (
+                parent_fs_group,
+                parent_fs_world_size,
+                parent_fs_rank,
+                int(parent_dist_meta.fs_start_idx),
+                int(parent_dist_meta.fs_end_idx),
+            )
+
+        if parent_fs_group is None:
+            raise RuntimeError(
+                "[DION_LINEAR_CHILD_MISSING_PARENT_FS_GROUP] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name}"
+            )
+        if parent_fs_rank < 0 or parent_fs_rank >= parent_fs_world_size:
+            raise RuntimeError(
+                "[DION_LINEAR_CHILD_INVALID_PARENT_FS_RANK] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"fs_rank={parent_fs_rank} fs_world_size={parent_fs_world_size}"
+            )
+
+        parent_global_shape = tuple(int(dim) for dim in parent_dist_meta.global_shape)
+        parent_global_rows = int(parent_global_shape[0])
+        child_index = 0 if child_kind == "gate" else 1
+        child_row_start = 0 if child_index == 0 else int(split_rows[0])
+        child_row_end = child_row_start + int(split_rows[child_index])
+        child_global_rows = child_row_end - child_row_start
+        parent_fs_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(parent_fs_group))
+        if len(parent_fs_ranks) != parent_fs_world_size:
+            raise RuntimeError(
+                "[DION_LINEAR_CHILD_PARENT_FS_GROUP_SIZE_MISMATCH] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"meta_fs_world_size={parent_fs_world_size} actual_group_size={len(parent_fs_ranks)}"
+            )
+
+        owner_global_ranks: list[int] = []
+        owner_parent_fs_ranks: list[int] = []
+        owner_child_ranges: list[tuple[int, int]] = []
+        for rank_idx in range(parent_fs_world_size):
+            parent_rank_start, parent_rank_end = compute_fs_shard_range(
+                parent_global_rows,
+                parent_fs_world_size,
+                rank_idx,
+            )
+            overlap_start = max(int(parent_rank_start), child_row_start)
+            overlap_end = min(int(parent_rank_end), child_row_end)
+            if overlap_end <= overlap_start:
+                continue
+            owner_parent_fs_ranks.append(int(rank_idx))
+            owner_global_ranks.append(int(parent_fs_ranks[rank_idx]))
+            owner_child_ranges.append(
+                (int(overlap_start - child_row_start), int(overlap_end - child_row_start))
+            )
+
+        if not owner_global_ranks:
+            raise RuntimeError(
+                "[DION_LINEAR_CHILD_NO_FS_OWNERS] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"child_kind={child_kind} split_rows={split_rows}"
+            )
+
+        if owner_child_ranges[0][0] != 0 or owner_child_ranges[-1][1] != child_global_rows:
+            raise RuntimeError(
+                "[DION_LINEAR_CHILD_FS_COVERAGE_MISMATCH] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"child_kind={child_kind} child_global_rows={child_global_rows} "
+                f"owner_child_ranges={owner_child_ranges}"
+            )
+        for prev_range, next_range in zip(owner_child_ranges, owner_child_ranges[1:]):
+            if prev_range[1] != next_range[0]:
+                raise RuntimeError(
+                    "[DION_LINEAR_CHILD_FS_NONCONTIGUOUS_COVERAGE] "
+                    f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                    f"child_kind={child_kind} owner_child_ranges={owner_child_ranges}"
+                )
+
+        child_fs_ranks = tuple(owner_global_ranks)
+        if child_fs_ranks == parent_fs_ranks:
+            child_fs_group = parent_fs_group
+        else:
+            child_fs_group = _get_or_create_child_fs_group(child_fs_ranks) if create_group else None
+        child_fs_world_size = len(owner_parent_fs_ranks)
+
+        if parent_fs_rank not in owner_parent_fs_ranks:
+            return (child_fs_group, child_fs_world_size, -1, -1, -1)
+
+        compact_rank = owner_parent_fs_ranks.index(parent_fs_rank)
+        compact_start, compact_end = owner_child_ranges[compact_rank]
+        return (
+            child_fs_group,
+            child_fs_world_size,
+            compact_rank,
+            int(compact_start),
+            int(compact_end),
+        )
+
+    def _prepare_linear_child_fs_groups(
+        self,
+        *,
+        dist_meta: DionDistMeta,
+        split_rows: tuple[int, int],
+    ) -> None:
+        """Create deterministic split-child FS subgroups on all ranks before step-time routing."""
+        for child_kind in iter_linear_child_kinds():
+            self._resolve_linear_child_fs_layout(
+                parent_dist_meta=dist_meta,
+                split_rows=split_rows,
+                child_kind=child_kind,
+                create_group=True,
+            )
+
+    def _prepare_qkv_child_fs_groups(
+        self,
+        *,
+        dist_meta: DionDistMeta,
+        split_shapes: tuple[int, int, int],
+    ) -> None:
+        """Create deterministic split-child FS subgroups on all ranks before step-time routing."""
+        for child_kind in iter_qkv_child_kinds():
+            self._resolve_qkv_child_fs_layout(
+                parent_dist_meta=dist_meta,
+                split_shapes=split_shapes,
+                child_kind=child_kind,
+                create_group=True,
+            )
 
     def _ensure_linear_child_state_(
         self,
@@ -2085,9 +2427,11 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 child_dist_meta=child_dist_meta,
             )
 
-            child_param = pack_qkv_child(param, split_shapes, child_kind)
-            child_grad = pack_qkv_child(grad.reshape(*parent_local_shape), split_shapes, child_kind)
-            child_momentum = pack_qkv_child(
+            child_param = extract_qkv_child(param, split_shapes, child_kind)
+            child_grad = extract_qkv_child(
+                grad.reshape(*parent_local_shape), split_shapes, child_kind
+            )
+            child_momentum = extract_qkv_child(
                 momentum.reshape(*parent_local_shape), split_shapes, child_kind
             )
             q_key = qkv_state_key("Q", child_kind)
@@ -2184,6 +2528,8 @@ class DistributedOptimizerForDion(DistributedOptimizer):
 
         child_step_params: list[DionStepParam] = []
         for child_kind in iter_linear_child_kinds():
+            if not linear_child_has_local_overlap(split_rows, dist_meta, child_kind):
+                continue
             child_local_shape = linear_child_local_shape(
                 parent_local_shape,
                 split_rows,
@@ -2279,6 +2625,15 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     dist_meta=child_dist_meta,
                     commit_update=_commit_update,
                 )
+            )
+
+        if not child_step_params:
+            raise RuntimeError(
+                "[DION_LINEAR_SPLIT_NO_LOCAL_CHILDREN] "
+                f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+                f"param_name={getattr(dist_meta, 'param_name', '')} "
+                f"split_rows={split_rows} "
+                f"parent_local_shape={parent_local_shape}"
             )
 
         return child_step_params
@@ -2453,6 +2808,8 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     continue
                 seen_param_ids.add(shard_param_id)
                 params.append(shard_param)
+                if getattr(model_param, "is_dion_param", False):
+                    continue
                 model_grad = getattr(model_param, "main_grad", None)
                 if model_grad is None:
                     continue
@@ -2463,6 +2820,7 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                     int(param_range.start) : int(param_range.end)
                 ]
         grads_for_norm = []
+        count_dion_grad = self._count_dion_grad_for_stats()
 
         def _stats_grad(param):
             main_grad_view = main_grad_view_by_param_id.get(id(param), None)
@@ -2470,7 +2828,11 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 return main_grad_view
             model_param = getattr(param, "_model_param", None)
             if model_param is not None and getattr(model_param, "is_dion_param", False):
-                return None
+                if not count_dion_grad:
+                    return None
+                if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                    return param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+                return param.grad
             if getattr(param, "__fsdp_param__", False):
                 return param.grad._local_tensor if param.grad is not None else None
             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -2488,6 +2850,26 @@ class DistributedOptimizerForDion(DistributedOptimizer):
                 grads_for_norm.append(grad)
 
         return grads_for_norm
+
+    def _count_dion_grad_for_stats(self) -> bool:
+        """Return whether this rank contributes Dion grads to grad-norm stats."""
+        if not dist.is_initialized():
+            return True
+        replica_group = self._get_replicate_group()
+        if replica_group is None or self._group_size(replica_group) <= 1:
+            return True
+
+        replica_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(replica_group))
+        stats_group = self.get_grad_stats_parallel_group()
+        if stats_group is None:
+            stats_rank_set = set(int(rank) for rank in range(dist.get_world_size()))
+        else:
+            stats_rank_set = set(int(rank) for rank in dist.get_process_group_ranks(stats_group))
+
+        replica_ranks_in_stats = tuple(rank for rank in replica_ranks if rank in stats_rank_set)
+        if len(replica_ranks_in_stats) <= 1:
+            return True
+        return int(dist.get_rank()) == int(replica_ranks_in_stats[0])
 
     @torch.no_grad()
     def get_grad_norm(self):

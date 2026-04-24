@@ -492,8 +492,8 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_lr_scaling: str = "moonlight"
     """Dion 2D learning-rate scaling rule."""
 
-    dion_moonlight_scale_factor: float = 1.0
-    """Additional multiplicative constant used by moonlight LR scaling."""
+    dion_scaling_factor: float = 1.0
+    """Additional multiplicative constant used by Dion 2D LR scaling."""
 
     dion_beta1: float = 0.9
     """Beta1 for Dion scalar optimizer states."""

@@ -103,6 +103,64 @@ def unique_preserve_order(items: Sequence[Any]) -> list[Any]:
     return list(dict.fromkeys(items))
 
 
+def _batch_key_sort_key(batch_key: tuple) -> str:
+    """Return a deterministic sort key for one canonical batch key."""
+    return repr(batch_key)
+
+
+def _sync_group_batch_metadata(
+    *,
+    sync_group,
+    local_batch_keys: Sequence[tuple],
+    batch_group_by_key: Dict[tuple, DionBatchGroup],
+) -> tuple[list[tuple], dict[tuple, int]]:
+    """Return canonical cross-rank batch order plus per-key chunk multiplicity.
+
+    The Dion update must not depend on local batch-key discovery order.
+    Canonicalize the batch schedule over each concrete sync group, then validate that
+    every participating rank contributes the same number of local params for each
+    batch key.
+    """
+    if sync_group is None or dist.get_world_size(sync_group) <= 1:
+        ordered = sorted(local_batch_keys, key=_batch_key_sort_key)
+        multiplicity = {
+            batch_key: len(batch_group_by_key[batch_key].params or [])
+            for batch_key in ordered
+        }
+        return ordered, multiplicity
+
+    local_counts = {
+        batch_key: len(batch_group_by_key[batch_key].params or [])
+        for batch_key in local_batch_keys
+    }
+    gathered = [None] * dist.get_world_size(sync_group)
+    dist.all_gather_object(
+        gathered,
+        {batch_key: int(count) for batch_key, count in local_counts.items()},
+        group=sync_group,
+    )
+
+    all_batch_keys = set()
+    for rank_counts in gathered:
+        all_batch_keys.update(rank_counts.keys())
+    ordered = sorted(all_batch_keys, key=_batch_key_sort_key)
+
+    multiplicity = {}
+    for batch_key in ordered:
+        counts = [int(rank_counts.get(batch_key, 0)) for rank_counts in gathered]
+        max_count = max(counts)
+        min_count = min(counts)
+        if min_count != max_count:
+            raise RuntimeError(
+                "[DION_BATCH_KEY_MULTIPLICITY_MISMATCH] "
+                f"rank={dist.get_rank()} batch_key={batch_key} counts={counts} "
+                f"group_ranks={tuple(dist.get_process_group_ranks(sync_group))}"
+            )
+        multiplicity[batch_key] = max_count
+
+    return ordered, multiplicity
+
+
 def group_items_by_batch_key(
     items: Sequence[Any],
     batch_keys: Sequence[tuple],
@@ -618,9 +676,23 @@ def group_and_order_param_batches(
             grouped_batch_keys.setdefault(id(sync_group), (sync_group, []))[1].append(batch_key)
 
     all_batch_keys = []
+    batch_multiplicity_by_key: dict[tuple, int] = {}
     for sync_group, group_keys in grouped_batch_keys.values():
-        del sync_group
-        all_batch_keys.extend(group_keys)
+        ordered_keys, multiplicity = _sync_group_batch_metadata(
+            sync_group=sync_group,
+            local_batch_keys=group_keys,
+            batch_group_by_key=batch_group_by_key,
+        )
+        all_batch_keys.extend(ordered_keys)
+        for batch_key, count in multiplicity.items():
+            existing = batch_multiplicity_by_key.get(batch_key, count)
+            if existing != count:
+                raise RuntimeError(
+                    "[DION_BATCH_KEY_MULTIPLICITY_INCONSISTENT_ACROSS_GROUPS] "
+                    f"rank={dist.get_rank()} batch_key={batch_key} "
+                    f"existing={existing} new={count}"
+                )
+            batch_multiplicity_by_key[batch_key] = count
     all_batch_keys = unique_preserve_order(all_batch_keys)
 
     ordered_batches = []
@@ -634,6 +706,7 @@ def group_and_order_param_batches(
             )
 
         batch_group = batch_group_by_key[batch_key]
+        batch_group.local_param_count = int(batch_multiplicity_by_key.get(batch_key, 0))
         ordered_batches.append((batch_key, batch_group))
 
     return ordered_batches
@@ -738,7 +811,7 @@ def build_dion_batches(
     global_param_offset = 0
     for batch_key, batch_group in ordered_batches:
         batch_size = batch_group.batch_world_size
-        local_num_params = len(batch_group.params or [])
+        local_num_params = int(getattr(batch_group, "local_param_count", len(batch_group.params or [])))
 
         for batch_start in range(0, local_num_params, batch_size):
             batch_end = min(batch_start + batch_size, local_num_params)

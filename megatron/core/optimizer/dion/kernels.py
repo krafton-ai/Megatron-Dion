@@ -19,11 +19,11 @@ def scaled_lr_for_shape(
     n_for_lr: int,
     rule: str,
     rank_fraction: float,
-    moonlight_scale_factor: float = 1.0,
+    scaling_factor: float = 1.0,
 ) -> float:
     """Return the canonical 2D Dion learning-rate scaling."""
     if rule == "moonlight":
-        base_scale = moonlight_scale_factor / (rank_fraction ** 0.5)
+        base_scale = scaling_factor / (rank_fraction ** 0.5)
         return base_scale * (max(m_for_lr, n_for_lr) ** 0.5) * lr
     if rule == "dion":
         if m_for_lr <= 0 or n_for_lr <= 0:
