@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 from ...distributed.param_and_grad_buffer import _HandleGroup
 from ...fp8_utils import is_float8tensor
+from ...transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
 from .sharding import (
     DionShardLayout,
     compute_fs_flat_segments,
@@ -24,7 +25,7 @@ from .sharding import (
 )
 
 
-def annotate_dion_candidates(module: torch.nn.Module) -> None:
+def mark_dion_candidates(module: torch.nn.Module) -> None:
     """Mark all local parameters as potential Dion candidates."""
     for param in module.parameters():
         param.dion_candidate = True
@@ -56,6 +57,9 @@ def is_dion_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool
 
 def is_moe_expert_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool:
     """Return True iff this parameter is a MoE expert weight."""
+    if not getattr(param, "allreduce", True):
+        return True
+
     num_local_experts = getattr(param, "num_local_experts", None)
     if num_local_experts is not None and int(num_local_experts) > 1:
         return True
@@ -81,8 +85,18 @@ def is_combined_grouped_mlp_param(param: torch.Tensor, param_name: Optional[str]
     return True
 
 
+def has_explicit_expert_index(param_name: Optional[str]) -> bool:
+    """Return whether MCore names this tensor as one explicit local expert."""
+    if not param_name:
+        return False
+    try:
+        return get_expert_index_from_key(param_name) is not None
+    except AssertionError:
+        return False
+
+
 @dataclass(frozen=True)
-class DionBucketEntry:
+class DionShardEntry:
     """Bucket-local Dion shard layout for one parameter."""
 
     param: torch.nn.Parameter
@@ -125,7 +139,7 @@ class DionBucketEntry:
 class DionBucketLayout:
     """Bucket-local Dion transport layout under stock DO control."""
 
-    entries: Tuple[DionBucketEntry, ...]
+    entries: Tuple[DionShardEntry, ...]
     shard_size: int
     gathered_numel: int
     grad_gathered_numel: int
@@ -145,14 +159,94 @@ class DionBucketLayout:
 
 
 @dataclass(frozen=True)
-class DionBucketNonDionParamRoute:
-    """Bucket all-gather layout for non-Dion params inside a mixed bucket."""
+class StandardParamGatherRoute:
+    """Bucket all-gather layout for standard params inside a mixed bucket."""
 
     group_size: int
     group_rank: int
     standard_shard_size: int
-    non_dion_size: int
+    standard_numel: int
     rank_segments: Tuple[Tuple[Tuple[int, int, int], ...], ...]
+
+
+@dataclass
+class ParamGatherBuffer:
+    tensor: torch.Tensor
+    active: bool = False
+
+
+def _param_gather_device_key(device: torch.device) -> Tuple[str, int]:
+    device = torch.device(device)
+    device_index = -1 if device.index is None else int(device.index)
+    return device.type, device_index
+
+
+def _param_gather_cache(bucket) -> tuple[dict, dict]:
+    cache = getattr(bucket, "_dion_param_gather_buffers", None)
+    if cache is None:
+        cache = {}
+        bucket._dion_param_gather_buffers = cache
+    refs = getattr(bucket, "_dion_param_gather_buffer_refs", None)
+    if refs is None:
+        refs = {}
+        bucket._dion_param_gather_buffer_refs = refs
+    return cache, refs
+
+
+def _acquire_param_gather_tensor(
+    bucket,
+    *,
+    name: str,
+    shape,
+    dtype,
+    device,
+    route_key,
+    zero: bool = False,
+) -> torch.Tensor:
+    shape = tuple(int(dim) for dim in shape)
+    device = torch.device(device)
+    key = (
+        str(name),
+        shape,
+        dtype,
+        _param_gather_device_key(device),
+        tuple(route_key),
+    )
+    cache, refs = _param_gather_cache(bucket)
+    tensors = cache.get(key)
+    if tensors is None:
+        tensors = []
+        cache[key] = tensors
+    for item in tensors:
+        if item.active:
+            continue
+        tensor = item.tensor
+        if tuple(tensor.shape) != shape or tensor.dtype != dtype or tensor.device != device:
+            continue
+        item.active = True
+        refs[id(tensor)] = item
+        if zero:
+            tensor.zero_()
+        return tensor
+
+    tensor = torch.empty(shape, dtype=dtype, device=device)
+    item = ParamGatherBuffer(tensor=tensor, active=True)
+    tensors.append(item)
+    refs[id(tensor)] = item
+    if zero:
+        tensor.zero_()
+    return tensor
+
+
+def _release_param_gather_tensor(bucket, tensor: torch.Tensor | None) -> None:
+    if tensor is None:
+        return
+    refs = getattr(bucket, "_dion_param_gather_buffer_refs", None)
+    if refs is None:
+        return
+    item = refs.get(id(tensor))
+    if item is not None:
+        item.active = False
 
 
 def _group_ranks(group) -> Tuple[int, ...]:
@@ -266,11 +360,11 @@ def resolve_grad_rank_to_fs_rank(
     return tuple(int(fs_rank) for fs_rank in grad_rank_to_fs_rank)
 
 
-def build_dion_entries(
+def build_dion_shard_entries(
     *,
     bucket,
     param_map,
-    dion_static_info_by_param,
+    dion_info_by_param,
     fs_size: int,
     fs_rank: int,
     grad_shard_group_size: int,
@@ -297,7 +391,7 @@ def build_dion_entries(
                 "[Dion] Dion grad rank maps outside FS range "
                 f"grad_rank={grad_rank} fs_rank={int(grad_fs_rank)} fs_size={fs_size}"
             )
-    entries: List[DionBucketEntry] = []
+    entries: List[DionShardEntry] = []
     dion_shard_layout_by_param = {}
     shard_offset = 0
 
@@ -305,15 +399,15 @@ def build_dion_entries(
         if not getattr(param, "is_dion_param", False):
             continue
 
-        static_info = dion_static_info_by_param.get(param)
+        static_info = dion_info_by_param.get(param)
         if static_info is None:
             continue
 
         global_shape = tuple(static_info["global_shape"])
         fs_shard_dim = int(static_info["fs_shard_dim"])
-        m, n = tuple(int(dim) for dim in param.shape)
+        m_local, n_local = tuple(int(dim) for dim in param.shape)
 
-        split_size = m if fs_shard_dim == 0 else n
+        split_size = m_local if fs_shard_dim == 0 else n_local
         start_idx, end_idx = compute_fs_shard_range(split_size, fs_size, fs_rank)
         local_split_size = int(end_idx) - int(start_idx)
         if local_split_size <= 0:
@@ -326,11 +420,11 @@ def build_dion_entries(
         size_per_rank = math.ceil(split_size / fs_size)
 
         if fs_shard_dim == 0:
-            local_shape = (local_split_size, n)
-            shard_capacity = size_per_rank * n
+            local_shape = (local_split_size, n_local)
+            shard_capacity = size_per_rank * n_local
         else:
-            local_shape = (m, local_split_size)
-            shard_capacity = m * size_per_rank
+            local_shape = (m_local, local_split_size)
+            shard_capacity = m_local * size_per_rank
 
         if not hasattr(bucket, "param_to_index") or param not in bucket.param_to_index:
             raise RuntimeError(
@@ -350,8 +444,8 @@ def build_dion_entries(
             canonical_rank_flat_segments.append(
                 compute_fs_flat_segments(
                     full_start=canonical_bucket_start,
-                    m=m,
-                    n=n,
+                    m=m_local,
+                    n=n_local,
                     fs_shard_dim=fs_shard_dim,
                     start_idx=rank_start,
                     end_idx=rank_end,
@@ -372,7 +466,7 @@ def build_dion_entries(
         )
         dion_shard_layout_by_param[param] = shard_layout
         entries.append(
-            DionBucketEntry(
+            DionShardEntry(
                 param=param,
                 shard_layout=shard_layout,
                 size_per_rank=int(size_per_rank),
@@ -406,13 +500,7 @@ def build_dion_entries(
     return bucket_layout, dion_shard_layout_by_param, len(entries)
 
 
-def select_non_dion_bucket_params_(*, bucket_params, dion_layout: DionBucketLayout | None):
-    """Return bucket params that are not carried by Dion transport layout entries."""
-    dion_param_ids = frozenset() if dion_layout is None else dion_layout.param_ids
-    return [param for param in bucket_params if id(param) not in dion_param_ids]
-
-
-def bucket_rank_range_(full_start: int, full_end: int, shard_size: int, rank: int) -> tuple[int, int]:
+def bucket_rank_range(full_start: int, full_end: int, shard_size: int, rank: int) -> tuple[int, int]:
     """Return the intersection of one full bucket span with one stock local shard."""
     shard_abs_start = rank * shard_size
     shard_abs_end = shard_abs_start + shard_size
@@ -423,7 +511,7 @@ def bucket_rank_range_(full_start: int, full_end: int, shard_size: int, rank: in
     return local_abs_start - shard_abs_start, local_abs_end - shard_abs_start
 
 
-def param_rank_range_(full_start: int, full_end: int, shard_size: int, rank: int) -> tuple[int, int]:
+def param_rank_range(full_start: int, full_end: int, shard_size: int, rank: int) -> tuple[int, int]:
     """Return the intersection of one full bucket span in param-local coordinates."""
     shard_abs_start = rank * shard_size
     shard_abs_end = shard_abs_start + shard_size
@@ -448,7 +536,7 @@ def collect_dion_bucket_params(dion_layout: DionBucketLayout | None) -> list[tor
     return params
 
 
-def serialize_dion_bucket_gather_layout_(dion_layout: DionBucketLayout) -> tuple[int, ...]:
+def serialize_bucket_gather_layout(dion_layout: DionBucketLayout) -> tuple[int, ...]:
     """Serialize bucket-global Dion gather invariants for cross-rank validation."""
     payload: list[int] = [
         int(dion_layout.entry_count),
@@ -475,7 +563,7 @@ def serialize_dion_bucket_gather_layout_(dion_layout: DionBucketLayout) -> tuple
     return tuple(payload)
 
 
-def validate_dion_bucket_gather_layout_(
+def validate_bucket_gather_layout(
     *,
     bucket,
     dion_layout: DionBucketLayout,
@@ -488,7 +576,7 @@ def validate_dion_bucket_gather_layout_(
     if shard_group_size <= 1:
         return
 
-    local_layout = serialize_dion_bucket_gather_layout_(dion_layout)
+    local_layout = serialize_bucket_gather_layout(dion_layout)
     gathered_layouts = [None for _ in range(shard_group_size)]
     dist.all_gather_object(gathered_layouts, local_layout, group=shard_group)
     mismatched_ranks = [
@@ -503,7 +591,7 @@ def validate_dion_bucket_gather_layout_(
         )
 
 
-def set_dion_local_shard_(
+def write_dion_shard_(
     *,
     entry,
     full_view_2d: torch.Tensor,
@@ -528,7 +616,7 @@ def set_dion_local_shard_(
     entry.param._fs_shard = local_target
 
 
-def restore_dion_local_shards_from_bucket(
+def restore_dion_shards_from_bucket_(
     *,
     dion_layout: DionBucketLayout | None,
     get_full_view_2d: Callable[[object], torch.Tensor],
@@ -539,7 +627,7 @@ def restore_dion_local_shards_from_bucket(
     if dion_layout is None or not dion_layout.has_params:
         return
     for entry in dion_layout.entries:
-        set_dion_local_shard_(
+        write_dion_shard_(
             entry=entry,
             full_view_2d=get_full_view_2d(entry),
             update_data_shard=update_data_shard,
@@ -569,7 +657,7 @@ def _restore_dion_bucket(
         )
 
     for entry, full_view_2d in prepared_entries:
-        m, n = (int(dim) for dim in full_view_2d.shape)
+        m_local, n_local = (int(dim) for dim in full_view_2d.shape)
         fs_shard_dim = int(entry.fs_shard_dim)
         shard_start = int(entry.shard_offset)
         shard_end = shard_start + int(entry.shard_capacity)
@@ -582,14 +670,14 @@ def _restore_dion_bucket(
                 continue
 
             if fs_shard_dim == 0:
-                local_numel = local_split_size * n
-                local_source = rank_source[:local_numel].view(local_split_size, n)
+                local_numel = local_split_size * n_local
+                local_source = rank_source[:local_numel].view(local_split_size, n_local)
                 full_view_2d[rank_start:rank_end, :].copy_(local_source)
             else:
-                local_numel = m * local_split_size
-                local_source = rank_source[:local_numel].view(m, local_split_size)
+                local_numel = m_local * local_split_size
+                local_source = rank_source[:local_numel].view(m_local, local_split_size)
                 full_view_2d[:, rank_start:rank_end].copy_(local_source)
-        set_dion_local_shard_(
+        write_dion_shard_(
             entry=entry,
             full_view_2d=full_view_2d,
             update_data_shard=update_data_shard,
@@ -619,20 +707,20 @@ class CallbackHandle:
 class BucketGatherHandle:
     """Preserve mixed-bucket canonical restore ordering behind one wait handle."""
 
-    def __init__(self, non_dion_handle, dion_handle):
-        self._non_dion_handle = non_dion_handle
+    def __init__(self, standard_handle, dion_handle):
+        self._standard_handle = standard_handle
         self._dion_handle = dion_handle
 
     def wait(self):
-        if self._non_dion_handle is not None:
-            self._non_dion_handle.wait()
+        if self._standard_handle is not None:
+            self._standard_handle.wait()
         if self._dion_handle is not None:
             self._dion_handle.wait()
-        self._non_dion_handle = None
+        self._standard_handle = None
         self._dion_handle = None
 
 
-def check_shard_identity(
+def assert_shard_aliased(
     *,
     optimizer,
     model_float16_groups,
@@ -750,13 +838,13 @@ def build_bucket_param_map(
     return canonical_param_map
 
 
-def mark_bucket_dion_params(cls, param_map, param_to_name, fs_size):
+def mark_dion_bucket_params(cls, param_map, param_to_name, fs_size):
     """Classify bucket params and build static Dion metadata once."""
     del cls, fs_size
     from .. import parallel_state
 
     dion_param_count = 0
-    dion_static_info_by_param = {}
+    dion_info_by_param = {}
 
     for param in param_map.keys():
         param_name = None
@@ -780,39 +868,40 @@ def mark_bucket_dion_params(cls, param_map, param_to_name, fs_size):
             continue
 
         dion_param_count += 1
-        m, n = param.shape
+        m_local, n_local = param.shape
         fs_shard_dim = get_fs_split_dim(tp_shard_dim)
 
         if tp_shard_dim == 0:
-            global_m = m * tp_world_size
-            global_n = n
+            m_global = m_local * tp_world_size
+            n_global = n_local
         elif tp_shard_dim == 1:
-            global_m = m
-            global_n = n * tp_world_size
+            m_global = m_local
+            n_global = n_local * tp_world_size
         else:
-            global_m = m
-            global_n = n
+            m_global = m_local
+            n_global = n_local
 
         num_local_experts = getattr(param, "num_local_experts", None)
-        if num_local_experts is not None and num_local_experts > 1:
+        is_explicit_expert = has_explicit_expert_index(param_name)
+        if num_local_experts is not None and num_local_experts > 1 and not is_explicit_expert:
             if tp_shard_dim == 0:
-                per_expert_global_shape = (global_m // num_local_experts, global_n)
+                per_expert_global_shape = (m_global // num_local_experts, n_global)
             elif tp_shard_dim == 1:
-                per_expert_global_shape = (global_m, global_n // num_local_experts)
+                per_expert_global_shape = (m_global, n_global // num_local_experts)
             else:
-                per_expert_global_shape = (global_m, global_n)
+                per_expert_global_shape = (m_global, n_global)
         else:
             per_expert_global_shape = None
 
-        dion_static_info_by_param[param] = {
+        dion_info_by_param[param] = {
             "is_dion": True,
-            "global_shape": (global_m, global_n),
+            "global_shape": (m_global, n_global),
             "fs_shard_dim": fs_shard_dim,
             "tp_shard_dim": tp_shard_dim,
             "per_expert_global_shape": per_expert_global_shape,
         }
 
-    return dion_param_count, dion_static_info_by_param
+    return dion_param_count, dion_info_by_param
 
 
 def bucket_param_view(bucket, param) -> Optional[torch.Tensor]:
@@ -897,7 +986,7 @@ def check_bucket_param_views(
     params: Optional[list[torch.nn.Parameter]] = None,
 ) -> None:
     """Verify selected param views still alias the canonical bucket buffer."""
-    if bucket is None or not getattr(bucket, "_dion_requires_param_sync_check", False):
+    if bucket is None or not getattr(bucket, "_tracks_dion_param_views", False):
         return
     if getattr(bucket, "param_data", None) is None:
         raise RuntimeError(
@@ -928,13 +1017,13 @@ def check_bucket_param_views(
             )
 
 
-def attach_dion_bucket_layout(
+def attach_dion_bucket_layout_(
     optimizer,
     *,
     gbuf_idx: int,
     buffer,
     bucket,
-    dion_bucket_layout: DionBucketLayout,
+    dion_layout: DionBucketLayout,
 ) -> None:
     """Validate that stored Dion entries already target the current runtime bucket."""
     if not hasattr(bucket, "param_to_index") or bucket.param_to_index is None:
@@ -942,7 +1031,7 @@ def attach_dion_bucket_layout(
             f"[Dion] buffer={gbuf_idx} bucket={bucket.bucket_id} missing bucket.param_to_index"
         )
 
-    for entry in dion_bucket_layout.entries:
+    for entry in dion_layout.entries:
         entry_param = entry.param
         if entry_param not in bucket.param_to_index:
             buffer_name_map = getattr(buffer, "param_to_name", None)
@@ -952,8 +1041,8 @@ def attach_dion_bucket_layout(
                 f"{param_name or f'id_{id(entry_param)}'} "
                 "is not present in the current runtime bucket"
             )
-    bucket.dion_layout = dion_bucket_layout
-    for entry in dion_bucket_layout.entries:
+    bucket.dion_layout = dion_layout
+    for entry in dion_layout.entries:
         optimizer._dion_buckets_by_param[entry.param] = bucket
         optimizer._dion_entries_by_param[entry.param] = entry
 
@@ -964,30 +1053,30 @@ def init_dion_bucket(
     gbuf_idx: int,
     buffer,
     bucket,
-    dion_bucket_layout: DionBucketLayout,
+    dion_layout: DionBucketLayout,
     fs_group,
 ) -> None:
     """Configure one bucket that contains at least one Dion param."""
-    attach_dion_bucket_layout(
+    attach_dion_bucket_layout_(
         optimizer,
         gbuf_idx=gbuf_idx,
         buffer=buffer,
         bucket=bucket,
-        dion_bucket_layout=dion_bucket_layout,
+        dion_layout=dion_layout,
     )
-    validate_dion_bucket_gather_layout_(
+    validate_bucket_gather_layout(
         bucket=bucket,
-        dion_layout=dion_bucket_layout,
+        dion_layout=dion_layout,
         shard_group=fs_group,
     )
     optimizer._init_bucket_comm(bucket, fs_group)
     bucket.dion_optimizer = optimizer
-    bucket._dion_requires_param_sync_check = True
+    bucket._tracks_dion_param_views = True
     bucket._dion_full_param_ready = True
     set_bucket_param_views(optimizer, bucket, copy_data=True)
 
 
-def init_non_dion_bucket(optimizer, *, gbuf_idx: int, buffer, bucket, fs_group) -> None:
+def init_standard_bucket(optimizer, *, gbuf_idx: int, buffer, bucket, fs_group) -> None:
     """Configure one bucket that has no Dion layout."""
     has_dion = any(getattr(param, "is_dion_param", False) for param in bucket.params)
     if has_dion:
@@ -998,20 +1087,20 @@ def init_non_dion_bucket(optimizer, *, gbuf_idx: int, buffer, bucket, fs_group) 
                 param_name = optimizer._lookup_param_name(name_map, param)
                 dion_params.append((id(param), param_name or f"id_{id(param)}", tuple(param.shape)))
         logger.error(
-            f"[Dion] Buffer {gbuf_idx} Bucket {bucket.bucket_id} has Dion params but no dion_bucket_layout. params={dion_params}"
+            f"[Dion] Buffer {gbuf_idx} Bucket {bucket.bucket_id} has Dion params but no Dion layout. params={dion_params}"
         )
         raise RuntimeError(
-            f"[Dion] Buffer {gbuf_idx} Bucket {bucket.bucket_id} has Dion params but no dion_bucket_layout"
+            f"[Dion] Buffer {gbuf_idx} Bucket {bucket.bucket_id} has Dion params but no Dion layout"
         )
 
     bucket.dion_layout = None
     optimizer._init_bucket_comm(bucket, fs_group)
     bucket.dion_optimizer = optimizer
-    bucket._dion_requires_param_sync_check = False
+    bucket._tracks_dion_param_views = False
     bucket._dion_full_param_ready = True
 
 
-def bucket_dion_full_view(optimizer, bucket, entry: DionBucketEntry) -> torch.Tensor:
+def bucket_dion_param_view(optimizer, bucket, entry: DionShardEntry) -> torch.Tensor:
     """Return the canonical full-param view for one Dion entry."""
     full_view_2d = bucket_full_param_view_2d(bucket, entry.param, entry)
     if full_view_2d is None:
@@ -1026,7 +1115,7 @@ def bucket_dion_full_view(optimizer, bucket, entry: DionBucketEntry) -> torch.Te
 def fill_dion_shard_buffer(
     optimizer,
     *,
-    entry: DionBucketEntry,
+    entry: DionShardEntry,
     full_view_2d: torch.Tensor,
     shard_buffer: torch.Tensor,
 ) -> None:
@@ -1062,7 +1151,7 @@ def fill_dion_shard_buffer(
     shard_buffer[:local_numel].copy_(canonical_local_source.reshape(-1)[:local_numel])
 
 
-def prepare_dion_bucket_gather(optimizer, bucket) -> Tuple[torch.Tensor, List[Tuple[DionBucketEntry, torch.Tensor]]]:
+def prepare_dion_param_gather(optimizer, bucket) -> Tuple[torch.Tensor, List[Tuple[DionShardEntry, torch.Tensor]]]:
     """Build one bucket-local Dion shard buffer in canonical entry order."""
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not dion_layout.has_params:
@@ -1070,19 +1159,26 @@ def prepare_dion_bucket_gather(optimizer, bucket) -> Tuple[torch.Tensor, List[Tu
             torch.empty(
                 0,
                 dtype=bucket.param_data.dtype,
-                device=torch.cuda.current_device(),
+                device=bucket.param_data.device,
             ),
             [],
         )
 
-    prepared_buffer = torch.empty(
-        int(dion_layout.shard_size),
+    prepared_buffer = _acquire_param_gather_tensor(
+        bucket,
+        name="dion_input",
+        shape=(int(dion_layout.shard_size),),
         dtype=bucket.param_data.dtype,
-        device=torch.cuda.current_device(),
+        device=bucket.param_data.device,
+        route_key=(
+            int(dion_layout.entry_count),
+            int(dion_layout.shard_size),
+            int(dion_layout.max_shard_capacity),
+        ),
     )
     prepared_entries = []
     for entry in dion_layout.entries:
-        full_view_2d = bucket_dion_full_view(optimizer, bucket, entry)
+        full_view_2d = bucket_dion_param_view(optimizer, bucket, entry)
         shard_start = int(entry.shard_offset)
         shard_end = shard_start + int(entry.shard_capacity)
         fill_dion_shard_buffer(
@@ -1095,7 +1191,7 @@ def prepare_dion_bucket_gather(optimizer, bucket) -> Tuple[torch.Tensor, List[Tu
     return prepared_buffer, prepared_entries
 
 
-def restore_bucket(
+def restore_bucket_param_data_(
     optimizer,
     *,
     bucket,
@@ -1114,7 +1210,7 @@ def restore_bucket(
     )
 
 
-def bucket_local_shard_group(optimizer, bucket):
+def get_bucket_shard_group(optimizer, bucket):
     """Resolve the stock DO local-shard group that owns one bucket."""
     dp_group = getattr(bucket, "intra_distributed_optimizer_instance_group", None)
     if dp_group is not None:
@@ -1143,7 +1239,7 @@ def bucket_local_shard_group(optimizer, bucket):
     return None, None, None
 
 
-def _build_non_dion_param_rank_segments(
+def _build_standard_rank_segments(
     *,
     bucket,
     group_size: int,
@@ -1173,14 +1269,14 @@ def _build_non_dion_param_rank_segments(
     return tuple(rank_segments), int(max_rank_numel)
 
 
-def _get_non_dion_param_route(
+def _get_standard_param_gather_route(
     *,
     bucket,
     group_size: int,
     group_rank: int,
     standard_shard_size: int,
-) -> DionBucketNonDionParamRoute:
-    cached = getattr(bucket, "_dion_non_dion_param_route", None)
+) -> StandardParamGatherRoute:
+    cached = getattr(bucket, "_standard_param_gather_route", None)
     if (
         cached is not None
         and int(cached.group_size) == int(group_size)
@@ -1189,39 +1285,39 @@ def _get_non_dion_param_route(
     ):
         return cached
 
-    rank_segments, non_dion_size = _build_non_dion_param_rank_segments(
+    rank_segments, standard_numel = _build_standard_rank_segments(
         bucket=bucket,
         group_size=int(group_size),
         shard_size=int(standard_shard_size),
     )
-    route = DionBucketNonDionParamRoute(
+    route = StandardParamGatherRoute(
         group_size=int(group_size),
         group_rank=int(group_rank),
         standard_shard_size=int(standard_shard_size),
-        non_dion_size=int(non_dion_size),
+        standard_numel=int(standard_numel),
         rank_segments=rank_segments,
     )
-    bucket._dion_non_dion_param_route = route
+    bucket._standard_param_gather_route = route
     return route
 
 
-def prepare_non_dion_bucket_gather(optimizer, bucket):
-    """Build the minimal non-Dion all-gather input for a mixed bucket."""
+def prepare_standard_param_gather(optimizer, bucket):
+    """Build the minimal standard all-gather input for a mixed bucket."""
     dion_layout = getattr(bucket, "dion_layout", None)
-    if dion_layout is None or not bucket.has_non_dion_params:
+    if dion_layout is None or not bucket.has_standard_params:
         return None, None, None
 
-    dp_group, dp_size, dp_rank = bucket_local_shard_group(optimizer, bucket)
+    dp_group, dp_size, dp_rank = get_bucket_shard_group(optimizer, bucket)
     if dp_group is None:
         raise RuntimeError(
-            "[Dion] mixed non-Dion all-gather requires the standard local-shard group."
+            "[Dion] mixed standard all-gather requires the standard local-shard group."
         )
     if dp_size == 1:
         return None, None, dp_group
 
     if bucket.param_data.numel() % dp_size != 0:
         raise RuntimeError(
-            "[Dion] mixed non-Dion all-gather requires a padded standard bucket "
+            "[Dion] mixed standard all-gather requires a padded standard bucket "
             f"bucket={getattr(bucket, 'bucket_id', -1)} "
             f"bucket_numel={int(bucket.param_data.numel())} group_size={int(dp_size)}"
         )
@@ -1229,21 +1325,29 @@ def prepare_non_dion_bucket_gather(optimizer, bucket):
     if shard_size <= 0:
         return None, None, dp_group
 
-    route = _get_non_dion_param_route(
+    route = _get_standard_param_gather_route(
         bucket=bucket,
         group_size=dp_size,
         group_rank=dp_rank,
         standard_shard_size=shard_size,
     )
-    if route.non_dion_size <= 0:
+    if route.standard_numel <= 0:
         return None, route, dp_group
 
-    input_shard = torch.empty(
-        int(route.non_dion_size),
+    input_shard = _acquire_param_gather_tensor(
+        bucket,
+        name="standard_input",
+        shape=(int(route.standard_numel),),
         dtype=bucket.param_data.dtype,
-        device=torch.cuda.current_device(),
+        device=bucket.param_data.device,
+        route_key=(
+            int(route.group_size),
+            int(route.group_rank),
+            int(route.standard_shard_size),
+            int(route.standard_numel),
+        ),
+        zero=True,
     )
-    input_shard.zero_()
     for source_start, source_end, target_start in route.rank_segments[int(dp_rank)]:
         source_start = int(source_start)
         source_end = int(source_end)
@@ -1255,18 +1359,18 @@ def prepare_non_dion_bucket_gather(optimizer, bucket):
     return input_shard, route, dp_group
 
 
-def restore_non_dion_bucket_gather(bucket, gathered_buffer: torch.Tensor, route) -> None:
-    """Restore gathered mixed-bucket non-Dion params into canonical bucket.param_data."""
-    if route is None or int(route.non_dion_size) <= 0:
+def restore_standard_param_gather_(bucket, gathered_buffer: torch.Tensor, route) -> None:
+    """Restore gathered mixed-bucket standard params into canonical bucket.param_data."""
+    if route is None or int(route.standard_numel) <= 0:
         return
-    expected_shape = (int(route.group_size), int(route.non_dion_size))
+    expected_shape = (int(route.group_size), int(route.standard_numel))
     if gathered_buffer.dim() == 1:
         gathered_view = gathered_buffer.view(*expected_shape)
     elif tuple(gathered_buffer.shape) == expected_shape:
         gathered_view = gathered_buffer
     else:
         raise RuntimeError(
-            "[Dion] mixed non-Dion all-gather output shape mismatch "
+            "[Dion] mixed standard all-gather output shape mismatch "
             f"bucket={getattr(bucket, 'bucket_id', -1)} "
             f"shape={tuple(gathered_buffer.shape)} expected={expected_shape}"
         )
@@ -1281,31 +1385,46 @@ def restore_non_dion_bucket_gather(bucket, gathered_buffer: torch.Tensor, route)
             flat_param_data[source_start:source_end].copy_(rank_source[target_start:target_end])
 
 
-def all_gather_non_dion_bucket(optimizer, bucket, async_op=False, prepared_gather=None):
-    """Gather mixed-bucket non-Dion params back into canonical bucket.param_data."""
+def all_gather_standard_params_(optimizer, bucket, async_op=False, prepared_gather=None):
+    """Gather mixed-bucket standard params back into canonical bucket.param_data."""
     if prepared_gather is None:
-        input_shard, route, dp_group = prepare_non_dion_bucket_gather(optimizer, bucket)
+        input_shard, route, dp_group = prepare_standard_param_gather(optimizer, bucket)
     else:
         input_shard, route, dp_group = prepared_gather
 
-    if input_shard is None or route is None or int(route.non_dion_size) <= 0:
+    if input_shard is None or route is None or int(route.standard_numel) <= 0:
         return None
 
-    gathered_buffer = torch.empty(
-        int(route.group_size) * int(route.non_dion_size),
+    gathered_buffer = _acquire_param_gather_tensor(
+        bucket,
+        name="standard_output",
+        shape=(int(route.group_size) * int(route.standard_numel),),
         dtype=bucket.param_data.dtype,
-        device=torch.cuda.current_device(),
+        device=bucket.param_data.device,
+        route_key=(
+            int(route.group_size),
+            int(route.standard_shard_size),
+            int(route.standard_numel),
+        ),
     )
-    work = dist.all_gather_into_tensor(
-        output_tensor=gathered_buffer,
-        input_tensor=input_shard,
-        group=dp_group,
-        async_op=async_op,
-    )
+    try:
+        work = dist.all_gather_into_tensor(
+            output_tensor=gathered_buffer,
+            input_tensor=input_shard,
+            group=dp_group,
+            async_op=async_op,
+        )
+    except Exception:
+        _release_param_gather_tensor(bucket, input_shard)
+        _release_param_gather_tensor(bucket, gathered_buffer)
+        raise
 
-    def _restore_callback(_input_shard=input_shard):
-        del _input_shard
-        restore_non_dion_bucket_gather(bucket, gathered_buffer, route)
+    def _restore_callback(_input_shard=input_shard, _gathered_buffer=gathered_buffer):
+        try:
+            restore_standard_param_gather_(bucket, _gathered_buffer, route)
+        finally:
+            _release_param_gather_tensor(bucket, _input_shard)
+            _release_param_gather_tensor(bucket, _gathered_buffer)
 
     if async_op:
         return CallbackHandle(work, _restore_callback)
@@ -1314,7 +1433,7 @@ def all_gather_non_dion_bucket(optimizer, bucket, async_op=False, prepared_gathe
     return None
 
 
-def all_gather_dion_bucket(
+def all_gather_dion_params_(
     optimizer,
     bucket,
     async_op=False,
@@ -1330,20 +1449,22 @@ def all_gather_dion_bucket(
         shard_group = optimizer.fs_group
     shard_group_size = optimizer._group_size(shard_group) if shard_group is not None else 1
     if prepared_gather is None:
-        prepared_buffer, prepared_entries = prepare_dion_bucket_gather(optimizer, bucket)
+        prepared_buffer, prepared_entries = prepare_dion_param_gather(optimizer, bucket)
     else:
         prepared_buffer, prepared_entries = prepared_gather
 
     if shard_group_size == 1:
         def _restore_callback(_prepared_buffer=prepared_buffer):
-            del _prepared_buffer
-            restore_bucket(
-                optimizer,
-                bucket=bucket,
-                prepared_entries=prepared_entries,
-                gathered_buffer=prepared_buffer.view(1, -1),
-                shard_group_size=1,
-            )
+            try:
+                restore_bucket_param_data_(
+                    optimizer,
+                    bucket=bucket,
+                    prepared_entries=prepared_entries,
+                    gathered_buffer=_prepared_buffer.view(1, -1),
+                    shard_group_size=1,
+                )
+            finally:
+                _release_param_gather_tensor(bucket, _prepared_buffer)
 
         if async_op:
             return CallbackHandle(None, _restore_callback)
@@ -1351,11 +1472,13 @@ def all_gather_dion_bucket(
         _restore_callback()
         return None
     if shard_group is None:
+        _release_param_gather_tensor(bucket, prepared_buffer)
         return None
 
     bucket_shard_size = int(dion_layout.shard_size)
     expected_gathered_numel = int(dion_layout.gathered_numel)
     if expected_gathered_numel != bucket_shard_size * shard_group_size:
+        _release_param_gather_tensor(bucket, prepared_buffer)
         raise RuntimeError(
             "[Dion] FS gather shard size invariant mismatch "
             f"bucket={getattr(bucket, 'bucket_id', -1)} "
@@ -1363,27 +1486,42 @@ def all_gather_dion_bucket(
             f"expected_total={expected_gathered_numel}"
         )
 
-    gathered_buffer = torch.empty(
-        expected_gathered_numel,
+    gathered_buffer = _acquire_param_gather_tensor(
+        bucket,
+        name="dion_output",
+        shape=(expected_gathered_numel,),
         dtype=bucket.param_data.dtype,
-        device=torch.cuda.current_device(),
+        device=bucket.param_data.device,
+        route_key=(
+            int(shard_group_size),
+            int(bucket_shard_size),
+            int(dion_layout.entry_count),
+        ),
     )
-    work = dist.all_gather_into_tensor(
-        output_tensor=gathered_buffer,
-        input_tensor=prepared_buffer,
-        group=shard_group,
-        async_op=async_op,
-    )
-
-    def _restore_callback(_prepared_buffer=prepared_buffer):
-        del _prepared_buffer
-        restore_bucket(
-            optimizer,
-            bucket=bucket,
-            prepared_entries=prepared_entries,
-            gathered_buffer=gathered_buffer.view(shard_group_size, bucket_shard_size),
-            shard_group_size=shard_group_size,
+    try:
+        work = dist.all_gather_into_tensor(
+            output_tensor=gathered_buffer,
+            input_tensor=prepared_buffer,
+            group=shard_group,
+            async_op=async_op,
         )
+    except Exception:
+        _release_param_gather_tensor(bucket, prepared_buffer)
+        _release_param_gather_tensor(bucket, gathered_buffer)
+        raise
+
+    def _restore_callback(_prepared_buffer=prepared_buffer, _gathered_buffer=gathered_buffer):
+        try:
+            restore_bucket_param_data_(
+                optimizer,
+                bucket=bucket,
+                prepared_entries=prepared_entries,
+                gathered_buffer=_gathered_buffer.view(shard_group_size, bucket_shard_size),
+                shard_group_size=shard_group_size,
+            )
+        finally:
+            _release_param_gather_tensor(bucket, _prepared_buffer)
+            _release_param_gather_tensor(bucket, _gathered_buffer)
 
     if async_op:
         return CallbackHandle(work, _restore_callback)
@@ -1392,19 +1530,19 @@ def all_gather_dion_bucket(
     return None
 
 
-def all_gather_combined_mixed_bucket(
+def all_gather_mixed_params_(
     optimizer,
     bucket,
     *,
     async_op: bool,
     prepared_dion_gather,
-    prepared_non_dion_gather,
+    prepared_standard_gather,
 ):
-    """Gather Dion and non-Dion mixed-bucket params in one collective."""
+    """Gather Dion and standard mixed-bucket params in one collective."""
     prepared_buffer, prepared_entries = prepared_dion_gather
-    non_dion_input, non_dion_route, dp_group = prepared_non_dion_gather
-    if non_dion_input is None or non_dion_route is None:
-        return all_gather_dion_bucket(
+    standard_input, standard_route, dp_group = prepared_standard_gather
+    if standard_input is None or standard_route is None:
+        return all_gather_dion_params_(
             optimizer,
             bucket,
             async_op=async_op,
@@ -1413,21 +1551,24 @@ def all_gather_combined_mixed_bucket(
 
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not dion_layout.has_params:
-        return all_gather_non_dion_bucket(
+        _release_param_gather_tensor(bucket, prepared_buffer)
+        return all_gather_standard_params_(
             optimizer,
             bucket,
             async_op=async_op,
-            prepared_gather=prepared_non_dion_gather,
+            prepared_gather=prepared_standard_gather,
         )
 
-    group_size = int(non_dion_route.group_size)
+    group_size = int(standard_route.group_size)
     dion_size = int(dion_layout.shard_size)
-    non_dion_size = int(non_dion_route.non_dion_size)
-    payload_size = dion_size + non_dion_size
+    standard_numel = int(standard_route.standard_numel)
+    payload_size = dion_size + standard_numel
     shard_group = getattr(bucket, "dion_shard_group", None)
     if shard_group is None:
         shard_group = optimizer.fs_group
     if not _groups_have_same_order(dp_group, shard_group):
+        _release_param_gather_tensor(bucket, prepared_buffer)
+        _release_param_gather_tensor(bucket, standard_input)
         raise RuntimeError(
             "[Dion] combined mixed-bucket gather requires identical group order "
             f"bucket={getattr(bucket, 'bucket_id', -1)} "
@@ -1435,47 +1576,71 @@ def all_gather_combined_mixed_bucket(
         )
     expected_gathered_numel = int(dion_layout.gathered_numel)
     if expected_gathered_numel != dion_size * group_size:
+        _release_param_gather_tensor(bucket, prepared_buffer)
+        _release_param_gather_tensor(bucket, standard_input)
         raise RuntimeError(
             "[Dion] combined mixed-bucket gather size invariant mismatch "
             f"bucket={getattr(bucket, 'bucket_id', -1)} "
             f"shard_size={dion_size} group_size={group_size} "
             f"expected_total={expected_gathered_numel}"
         )
-    input_payload = torch.empty(
-        payload_size,
+    input_payload = _acquire_param_gather_tensor(
+        bucket,
+        name="mixed_input",
+        shape=(payload_size,),
         dtype=bucket.param_data.dtype,
-        device=torch.cuda.current_device(),
+        device=bucket.param_data.device,
+        route_key=(int(group_size), int(dion_size), int(standard_numel)),
     )
-    input_payload[:dion_size].copy_(prepared_buffer)
-    input_payload[dion_size:payload_size].copy_(non_dion_input)
+    try:
+        input_payload[:dion_size].copy_(prepared_buffer)
+        input_payload[dion_size:payload_size].copy_(standard_input)
+    except Exception:
+        _release_param_gather_tensor(bucket, prepared_buffer)
+        _release_param_gather_tensor(bucket, standard_input)
+        _release_param_gather_tensor(bucket, input_payload)
+        raise
+    _release_param_gather_tensor(bucket, prepared_buffer)
+    _release_param_gather_tensor(bucket, standard_input)
 
-    gathered_buffer = torch.empty(
-        group_size * payload_size,
+    gathered_buffer = _acquire_param_gather_tensor(
+        bucket,
+        name="mixed_output",
+        shape=(group_size * payload_size,),
         dtype=bucket.param_data.dtype,
-        device=torch.cuda.current_device(),
+        device=bucket.param_data.device,
+        route_key=(int(group_size), int(dion_size), int(standard_numel)),
     )
-    work = dist.all_gather_into_tensor(
-        output_tensor=gathered_buffer,
-        input_tensor=input_payload,
-        group=dp_group,
-        async_op=async_op,
-    )
+    try:
+        work = dist.all_gather_into_tensor(
+            output_tensor=gathered_buffer,
+            input_tensor=input_payload,
+            group=dp_group,
+            async_op=async_op,
+        )
+    except Exception:
+        _release_param_gather_tensor(bucket, input_payload)
+        _release_param_gather_tensor(bucket, gathered_buffer)
+        raise
 
-    def _restore_callback(_input_payload=input_payload):
-        del _input_payload
-        gathered_view = gathered_buffer.view(group_size, payload_size)
-        restore_bucket(
-            optimizer,
-            bucket=bucket,
-            prepared_entries=prepared_entries,
-            gathered_buffer=gathered_view[:, :dion_size],
-            shard_group_size=group_size,
-        )
-        restore_non_dion_bucket_gather(
-            bucket,
-            gathered_view[:, dion_size:payload_size],
-            non_dion_route,
-        )
+    def _restore_callback(_input_payload=input_payload, _gathered_buffer=gathered_buffer):
+        try:
+            gathered_view = _gathered_buffer.view(group_size, payload_size)
+            restore_bucket_param_data_(
+                optimizer,
+                bucket=bucket,
+                prepared_entries=prepared_entries,
+                gathered_buffer=gathered_view[:, :dion_size],
+                shard_group_size=group_size,
+            )
+            restore_standard_param_gather_(
+                bucket,
+                gathered_view[:, dion_size:payload_size],
+                standard_route,
+            )
+        finally:
+            _release_param_gather_tensor(bucket, _input_payload)
+            _release_param_gather_tensor(bucket, _gathered_buffer)
 
     if async_op:
         return CallbackHandle(work, _restore_callback)
@@ -1484,62 +1649,62 @@ def all_gather_combined_mixed_bucket(
     return None
 
 
-def all_gather_bucket_params(optimizer, bucket, async_op=False):
-    """Gather all custom bucket params that do not follow the pure standard DO path."""
+def all_gather_bucket_params_(optimizer, bucket, async_op=False):
+    """Gather all Dion bucket params that do not follow the pure standard DO path."""
     dion_layout = getattr(bucket, "dion_layout", None)
     has_dion = dion_layout is not None and dion_layout.has_params
-    has_mixed_non_dion = has_dion and bucket.has_non_dion_params
+    has_mixed_standard_params = has_dion and bucket.has_standard_params
 
     prepared_dion_entries = None
-    if has_mixed_non_dion:
-        prepared_dion_entries = prepare_dion_bucket_gather(optimizer, bucket)
-        prepared_non_dion_gather = prepare_non_dion_bucket_gather(optimizer, bucket)
-        _, non_dion_route, dp_group = prepared_non_dion_gather
+    if has_mixed_standard_params:
+        prepared_dion_entries = prepare_dion_param_gather(optimizer, bucket)
+        prepared_standard_gather = prepare_standard_param_gather(optimizer, bucket)
+        _, standard_route, dp_group = prepared_standard_gather
         shard_group = getattr(bucket, "dion_shard_group", None)
         if shard_group is None:
             shard_group = optimizer.fs_group
         shard_group_size = optimizer._group_size(shard_group) if shard_group is not None else 1
         if (
-            non_dion_route is not None
-            and int(non_dion_route.non_dion_size) > 0
-            and int(non_dion_route.group_size) == int(shard_group_size)
+            standard_route is not None
+            and int(standard_route.standard_numel) > 0
+            and int(standard_route.group_size) == int(shard_group_size)
             and _groups_have_same_order(dp_group, shard_group)
         ):
-            return all_gather_combined_mixed_bucket(
+            return all_gather_mixed_params_(
                 optimizer,
                 bucket,
                 async_op=async_op,
                 prepared_dion_gather=prepared_dion_entries,
-                prepared_non_dion_gather=prepared_non_dion_gather,
+                prepared_standard_gather=prepared_standard_gather,
             )
 
-        mixed_non_dion_handle = all_gather_non_dion_bucket(
+        standard_handle = all_gather_standard_params_(
             optimizer,
             bucket,
             async_op=async_op,
-            prepared_gather=prepared_non_dion_gather,
+            prepared_gather=prepared_standard_gather,
         )
-        dion_handle = all_gather_dion_bucket(
+        dion_handle = all_gather_dion_params_(
             optimizer,
             bucket,
             async_op=async_op,
             prepared_gather=prepared_dion_entries,
         )
-        if async_op and (mixed_non_dion_handle is not None or dion_handle is not None):
-            return BucketGatherHandle(mixed_non_dion_handle, dion_handle)
+        if async_op and (standard_handle is not None or dion_handle is not None):
+            return BucketGatherHandle(standard_handle, dion_handle)
         return None
 
     handles = []
-    dion_handle = all_gather_dion_bucket(
+    dion_handle = all_gather_dion_params_(
         optimizer,
         bucket,
         async_op=async_op,
     )
     if dion_handle is not None:
         handles.append(dion_handle)
-    mixed_non_dion_handle = all_gather_non_dion_bucket(optimizer, bucket, async_op=async_op)
-    if mixed_non_dion_handle is not None:
-        handles.append(mixed_non_dion_handle)
+    standard_handle = all_gather_standard_params_(optimizer, bucket, async_op=async_op)
+    if standard_handle is not None:
+        handles.append(standard_handle)
     if async_op and handles:
         return _HandleGroup(handles)
     return None

@@ -1,4 +1,4 @@
-"""Foreach-style scalar optimizer helpers for Dion scalar buckets."""
+"""Foreach-style elementwise optimizer helpers for Dion elementwise buckets."""
 
 from __future__ import annotations
 
@@ -7,19 +7,19 @@ from typing import Iterator, List, Tuple
 import torch
 from torch import Tensor
 
-_SCALAR_FOREACH_TEMP_BYTES_CAP = 128 * 1024 * 1024
+_ELEMENTWISE_FOREACH_TEMP_BYTES_CAP = 128 * 1024 * 1024
 
 
-def _iter_chunk_slices_by_numel(params: List[Tensor], max_numel_per_chunk: int) -> Iterator[Tuple[int, int]]:
-    """Yield contiguous chunk slices whose total tensor elements stay under the cap.
+def _iter_chunk_ranges_by_numel(params: List[Tensor], max_numel_per_chunk: int) -> Iterator[Tuple[int, int]]:
+    """Yield contiguous chunk ranges whose total tensor elements stay under the cap.
 
-    Chunking is mathematically exact because scalar AdamW/Lion updates are tensor-separable:
-    each tensor's state transition depends only on that tensor's local state and scalar
+    Chunking is mathematically exact because elementwise AdamW/Lion updates are tensor-separable:
+    each tensor's state transition depends only on that tensor's local state and elementwise
     hyperparameters, not on neighboring tensors in the same foreach list.
     """
     if max_numel_per_chunk <= 0:
         raise RuntimeError(
-            "[DION_INVALID_SCALAR_CHUNK_CAP] "
+            "[DION_INVALID_ELEMENTWISE_CHUNK_CAP] "
             f"max_numel_per_chunk={max_numel_per_chunk}"
         )
 
@@ -29,7 +29,7 @@ def _iter_chunk_slices_by_numel(params: List[Tensor], max_numel_per_chunk: int) 
         tensor_numel = int(param.numel())
         if tensor_numel <= 0:
             raise RuntimeError(
-                "[DION_INVALID_SCALAR_TENSOR_NUMEL] "
+                "[DION_INVALID_ELEMENTWISE_TENSOR_NUMEL] "
                 f"index={idx} numel={tensor_numel}"
             )
         if idx > start and chunk_numel + tensor_numel > max_numel_per_chunk:
@@ -55,7 +55,7 @@ def _adamw_update_foreach_chunk(
     step: int,
     epsilon: float,
 ) -> None:
-    """Reference-style foreach AdamW update on one homogeneous scalar chunk."""
+    """Reference-style foreach AdamW update on one homogeneous elementwise chunk."""
     batch_size = len(params)
     first_moment_dtype = first_moments[0].dtype
     second_moment_dtype = second_moments[0].dtype
@@ -92,7 +92,7 @@ def _lion_update_foreach_chunk(
     beta2: float,
     weight_decay: float,
 ) -> None:
-    """Reference-style foreach Lion update on one homogeneous scalar chunk."""
+    """Reference-style foreach Lion update on one homogeneous elementwise chunk."""
     batch_size = len(params)
     first_moment_dtype = first_moments[0].dtype
     grads = [grad.to(dtype=first_moment_dtype) for grad in grads]
@@ -120,22 +120,22 @@ def adamw_update_foreach(
     step: int,
     epsilon: float,
 ) -> None:
-    """Reference-style foreach AdamW update on one homogeneous scalar bucket."""
+    """Reference-style foreach AdamW update on one homogeneous elementwise bucket."""
     batch_size = len(params)
     if batch_size == 0:
         return
     if batch_size != len(grads) or batch_size != len(first_moments) or batch_size != len(second_moments):
         raise RuntimeError(
-            "[DION_SCALAR_ADAMW_BUCKET_MISMATCH] "
+            "[DION_ELEMENTWISE_ADAMW_BUCKET_MISMATCH] "
             f"params={batch_size} grads={len(grads)} first_moments={len(first_moments)} second_moments={len(second_moments)}"
         )
     if step <= 0:
-        raise RuntimeError(f"[DION_INVALID_SCALAR_ADAMW_STEP] step={step}")
+        raise RuntimeError(f"[DION_INVALID_ELEMENTWISE_ADAMW_STEP] step={step}")
 
     dtype_bytes = max(first_moments[0].element_size(), second_moments[0].element_size())
-    max_numel_per_chunk = max(1, _SCALAR_FOREACH_TEMP_BYTES_CAP // dtype_bytes)
+    max_numel_per_chunk = max(1, _ELEMENTWISE_FOREACH_TEMP_BYTES_CAP // dtype_bytes)
 
-    for start, end in _iter_chunk_slices_by_numel(params, max_numel_per_chunk):
+    for start, end in _iter_chunk_ranges_by_numel(params, max_numel_per_chunk):
         _adamw_update_foreach_chunk(
             params[start:end],
             grads[start:end],
@@ -160,19 +160,19 @@ def lion_update_foreach(
     beta2: float,
     weight_decay: float,
 ) -> None:
-    """Reference-style foreach Lion update on one homogeneous scalar bucket."""
+    """Reference-style foreach Lion update on one homogeneous elementwise bucket."""
     batch_size = len(params)
     if batch_size == 0:
         return
     if batch_size != len(grads) or batch_size != len(first_moments):
         raise RuntimeError(
-            "[DION_SCALAR_LION_BUCKET_MISMATCH] "
+            "[DION_ELEMENTWISE_LION_BUCKET_MISMATCH] "
             f"params={batch_size} grads={len(grads)} first_moments={len(first_moments)}"
         )
 
-    max_numel_per_chunk = max(1, _SCALAR_FOREACH_TEMP_BYTES_CAP // first_moments[0].element_size())
+    max_numel_per_chunk = max(1, _ELEMENTWISE_FOREACH_TEMP_BYTES_CAP // first_moments[0].element_size())
 
-    for start, end in _iter_chunk_slices_by_numel(params, max_numel_per_chunk):
+    for start, end in _iter_chunk_ranges_by_numel(params, max_numel_per_chunk):
         _lion_update_foreach_chunk(
             params[start:end],
             grads[start:end],

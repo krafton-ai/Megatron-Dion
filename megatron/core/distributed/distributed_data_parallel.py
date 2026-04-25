@@ -608,6 +608,30 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
 
+    def get_dion_local_grad(self, param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+        """Return the Dion local grad shard for `param` when the param uses Dion."""
+        if not getattr(param, "is_dion_param", False):
+            return None
+        bucket_group = self.param_to_bucket_group.get(param)
+        if bucket_group is None:
+            return None
+        bucket = bucket_group.param_to_bucket.get(param)
+        if bucket is None or not bucket.has_dion_params or id(param) not in bucket.dion_param_ids:
+            return None
+        optimizer = getattr(bucket, "dion_optimizer", None)
+        if optimizer is None or not hasattr(optimizer, "_dion_local_grad_by_param"):
+            raise RuntimeError(
+                "[Dion] missing optimizer local grad storage for PP-shared param "
+                f"name={getattr(param, '_param_name', f'id_{id(param)}')}"
+            )
+        local_grad = optimizer._dion_local_grad_by_param.get(param)
+        if local_grad is None:
+            raise RuntimeError(
+                "[Dion] missing local grad for PP-shared Dion param "
+                f"name={getattr(param, '_param_name', f'id_{id(param)}')}"
+            )
+        return local_grad
+
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
         for buffer in self.buffers + self.expert_parallel_buffers:

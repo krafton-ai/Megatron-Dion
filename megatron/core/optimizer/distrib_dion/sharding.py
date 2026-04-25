@@ -9,7 +9,7 @@ from typing import Callable, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from ..dion.state import p_is_fs_sharded, p_is_tp_sharded
+from ..dion.state import is_p_fs_sharded, is_p_tp_sharded
 
 
 logger = logging.getLogger(__name__)
@@ -68,20 +68,6 @@ def get_fs_split_dim(tp_shard_dim: int) -> int:
     if tp_shard_dim == 1:
         return 0
     return 0
-
-
-def compute_local_shape(
-    m: int,
-    n: int,
-    start_idx: int,
-    end_idx: int,
-    fs_shard_dim: int,
-) -> Tuple[int, int]:
-    """Return local (m, n) shape after FS sharding."""
-    local_split_size = end_idx - start_idx
-    if fs_shard_dim == 0:
-        return (local_split_size, n)
-    return (m, local_split_size)
 
 
 def fs_shard_view_2d(
@@ -169,7 +155,7 @@ def resolve_tp_group(
     return tp_group
 
 
-def resolve_fs_group(
+def resolve_fs_group_from_meta(
     dist_meta,
     *,
     expect_group: bool,
@@ -211,15 +197,15 @@ def resolve_ortho_group(
     *,
     use_fs_collectives: bool,
     resolve_tp_group: Callable,
-    resolve_fs_group: Callable,
+    resolve_fs_group_from_meta: Callable,
 ):
     """Return the authoritative orthogonalization group from adapter metadata."""
-    use_tp_shard = bool(getattr(config, "use_tp_shard", False))
+    tp_active = bool(getattr(config, "use_tp_shard", False))
 
-    if p_is_tp_sharded(config, use_tp_shard=use_tp_shard):
+    if is_p_tp_sharded(config, tp_active=tp_active):
         return resolve_tp_group(dist_meta, expect_group=True)
-    if use_fs_collectives and p_is_fs_sharded(config):
-        return resolve_fs_group(dist_meta, expect_group=True)
+    if use_fs_collectives and is_p_fs_sharded(config):
+        return resolve_fs_group_from_meta(dist_meta, expect_group=True)
     return None
 
 
@@ -234,7 +220,7 @@ def create_fs_shard(optimizer, model_param, shard_layout: DionShardLayout):
     return shard
 
 
-def prepare_fs_shard(optimizer, model_param, shard):
+def attach_fs_shard_(optimizer, model_param, shard):
     """Attach FS shard to model_param for optimizer state."""
     shard_layout = optimizer._param_shard_layout(model_param)
     if shard_layout is not None:

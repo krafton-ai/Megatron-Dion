@@ -21,7 +21,7 @@ from .ortho import (
     orthogonalize,
     reshard_q_along_tp,
 )
-from .state import has_tp_shard, is_fs_only_config
+from .state import is_tp_active, is_fs_without_tp
 from .types import DionBatch, DionBatchCollectives, DionBatchGroup, DionParamConfig
 from .utils import get_global_shape
 
@@ -47,7 +47,7 @@ def _rank_range_for_dim(size: int, world_size: int, rank: int) -> tuple[int, int
 
 
 class AsyncTask:
-    """Wrapper for async generator tasks to enable concurrent execution."""
+    """Async generator task used for concurrent Dion execution."""
 
     def __init__(self, generator: Generator[None, None, None]):
         self.generator = generator
@@ -123,88 +123,7 @@ def resolve_async_task_limit(
     return min(task_count, limit)
 
 
-def _collective_signature(collectives) -> tuple:
-    return tuple(
-        (
-            id(collective.process_group),
-            int(collective.world_size),
-            int(collective.rank),
-            tuple(int(index) for index in collective.indices),
-        )
-        for collective in collectives
-    )
-
-
-def _fsdp_tp_compressed_run_key(optimizer, dion_batch: DionBatch) -> Optional[tuple]:
-    batch_group = dion_batch.batch_group
-    batch_collectives = dion_batch.batch_collectives
-    if batch_group is None or batch_collectives is None:
-        return None
-    if batch_group.kernel_kind != "fsdp_tp":
-        return None
-    replicate_group = batch_group.replicate_group
-    if replicate_group is None or dist.get_world_size(replicate_group) <= 1:
-        return None
-    if int(dion_batch.real_batch_size) != int(batch_group.batch_world_size):
-        return None
-    configs = [config for config in dion_batch.configs if config is not None]
-    if not configs:
-        return None
-    if not optimizer.use_compressed_comm or not all(
-        bool(config.compressed_all_reduce) for config in configs
-    ):
-        return None
-    ortho_group = batch_group.ortho_group
-    return (
-        dion_batch.batch_key,
-        id(replicate_group),
-        dist.get_world_size(replicate_group),
-        dist.get_rank(replicate_group),
-        id(ortho_group),
-        1 if ortho_group is None else dist.get_world_size(ortho_group),
-        0 if ortho_group is None else dist.get_rank(ortho_group),
-        int(batch_group.batch_world_size),
-        int(dion_batch.real_batch_size),
-        _collective_signature(batch_collectives.tp_q_gathers),
-        _collective_signature(batch_collectives.fs_p_collectives),
-        _collective_signature(batch_collectives.tp_r_collectives),
-    )
-
-
-def _iter_coalesced_dion_batch_runs(optimizer, dion_batches: List[DionBatch]):
-    current_run: List[DionBatch] = []
-    current_key = None
-    for dion_batch in dion_batches:
-        run_key = _fsdp_tp_compressed_run_key(optimizer, dion_batch)
-        if (
-            run_key is None
-            or current_key is None
-            or run_key != current_key
-        ):
-            if current_run:
-                yield current_run
-                current_run = []
-            current_key = run_key
-        if run_key is None:
-            yield [dion_batch]
-            current_key = None
-            continue
-        current_run.append(dion_batch)
-    if current_run:
-        yield current_run
-
-
-def _split_stacked_batches(stacked_batch: Tensor, batch_sizes: List[int]) -> List[Tensor]:
-    split_batches = []
-    cursor = 0
-    for batch_size in batch_sizes:
-        next_cursor = cursor + int(batch_size)
-        split_batches.append(stacked_batch[cursor:next_cursor].contiguous())
-        cursor = next_cursor
-    return split_batches
-
-
-def _validate_batch_update_contract(
+def validate_update_contract(
     optimizer,
     *,
     optim_groups: List[dict],
@@ -221,19 +140,18 @@ def _validate_batch_update_contract(
         optimizer_state = optimizer_states[index]
         dist_meta = dist_metas[index]
         param_shape = param_shapes[index]
-        true_global_shape = tuple(
+        global_shape = tuple(
             int(dim)
             for dim in optimizer_state.get(
-                "true_global_shape",
+                "global_shape",
                 get_global_shape(dist_meta, param_shape[0], param_shape[1]),
             )
         )
         per_expert_global_shape = optimizer_state.get("per_expert_global_shape", None)
         if per_expert_global_shape is not None:
             per_expert_global_shape = tuple(int(dim) for dim in per_expert_global_shape)
-            m_for_lr, n_for_lr = per_expert_global_shape
-        else:
-            m_for_lr, n_for_lr = true_global_shape
+            global_shape = per_expert_global_shape
+        m_global, n_global = global_shape
 
         optim_group = optim_groups[index]
         lr = float(optim_group.get("lr", optimizer.defaults["lr"]))
@@ -252,30 +170,42 @@ def _validate_batch_update_contract(
                     getattr(dist_meta, "param_uid", None) if dist_meta is not None else None
                 ),
                 "param_name": getattr(dist_meta, "param_name", "") if dist_meta is not None else "",
-                "true_global_shape": true_global_shape,
+                "global_shape": global_shape,
                 "per_expert_global_shape": per_expert_global_shape,
-                "m_for_lr": int(m_for_lr),
-                "n_for_lr": int(n_for_lr),
+                "m_global": int(m_global),
+                "n_global": int(n_global),
                 "lr": lr,
                 "rank_fraction": rank_fraction,
                 "weight_decay": weight_decay,
                 "mu": mu,
                 "r": int(optimizer_state.get("r", -1)),
+                "tensor_row_shard_sizes": (
+                    tuple(int(size) for size in getattr(dist_meta, "tensor_row_shard_sizes", ()))
+                    if dist_meta is not None and getattr(dist_meta, "tensor_row_shard_sizes", None) is not None
+                    else ()
+                ),
+                "row_shard_sizes": (
+                    tuple(int(size) for size in getattr(dist_meta, "row_shard_sizes", ()))
+                    if dist_meta is not None and getattr(dist_meta, "row_shard_sizes", None) is not None
+                    else ()
+                ),
             }
         )
 
     expected_contract = {
         key: update_contract_rows[0][key]
         for key in (
-            "true_global_shape",
+            "global_shape",
             "per_expert_global_shape",
-            "m_for_lr",
-            "n_for_lr",
+            "m_global",
+            "n_global",
             "lr",
             "rank_fraction",
             "weight_decay",
             "mu",
             "r",
+            "tensor_row_shard_sizes",
+            "row_shard_sizes",
         )
     }
     mismatched_rows = [
@@ -291,54 +221,6 @@ def _validate_batch_update_contract(
         )
 
 
-def _all_reduce_stacked_collectives(
-    stacked_batch: Tensor,
-    *,
-    template_collectives,
-    per_batch_size: int,
-    run_count: int,
-    op,
-) -> Generator[None, None, None]:
-    if not template_collectives:
-        yield
-        return
-
-    full_batch = int(per_batch_size) * int(run_count)
-    did_yield = False
-    for collective in template_collectives:
-        process_group = collective.process_group
-        if process_group is None or int(collective.world_size) <= 1:
-            continue
-        indices = []
-        base_indices = [int(index) for index in collective.indices]
-        for run_idx in range(int(run_count)):
-            offset = run_idx * int(per_batch_size)
-            indices.extend(offset + index for index in base_indices)
-        if len(indices) == full_batch and len(template_collectives) == 1:
-            handle = dist.all_reduce(
-                stacked_batch,
-                op=op,
-                group=process_group,
-                async_op=True,
-            )
-        else:
-            tensors = [stacked_batch[index] for index in indices]
-            handle = dist.all_reduce_coalesced(
-                tensors,
-                op=op,
-                group=process_group,
-                async_op=True,
-            )
-        yield
-        handle.wait()
-        if len(indices) != full_batch or len(template_collectives) != 1:
-            del tensors
-        did_yield = True
-
-    if not did_yield:
-        yield
-
-
 def iter_dist_tasks(optimizer) -> Generator[AsyncTask, None, None]:
     """Create async tasks for distributed Dion execution."""
     route_step_params = getattr(
@@ -352,15 +234,15 @@ def iter_dist_tasks(optimizer) -> Generator[AsyncTask, None, None]:
             f"step={optimizer._step_count} rank={optimizer._global_rank}"
         )
 
-    dion_batches, scalar_params = route_step_params()
+    dion_batches, elementwise_params = route_step_params()
     optimizer._dion_update_count += sum(int(batch.real_batch_size) for batch in dion_batches)
-    optimizer._scalar_update_count += len(scalar_params)
+    optimizer._elementwise_update_count += len(elementwise_params)
 
     for dion_batch in dion_batches:
         yield AsyncTask(run_dion_batch_async(optimizer, dion_batch))
 
-    if scalar_params:
-        yield AsyncTask(optimizer._apply_scalar_buckets(scalar_params))
+    if elementwise_params:
+        yield AsyncTask(optimizer._apply_elementwise_batches(elementwise_params))
 
 
 def run_dion_batch_async(
@@ -413,17 +295,17 @@ def replicate_reduce_op(optimizer):
 
 
 def low_rank_replicate_reduce_op():
-    """Return the reference Dion compressed P/R replica reduction op."""
+    """Return the reference Dion low-rank P/R replica reduction op."""
     return dist.ReduceOp.AVG
 
 
-def collapse_grads_across_replicas(
+def all_reduce_grads_across_replicas(
     optimizer,
     grads: List[Tensor],
     *,
     replicate_group=_REPLICATE_GROUP_UNSET,
 ) -> Generator[None, None, None]:
-    """Collapse true Dion replicate replicas on G for non-compressed batches."""
+    """All-reduce Dion gradients across true replicate replicas."""
     if replicate_group is _REPLICATE_GROUP_UNSET:
         raise RuntimeError(
             "[DION_MISSING_REPLICATE_GROUP] "
@@ -444,7 +326,7 @@ def collapse_grads_across_replicas(
             grad.copy_(reduced_grad)
 
 
-def collapse_batch_across_replicas(
+def all_reduce_batch_across_replicas(
     optimizer,
     batch: Tensor,
     *,
@@ -487,7 +369,7 @@ def _orthogonalize_real_batch(
     real_batch_size: Optional[int],
     make_sketch=None,
 ) -> Tensor:
-    """Orthogonalize real batch entries while preserving inert padded slots."""
+    """Orthogonalize real batch entries while preserving inert padded entries."""
     batch_size = int(P_batch.size(0))
     real_entry_count = batch_size if real_batch_size is None else int(real_batch_size)
     if real_entry_count <= 0 or real_entry_count > batch_size:
@@ -853,7 +735,7 @@ def apply_batch_updates(
     del global_param_offset, R_batch
     if real_batch_size <= 0:
         return
-    _validate_batch_update_contract(
+    validate_update_contract(
         optimizer,
         optim_groups=optim_groups,
         optimizer_states=optimizer_states,
@@ -871,18 +753,16 @@ def apply_batch_updates(
     )
 
     optimizer_state0 = optimizer_states[0]
-    if "true_global_shape" in optimizer_state0:
-        m_global, n_global = optimizer_state0["true_global_shape"]
+    if "global_shape" in optimizer_state0:
+        m_global, n_global = optimizer_state0["global_shape"]
     else:
         m_global, n_global = get_global_shape(
             dist_metas[0],
             param_shapes[0][0],
             param_shapes[0][1],
         )
-
-    m_for_lr, n_for_lr = m_global, n_global
     if "per_expert_global_shape" in optimizer_state0:
-        m_for_lr, n_for_lr = optimizer_state0["per_expert_global_shape"]
+        m_global, n_global = optimizer_state0["per_expert_global_shape"]
 
     lr = optim_groups[0].get("lr", optimizer.defaults["lr"])
     if dist_metas is None or dist_metas[0] is None:
@@ -898,14 +778,14 @@ def apply_batch_updates(
         )
     scaled_lr = scaled_lr_for_shape(
         lr=lr,
-        m_for_lr=m_for_lr,
-        n_for_lr=n_for_lr,
-        rule=optimizer.defaults.get("lr_scaling_rule", "dion"),
+        m_global=m_global,
+        n_global=n_global,
+        scale_mode=optimizer.defaults.get("scale_mode", "spectral"),
         rank_fraction=optim_groups[0].get(
             "rank_fraction",
             optimizer.defaults.get("rank_fraction", 0.25),
         ),
-        scaling_factor=optimizer.defaults.get("scaling_factor", 1.0),
+        extra_scale_factor=optimizer.defaults.get("extra_scale_factor", 0.2),
     )
 
     wd_mult = optim_groups[0].get("wd_mult", 1.0)
@@ -942,7 +822,7 @@ def apply_batch_updates(
                     f"param_uid={getattr(dist_metas[index], 'param_uid', None) if dist_metas is not None else None}"
                 )
             q_state = reshard_q_along_tp(q_state, tp_group, tp_q_reshard.rank)
-        elif optimizer.is_distributed_mode and has_tp_shard(configs[index]):
+        elif optimizer.is_distributed_mode and is_tp_active(configs[index]):
             raise RuntimeError(
                 "[DION_MISSING_TP_Q_RESHARD] "
                 f"step={optimizer._step_count} rank={optimizer._global_rank} "
@@ -966,7 +846,7 @@ def apply_batch_updates(
     del delta_batch
 
 
-def run_compressed_comm_async(
+def run_low_rank_sync_async(
     optimizer,
     P_batch: torch.Tensor,
     M_batch: torch.Tensor,
@@ -979,7 +859,7 @@ def run_compressed_comm_async(
     skip_p_replicate: bool = False,
     skip_r_replicate: bool = False,
 ) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
-    """Run the compressed Dion communication path selected by the adapter."""
+    """Run the low-rank Dion synchronization path selected by the adapter."""
     if batch_group is None:
         raise RuntimeError(
             "[DION_MISSING_BATCH_GROUPS] "
@@ -1015,7 +895,7 @@ def run_compressed_comm_async(
         )
     fs_group = fs_collective.process_group if fs_collective is not None else None
     fs_group_world = fs_collective.world_size if fs_collective is not None else 1
-    compressed_replicate_group = batch_group.compressed_replicate_group
+    low_rank_replicate_group = batch_group.low_rank_replicate_group
 
     if kernel_kind == "fsdp" and optimizer.use_fs_collectives and fs_group and fs_group_world > 1:
         batch_size = int(P_batch.size(0))
@@ -1044,13 +924,13 @@ def run_compressed_comm_async(
         yield
 
         if (
-            compressed_replicate_group is not None
-            and dist.get_world_size(compressed_replicate_group) > 1
+            low_rank_replicate_group is not None
+            and dist.get_world_size(low_rank_replicate_group) > 1
         ):
             dist.all_reduce(
                 P_single,
                 op=low_rank_replicate_reduce_op(),
-                group=compressed_replicate_group,
+                group=low_rank_replicate_group,
             )
             yield
 
@@ -1102,16 +982,16 @@ def run_compressed_comm_async(
             dist_metas,
             batch_collectives=batch_collectives,
         )
-        if compressed_replicate_group is not None:
-            R_batch = yield from collapse_batch_across_replicas(
+        if low_rank_replicate_group is not None:
+            R_batch = yield from all_reduce_batch_across_replicas(
                 optimizer,
                 R_batch,
-                replicate_group=compressed_replicate_group,
+                replicate_group=low_rank_replicate_group,
             )
         return P_batch, R_batch
 
     if comm_group is None or comm_world_size <= 1:
-        P_batch = yield from collapse_batch_across_replicas(
+        P_batch = yield from all_reduce_batch_across_replicas(
             optimizer, P_batch, replicate_group=comm_group
         )
         if ortho_group is not None:
@@ -1138,7 +1018,7 @@ def run_compressed_comm_async(
             dist_metas,
             batch_collectives=batch_collectives,
         )
-        R_batch = yield from collapse_batch_across_replicas(
+        R_batch = yield from all_reduce_batch_across_replicas(
             optimizer, R_batch, replicate_group=comm_group
         )
         return P_batch, R_batch
@@ -1155,7 +1035,7 @@ def run_compressed_comm_async(
                 f"step={optimizer._step_count} rank={optimizer._global_rank}"
             )
         if comm_group is not None and comm_world_size > 1 and not skip_p_replicate:
-            P_batch = yield from collapse_batch_across_replicas(
+            P_batch = yield from all_reduce_batch_across_replicas(
                 optimizer,
                 P_batch,
                 replicate_group=comm_group,
@@ -1185,7 +1065,7 @@ def run_compressed_comm_async(
             batch_collectives=batch_collectives,
         )
         if comm_group is not None and comm_world_size > 1 and not skip_r_replicate:
-            R_batch = yield from collapse_batch_across_replicas(
+            R_batch = yield from all_reduce_batch_across_replicas(
                 optimizer,
                 R_batch,
                 replicate_group=comm_group,
@@ -1195,10 +1075,10 @@ def run_compressed_comm_async(
     use_replicated_orthogonalize = (
         comm_world_size > 1
         and ortho_group is None
-        and not (configs and all(is_fs_only_config(config) for config in configs))
+        and not (configs and all(is_fs_without_tp(config) for config in configs))
     )
     if comm_group is not None and comm_world_size > 1 and not use_replicated_orthogonalize:
-        P_batch = yield from collapse_batch_across_replicas(
+        P_batch = yield from all_reduce_batch_across_replicas(
             optimizer,
             P_batch,
             replicate_group=comm_group,
@@ -1298,7 +1178,7 @@ def run_compressed_comm_async(
         batch_collectives=batch_collectives,
     )
     if comm_group is not None and comm_world_size > 1:
-        R_batch = yield from collapse_batch_across_replicas(
+        R_batch = yield from all_reduce_batch_across_replicas(
             optimizer,
             R_batch,
             replicate_group=comm_group,
@@ -1342,7 +1222,7 @@ def batch_dion_update_async(
             "[DION_MISSING_BATCH_COLLECTIVES] "
             f"step={optimizer._step_count} rank={optimizer._global_rank}"
         )
-    _validate_batch_update_contract(
+    validate_update_contract(
         optimizer,
         optim_groups=optim_groups,
         optimizer_states=optimizer_states,
@@ -1355,14 +1235,14 @@ def batch_dion_update_async(
     replicate_world_size = (
         dist.get_world_size(replicate_group) if replicate_group is not None else 1
     )
-    use_compressed = (
-        optimizer.use_compressed_comm
+    use_low_rank = (
+        optimizer.use_low_rank_sync
         and replicate_world_size > 1
-        and any(config.compressed_all_reduce for config in configs)
+        and any(config.use_low_rank_sync for config in configs)
     )
 
-    if not use_compressed:
-        yield from collapse_grads_across_replicas(
+    if not use_low_rank:
+        yield from all_reduce_grads_across_replicas(
             optimizer,
             grads,
             replicate_group=replicate_group,
@@ -1396,7 +1276,7 @@ def batch_dion_update_async(
     with _dion_math_precision_context():
         P_batch = M_batch @ Q_batch
 
-    if not (configs and all(is_fs_only_config(config) for config in configs)):
+    if not (configs and all(is_fs_without_tp(config) for config in configs)):
         yield from reduce_p_across_fs_groups(
             optimizer,
             P_batch,
@@ -1405,8 +1285,8 @@ def batch_dion_update_async(
             batch_collectives=batch_collectives,
         )
 
-    if use_compressed:
-        P_batch, R_batch = yield from run_compressed_comm_async(
+    if use_low_rank:
+        P_batch, R_batch = yield from run_low_rank_sync_async(
             optimizer,
             P_batch,
             M_batch,
@@ -1421,7 +1301,7 @@ def batch_dion_update_async(
         use_replicated_orthogonalize = (
             replicate_world_size > 1
             and ortho_group is None
-            and not (configs and all(is_fs_only_config(config) for config in configs))
+            and not (configs and all(is_fs_without_tp(config) for config in configs))
         )
         if use_replicated_orthogonalize:
             if replicate_world_size <= 1:
@@ -1492,7 +1372,7 @@ def batch_dion_update_async(
 
                 P_batch = P_ortho_batch[:unpadded_batch_size]
         else:
-            if configs and all(is_fs_only_config(config) for config in configs):
+            if configs and all(is_fs_without_tp(config) for config in configs):
                 if batch_collectives is None or batch_collectives.fs_collective is None:
                     raise RuntimeError(
                         "[DION_MISSING_FS_ONLY_ORTHO_GROUP] "

@@ -7,7 +7,7 @@ from typing import Callable
 import torch.distributed as dist
 
 from ... import parallel_state
-from ..dion.linear import is_linear_fc1_param
+from ..dion.linear import get_linear_split_rows, is_linear_fc1_param
 from ..dion.qkv import get_qkv_split_shapes, is_qkv_param
 from ..dion.state import build_param_config
 from ..dion.types import DionDistMeta
@@ -17,7 +17,7 @@ from .sharding import get_tp_split_dim, is_tp_enabled
 from ...transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
 
 
-def resolve_expert_layout(*, model_param, shard_param, param_name: str, dion_shard_layout):
+def get_expert_layout(*, model_param, shard_param, param_name: str, dion_shard_layout):
     """Return local-shape metadata for one expert Dion object."""
     per_expert_global_shape = dion_shard_layout.per_expert_global_shape
     if per_expert_global_shape is None:
@@ -39,7 +39,7 @@ def resolve_expert_layout(*, model_param, shard_param, param_name: str, dion_sha
     expert_global = int(per_expert_global_shape[expert_axis])
     if expert_global <= 0 or combined_global % expert_global != 0:
         raise RuntimeError(
-            "[DION_INVALID_EXPERT_PACKING_RATIO] "
+            "[DION_INVALID_EXPERT_LAYOUT_RATIO] "
             f"param={param_name} global_shape={global_shape} per_expert_global_shape={per_expert_global_shape}"
         )
     num_local_experts = combined_global // expert_global
@@ -82,14 +82,14 @@ def resolve_expert_layout(*, model_param, shard_param, param_name: str, dion_sha
     }
 
 
-def group_info(group) -> tuple[int, int]:
+def get_group_size_rank(group) -> tuple[int, int]:
     """Return ``(world_size, rank)`` for a process group, or ``(1, -1)`` if absent."""
     if group is None:
         return 1, -1
     return dist.get_world_size(group), dist.get_rank(group)
 
 
-def group_ranks(group):
+def get_group_ranks(group):
     """Return global ranks for a process group, or ``None`` when the group is absent."""
     if group is None:
         return None
@@ -106,19 +106,19 @@ def assert_context_parallel_excluded(*, label: str, group, extra: str = "") -> N
     cp_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(cp_group))
     if len(cp_ranks) <= 1:
         return
-    group_rank_tuple = tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+    group_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(group))
     global_rank = int(dist.get_rank())
     cp_rank_set = set(cp_ranks)
-    overlap = tuple(rank for rank in group_rank_tuple if rank in cp_rank_set)
+    overlap = tuple(rank for rank in group_ranks if rank in cp_rank_set)
     if overlap != (global_rank,):
         raise RuntimeError(
-            f"[Dion][CP] {label} group must exclude context-parallel peers: "
-            f"group_ranks={group_rank_tuple} context_parallel_ranks={cp_ranks} "
+            f"[Dion][CP] {label} must exclude context-parallel peers: "
+            f"group_ranks={group_ranks} context_parallel_ranks={cp_ranks} "
             f"overlap={overlap} global_rank={global_rank}. {extra}".strip()
         )
 
 
-def expected_expert_fs_group():
+def get_expected_expert_fs_group():
     """Return the authoritative Megatron-Core expert-local shard group."""
     group = parallel_state.get_expert_data_parallel_group(
         check_initialized=False,
@@ -132,10 +132,10 @@ def expected_expert_fs_group():
     return group
 
 
-def assert_group_matches(*, label: str, actual_group, expected_group, extra: str = "") -> None:
+def assert_same_group_ranks(*, label: str, actual_group, expected_group, extra: str = "") -> None:
     """Fail fast when two runtime groups do not contain the same global-rank membership."""
-    actual_ranks = group_ranks(actual_group)
-    expected_ranks = group_ranks(expected_group)
+    actual_ranks = get_group_ranks(actual_group)
+    expected_ranks = get_group_ranks(expected_group)
     if actual_ranks != expected_ranks:
         raise RuntimeError(
             f"[Dion][EP] {label} group mismatch: "
@@ -146,8 +146,8 @@ def assert_group_matches(*, label: str, actual_group, expected_group, extra: str
 def select_fs_group(*, model_param, fs_group):
     """Return the authoritative local-shard group for one model param."""
     if not getattr(model_param, "allreduce", True):
-        expert_group = expected_expert_fs_group()
-        assert_group_matches(
+        expert_group = get_expected_expert_fs_group()
+        assert_same_group_ranks(
             label="expert param fs_group",
             actual_group=fs_group,
             expected_group=expert_group,
@@ -188,7 +188,16 @@ def select_tp_group(model_param):
             ),
         )
         return group
-    return parallel_state.get_tensor_model_parallel_group(check_initialized=False)
+    group = parallel_state.get_tensor_model_parallel_group(check_initialized=False)
+    assert_context_parallel_excluded(
+        label="dense TP group",
+        group=group,
+        extra=(
+            f"param={getattr(model_param, '_param_name', '') or id(model_param)} "
+            "CP must not be part of Dion distributed orthogonalization domains."
+        ),
+    )
+    return group
 
 
 def make_param_uid(
@@ -207,23 +216,37 @@ def make_param_uid(
     )
 
 
-def build_dist_meta(
+def build_param_dist_meta(
     *,
     model_param,
     shard_param,
     fs_group,
+    tp_group=None,
     shard_layouts_by_param,
     get_param_name: Callable,
     rank_fraction_default: float,
     rank_multiple_of_default: int,
-    use_compressed_comm: bool,
+    use_low_rank_sync: bool,
 ) -> DionDistMeta:
     """Build one Dion distributed metadata record from adapter shard metadata."""
     param_name = get_param_name(model_param) or ""
     fs_group = select_fs_group(model_param=model_param, fs_group=fs_group)
-    fs_world_size, fs_rank = group_info(fs_group)
-    tp_group = select_tp_group(model_param)
-    tp_world_size, tp_rank = group_info(tp_group)
+    fs_world_size, fs_rank = get_group_size_rank(fs_group)
+    if is_tp_enabled(model_param):
+        if tp_group is None:
+            tp_group = select_tp_group(model_param)
+        else:
+            assert_context_parallel_excluded(
+                label="expert TP group" if is_moe_expert_param(model_param, param_name) else "dense TP group",
+                group=tp_group,
+                extra=(
+                    f"param={param_name or id(model_param)} "
+                    "CP must not be part of Dion distributed orthogonalization domains."
+                ),
+            )
+    else:
+        tp_group = None
+    tp_world_size, tp_rank = get_group_size_rank(tp_group)
     tp_shard_dim = (
         get_tp_split_dim(model_param)
         if is_tp_enabled(model_param) and tp_world_size > 1
@@ -236,7 +259,7 @@ def build_dist_meta(
             f"for param={param_name or id(model_param)}"
         )
 
-    expert_layout = resolve_expert_layout(
+    expert_layout = get_expert_layout(
         model_param=model_param,
         shard_param=shard_param,
         param_name=param_name,
@@ -287,13 +310,14 @@ def build_dist_meta(
             if is_qkv_param(model_param)
             else None
         ),
-        linear_split_rows=(
-            (
-                int(dion_shard_layout.global_shape[0]) // 2,
-                int(dion_shard_layout.global_shape[0]) // 2,
-            )
+        linear_split_rows=get_linear_split_rows(
+            model_param,
+            global_rows=int(dion_shard_layout.global_shape[0]),
+        ),
+        linear_partition_stride=(
+            int(getattr(model_param, "partition_stride", 1))
             if is_linear_fc1_param(model_param)
-            else None
+            else 1
         ),
     )
 
@@ -306,18 +330,18 @@ def build_dist_meta(
         param_ndim=shard_param.ndim,
         local_shape=config_local_shape if shard_param.ndim == 2 else None,
         dist_meta=dist_meta,
-        use_compressed_comm=bool(use_compressed_comm),
+        use_low_rank_sync=bool(use_low_rank_sync),
         r_global_override=None,
         rank_fraction_default=rank_fraction_default,
         rank_multiple_of_default=rank_multiple_of_default,
         tp_world_size=tp_world_size,
-        use_tp_shard=bool(tp_shard_dim in (0, 1) and tp_world_size > 1),
+        tp_active=bool(tp_shard_dim in (0, 1) and tp_world_size > 1),
     )
 
     return dist_meta
 
 
-def add_non_dion_metas(
+def add_standard_metas(
     *,
     param_groups,
     dist_metas_sharded,
@@ -325,9 +349,9 @@ def add_non_dion_metas(
     get_direct_param_name: Callable,
     rank_fraction_default: float,
     rank_multiple_of_default: int,
-    use_compressed_comm: bool,
+    use_low_rank_sync: bool,
 ) -> None:
-    """Add dist_metas for non-Dion parameters."""
+    """Add dist_metas for standard parameters."""
     for param_group in param_groups:
         for param in param_group['params']:
             if param in dist_metas_sharded:
@@ -336,7 +360,7 @@ def add_non_dion_metas(
             model_param = getattr(param, '_model_param', None)
             if model_param is None:
                 raise RuntimeError(
-                    "[Dion] non-Dion optimizer shard is missing _model_param backlink; "
+                    "[Dion] standard optimizer shard is missing _model_param backlink; "
                     f"shape={tuple(param.shape)} id={id(param)}"
                 )
 
@@ -353,7 +377,7 @@ def add_non_dion_metas(
                 is_dion_param=getattr(model_param, 'is_dion_param', False),
             )
             tp_group = select_tp_group(model_param)
-            tp_world_size, tp_rank = group_info(tp_group)
+            tp_world_size, tp_rank = get_group_size_rank(tp_group)
             dist_meta = DionDistMeta(
                 shape=param.shape,
                 global_shape=tuple(model_param.shape) if model_param.ndim == 2 else None,
@@ -373,50 +397,44 @@ def add_non_dion_metas(
                     if is_qkv_param(model_param)
                     else None
                 ),
-                linear_split_rows=(
-                    (
-                        int(model_param.shape[0]) // 2,
-                        int(model_param.shape[0]) // 2,
-                    )
-                    if is_linear_fc1_param(model_param) and model_param.ndim == 2
-                    else None
-                ),
+                linear_split_rows=None,
+                linear_partition_stride=1,
             )
             dist_meta.param_config = build_param_config(
                 param_ndim=param.ndim,
                 local_shape=tuple(param.shape) if param.ndim == 2 else None,
                 dist_meta=dist_meta,
-                use_compressed_comm=bool(use_compressed_comm),
+                use_low_rank_sync=bool(use_low_rank_sync),
                 r_global_override=None,
                 rank_fraction_default=rank_fraction_default,
                 rank_multiple_of_default=rank_multiple_of_default,
                 tp_world_size=1,
-                use_tp_shard=False,
+                tp_active=False,
             )
             dist_metas_sharded[param] = dist_meta
             param._dion_param_uid = param_uid
 
 
-def build_dist_metas(
+def build_all_dist_metas(
     *,
     shard_pairs_by_param,
-    build_dist_meta: Callable,
-    add_non_dion_metas: Callable,
+    build_param_dist_meta: Callable,
+    add_standard_metas: Callable,
     validate_dist_meta_uids: Callable,
 ):
-    """Create distributed metadata for Dion and non-Dion optimizer shards."""
+    """Create distributed metadata for Dion and standard optimizer shards."""
     dist_metas_sharded = {}
 
     for model_param, shard_pair in shard_pairs_by_param.items():
         _, shard_param = shard_pair
-        dist_meta = build_dist_meta(
+        dist_meta = build_param_dist_meta(
             model_param=model_param,
             shard_param=shard_param,
         )
         dist_metas_sharded[shard_param] = dist_meta
         shard_param._dion_param_uid = dist_meta.param_uid
 
-    add_non_dion_metas(dist_metas_sharded)
+    add_standard_metas(dist_metas_sharded)
     validate_dist_meta_uids(dist_metas_sharded)
     return dist_metas_sharded
 

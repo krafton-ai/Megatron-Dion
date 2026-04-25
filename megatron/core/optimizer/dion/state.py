@@ -120,14 +120,15 @@ def require_2d_local_shape(
             f"dist_meta_shape={getattr(dist_meta, 'shape', None)}"
         )
     local_shape = tuple(int(dim) for dim in dist_meta.shape)
-    if local_shape[0] <= 0 or local_shape[1] <= 0:
+    m_local, n_local = local_shape
+    if m_local <= 0 or n_local <= 0:
         raise RuntimeError(
             "[Dion] invalid empty local 2D shape metadata "
             f"param_uid={getattr(dist_meta, 'param_uid', None)} "
             f"param_name={getattr(dist_meta, 'param_name', '')} "
             f"local_shape={local_shape}"
         )
-    if int(param.numel()) != local_shape[0] * local_shape[1]:
+    if int(param.numel()) != m_local * n_local:
         raise RuntimeError(
             "[Dion] local 2D shape metadata does not match shard numel "
             f"param_uid={getattr(dist_meta, 'param_uid', None)} "
@@ -138,25 +139,25 @@ def require_2d_local_shape(
 
 
 def restore_tp_shape(
-    local_m: int,
-    local_n: int,
+    m_local: int,
+    n_local: int,
     config: DionParamConfig,
     *,
     tp_world_size: int,
 ) -> Tuple[int, int]:
     """Restore TP-sharded global shape from a local 2D shard shape."""
     if not config.has_tp_shard or tp_world_size <= 1:
-        return local_m, local_n
+        return m_local, n_local
     if config.tp_shard_dim == 0:
-        return local_m * tp_world_size, local_n
+        return m_local * tp_world_size, n_local
     if config.tp_shard_dim == 1:
-        return local_m, local_n * tp_world_size
-    return local_m, local_n
+        return m_local, n_local * tp_world_size
+    return m_local, n_local
 
 
 def resolve_q_state_layout(
-    local_m: int,
-    local_n: int,
+    m_local: int,
+    n_local: int,
     config: DionParamConfig,
     *,
     tp_world_size: int,
@@ -169,15 +170,15 @@ def resolve_q_state_layout(
     """Resolve global/local Q layout and rank dimensions for a 2D Dion param."""
     if global_shape is None:
         m_global, n_global = restore_tp_shape(
-            local_m,
-            local_n,
+            m_local,
+            n_local,
             config,
             tp_world_size=tp_world_size,
         )
     else:
         m_global, n_global = global_shape
 
-    q_base_local = local_m if config.is_transposed else local_n
+    q_base_local = m_local if config.is_transposed else n_local
     q_base_global = m_global if config.is_transposed else n_global
 
     r_global = rank_fraction * min(m_global, n_global)
@@ -193,7 +194,7 @@ def resolve_q_state_layout(
     if q_base_local <= 0 or r_local <= 0:
         raise RuntimeError(
             "[DION_EMPTY_Q_SHARD] "
-            f"local_shape=({local_m}, {local_n}) global_shape=({m_global}, {n_global}) "
+            f"local_shape=({m_local}, {n_local}) global_shape=({m_global}, {n_global}) "
             f"q_base_local={q_base_local} r_global={r_global} "
             f"r_local={r_local} tp_world_size={tp_world_size} tp_rank={tp_rank}"
         )
@@ -215,13 +216,13 @@ def resolve_q_state_layout(
     )
 
 
-def should_compress_all_reduce(
+def should_use_low_rank_sync(
     *,
     global_shape: Tuple[int, int],
     r_global: int,
     rank_fraction: float,
 ) -> bool:
-    """Return the reference compressed-all-reduce decision."""
+    """Return whether the low-rank replica-sync path is cheaper than dense sync."""
     m_global, n_global = int(global_shape[0]), int(global_shape[1])
     if rank_fraction >= 1.0:
         return False
@@ -263,12 +264,12 @@ def build_param_config(
     param_ndim: int,
     local_shape: Optional[Tuple[int, int]],
     dist_meta: Optional[DionDistMeta],
-    use_compressed_comm: bool,
+    use_low_rank_sync: bool,
     r_global_override: Optional[int],
     rank_fraction_default: float,
     rank_multiple_of_default: int,
     tp_world_size: int,
-    use_tp_shard: bool,
+    tp_active: bool,
 ) -> DionParamConfig:
     """Build one Dion parameter config from explicit metadata and runtime inputs."""
     config = DionParamConfig()
@@ -285,12 +286,12 @@ def build_param_config(
         and param_ndim == 2
         and local_shape is not None
     ):
-        local_m, local_n = local_shape
+        m_local, n_local = local_shape
 
         tp_shard_dim = getattr(dist_meta, "tp_shard_dim", -1)
         if tp_shard_dim in (0, 1):
             config.has_tp_shard = True
-            config.use_tp_shard = bool(use_tp_shard)
+            config.use_tp_shard = bool(tp_active)
             config.tp_shard_dim = tp_shard_dim
 
         fs_shard_dim = getattr(dist_meta, "fs_shard_dim", -1)
@@ -301,20 +302,20 @@ def build_param_config(
 
         inner = config.tp_shard_dim
         outer = config.fs_shard_dim
-        config.is_transposed = local_m < local_n
+        config.is_transposed = m_local < n_local
         if inner == 0 or outer == 1:
             config.is_transposed = False
         if outer == 0 or inner == 1:
             config.is_transposed = True
 
-        if use_compressed_comm:
-            global_shape = get_global_shape(dist_meta, local_m, local_n)
+        if use_low_rank_sync:
+            global_shape = get_global_shape(dist_meta, m_local, n_local)
             layout = resolve_q_state_layout(
-                local_m,
-                local_n,
+                m_local,
+                n_local,
                 config,
                 tp_world_size=tp_world_size,
-                use_q_unshard=bool(config.has_tp_shard and use_tp_shard),
+                use_q_unshard=bool(config.has_tp_shard and tp_active),
                 global_shape=global_shape,
                 rank_fraction=dist_meta.rank_fraction,
                 rank_multiple_of=rank_multiple_of_default,
@@ -325,27 +326,27 @@ def build_param_config(
                 else int(layout.r_global)
             )
             m_global, n_global = global_shape
-            config.compressed_all_reduce = should_compress_all_reduce(
+            config.use_low_rank_sync = should_use_low_rank_sync(
                 global_shape=(m_global, n_global),
                 r_global=r_global,
                 rank_fraction=dist_meta.rank_fraction,
             )
         else:
-            config.compressed_all_reduce = False
+            config.use_low_rank_sync = False
 
         return config
 
     if param_ndim == 2 and local_shape is not None:
-        local_m, local_n = local_shape
-        config.is_transposed = local_m < local_n
-        if use_compressed_comm:
+        m_local, n_local = local_shape
+        config.is_transposed = m_local < n_local
+        if use_low_rank_sync:
             layout = resolve_q_state_layout(
-                local_m,
-                local_n,
+                m_local,
+                n_local,
                 config,
                 tp_world_size=tp_world_size,
                 use_q_unshard=False,
-                global_shape=(local_m, local_n),
+                global_shape=(m_local, n_local),
                 rank_fraction=rank_fraction_default,
                 rank_multiple_of=rank_multiple_of_default,
             )
@@ -354,19 +355,19 @@ def build_param_config(
                 if r_global_override is not None
                 else int(layout.r_global)
             )
-            m_global, n_global = local_m, local_n
-            config.compressed_all_reduce = should_compress_all_reduce(
+            m_global, n_global = m_local, n_local
+            config.use_low_rank_sync = should_use_low_rank_sync(
                 global_shape=(m_global, n_global),
                 r_global=r_global,
                 rank_fraction=rank_fraction_default,
             )
         else:
-            config.compressed_all_reduce = False
+            config.use_low_rank_sync = False
 
     return config
 
 
-def p_is_fs_sharded(config: DionParamConfig) -> bool:
+def is_p_fs_sharded(config: DionParamConfig) -> bool:
     """Return whether P is FS-sharded from config-local topology only."""
     return bool(config.use_fs_shard) and (
         (not config.is_transposed and config.fs_shard_dim == 0)
@@ -374,28 +375,27 @@ def p_is_fs_sharded(config: DionParamConfig) -> bool:
     )
 
 
-def has_tp_shard(config: DionParamConfig) -> bool:
+def is_tp_active(config: DionParamConfig) -> bool:
     """Return whether TP sharding is configured and active."""
     return bool(getattr(config, "use_tp_shard", False))
 
 
-def has_fs_shard(config: DionParamConfig, dist_meta=None) -> bool:
+def is_fs_active(config: DionParamConfig) -> bool:
     """Return whether FS sharding is configured and active."""
-    del dist_meta
     return bool(config.has_fs_shard and getattr(config, "use_fs_shard", False))
 
 
 def use_q_unshard(config: DionParamConfig) -> bool:
     """Return whether STEP 2 must all-gather Q across TP ranks."""
-    return has_tp_shard(config)
+    return is_tp_active(config)
 
 
-def is_fs_only_config(config: DionParamConfig) -> bool:
+def is_fs_without_tp(config: DionParamConfig) -> bool:
     """Return whether the config follows dion_reference.py fs-only semantics."""
-    return has_fs_shard(config) and not has_tp_shard(config)
+    return is_fs_active(config) and not is_tp_active(config)
 
 
-def needs_fs_p_reduce(config: DionParamConfig) -> bool:
+def should_reduce_p_over_fs(config: DionParamConfig) -> bool:
     """Return whether STEP 3.5 must reduce P across FS shards."""
     return bool(config.use_fs_shard) and (
         (not config.is_transposed and config.fs_shard_dim == 1)
@@ -403,25 +403,25 @@ def needs_fs_p_reduce(config: DionParamConfig) -> bool:
     )
 
 
-def p_is_tp_sharded(
+def is_p_tp_sharded(
     config: DionParamConfig,
     *,
-    use_tp_shard: bool,
+    tp_active: bool,
 ) -> bool:
     """Return whether P is TP-sharded from config-local topology plus explicit TP activity."""
-    return bool(config.has_tp_shard and use_tp_shard) and (
+    return bool(config.has_tp_shard and tp_active) and (
         (not config.is_transposed and config.tp_shard_dim == 0)
         or (config.is_transposed and config.tp_shard_dim == 1)
     )
 
 
-def needs_tp_r_reduce(
+def should_reduce_r_over_tp(
     config: DionParamConfig,
     *,
-    use_tp_shard: bool,
+    tp_active: bool,
 ) -> bool:
     """Return whether STEP 5 must all-reduce R across TP ranks."""
-    return p_is_tp_sharded(config, use_tp_shard=use_tp_shard)
+    return is_p_tp_sharded(config, tp_active=tp_active)
 
 
 def init_q_state(
@@ -559,7 +559,7 @@ def init_param_state(
         state["linear_split_rows"] = linear_split_rows
         return
 
-    m, n = local_shape
+    m_local, n_local = local_shape
 
     if q_init is None:
         raise RuntimeError(
@@ -586,7 +586,7 @@ def init_param_state(
             f"param_name={getattr(dist_meta, 'param_name', '') if dist_meta is not None else ''}"
         )
 
-    m_true_global, n_true_global = get_global_shape(dist_meta, m, n)
+    m_global, n_global = get_global_shape(dist_meta, m_local, n_local)
     q_local_shape = tuple(int(dim) for dim in (q_layout.q_local_shape or ()))
     q_gathered_shape = tuple(
         int(dim) for dim in (q_layout.q_gathered_shape or ())
@@ -638,8 +638,8 @@ def init_param_state(
     state["Q"] = q_state
     state["_needs_state_replica_q_sync"] = True
     state["r"] = int(q_layout.r_global)
-    state["local_shape"] = (m, n)
-    state["true_global_shape"] = (m_true_global, n_true_global)
+    state["local_shape"] = (m_local, n_local)
+    state["global_shape"] = (m_global, n_global)
 
     per_expert = (
         getattr(dist_meta, "per_expert_global_shape", None) if dist_meta is not None else None

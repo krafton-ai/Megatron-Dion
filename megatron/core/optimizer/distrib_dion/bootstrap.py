@@ -13,10 +13,10 @@ from ..dion.state import (
     get_global_shape,
     q_seed_from_param_key,
     resolve_q_state_layout,
-    should_compress_all_reduce,
+    should_use_low_rank_sync,
 )
 from ..dion.utils import get_local_shape
-from ..dion.types import DionQInit, DionStepParam, ScalarStepParam
+from ..dion.types import DionQInit, DionStepParam, ElementwiseStepParam
 
 
 def make_group_broadcast(process_group, *, group_size: Callable):
@@ -54,7 +54,7 @@ def build_q_init(
     dist_meta,
     rank_fraction_default: float,
     rank_multiple_of_default: int,
-    use_compressed_comm: bool,
+    use_low_rank_sync: bool,
     base_training_seed: int,
     get_replicate_group: Callable,
     make_group_broadcast: Callable,
@@ -86,6 +86,7 @@ def build_q_init(
             f"rank={dist.get_rank()} param={getattr(dist_meta, 'param_name', '')} "
             f"param_uid={getattr(dist_meta, 'param_uid', None)} shape={local_shape}"
         )
+    m_local, n_local = local_shape
 
     rank_fraction = float(optim_group.get("rank_fraction", rank_fraction_default))
     rank_multiple_of = int(optim_group.get("rank_multiple_of", rank_multiple_of_default))
@@ -94,13 +95,13 @@ def build_q_init(
     use_q_unshard = bool(getattr(config, "use_tp_shard", False))
 
     q_layout = resolve_q_state_layout(
-        local_shape[0],
-        local_shape[1],
+        m_local,
+        n_local,
         config,
         tp_world_size=tp_world_size,
         tp_rank=tp_rank,
         use_q_unshard=use_q_unshard,
-        global_shape=get_global_shape(dist_meta, local_shape[0], local_shape[1]),
+        global_shape=get_global_shape(dist_meta, m_local, n_local),
         rank_fraction=rank_fraction,
         rank_multiple_of=rank_multiple_of,
     )
@@ -111,8 +112,8 @@ def build_q_init(
         is_transposed=config.is_transposed,
     )
     dist_meta.rank_fraction = float(rank_fraction)
-    config.compressed_all_reduce = bool(use_compressed_comm) and should_compress_all_reduce(
-        global_shape=get_global_shape(dist_meta, local_shape[0], local_shape[1]),
+    config.use_low_rank_sync = bool(use_low_rank_sync) and should_use_low_rank_sync(
+        global_shape=get_global_shape(dist_meta, m_local, n_local),
         r_global=int(q_layout.r_global),
         rank_fraction=float(rank_fraction),
     )
@@ -171,7 +172,7 @@ def sync_q_replicas(
             post_q_sync()
 
 
-def use_distributed_dion_update(
+def should_use_distributed_dion_update(
     *,
     param,
     state,
@@ -206,7 +207,7 @@ def use_distributed_dion_update(
     )
 
 
-def get_or_initialize_optimizer_state(
+def ensure_optimizer_state(
     *,
     optimizer,
     param,
@@ -240,7 +241,7 @@ def get_or_initialize_optimizer_state(
     return state
 
 
-def validate_step_groups_(
+def validate_step_groups(
     *,
     replica_group,
     tp_group,
@@ -250,7 +251,7 @@ def validate_step_groups_(
     route_step_params: Callable,
     group_size: Callable,
     group_rank: Callable,
-    use_compressed_comm: bool,
+    use_low_rank_sync: bool,
     use_fs_collectives: bool,
 ) -> Callable:
     """Validate distributed bootstrap inputs and return the step-routing callback."""
@@ -314,7 +315,7 @@ def validate_step_groups_(
         world_size = dist.get_world_size(replica_group)
         if world_size > 1:
             local_config = {
-                "use_compressed_comm": bool(use_compressed_comm),
+                "use_low_rank_sync": bool(use_low_rank_sync),
                 "use_fs_collectives": bool(use_fs_collectives),
                 "rp_group_size": rp_world_size if rp_group is not None else 0,
                 "fs_group_size": fs_world_size if fs_group is not None else 0,
@@ -322,34 +323,6 @@ def validate_step_groups_(
             del local_config
 
     return route_step_params
-
-
-def validate_uniform_fs_topology_(
-    *,
-    fs_group,
-    dp_group,
-    global_rank: int,
-) -> None:
-    """Fail fast unless every DP rank has the authoritative FS group."""
-    have_fs = torch.tensor(
-        [1 if fs_group is not None else 0],
-        device=torch.cuda.current_device(),
-        dtype=torch.int64,
-    )
-    dist.all_reduce(have_fs, op=dist.ReduceOp.MIN, group=dp_group)
-    all_have_fs = int(have_fs.item()) == 1
-
-    if all_have_fs:
-        return
-    if fs_group is not None:
-        raise RuntimeError(
-            f"Global rank {global_rank}: FS groups exist only on subset of ranks! "
-            f"Ensure rp_group/fs_group are provided uniformly to prevent new_group() mismatch."
-        )
-    raise RuntimeError(
-        f"Global rank {global_rank}: No FS group found! "
-        f"FS group must be provided from the standard Megatron-Core optimizer topology."
-    )
 
 
 def _rp_param_signature(dist_metas_sharded) -> tuple:
@@ -386,7 +359,7 @@ def _rp_param_signature(dist_metas_sharded) -> tuple:
                 bool(getattr(config, "use_fs_shard", False)) if config is not None else False,
                 bool(getattr(config, "use_tp_shard", False)) if config is not None else False,
                 bool(getattr(config, "is_transposed", False)) if config is not None else False,
-                bool(getattr(config, "compressed_all_reduce", False))
+                bool(getattr(config, "use_low_rank_sync", False))
                 if config is not None
                 else False,
             )
@@ -416,8 +389,9 @@ def validate_enabled_rp_topology(
     all_have_rp = int(have_rp.item()) == 1
     if not all_have_rp:
         raise RuntimeError(
-            f"[Dion] Global rank {global_rank}: not all DP ranks have rp_group "
-            f"(MIN={have_rp.item()}); RP topology must be identical across the data-parallel group"
+            f"[Dion] Global rank {global_rank}: not all ranks in the CP-excluded "
+            f"topology validation group have rp_group (MIN={have_rp.item()}); "
+            "RP topology must be identical across the Dion validation domain"
         )
     if rp_group is None:
         raise RuntimeError(
@@ -443,9 +417,8 @@ def validate_enabled_rp_topology(
             f"CRITICAL: Dion eligibility mismatch within RP group! "
             f"My Dion count: {my_dion_count}, RP group counts: {gathered_counts}. "
             f"This will cause collective operation hangs. "
-            f"DistributedOptimizer did uniform sharding across DP (RP×FS), "
-            f"so RP group members have different param chunks. "
-            f"Consider disabling DistributedOptimizer sharding or implementing custom FS-aware sharding."
+            f"RP group members have different Dion param chunks. "
+            f"Consider disabling DistributedOptimizer sharding or implementing FS-aware sharding."
         )
 
     gathered_signatures = [None for _ in range(rp_world_size)]
@@ -453,7 +426,7 @@ def validate_enabled_rp_topology(
     if all(signature == my_signature for signature in gathered_signatures):
         return
 
-    group_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(rp_group))
+    rp_group_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(rp_group))
     first_mismatch = next(
         (
             index
@@ -462,7 +435,7 @@ def validate_enabled_rp_topology(
         ),
         -1,
     )
-    mismatch_rank = group_ranks[first_mismatch] if first_mismatch >= 0 else None
+    mismatch_rank = rp_group_ranks[first_mismatch] if first_mismatch >= 0 else None
     log_error(
         "[Dion] RP param signature mismatch rank=%s mismatch_rank=%s local=%s remote=%s",
         global_rank,
@@ -472,7 +445,7 @@ def validate_enabled_rp_topology(
     )
     raise RuntimeError(
         "[DION_RP_PARAM_SIGNATURE_MISMATCH] "
-        f"rank={global_rank} rp_group_ranks={group_ranks} "
+        f"rank={global_rank} rp_group_ranks={rp_group_ranks} "
         f"local_count={my_dion_count} counts={gathered_counts} "
         f"mismatch_rank={mismatch_rank}"
     )
@@ -489,11 +462,11 @@ def enable_distributed_dion(
     fs_group,
     state_replica_group,
     expected_rp_size: int,
-    build_dist_metas: Callable,
+    build_all_dist_metas: Callable,
     route_step_params: Callable,
     group_size: Callable,
     group_rank: Callable,
-    use_compressed_comm: bool,
+    use_low_rank_sync: bool,
     use_fs_collectives: bool,
     validate_enabled_rp_topology: Callable,
     log_error: Callable,
@@ -503,15 +476,15 @@ def enable_distributed_dion(
         return None
 
     try:
-        dist_metas_sharded = build_dist_metas()
+        dist_metas_sharded = build_all_dist_metas()
     except Exception as exc:
-        log_error("[Dion] Global rank %s: Failed in _build_dist_metas: %s", global_rank, exc)
+        log_error("[Dion] Global rank %s: Failed in _build_all_dist_metas: %s", global_rank, exc)
         log_error(traceback.format_exc())
         raise
 
     replica_group = replica_group or data_parallel_group
     optimizer.enable_distributed_mode(
-        route_step_params=validate_step_groups_(
+        route_step_params=validate_step_groups(
             replica_group=replica_group,
             tp_group=tp_group,
             rp_group=rp_group,
@@ -520,7 +493,7 @@ def enable_distributed_dion(
             route_step_params=route_step_params,
             group_size=group_size,
             group_rank=group_rank,
-            use_compressed_comm=use_compressed_comm,
+            use_low_rank_sync=use_low_rank_sync,
             use_fs_collectives=use_fs_collectives,
         ),
     )
@@ -540,16 +513,16 @@ def route_step_params(
     param_groups,
     dist_metas,
     get_step_param_grad: Callable,
-    get_or_initialize_optimizer_state: Callable,
+    ensure_optimizer_state: Callable,
     require_param_config: Callable,
-    use_distributed_dion_update: Callable,
-    maybe_expand_split_dion_params: Callable,
+    should_use_distributed_dion_update: Callable,
+    expand_split_dion_params: Callable,
     refresh_dion_step_metadata: Callable | None = None,
     sync_q_replicas: Callable,
     build_dion_batches: Callable,
 ):
-    """Route one optimizer step into Dion batches and scalar updates."""
-    scalar_params: list[ScalarStepParam] = []
+    """Route one optimizer step into Dion batches and elementwise updates."""
+    elementwise_params: list[ElementwiseStepParam] = []
     dion_params: list[DionStepParam] = []
 
     for optim_group in param_groups:
@@ -558,7 +531,7 @@ def route_step_params(
             if grad is None:
                 continue
 
-            optimizer_state = get_or_initialize_optimizer_state(param, optim_group)
+            optimizer_state = ensure_optimizer_state(param, optim_group)
             dist_meta = dist_metas.get(param, None)
             if refresh_dion_step_metadata is not None:
                 refresh_dion_step_metadata(
@@ -569,7 +542,7 @@ def route_step_params(
                 )
             config = require_param_config(param, dist_meta)
 
-            split_child_params = maybe_expand_split_dion_params(
+            split_child_params = expand_split_dion_params(
                 param=param,
                 grad=grad,
                 optimizer_state=optimizer_state,
@@ -581,7 +554,7 @@ def route_step_params(
                 dion_params.extend(split_child_params)
                 continue
 
-            if use_distributed_dion_update(param, optimizer_state, optim_group, dist_meta):
+            if should_use_distributed_dion_update(param, optimizer_state, optim_group, dist_meta):
                 dion_params.append(
                     DionStepParam(
                         param=param,
@@ -594,8 +567,8 @@ def route_step_params(
                 )
                 continue
 
-            scalar_params.append(
-                ScalarStepParam(
+            elementwise_params.append(
+                ElementwiseStepParam(
                     param=param,
                     grad=grad,
                     optimizer_state=optimizer_state,
@@ -622,4 +595,4 @@ def route_step_params(
         sync_q_replicas(dion_params)
         dion_batches = build_dion_batches(dion_params)
 
-    return dion_batches, scalar_params
+    return dion_batches, elementwise_params

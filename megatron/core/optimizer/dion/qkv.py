@@ -142,9 +142,170 @@ def _validate_qkv_layout_rows(*, rows: int, split_shapes: Tuple[int, int, int], 
             "[DION_QKV_LOCAL_LAYOUT_MISMATCH] "
             f"context={context} rows={rows} total_per_group={total_per_group} "
             f"split_shapes={split_shapes} "
-            "dion_split_qkv currently requires a clean local grouped-QKV row layout."
+            "dion_split_qkv requires an integral global grouped-QKV row layout."
         )
     return rows // total_per_group
+
+
+def _split_range(size: int, world_size: int, rank: int) -> Tuple[int, int]:
+    if world_size <= 0:
+        raise RuntimeError(f"[DION_INVALID_QKV_WORLD_SIZE] world_size={world_size}")
+    if rank < 0 or rank >= world_size:
+        raise RuntimeError(
+            f"[DION_INVALID_QKV_RANK] rank={rank} world_size={world_size}"
+        )
+    size_per_rank = int(size) // int(world_size)
+    remainder = int(size) % int(world_size)
+    if rank < remainder:
+        start = rank * (size_per_rank + 1)
+        end = start + size_per_rank + 1
+    else:
+        start = remainder * (size_per_rank + 1) + (rank - remainder) * size_per_rank
+        end = start + size_per_rank
+    return int(start), int(end)
+
+
+def _global_row_count(dist_meta, *, context: str) -> int:
+    parent_global_shape = getattr(dist_meta, "global_shape", None)
+    if parent_global_shape is None or len(parent_global_shape) != 2:
+        raise RuntimeError(
+            "[DION_QKV_MISSING_GLOBAL_SHAPE] "
+            f"context={context} "
+            f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+            f"param_name={getattr(dist_meta, 'param_name', '')}"
+        )
+    return int(parent_global_shape[0])
+
+
+def _parent_row_range(
+    *,
+    local_rows: int,
+    dist_meta,
+    context: str,
+) -> Tuple[int, int]:
+    if dist_meta is None:
+        return 0, int(local_rows)
+
+    fs_shard_dim = int(getattr(dist_meta, "fs_shard_dim", -1))
+    fs_world_size = int(getattr(dist_meta, "fs_world_size", 1))
+    if fs_shard_dim == 0 and fs_world_size > 1:
+        fs_rank = int(getattr(dist_meta, "fs_rank", -1))
+        if fs_rank < 0:
+            return -1, -1
+        parent_row_start = int(getattr(dist_meta, "fs_start_idx", -1))
+        parent_row_end = int(getattr(dist_meta, "fs_end_idx", -1))
+        if parent_row_start < 0 or parent_row_end < parent_row_start:
+            raise RuntimeError(
+                "[DION_QKV_MISSING_FS_RANGE] "
+                f"context={context} "
+                f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+                f"param_name={getattr(dist_meta, 'param_name', '')}"
+            )
+        if parent_row_end - parent_row_start != int(local_rows):
+            raise RuntimeError(
+                "[DION_QKV_LOCAL_ROW_RANGE_MISMATCH] "
+                f"context={context} local_rows={local_rows} "
+                f"parent_row_range=({parent_row_start}, {parent_row_end})"
+            )
+        return parent_row_start, parent_row_end
+
+    tp_shard_dim = int(getattr(dist_meta, "tp_shard_dim", -1))
+    tp_world_size = int(getattr(dist_meta, "tp_world_size", 1))
+    if tp_shard_dim == 0 and tp_world_size > 1:
+        tp_rank = int(getattr(dist_meta, "tp_rank", -1))
+        parent_global_rows = _global_row_count(dist_meta, context=context)
+        parent_row_start, parent_row_end = _split_range(
+            parent_global_rows,
+            tp_world_size,
+            tp_rank,
+        )
+        if parent_row_end - parent_row_start != int(local_rows):
+            raise RuntimeError(
+                "[DION_QKV_LOCAL_ROW_RANGE_MISMATCH] "
+                f"context={context} local_rows={local_rows} "
+                f"parent_row_range=({parent_row_start}, {parent_row_end})"
+            )
+        return parent_row_start, parent_row_end
+
+    return 0, int(local_rows)
+
+
+def _child_segments(
+    *,
+    parent_row_start: int,
+    parent_row_end: int,
+    split_shapes: Tuple[int, int, int],
+    child_kind: str,
+) -> list[tuple[int, int, int, int]]:
+    """Map one parent row interval to source and child row intervals."""
+    if parent_row_start < 0 or parent_row_end <= parent_row_start:
+        return []
+    total_per_group = int(sum(split_shapes))
+    child_index = _qkv_child_index(child_kind)
+    child_rows_per_group = int(split_shapes[child_index])
+    child_offset = sum(int(split_shapes[idx]) for idx in range(child_index))
+    first_group = int(parent_row_start) // total_per_group
+    last_group = (int(parent_row_end) - 1) // total_per_group
+
+    segments: list[tuple[int, int, int, int]] = []
+    for group_idx in range(first_group, last_group + 1):
+        parent_child_start = group_idx * total_per_group + child_offset
+        parent_child_end = parent_child_start + child_rows_per_group
+        overlap_start = max(int(parent_row_start), parent_child_start)
+        overlap_end = min(int(parent_row_end), parent_child_end)
+        if overlap_end <= overlap_start:
+            continue
+        child_start = group_idx * child_rows_per_group + (
+            overlap_start - parent_child_start
+        )
+        child_end = child_start + (overlap_end - overlap_start)
+        source_start = overlap_start - int(parent_row_start)
+        source_end = overlap_end - int(parent_row_start)
+        if segments and segments[-1][3] != child_start:
+            raise RuntimeError(
+                "[DION_QKV_CHILD_NONCONTIGUOUS_LOCAL_RANGE] "
+                f"child_kind={child_kind} parent_row_range=({parent_row_start}, {parent_row_end}) "
+                f"previous_child_end={segments[-1][3]} next_child_start={child_start}"
+            )
+        segments.append((int(source_start), int(source_end), int(child_start), int(child_end)))
+    return segments
+
+
+def _child_row_count(
+    *,
+    parent_row_start: int,
+    parent_row_end: int,
+    split_shapes: Tuple[int, int, int],
+    child_kind: str,
+) -> int:
+    return sum(
+        int(source_end - source_start)
+        for source_start, source_end, _, _ in _child_segments(
+            parent_row_start=parent_row_start,
+            parent_row_end=parent_row_end,
+            split_shapes=split_shapes,
+            child_kind=child_kind,
+        )
+    )
+
+
+def qkv_child_row_range(
+    *,
+    parent_row_start: int,
+    parent_row_end: int,
+    split_shapes: Tuple[int, int, int],
+    child_kind: str,
+) -> Optional[Tuple[int, int]]:
+    """Project a fused-QKV parent row interval to one child row interval."""
+    segments = _child_segments(
+        parent_row_start=parent_row_start,
+        parent_row_end=parent_row_end,
+        split_shapes=split_shapes,
+        child_kind=child_kind,
+    )
+    if not segments:
+        return None
+    return int(segments[0][2]), int(segments[-1][3])
 
 
 def qkv_child_global_shape(
@@ -152,7 +313,7 @@ def qkv_child_global_shape(
     split_shapes: Tuple[int, int, int],
     child_kind: str,
 ) -> Tuple[int, int]:
-    """Return the logical global 2D shape for one Q/K/V child."""
+    """Return the global 2D shape for one Q/K/V child."""
     parent_rows, parent_cols = (int(parent_global_shape[0]), int(parent_global_shape[1]))
     num_query_groups = _validate_qkv_layout_rows(
         rows=parent_rows,
@@ -167,15 +328,26 @@ def qkv_child_local_shape(
     parent_local_shape: Tuple[int, int],
     split_shapes: Tuple[int, int, int],
     child_kind: str,
+    dist_meta=None,
 ) -> Tuple[int, int]:
-    """Return the local packed 2D shape for one Q/K/V child."""
+    """Return the local 2D shape for one Q/K/V child."""
     local_rows, local_cols = (int(parent_local_shape[0]), int(parent_local_shape[1]))
-    local_query_groups = _validate_qkv_layout_rows(
-        rows=local_rows,
-        split_shapes=split_shapes,
-        context="local_shape",
+    parent_row_start, parent_row_end = _parent_row_range(
+        local_rows=local_rows,
+        dist_meta=dist_meta,
+        context=f"local_shape:{child_kind}",
     )
-    child_rows = int(split_shapes[_qkv_child_index(child_kind)]) * int(local_query_groups)
+    child_rows = _child_row_count(
+        parent_row_start=parent_row_start,
+        parent_row_end=parent_row_end,
+        split_shapes=split_shapes,
+        child_kind=child_kind,
+    )
+    if child_rows <= 0:
+        raise RuntimeError(
+            "[DION_QKV_EMPTY_CHILD_LOCAL_SHAPE] "
+            f"child_kind={child_kind} parent_local_shape={parent_local_shape}"
+        )
     return (child_rows, local_cols)
 
 
@@ -185,24 +357,10 @@ def qkv_child_has_local_overlap(
     child_kind: str,
 ) -> bool:
     """Return whether one Q/K/V child has a non-empty local shard on this rank."""
-    fs_shard_dim = int(getattr(dist_meta, "fs_shard_dim", -1)) if dist_meta is not None else -1
-    fs_world_size = int(getattr(dist_meta, "fs_world_size", 1)) if dist_meta is not None else 1
-    if fs_shard_dim != 0 or fs_world_size <= 1:
+    if dist_meta is None:
         return True
 
-    fs_rank = int(getattr(dist_meta, "fs_rank", -1))
-    if fs_rank < 0:
-        return False
-
-    parent_global_shape = getattr(dist_meta, "global_shape", None)
-    if parent_global_shape is None:
-        raise RuntimeError(
-            "[DION_QKV_MISSING_GLOBAL_SHAPE] "
-            f"child_kind={child_kind} "
-            f"param_uid={getattr(dist_meta, 'param_uid', None)} "
-            f"param_name={getattr(dist_meta, 'param_name', '')}"
-        )
-    parent_global_rows = int(parent_global_shape[0])
+    parent_global_rows = _global_row_count(dist_meta, context=f"has_overlap:{child_kind}")
     total_per_group = int(sum(int(dim) for dim in split_shapes))
     if total_per_group <= 0 or parent_global_rows % total_per_group != 0:
         raise RuntimeError(
@@ -211,36 +369,26 @@ def qkv_child_has_local_overlap(
             f"split_shapes={split_shapes}"
         )
 
-    parent_row_start = int(getattr(dist_meta, "fs_start_idx", -1))
-    parent_row_end = int(getattr(dist_meta, "fs_end_idx", -1))
-    if parent_row_start < 0 or parent_row_end < parent_row_start:
-        raise RuntimeError(
-            "[DION_QKV_MISSING_FS_RANGE] "
-            f"child_kind={child_kind} "
-            f"param_uid={getattr(dist_meta, 'param_uid', None)} "
-            f"param_name={getattr(dist_meta, 'param_name', '')}"
-        )
-    parent_local_rows = parent_row_end - parent_row_start
-    if parent_local_rows <= 0:
+    fs_shard_dim = int(getattr(dist_meta, "fs_shard_dim", -1))
+    fs_world_size = int(getattr(dist_meta, "fs_world_size", 1))
+    if fs_shard_dim == 0 and fs_world_size > 1 and int(getattr(dist_meta, "fs_rank", -1)) < 0:
         return False
-    if parent_local_rows % total_per_group != 0:
-        raise RuntimeError(
-            "[DION_QKV_PARENT_FS_LAYOUT_MISMATCH] "
-            f"child_kind={child_kind} parent_local_rows={parent_local_rows} "
-            f"split_shapes={split_shapes}"
-        )
-    return True
 
-
-def _qkv_child_slice_bounds(
-    split_shapes: Tuple[int, int, int],
-    child_kind: str,
-) -> Tuple[int, int, int]:
-    child_index = _qkv_child_index(child_kind)
-    child_rows = int(split_shapes[child_index])
-    start = sum(int(split_shapes[idx]) for idx in range(child_index))
-    end = start + child_rows
-    return start, end, child_rows
+    local_shape = getattr(dist_meta, "local_shape", None) or getattr(dist_meta, "shape", None)
+    local_rows = int(local_shape[0]) if local_shape is not None else int(
+        getattr(dist_meta, "fs_end_idx", 0)
+    ) - int(getattr(dist_meta, "fs_start_idx", 0))
+    parent_row_start, parent_row_end = _parent_row_range(
+        local_rows=local_rows,
+        dist_meta=dist_meta,
+        context=f"has_overlap:{child_kind}",
+    )
+    return _child_row_count(
+        parent_row_start=parent_row_start,
+        parent_row_end=parent_row_end,
+        split_shapes=split_shapes,
+        child_kind=child_kind,
+    ) > 0
 
 
 def _shares_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
@@ -254,26 +402,38 @@ def extract_qkv_child(
     tensor: torch.Tensor,
     split_shapes: Tuple[int, int, int],
     child_kind: str,
+    dist_meta=None,
 ) -> torch.Tensor:
-    """Pack one logical Q/K/V child from a fused QKV tensor into a contiguous 2D tensor."""
+    """Read one Q/K/V child from a fused QKV tensor into a contiguous 2D tensor."""
     if tensor.ndim != 2:
         raise RuntimeError(
-            "[DION_QKV_PACK_REQUIRES_2D] "
+            "[DION_QKV_READ_REQUIRES_2D] "
             f"child_kind={child_kind} shape={tuple(int(dim) for dim in tensor.shape)}"
         )
     rows, cols = int(tensor.size(0)), int(tensor.size(1))
-    num_query_groups = _validate_qkv_layout_rows(
-        rows=rows,
-        split_shapes=split_shapes,
+    parent_row_start, parent_row_end = _parent_row_range(
+        local_rows=rows,
+        dist_meta=dist_meta,
         context=f"extract:{child_kind}",
     )
-    start, end, child_rows_per_group = _qkv_child_slice_bounds(split_shapes, child_kind)
-    grouped = tensor.contiguous().view(num_query_groups, int(sum(split_shapes)), cols)
-    child = grouped[:, start:end, :].contiguous().reshape(
-        num_query_groups * child_rows_per_group,
-        cols,
+    segments = _child_segments(
+        parent_row_start=parent_row_start,
+        parent_row_end=parent_row_end,
+        split_shapes=split_shapes,
+        child_kind=child_kind,
     )
-    return child
+    if not segments:
+        raise RuntimeError(
+            "[DION_QKV_EMPTY_CHILD_LOCAL_SHAPE] "
+            f"child_kind={child_kind} tensor_shape={tuple(int(dim) for dim in tensor.shape)}"
+        )
+    pieces = [
+        tensor.narrow(0, source_start, source_end - source_start)
+        for source_start, source_end, _, _ in segments
+    ]
+    if len(pieces) == 1:
+        return pieces[0].contiguous()
+    return torch.cat([piece.contiguous() for piece in pieces], dim=0)
 
 
 def scatter_qkv_child_(
@@ -281,8 +441,9 @@ def scatter_qkv_child_(
     child: torch.Tensor,
     split_shapes: Tuple[int, int, int],
     child_kind: str,
+    dist_meta=None,
 ) -> None:
-    """Scatter one packed Q/K/V child back into the fused parent tensor."""
+    """Write one Q/K/V child back into the fused parent tensor."""
     if dest.ndim != 2 or child.ndim != 2:
         raise RuntimeError(
             "[DION_QKV_SCATTER_REQUIRES_2D] "
@@ -290,13 +451,21 @@ def scatter_qkv_child_(
             f"child_shape={tuple(int(dim) for dim in child.shape)}"
         )
     rows, cols = int(dest.size(0)), int(dest.size(1))
-    num_query_groups = _validate_qkv_layout_rows(
-        rows=rows,
-        split_shapes=split_shapes,
+    parent_row_start, parent_row_end = _parent_row_range(
+        local_rows=rows,
+        dist_meta=dist_meta,
         context=f"scatter:{child_kind}",
     )
-    start, end, child_rows_per_group = _qkv_child_slice_bounds(split_shapes, child_kind)
-    expected_child_shape = (num_query_groups * child_rows_per_group, cols)
+    segments = _child_segments(
+        parent_row_start=parent_row_start,
+        parent_row_end=parent_row_end,
+        split_shapes=split_shapes,
+        child_kind=child_kind,
+    )
+    expected_child_rows = sum(
+        int(source_end - source_start) for source_start, source_end, _, _ in segments
+    )
+    expected_child_shape = (expected_child_rows, cols)
     if tuple(int(dim) for dim in child.shape) != expected_child_shape:
         raise RuntimeError(
             "[DION_QKV_SCATTER_CHILD_SHAPE_MISMATCH] "
@@ -308,13 +477,16 @@ def scatter_qkv_child_(
             "[DION_QKV_SCATTER_REQUIRES_CONTIGUOUS_DEST] "
             f"child_kind={child_kind} dest_shape={tuple(int(dim) for dim in dest.shape)}"
         )
-    grouped_dest = dest.view(num_query_groups, int(sum(split_shapes)), cols)
-    grouped_child = child.contiguous().view(num_query_groups, child_rows_per_group, cols)
-    if _shares_storage(dest, child):
-        # Split-QKV can write a child tensor back into the same fused storage
-        # it was read from; clone first so values stay stable.
-        grouped_child = grouped_child.clone()
-    grouped_dest[:, start:end, :].copy_(grouped_child)
+    child_source = child.contiguous()
+    if _shares_storage(dest, child_source):
+        child_source = child_source.clone()
+    child_cursor = 0
+    for source_start, source_end, _, _ in segments:
+        rows_in_segment = int(source_end - source_start)
+        dest.narrow(0, source_start, rows_in_segment).copy_(
+            child_source.narrow(0, child_cursor, rows_in_segment)
+        )
+        child_cursor += rows_in_segment
 
 
 def iter_qkv_child_kinds() -> Iterable[str]:

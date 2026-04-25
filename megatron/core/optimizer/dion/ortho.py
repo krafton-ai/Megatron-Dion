@@ -3,7 +3,7 @@
 import contextlib
 import hashlib
 import math
-from typing import Any, Callable, List, Optional, Sequence
+from typing import List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -300,6 +300,22 @@ def _resolve_row_sizes_from_dist_meta(
             f"is_transposed={int(is_transposed)} global_rows={global_rows}"
         )
 
+    explicit_row_sizes = getattr(first_meta, "row_shard_sizes", None)
+    if explicit_row_sizes is not None:
+        explicit_row_sizes = tuple(int(size) for size in explicit_row_sizes)
+        if len(explicit_row_sizes) != int(ortho_world_size):
+            raise RuntimeError(
+                "[DION_ORTHO_ROW_SIZES_MISMATCH] explicit row-shard sizes do not match "
+                f"ortho world size meta_id={meta_id} row_shard_sizes={explicit_row_sizes} "
+                f"ortho_world_size={ortho_world_size}"
+            )
+        if sum(explicit_row_sizes) != global_rows:
+            raise RuntimeError(
+                "[DION_ORTHO_ROW_SIZES_MISMATCH] explicit row-shard sizes do not cover "
+                f"the global row axis meta_id={meta_id} row_shard_sizes={explicit_row_sizes} "
+                f"global_rows={global_rows}"
+            )
+
     for index, dist_meta in enumerate(active_metas[1:], start=1):
         other_shape = get_global_shape(dist_meta, 0, 0)
         other_config = getattr(dist_meta, "param_config", None)
@@ -312,17 +328,30 @@ def _resolve_row_sizes_from_dist_meta(
         other_is_transposed = bool(
             getattr(other_config, "is_transposed", False) if other_config is not None else False
         )
-        if other_shape != (m_global, n_global) or other_is_transposed != is_transposed:
+        other_row_sizes = getattr(dist_meta, "row_shard_sizes", None)
+        if other_row_sizes is not None:
+            other_row_sizes = tuple(int(size) for size in other_row_sizes)
+        if (
+            other_shape != (m_global, n_global)
+            or other_is_transposed != is_transposed
+            or other_row_sizes != explicit_row_sizes
+        ):
             raise RuntimeError(
                 "[DION_INCONSISTENT_ORTHO_ROW_META] all batch entries routed into one "
                 "distributed orthogonalize call must share the same Dion row axis "
                 f"batch_index={index} first_meta_id={meta_id} meta_id={format_meta_id(dist_meta)} "
                 f"first_global_shape={(m_global, n_global)} other_global_shape={other_shape} "
                 f"first_is_transposed={int(is_transposed)} "
-                f"other_is_transposed={int(other_is_transposed)}"
+                f"other_is_transposed={int(other_is_transposed)} "
+                f"first_row_shard_sizes={explicit_row_sizes} "
+                f"other_row_shard_sizes={other_row_sizes}"
             )
 
-    row_sizes = _canonical_shard_sizes(global_rows, ortho_world_size)
+    row_sizes = (
+        list(explicit_row_sizes)
+        if explicit_row_sizes is not None
+        else _canonical_shard_sizes(global_rows, ortho_world_size)
+    )
     expected_local_rows = int(row_sizes[ortho_rank])
     if expected_local_rows != int(local_rows):
         raise RuntimeError(
@@ -375,50 +404,6 @@ def _all_gather_batch_shards(
             dtype=local_tensor.dtype,
         )
     return torch.cat(parts, dim=0).contiguous()
-
-
-def _all_gather_row_shards(
-    local_tensor: Tensor,
-    *,
-    row_sizes: Sequence[int],
-    group: torch.distributed.ProcessGroup,
-) -> Tensor:
-    """All-gather a row-sharded tensor with variable local row counts."""
-    world_size = dist.get_world_size(group)
-    max_rows = max(int(size) for size in row_sizes)
-    padded_shape = (int(local_tensor.size(0)), max_rows, int(local_tensor.size(2)))
-    padded = torch.zeros(
-        padded_shape,
-        device=local_tensor.device,
-        dtype=local_tensor.dtype,
-    )
-    local_rows = int(local_tensor.size(1))
-    if local_rows > 0:
-        padded[:, :local_rows].copy_(local_tensor)
-    gathered = torch.empty(
-        (world_size * int(local_tensor.size(0)), max_rows, int(local_tensor.size(2))),
-        device=local_tensor.device,
-        dtype=local_tensor.dtype,
-    )
-    dist.all_gather_into_tensor(gathered, padded.contiguous(), group=group)
-    gathered = gathered.view(
-        world_size,
-        int(local_tensor.size(0)),
-        max_rows,
-        int(local_tensor.size(2)),
-    )
-    parts = [
-        shard[:, : int(row_size)]
-        for shard, row_size in zip(gathered.unbind(dim=0), row_sizes)
-        if int(row_size) > 0
-    ]
-    if not parts:
-        return torch.empty(
-            (int(local_tensor.size(0)), 0, int(local_tensor.size(2))),
-            device=local_tensor.device,
-            dtype=local_tensor.dtype,
-        )
-    return torch.cat(parts, dim=1).contiguous()
 
 
 def _row_to_batch(
@@ -814,34 +799,6 @@ def distributed_orthogonalize(
         P_ortho = P_batch.clone().contiguous()
         P_ortho[:active_batch_size].copy_(P_local)
         return P_ortho
-
-
-def _default_sketch_matrix(P: Tensor, oversample: float) -> Tensor:
-    """Generate default random sketch matrix without synchronization.
-
-    Used when no explicit sketch generator is provided (single-rank case).
-
-    Args:
-        P: Matrix being orthogonalized, shape (..., m, r)
-        oversample: Oversampling factor
-
-    Returns:
-        Sketch matrix S of shape (..., k, m)
-    """
-
-    batch_shape = P.shape[:-2]
-    m = P.size(-2)
-    r = P.size(-1)
-
-    # Round k to multiple of 128 for efficiency (matches reference)
-    k = math.ceil(oversample * r / 128.0) * 128
-
-    std = math.sqrt(1.0 / k)
-
-    S = torch.empty((*batch_shape, k, m), device=P.device, dtype=P.dtype)
-    S.normal_(std=std)
-
-    return S
 
 
 def reshard_q_along_tp(

@@ -1,4 +1,4 @@
-"""Utility functions for Dion optimizer."""
+"""Shared Dion optimizer functions."""
 
 from typing import Optional, Tuple
 
@@ -8,8 +8,8 @@ from .types import DionDistMeta
 
 def get_global_shape(
     dist_meta: Optional[DionDistMeta],
-    local_m: int,
-    local_n: int,
+    m_local: int,
+    n_local: int,
 ) -> Tuple[int, int]:
     """Get the global shape used by Dion math.
 
@@ -19,11 +19,11 @@ def get_global_shape(
 
     Args:
         dist_meta: Distribution metadata for the parameter
-        local_m: Local m dimension
-        local_n: Local n dimension
+        m_local: Local m dimension
+        n_local: Local n dimension
 
     Returns:
-        Tuple `(global_m, global_n)`
+        Tuple `(m_global, n_global)`
     """
     if dist_meta is not None:
         if getattr(dist_meta, 'per_expert_global_shape', None) is not None:
@@ -33,17 +33,17 @@ def get_global_shape(
         if getattr(dist_meta, 'is_dion_param', False):
             raise RuntimeError(
                 "Dion distributed param is missing global_shape needed to compute "
-                f"LR/rank scaling: local_shape=({local_m}, {local_n}) "
+                f"LR/rank scaling: local_shape=({m_local}, {n_local}) "
                 f"param={getattr(dist_meta, 'param_name', '')}"
             )
     # Local non-distributed case.
-    return (local_m, local_n)
+    return (m_local, n_local)
 
 
 def get_local_shape(
     dist_meta: Optional[DionDistMeta],
-    local_m: int,
-    local_n: int,
+    m_local: int,
+    n_local: int,
 ) -> Tuple[int, int]:
     """Return the Dion-object local matrix shape.
 
@@ -53,7 +53,7 @@ def get_local_shape(
     """
     if dist_meta is not None and getattr(dist_meta, "local_shape", None) is not None:
         return tuple(int(dim) for dim in dist_meta.local_shape)
-    return (local_m, local_n)
+    return (m_local, n_local)
 
 
 def has_multiple_local_experts(dist_meta: Optional[DionDistMeta]) -> bool:

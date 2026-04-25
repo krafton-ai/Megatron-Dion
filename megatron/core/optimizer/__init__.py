@@ -47,11 +47,11 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
 from .distrib_dion.integration import (
-    build_distributed_optimizer_for_dion,
-    build_megatron_dion,
+    build_dion_distributed_optimizer,
+    build_dion_optimizer,
     get_dion_param_override,
 )
-from .distrib_dion.parameter import annotate_dion_candidates
+from .distrib_dion.parameter import mark_dion_candidates
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import (
@@ -155,6 +155,15 @@ def _get_param_groups(
                 continue
 
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
+                if bool(getattr(model_chunk.config, 'attention_output_gate', False)):
+                    if bool(getattr(config, 'dion_split_qkv', False)):
+                        raise RuntimeError(
+                            "[DION_QKV_SPLIT_OUTPUT_GATE_UNSUPPORTED] "
+                            f"param={name} uses attention_output_gate=True, whose "
+                            "linear_qkv layout is [Q, gate, K, V]. Dion split_qkv "
+                            "currently supports only the standard [Q, K, V] layout."
+                        )
+                    continue
                 num_attention_heads = int(model_chunk.config.num_attention_heads)
                 num_query_groups = int(model_chunk.config.num_query_groups)
                 kv_channels = int(model_chunk.config.kv_channels)
@@ -171,6 +180,8 @@ def _get_param_groups(
                 and int(getattr(param, 'partition_stride', 1)) == 2
             ):
                 param.is_linear_fc1 = True
+                ffn_hidden_size = int(model_chunk.config.ffn_hidden_size)
+                param.linear_split_rows = (ffn_hidden_size, ffn_hidden_size)
 
             # Get optimizer config overrides for this parameter.
             matching_param_overrides: list[ParamGroupOverride] = []
@@ -308,6 +319,8 @@ def _get_megatron_optimizer_based_on_param_groups(
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_idx: Optional[int] = None,
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
+    intra_dist_opt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expert_tensor_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
     pg_collection: Optional[ProcessGroupCollection] = None,
     is_expert_parallel: bool = False,
@@ -442,11 +455,13 @@ def _get_megatron_optimizer_based_on_param_groups(
             )
             init_state = None
         elif config.optimizer == 'dion':
-            optimizer = build_megatron_dion(
+            optimizer = build_dion_optimizer(
                 config=config,
                 param_groups=param_groups,
                 data_parallel_group=data_parallel_group,
                 pure_data_parallel_group=pure_data_parallel_group,
+                dense_fs_group=intra_dist_opt_dp_group,
+                dion_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
                 pg_collection=pg_collection,
                 is_expert_parallel=is_expert_parallel,
             )
@@ -490,13 +505,15 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer_args = [optimizer, config, grad_scaler, init_state]
         if config.use_distributed_optimizer:
             if config.optimizer == 'dion':
-                optimizer = build_distributed_optimizer_for_dion(
+                optimizer = build_dion_distributed_optimizer(
                     optimizer_args=optimizer_args,
                     config=config,
                     model_chunks=model_chunks,
                     per_model_buffers=per_model_buffers,
                     data_parallel_group=data_parallel_group,
                     pure_data_parallel_group=pure_data_parallel_group,
+                    dense_fs_group=intra_dist_opt_dp_group,
+                    dion_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
                     data_parallel_group_gloo=data_parallel_group_gloo,
                     data_parallel_group_idx=data_parallel_group_idx,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
@@ -525,7 +542,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    if pg_collection is None or not hasattr(pg_collection, 'tp'):
+    if is_expert_parallel and expert_tensor_parallel_group is not None:
+        tp_group = expert_tensor_parallel_group
+    elif pg_collection is None or not hasattr(pg_collection, 'tp'):
         tp_group = parallel_state.get_tensor_model_parallel_group()
     else:
         tp_group = pg_collection.tp
@@ -594,7 +613,7 @@ def get_megatron_optimizer(
 
     if getattr(config, 'optimizer', None) == 'dion':
         for model_chunk in model_chunks:
-            annotate_dion_candidates(model_chunk)
+            mark_dion_candidates(model_chunk)
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
@@ -618,6 +637,8 @@ def get_megatron_optimizer(
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
+    intra_dist_opt_dp_group = process_groups_dict.get('intra_dist_opt_dp_group')
+    expt_tp_group = process_groups_dict.get('expt_tp_group')
 
     model_parallel_rank = get_pg_rank(mp_group)
 
@@ -655,6 +676,8 @@ def get_megatron_optimizer(
                     data_parallel_group_gloo=intra_dp_cp_group_gloo,
                     data_parallel_group_idx=model_parallel_rank,
                     intra_dist_opt_group=intra_dist_opt_group,
+                    intra_dist_opt_dp_group=intra_dist_opt_dp_group,
+                    expert_tensor_parallel_group=expt_tp_group,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                     pg_collection=pg_collection,
                 )
@@ -704,6 +727,8 @@ def get_megatron_optimizer(
                 data_parallel_group_gloo=intra_dp_cp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
+                intra_dist_opt_dp_group=intra_dist_opt_dp_group,
+                expert_tensor_parallel_group=expt_tp_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )
@@ -743,6 +768,8 @@ def get_megatron_optimizer(
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
+                intra_dist_opt_dp_group=intra_dist_opt_dp_group,
+                expert_tensor_parallel_group=expt_tp_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
                 is_expert_parallel=True,

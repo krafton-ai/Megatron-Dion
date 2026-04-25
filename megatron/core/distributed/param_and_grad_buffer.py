@@ -138,8 +138,8 @@ class _ParamAndGradBucket:
         return self.dion_layout is not None and self.dion_layout.has_params
 
     @property
-    def has_non_dion_params(self) -> bool:
-        """Whether bucket has non-Dion params."""
+    def has_standard_params(self) -> bool:
+        """Whether bucket has standard params."""
         dion_param_ids = self.dion_param_ids
         return any(id(param) not in dion_param_ids for param in self.params)
 
@@ -181,6 +181,12 @@ class _ParamAndGradBucketGroup:
         self.param_to_bucket = {}
         self.params = set()
         for bucket in self.buckets:
+            if self.ddp_config.use_distributed_optimizer:
+                bucket.intra_distributed_optimizer_instance_group = collective_group
+                bucket.intra_distributed_optimizer_instance_size = collective_group_size
+                bucket.intra_distributed_optimizer_instance_rank = collective_group.rank()
+            else:
+                bucket.data_parallel_group = collective_group
             for param in bucket.params_list:
                 self.param_to_bucket[param] = bucket
                 self.params.add(param)
@@ -232,7 +238,7 @@ class _ParamAndGradBucketGroup:
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
     def _mark_dion_param_sync_ready(self, ready: bool):
-        """Update forward-readiness state for custom Dion param-gather buckets."""
+        """Update forward-readiness state for Dion param-gather buckets."""
         for bucket in self.buckets:
             if hasattr(bucket, "_dion_full_param_ready"):
                 bucket._dion_full_param_ready = ready
@@ -240,7 +246,7 @@ class _ParamAndGradBucketGroup:
     def _check_dion_param_sync_ready(self):
         """Verify bucket.param_data remains the forward-visible canonical storage."""
         for bucket in self.buckets:
-            if not getattr(bucket, "_dion_requires_param_sync_check", False):
+            if not getattr(bucket, "_tracks_dion_param_views", False):
                 continue
             optimizer = getattr(bucket, "dion_optimizer", None)
             if optimizer is None:
@@ -261,37 +267,37 @@ class _ParamAndGradBucketGroup:
     def _collect_param_gather_launches(self, async_op: bool):
         """Collect bucket-wise param-gather launches for one dispatch.
 
-        Pure non-Dion buckets follow the stock DO path from the standard local
+        Pure standard buckets follow the stock DO path from the standard local
         contiguous bucket shard. Buckets that contain Dion params must instead
         launch the Dion bucket-wise gather helper, because a Dion local FS shard
         is not generally the same layout as the stock flat bucket shard source.
         """
         standard_bucket_indices = []
-        custom_handles = []
+        dion_handles = []
 
         for idx, bucket in enumerate(self.buckets):
             has_dion = bucket.has_dion_params
-            has_non_dion = bucket.has_non_dion_params
+            has_standard = bucket.has_standard_params
 
             if has_dion:
                 optimizer = getattr(bucket, "dion_optimizer", None)
-                if optimizer is None or not hasattr(optimizer, "_all_gather_bucket_params"):
+                if optimizer is None or not hasattr(optimizer, "_all_gather_bucket_params_"):
                     raise RuntimeError(
                         "[Dion] missing bucket-wise Dion param-gather helper "
                         f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                     )
-                handle = optimizer._all_gather_bucket_params(
+                handle = optimizer._all_gather_bucket_params_(
                     bucket,
                     async_op=async_op,
                 )
                 if handle is not None:
-                    custom_handles.append(handle)
+                    dion_handles.append(handle)
                 continue
 
-            if has_non_dion:
+            if has_standard:
                 standard_bucket_indices.append(idx)
 
-        return standard_bucket_indices, custom_handles
+        return standard_bucket_indices, dion_handles
 
     def reset(self):
         """
@@ -309,8 +315,8 @@ class _ParamAndGradBucketGroup:
                     optimizer._clear_dion_local_grads(
                         [entry.param for entry in dion_layout.entries]
                     )
-                if hasattr(optimizer, "_clear_bucket_grad_sync"):
-                    optimizer._clear_bucket_grad_sync(bucket)
+                if hasattr(optimizer, "_clear_grad_transport"):
+                    optimizer._clear_grad_transport(bucket)
         if self.is_first_batch and len(self.per_param_grad_ready_counts) > 0:
             assert len(self.per_param_grad_ready_counts) == len(self.params)
             self.golden_per_param_grad_ready_counts = self.per_param_grad_ready_counts
@@ -382,15 +388,15 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
         self._mark_dion_param_sync_ready(False)
-        pure_non_dion_indices, custom_handles = self._collect_param_gather_launches(
+        pure_standard_indices, dion_handles = self._collect_param_gather_launches(
             async_op=async_op,
         )
         standard_handle = None
-        if pure_non_dion_indices:
+        if pure_standard_indices:
             with _coalescing_manager(
                 self.intra_distributed_optimizer_instance_group, async_ops=async_op
             ) as cm:
-                for idx in pure_non_dion_indices:
+                for idx in pure_standard_indices:
                     bucket = self.buckets[idx]
                     if self.cached_param_buffer_shard_list[idx] is None:
                         self.cached_param_buffer_shard_list[idx] = shard_buffer(
@@ -408,7 +414,7 @@ class _ParamAndGradBucketGroup:
             standard_handle = cm if async_op else None
 
         if async_op:
-            self.param_gather_handle = _HandleGroup([standard_handle, *custom_handles])
+            self.param_gather_handle = _HandleGroup([standard_handle, *dion_handles])
         else:
             self.param_gather_handle = None
             self._check_dion_param_sync_ready()
@@ -536,26 +542,26 @@ class _ParamAndGradBucketGroup:
         )
 
         grad_reduce_handle = None
-        call_idx = int(getattr(self, "_dion_standard_local_grad_metrics_call_idx", 0))
-        self._dion_standard_local_grad_metrics_call_idx = call_idx + 1
+        call_idx = int(getattr(self, "_standard_grad_log_call_idx", 0))
+        self._standard_grad_log_call_idx = call_idx + 1
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
                     optimizer = getattr(bucket, "dion_optimizer", None)
                     has_dion = bucket.has_dion_params
-                    has_non_dion = bucket.has_non_dion_params
+                    has_standard = bucket.has_standard_params
                     local_data_view = (
                         self._get_standard_local_grad_view(idx, bucket)
-                        if (not has_dion or has_non_dion)
+                        if (not has_dion or has_standard)
                         else None
                     )
                     if bucket.has_dion_params:
-                        if optimizer is None or not hasattr(optimizer, "_start_dion_bucket_grad_sync"):
+                        if optimizer is None or not hasattr(optimizer, "_start_dion_grad_sync"):
                             raise RuntimeError(
                                 "[Dion] missing adapter grad launch hook "
                                 f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                             )
-                        grad_reduce_handle = optimizer._start_dion_bucket_grad_sync(
+                        grad_reduce_handle = optimizer._start_dion_grad_sync(
                             bucket=bucket,
                             local_data_view=local_data_view,
                             communication_group=communication_group,
@@ -596,7 +602,7 @@ class _ParamAndGradBucketGroup:
             ):
                 for idx, bucket in enumerate(self.buckets):
                     has_dion = bucket.has_dion_params
-                    has_non_dion = bucket.has_non_dion_params
+                    has_standard = bucket.has_standard_params
                     if not has_dion:
                         local_data_view = self._get_standard_local_grad_view(idx, bucket)
                         has_standard_local_grad = (
@@ -609,21 +615,21 @@ class _ParamAndGradBucketGroup:
                                 group=self.inter_distributed_optimizer_instance_group,
                                 async_op=async_op,
                             )
-                    elif has_non_dion:
+                    elif has_standard:
                         optimizer = getattr(bucket, "dion_optimizer", None)
                         if not hasattr(
-                            optimizer, "_get_dion_bucket_inter_instance_non_dion_grad_buffer"
+                            optimizer, "_get_standard_inter_instance_grad_buffer"
                         ):
                             raise RuntimeError(
-                                "[Dion] missing adapter inter-instance non-Dion grad hook "
+                                "[Dion] missing adapter inter-instance standard grad hook "
                                 f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                             )
-                        non_dion_data_view = (
-                            optimizer._get_dion_bucket_inter_instance_non_dion_grad_buffer(bucket)
+                        standard_data_view = (
+                            optimizer._get_standard_inter_instance_grad_buffer(bucket)
                         )
-                        if non_dion_data_view is not None and non_dion_data_view.numel() > 0:
+                        if standard_data_view is not None and standard_data_view.numel() > 0:
                             torch.distributed.all_reduce(
-                                non_dion_data_view,
+                                standard_data_view,
                                 op=reduce_op,
                                 group=self.inter_distributed_optimizer_instance_group,
                                 async_op=async_op,
@@ -641,7 +647,7 @@ class _ParamAndGradBucketGroup:
             self.grad_reduce_handle = None
         self.grad_sync_launched = True
 
-    def _dispatch_custom_bucket_grad_transports(self) -> None:
+    def _finish_dion_grad_transports(self) -> None:
         """Hand stock local bucket shards off to the Dion adapter grad transport hook.
 
         Stock DO owns the bucket-wise RS/AR lifecycle and leaves each rank with
@@ -667,7 +673,7 @@ class _ParamAndGradBucketGroup:
 
             local_data_view = (
                 self._get_standard_local_grad_view(idx, bucket)
-                if bucket.has_non_dion_params
+                if bucket.has_standard_params
                 else None
             )
             optimizer._apply_bucket_grads(
@@ -690,7 +696,7 @@ class _ParamAndGradBucketGroup:
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
-            self._dispatch_custom_bucket_grad_transports()
+            self._finish_dion_grad_transports()
             return
         if self.is_first_batch:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
@@ -699,7 +705,7 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             if self.communication_stream is not None:
                 torch.cuda.default_stream().wait_stream(self.communication_stream)
-            self._dispatch_custom_bucket_grad_transports()
+            self._finish_dion_grad_transports()
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -708,7 +714,7 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
-        self._dispatch_custom_bucket_grad_transports()
+        self._finish_dion_grad_transports()
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
@@ -773,9 +779,7 @@ class _ParamAndGradBuffer:
     ):
 
         if pg_collection is None:
-            self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
-                with_context_parallel=True
-            )
+            self.dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
             self.tp_group = parallel_state.get_tensor_model_parallel_group()
         else:
             assert hasattr(pg_collection, 'tp') and hasattr(pg_collection, 'dp_cp')

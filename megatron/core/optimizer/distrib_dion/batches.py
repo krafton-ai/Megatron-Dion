@@ -7,13 +7,12 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 import torch
 import torch.distributed as dist
 
-from ... import parallel_state
 from ..dion.state import require_2d_local_shape
 from ..dion.state import (
-    is_fs_only_config,
-    needs_fs_p_reduce,
-    needs_tp_r_reduce,
-    p_is_tp_sharded,
+    is_fs_without_tp,
+    should_reduce_p_over_fs,
+    should_reduce_r_over_tp,
+    is_p_tp_sharded,
 )
 from ..dion.utils import get_local_shape, has_multiple_local_experts
 from ..dion.types import (
@@ -78,11 +77,13 @@ def build_batch_key(
     cfg,
     dtype: torch.dtype,
     *,
-    true_global_shape=None,
+    global_shape=None,
     per_expert_global_shape=None,
+    tensor_row_shard_sizes=None,
+    row_shard_sizes=None,
 ) -> tuple:
     """Build the canonical Dion batch key used by local/distributed runtimes."""
-    key_shape = per_expert_global_shape or true_global_shape or shape
+    key_shape = per_expert_global_shape or global_shape or shape
     if len(key_shape) == 2:
         resolved_shape = (int(key_shape[0]), int(key_shape[1]))
     else:
@@ -94,12 +95,14 @@ def build_batch_key(
         bool(cfg.has_tp_shard),
         bool(getattr(cfg, "use_tp_shard", cfg.has_tp_shard)),
         bool(cfg.is_transposed),
-        bool(cfg.compressed_all_reduce),
+        bool(cfg.use_low_rank_sync),
         _normalize_shard_dim(cfg.tp_shard_dim, cfg.has_tp_shard),
         _normalize_shard_dim(cfg.fs_shard_dim, cfg.has_fs_shard),
         dtype,
-        _normalize_shape(true_global_shape),
+        _normalize_shape(global_shape),
         _normalize_shape(per_expert_global_shape),
+        _normalize_shape(tensor_row_shard_sizes),
+        _normalize_shape(row_shard_sizes),
     )
 
 
@@ -218,7 +221,7 @@ def _batch_group_key(batch_group: DionBatchGroup) -> tuple:
         _group_ranks_key(batch_group.replicate_group),
         _group_ranks_key(batch_group.ortho_group),
         _group_ranks_key(batch_group.q_norm_group),
-        _group_ranks_key(batch_group.compressed_replicate_group),
+        _group_ranks_key(batch_group.low_rank_replicate_group),
         tuple(_group_ranks_key(group) for group in batch_group.sync_groups),
     )
 
@@ -257,7 +260,7 @@ def _batch_key_for_sync(batch_key: tuple, sync_group, *, param_uids: tuple = ())
         replicate_ranks,
         ortho_ranks,
         q_norm_ranks,
-        compressed_replicate_ranks,
+        low_rank_replicate_ranks,
         sync_group_ranks_by_role,
     ) = group_key
     sync_group_ranks = _group_ranks_key(sync_group)
@@ -271,7 +274,7 @@ def _batch_key_for_sync(batch_key: tuple, sync_group, *, param_uids: tuple = ())
             _project_group_for_sync(replicate_ranks, sync_group_ranks),
             _project_group_for_sync(ortho_ranks, sync_group_ranks),
             _project_group_for_sync(q_norm_ranks, sync_group_ranks),
-            _project_group_for_sync(compressed_replicate_ranks, sync_group_ranks),
+            _project_group_for_sync(low_rank_replicate_ranks, sync_group_ranks),
             tuple(
                 _project_group_for_sync(group_ranks, sync_group_ranks)
                 for group_ranks in sync_group_ranks_by_role
@@ -381,7 +384,8 @@ def _local_expert_q_view(
     num_local_experts = int(getattr(dist_meta, "num_local_experts", 1))
     local_expert_index = int(getattr(dist_meta, "local_expert_index", -1))
     q_base_axis = 0 if bool(getattr(config, "is_transposed", False)) else 1
-    expected_q_rows = int(local_shape[0] if q_base_axis == 0 else local_shape[1])
+    m_local, n_local = local_shape
+    expected_q_rows = int(m_local if q_base_axis == 0 else n_local)
 
     if int(q_tensor.size(0)) == expected_q_rows:
         return q_tensor
@@ -483,11 +487,11 @@ def resolve_batch_group(
     ortho_group = resolve_ortho_group(config, dist_meta)
     fs_group = getattr(dist_meta, "fs_group", None) if dist_meta is not None else None
     tp_group = getattr(dist_meta, "tp_group", None) if dist_meta is not None else None
-    use_tp_shard = bool(getattr(config, "use_tp_shard", False))
+    tp_active = bool(getattr(config, "use_tp_shard", False))
 
     sync_groups = []
     if (
-        config.compressed_all_reduce
+        config.use_low_rank_sync
         and replicate_group is not None
         and group_size(replicate_group) > 1
     ):
@@ -500,7 +504,7 @@ def resolve_batch_group(
     ):
         sync_groups.append(state_replica_group)
 
-    if use_tp_shard:
+    if tp_active:
         if tp_group is None:
             raise RuntimeError(
                 "[DION_MISSING_BATCH_TP_GROUP] "
@@ -519,11 +523,11 @@ def resolve_batch_group(
         if group_size(fs_group) > 1 and all(id(fs_group) != id(existing) for existing in sync_groups):
             sync_groups.append(fs_group)
 
-    if use_tp_shard:
+    if tp_active:
         batch_world_size = group_size(tp_group)
     elif bool(getattr(config, "use_fs_shard", False)):
         batch_world_size = group_size(fs_group)
-    elif config.compressed_all_reduce and replicate_group is not None:
+    elif config.use_low_rank_sync and replicate_group is not None:
         batch_world_size = group_size(replicate_group)
     else:
         batch_world_size = group_size(replicate_group) if replicate_group is not None else 1
@@ -539,27 +543,27 @@ def resolve_batch_group(
 
     kernel_kind = "ddp"
     if (
-        p_is_tp_sharded(config, use_tp_shard=use_tp_shard)
+        is_p_tp_sharded(config, tp_active=tp_active)
         and ortho_group is not None
         and group_size(ortho_group) > 1
     ):
         kernel_kind = "fsdp_tp"
     elif (
         use_fs_collectives
-        and is_fs_only_config(config)
+        and is_fs_without_tp(config)
         and fs_group is not None
         and group_size(fs_group) > 1
     ):
         kernel_kind = "fsdp"
 
-    compressed_replicate_group = None
+    low_rank_replicate_group = None
     if (
-        config.compressed_all_reduce
+        config.use_low_rank_sync
         and kernel_kind == "fsdp"
         and replicate_group is not None
         and group_size(replicate_group) > 1
     ):
-        compressed_replicate_group = replicate_group
+        low_rank_replicate_group = replicate_group
 
     return DionBatchGroup(
         sync_groups=tuple(sync_groups),
@@ -567,7 +571,7 @@ def resolve_batch_group(
         replicate_group=replicate_group,
         ortho_group=ortho_group,
         q_norm_group=q_norm_group,
-        compressed_replicate_group=compressed_replicate_group,
+        low_rank_replicate_group=low_rank_replicate_group,
         batch_world_size=batch_world_size,
     )
 
@@ -580,14 +584,14 @@ def build_batch_collectives(
     real_batch_size: int,
     use_fs_collectives: bool,
     resolve_tp_group: Callable,
-    resolve_fs_group: Callable,
+    resolve_fs_group_from_meta: Callable,
 ) -> DionBatchCollectives:
     """Return the TP/FS collectives for one concrete batch."""
     tp_q_gather_groups = {}
     fs_p_reduce_groups = {}
     tp_r_reduce_groups = {}
     tp_q_reshard_groups = {}
-    fs_group_info = None
+    fs_collective_group = None
     fs_indices = []
     ortho_group = None
 
@@ -634,9 +638,9 @@ def build_batch_collectives(
                     f"rank={dist.get_rank()} idx={idx} real_batch_size={real_batch_size}"
                 )
             dist_meta = template_dist_meta
-        use_tp_shard = bool(getattr(config, "use_tp_shard", False))
+        tp_active = bool(getattr(config, "use_tp_shard", False))
 
-        if use_tp_shard:
+        if tp_active:
             tp_group = resolve_tp_group(dist_meta, expect_group=True)
             if tp_group is None or dist.get_world_size(tp_group) <= 1:
                 raise RuntimeError(
@@ -663,14 +667,14 @@ def build_batch_collectives(
                 if q_key not in tp_q_gather_groups:
                     tp_q_gather_groups[q_key] = (tp_group, [])
                 tp_q_gather_groups[q_key][1].append(idx)
-            if needs_tp_r_reduce(config, use_tp_shard=use_tp_shard):
+            if should_reduce_r_over_tp(config, tp_active=tp_active):
                 if tp_key not in tp_r_reduce_groups:
                     tp_r_reduce_groups[tp_key] = (tp_group, [])
                 tp_r_reduce_groups[tp_key][1].append(idx)
             register_ortho_group(tp_group, idx=idx, axis="tp")
 
-        if needs_fs_p_reduce(config):
-            fs_group = resolve_fs_group(dist_meta, expect_group=True)
+        if should_reduce_p_over_fs(config):
+            fs_group = resolve_fs_group_from_meta(dist_meta, expect_group=True)
             if fs_group is None or dist.get_world_size(fs_group) <= 1:
                 raise RuntimeError(
                     "[DION_MISSING_FS_GROUP_FOR_BATCH_COLLECTIVES] "
@@ -683,8 +687,8 @@ def build_batch_collectives(
                 fs_p_reduce_groups[fs_key] = (fs_group, [])
             fs_p_reduce_groups[fs_key][1].append(idx)
 
-        if use_fs_collectives and bool(getattr(config, "use_fs_shard", False)) and not use_tp_shard:
-            fs_group = resolve_fs_group(dist_meta, expect_group=True)
+        if use_fs_collectives and bool(getattr(config, "use_fs_shard", False)) and not tp_active:
+            fs_group = resolve_fs_group_from_meta(dist_meta, expect_group=True)
             if fs_group is None or dist.get_world_size(fs_group) <= 1:
                 raise RuntimeError(
                     "[DION_MISSING_FS_ONLY_ORTHO_GROUP] "
@@ -693,13 +697,13 @@ def build_batch_collectives(
                     f"param_uid={getattr(dist_meta, 'param_uid', None)}"
                 )
             fs_key = (id(fs_group), dist.get_world_size(fs_group), dist.get_rank(fs_group))
-            if fs_group_info is None:
-                fs_group_info = fs_group
+            if fs_collective_group is None:
+                fs_collective_group = fs_group
             else:
                 current_key = (
-                    id(fs_group_info),
-                    dist.get_world_size(fs_group_info),
-                    dist.get_rank(fs_group_info),
+                    id(fs_collective_group),
+                    dist.get_world_size(fs_collective_group),
+                    dist.get_rank(fs_collective_group),
                 )
                 if current_key != fs_key:
                     raise RuntimeError(
@@ -723,12 +727,12 @@ def build_batch_collectives(
         return tuple(collectives)
 
     fs_collective = None
-    if fs_group_info is not None:
+    if fs_collective_group is not None:
         fs_collective = DionAxisCollective(
             indices=tuple(fs_indices),
-            process_group=fs_group_info,
-            world_size=dist.get_world_size(fs_group_info),
-            rank=dist.get_rank(fs_group_info),
+            process_group=fs_collective_group,
+            world_size=dist.get_world_size(fs_collective_group),
+            rank=dist.get_rank(fs_collective_group),
         )
 
     return DionBatchCollectives(
@@ -765,9 +769,9 @@ def group_and_order_param_batches(
         if local_shape is None:
             local_shape = require_2d_local_shape(param, dist_meta)
             state["local_shape"] = local_shape
-        true_global_shape = state.get("true_global_shape", None)
-        if true_global_shape is None and dist_meta is not None:
-            true_global_shape = getattr(dist_meta, "global_shape", None)
+        global_shape = state.get("global_shape", None)
+        if global_shape is None and dist_meta is not None:
+            global_shape = getattr(dist_meta, "global_shape", None)
         per_expert_global_shape = state.get("per_expert_global_shape", None)
         if per_expert_global_shape is None and dist_meta is not None:
             per_expert_global_shape = getattr(dist_meta, "per_expert_global_shape", None)
@@ -788,8 +792,10 @@ def group_and_order_param_batches(
                     local_shape,
                     config,
                     routed_param.grad.dtype,
-                    true_global_shape=true_global_shape,
+                    global_shape=global_shape,
                     per_expert_global_shape=per_expert_global_shape,
+                    tensor_row_shard_sizes=getattr(dist_meta, "tensor_row_shard_sizes", None),
+                    row_shard_sizes=getattr(dist_meta, "row_shard_sizes", None),
                 ),
                 _build_update_contract_key(
                     routed_param.optim_group,
@@ -815,7 +821,7 @@ def group_and_order_param_batches(
             replicate_group=first_group.replicate_group,
             ortho_group=first_group.ortho_group,
             q_norm_group=first_group.q_norm_group,
-            compressed_replicate_group=first_group.compressed_replicate_group,
+            low_rank_replicate_group=first_group.low_rank_replicate_group,
             batch_world_size=first_group.batch_world_size,
         )
 
@@ -947,7 +953,7 @@ def build_dion_batches(
     get_replicate_group: Callable,
     resolve_ortho_group: Callable,
     resolve_tp_group: Callable,
-    resolve_fs_group: Callable,
+    resolve_fs_group_from_meta: Callable,
 ) -> List[DionBatch]:
     """Build Dion batches from explicit runtime state."""
     ordered_batches = group_and_order_param_batches(
@@ -1008,7 +1014,7 @@ def build_dion_batches(
                 real_batch_size=batch_data["real_batch_size"],
                 use_fs_collectives=use_fs_collectives,
                 resolve_tp_group=resolve_tp_group,
-                resolve_fs_group=resolve_fs_group,
+                resolve_fs_group_from_meta=resolve_fs_group_from_meta,
             )
             dion_batches.append(
                 DionBatch(

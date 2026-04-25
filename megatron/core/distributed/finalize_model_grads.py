@@ -37,6 +37,30 @@ def _get_main_grad_attr(param: torch.nn.Parameter):
     return "grad"
 
 
+def _get_dion_local_grad(model_chunk: torch.nn.Module, param: torch.nn.Parameter):
+    getter = getattr(model_chunk, "get_dion_local_grad", None)
+    if getter is None:
+        return None
+    return getter(param)
+
+
+def _all_reduce_tensors(tensors: List[torch.Tensor], group: torch.distributed.ProcessGroup):
+    tensors_by_dtype_device = {}
+    for tensor in tensors:
+        if tensor is None:
+            continue
+        tensors_by_dtype_device.setdefault((tensor.device, tensor.dtype), []).append(tensor)
+
+    for group_tensors in tensors_by_dtype_device.values():
+        if len(group_tensors) == 1:
+            torch.distributed.all_reduce(group_tensors[0], group=group)
+            continue
+        coalesced = _flatten_dense_tensors(group_tensors)
+        torch.distributed.all_reduce(coalesced, group=group)
+        for buf, synced in zip(group_tensors, _unflatten_dense_tensors(coalesced, group_tensors)):
+            buf.copy_(synced)
+
+
 def _unshard_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
     """
     Unshards the input tensor if it is a DTensor and otherwise returns the
@@ -103,6 +127,7 @@ def _allreduce_conditional_embedding_grads(
 
     if pp_group.size() > 1 and getattr(config, "has_cond_embedder", False):
         grads_dict = {}
+        dion_grads_dict = {}
         for model_chunk in model:
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
                 if param.requires_grad and getattr(param, 'pipeline_parallel', False):
@@ -115,16 +140,24 @@ def _allreduce_conditional_embedding_grads(
                         grads_dict[name].append(grad)
                     else:
                         grads_dict[name] = [grad]
-        if grads_dict:
+                    dion_grad = _get_dion_local_grad(model_chunk, param)
+                    if dion_grad is not None:
+                        if name in dion_grads_dict:
+                            dion_grads_dict[name][0].add_(dion_grad)
+                            dion_grads_dict[name].append(dion_grad)
+                        else:
+                            dion_grads_dict[name] = [dion_grad]
+        if grads_dict or dion_grads_dict:
             # All-reduce the gradient on the first VPP rank.
             grads = [param_grad[0] for _, param_grad in grads_dict.items()]
-            coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(coalesced, group=pp_group)
-            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
-                buf.copy_(synced)
+            grads.extend(param_grad[0] for _, param_grad in dion_grads_dict.items())
+            _all_reduce_tensors(grads, pp_group)
 
             # Update the gradients on other VPP ranks.
             for grads in grads_dict.values():
+                for grad in grads[1:]:
+                    grad.copy_(grads[0])
+            for grads in dion_grads_dict.values():
                 for grad in grads[1:]:
                     grad.copy_(grads[0])
 
@@ -240,6 +273,7 @@ def _allreduce_embedding_grad(
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_model_module = model_module
         ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
 
@@ -255,7 +289,8 @@ def _allreduce_embedding_grad(
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
-        torch.distributed.all_reduce(grad, group=embd_group)
+        dion_grad = _get_dion_local_grad(ddp_model_module, weight)
+        _all_reduce_tensors([grad, dion_grad], embd_group)
         setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 

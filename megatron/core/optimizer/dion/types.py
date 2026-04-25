@@ -29,12 +29,12 @@ class DionParamConfig:
     has_tp_shard: bool = False
     use_tp_shard: bool = False
     is_transposed: bool = False
-    compressed_all_reduce: bool = False
+    use_low_rank_sync: bool = False
 
 
 @dataclass
-class ScalarStepParam:
-    """One scalar/non-Dion step item routed by the distributed adapter."""
+class ElementwiseStepParam:
+    """One standard-param elementwise step item routed by the distributed adapter."""
 
     param: torch.Tensor | None = None
     grad: torch.Tensor | None = None
@@ -87,7 +87,7 @@ class DionBatchGroup:
     replicate_group: Optional[torch.distributed.ProcessGroup] = None
     ortho_group: Optional[torch.distributed.ProcessGroup] = None
     q_norm_group: Optional[torch.distributed.ProcessGroup] = None
-    compressed_replicate_group: Optional[torch.distributed.ProcessGroup] = None
+    low_rank_replicate_group: Optional[torch.distributed.ProcessGroup] = None
     batch_world_size: int = 1
 
 
@@ -114,6 +114,10 @@ class DionDistMeta:
     tp_rank: int = -1
     per_expert_global_shape: Optional[Tuple[int, int]] = None
     local_shape: Optional[Tuple[int, int]] = None
+    tensor_row_shard_sizes: Optional[Tuple[int, ...]] = None
+    row_shard_start_idx: int = -1
+    row_shard_end_idx: int = -1
+    row_shard_sizes: Optional[Tuple[int, ...]] = None
     expert_axis: int = -1
     num_local_experts: int = 1
     local_expert_index: int = -1
@@ -124,6 +128,7 @@ class DionDistMeta:
     qkv_child_kind: str = ""
     qkv_split_shapes: Optional[Tuple[int, int, int]] = None
     linear_split_rows: Optional[Tuple[int, int]] = None
+    linear_partition_stride: int = 1
     is_linear_child: bool = False
     linear_child_kind: str = ""
 

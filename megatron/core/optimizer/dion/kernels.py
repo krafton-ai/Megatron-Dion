@@ -15,24 +15,29 @@ from .types import DionParamConfig
 def scaled_lr_for_shape(
     *,
     lr: float,
-    m_for_lr: int,
-    n_for_lr: int,
-    rule: str,
+    m_global: int,
+    n_global: int,
+    scale_mode: str,
     rank_fraction: float,
-    scaling_factor: float = 1.0,
+    extra_scale_factor: float = 0.2,
 ) -> float:
     """Return the canonical 2D Dion learning-rate scaling."""
-    if rule == "moonlight":
-        base_scale = scaling_factor / (rank_fraction ** 0.5)
-        return base_scale * (max(m_for_lr, n_for_lr) ** 0.5) * lr
-    if rule == "dion":
-        if m_for_lr <= 0 or n_for_lr <= 0:
-            raise RuntimeError(
-                "[DION_INVALID_LR_SCALING_SHAPE] "
-                f"m_for_lr={m_for_lr} n_for_lr={n_for_lr}"
-            )
-        return lr * math.sqrt(float(m_for_lr) / float(n_for_lr))
-    raise RuntimeError(f"[DION_INVALID_LR_SCALING_RULE] rule={rule!r}")
+    if m_global <= 0 or n_global <= 0:
+        raise RuntimeError(
+            "[DION_INVALID_SCALE_SHAPE] "
+            f"m_global={m_global} n_global={n_global}"
+        )
+    if rank_fraction <= 0.0:
+        raise RuntimeError(f"[DION_INVALID_RANK_FRACTION] rank_fraction={rank_fraction}")
+
+    rank_scale = extra_scale_factor / math.sqrt(float(rank_fraction))
+    if scale_mode == "spectral":
+        return lr * rank_scale * math.sqrt(float(max(m_global, n_global)))
+    if scale_mode == "unit_rms_norm":
+        return lr * rank_scale * math.sqrt(float(m_global) / float(n_global))
+    if scale_mode == "shape_scaling":
+        return lr * rank_scale * math.sqrt(max(1.0, float(m_global) / float(n_global)))
+    raise RuntimeError(f"[DION_INVALID_SCALE_MODE] scale_mode={scale_mode!r}")
 
 
 @torch.compile(fullgraph=True)

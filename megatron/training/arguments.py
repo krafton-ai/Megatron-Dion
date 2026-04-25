@@ -2088,30 +2088,30 @@ def _add_training_args(parser):
                        help='Dion low-rank approximation fraction.')
     group.add_argument('--dion-rank-multiple-of', type=int, default=1,
                        help='Round the Dion rank up to a multiple of this value.')
-    group.add_argument('--dion-normalize-eps', '--dion-epsilon', type=float, default=1e-8,
+    group.add_argument('--dion-normalize-eps', type=float, default=1e-8,
                        help='Dion epsilon used when normalizing right factors.')
     group.add_argument('--dion-oversample', type=float, default=1.25,
                        help='Oversampling factor for Dion RCQR.')
     group.add_argument('--dion-use-fs-collectives', action=argparse.BooleanOptionalAction,
                        default=True,
                        help='Use Dion FS collectives when distributed Dion runs on sharded layouts.')
-    group.add_argument('--dion-use-compressed-comm', action=argparse.BooleanOptionalAction,
+    group.add_argument('--dion-use-low-rank-sync', action=argparse.BooleanOptionalAction,
                        default=True,
-                       help='Use Dion compressed P/R communication when the logical compression contract applies.')
-    group.add_argument('--dion-scalar-optimizer', type=str, default='adamw',
+                       help='Use Dion low-rank P/R synchronization when its contract applies.')
+    group.add_argument('--dion-elementwise-optimizer', type=str, default='adamw',
                        choices=['lion', 'adamw'],
-                       help='Scalar optimizer used for non-2D Dion parameters.')
-    group.add_argument('--dion-lr-scaling', type=str, default='dion',
-                       choices=['moonlight', 'dion'],
-                       help='2D Dion learning-rate scaling rule.')
-    group.add_argument('--dion-scaling-factor', type=float, default=1.0,
-                       help='Additional multiplicative constant used by Dion 2D LR scaling.')
+                       help='Elementwise optimizer used for non-2D Dion parameters.')
+    group.add_argument('--dion-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       help='2D Dion scale mode.')
+    group.add_argument('--dion-extra-scale-factor', type=float, default=0.2,
+                       help='Additional multiplicative constant used by Dion 2D scaling.')
     group.add_argument('--dion-beta1', type=float, default=0.9,
-                       help='Beta1 for the Dion scalar optimizer.')
+                       help='Beta1 for the Dion elementwise optimizer.')
     group.add_argument('--dion-beta2', type=float, default=0.95,
-                       help='Beta2 for the Dion scalar optimizer.')
-    group.add_argument('--dion-scalar-eps', '--dion-eps', type=float, default=1e-8,
-                       help='Epsilon for the Dion scalar optimizer.')
+                       help='Beta2 for the Dion elementwise optimizer.')
+    group.add_argument('--dion-elementwise-eps', type=float, default=1e-8,
+                       help='Epsilon for the Dion elementwise optimizer.')
     group.add_argument('--dion-split-qkv', action='store_true', dest='dion_split_qkv',
                        help='Treat fused QKV weights as optimizer-only Q/K/V children for Dion.')
     group.add_argument('--no-dion-split-qkv', action='store_false', dest='dion_split_qkv',

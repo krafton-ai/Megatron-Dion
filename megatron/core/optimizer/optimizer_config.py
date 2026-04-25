@@ -483,26 +483,26 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_use_fs_collectives: bool = True
     """Enable Dion FS-aware communication when distributed optimizer is active."""
 
-    dion_use_compressed_comm: bool = True
-    """Enable Dion compressed P/R communication."""
+    dion_use_low_rank_sync: bool = True
+    """Enable Dion low-rank P/R synchronization."""
 
-    dion_scalar_optimizer: str = "adamw"
-    """Scalar optimizer used for non-Dion parameter surfaces."""
+    dion_elementwise_optimizer: str = "adamw"
+    """Elementwise optimizer used for standard parameter surfaces."""
 
-    dion_lr_scaling: str = "dion"
-    """Dion 2D learning-rate scaling rule."""
+    dion_scale_mode: str = "spectral"
+    """Dion 2D scale mode."""
 
-    dion_scaling_factor: float = 1.0
-    """Additional multiplicative constant used by Dion 2D LR scaling."""
+    dion_extra_scale_factor: float = 0.2
+    """Additional multiplicative constant used by Dion 2D scaling."""
 
     dion_beta1: float = 0.9
-    """Beta1 for Dion scalar optimizer states."""
+    """Beta1 for Dion elementwise optimizer states."""
 
     dion_beta2: float = 0.95
-    """Beta2 for Dion scalar optimizer states."""
+    """Beta2 for Dion elementwise optimizer states."""
 
-    dion_scalar_eps: float = 1e-8
-    """Epsilon for Dion scalar optimizer updates."""
+    dion_elementwise_eps: float = 1e-8
+    """Epsilon for Dion elementwise optimizer updates."""
 
     dion_split_qkv: bool = False
     """Whether Dion should treat fused QKV weights as optimizer-only Q/K/V children."""
