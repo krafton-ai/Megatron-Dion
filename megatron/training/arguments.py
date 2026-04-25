@@ -2101,7 +2101,7 @@ def _add_training_args(parser):
     group.add_argument('--dion-scalar-optimizer', type=str, default='adamw',
                        choices=['lion', 'adamw'],
                        help='Scalar optimizer used for non-2D Dion parameters.')
-    group.add_argument('--dion-lr-scaling', type=str, default='moonlight',
+    group.add_argument('--dion-lr-scaling', type=str, default='dion',
                        choices=['moonlight', 'dion'],
                        help='2D Dion learning-rate scaling rule.')
     group.add_argument('--dion-scaling-factor', type=float, default=1.0,

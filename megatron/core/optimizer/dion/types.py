@@ -8,7 +8,10 @@ import torch
 
 @dataclass
 class DionMixedPrecisionConfig:
-    """Configuration for mixed precision in Dion optimizer."""
+    """Configuration for mixed precision in Dion optimizer.
+
+    None uses the same dtype as the optimizer parameter.
+    """
 
     momentum_dtype: Optional[torch.dtype] = None
     q_dtype: Optional[torch.dtype] = None

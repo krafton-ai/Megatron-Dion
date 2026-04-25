@@ -64,6 +64,14 @@ class MegatronDion(Optimizer):
         split_linear: bool = False,
         max_concurrent_tasks: Optional[int] = None,  # Optional async concurrency hint
     ):
+        if isinstance(params, (list, tuple)):
+            for param_group in params:
+                if isinstance(param_group, dict) and "wd_mult" in param_group:
+                    base_weight_decay = float(param_group.get("weight_decay", weight_decay))
+                    param_group["weight_decay"] = base_weight_decay * float(
+                        param_group.get("wd_mult", 1.0)
+                    )
+
         defaults = dict(
             lr=lr,
             mu=mu,
@@ -243,7 +251,12 @@ class MegatronDion(Optimizer):
                 elif 'momentum' in state:
                     state['first_moment'] = state.pop('momentum')
                 else:
-                    state['first_moment'] = torch.zeros_like(param, dtype=torch.float32)
+                    momentum_dtype = (
+                        self._mixed_precision_config.momentum_dtype
+                        if self._mixed_precision_config.momentum_dtype is not None
+                        else param.dtype
+                    )
+                    state['first_moment'] = torch.zeros_like(param, dtype=momentum_dtype)
             return state['first_moment']
 
         def _ensure_scalar_second_moment_state(param, state) -> torch.Tensor:
@@ -260,7 +273,7 @@ class MegatronDion(Optimizer):
                     variance_dtype = (
                         self._mixed_precision_config.variance_dtype
                         if self._mixed_precision_config.variance_dtype is not None
-                        else torch.float32
+                        else param.dtype
                     )
                     state['second_moment'] = torch.zeros_like(param, dtype=variance_dtype)
             return state['second_moment']

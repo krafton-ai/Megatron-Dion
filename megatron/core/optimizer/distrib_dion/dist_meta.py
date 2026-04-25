@@ -96,6 +96,28 @@ def group_ranks(group):
     return tuple(dist.get_process_group_ranks(group))
 
 
+def assert_context_parallel_excluded(*, label: str, group, extra: str = "") -> None:
+    """Fail fast when a Dion group contains the caller's context-parallel peers."""
+    if group is None:
+        return
+    cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+    if cp_group is None:
+        return
+    cp_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(cp_group))
+    if len(cp_ranks) <= 1:
+        return
+    group_rank_tuple = tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+    global_rank = int(dist.get_rank())
+    cp_rank_set = set(cp_ranks)
+    overlap = tuple(rank for rank in group_rank_tuple if rank in cp_rank_set)
+    if overlap != (global_rank,):
+        raise RuntimeError(
+            f"[Dion][CP] {label} group must exclude context-parallel peers: "
+            f"group_ranks={group_rank_tuple} context_parallel_ranks={cp_ranks} "
+            f"overlap={overlap} global_rank={global_rank}. {extra}".strip()
+        )
+
+
 def expected_expert_fs_group():
     """Return the authoritative Megatron-Core expert-local shard group."""
     group = parallel_state.get_expert_data_parallel_group(
@@ -134,6 +156,14 @@ def select_fs_group(*, model_param, fs_group):
                 "Dion EP must keep expert params on the standard expert-local DO shard group."
             ),
         )
+        assert_context_parallel_excluded(
+            label="expert param fs_group",
+            group=expert_group,
+            extra=(
+                f"param={getattr(model_param, '_param_name', '') or id(model_param)} "
+                "CP must not be part of Dion expert FS/orthogonalization domains."
+            ),
+        )
         return expert_group
     return fs_group
 
@@ -149,6 +179,14 @@ def select_tp_group(model_param):
                 "[Dion][EP] missing expert TP group for expert TP-sharded param "
                 f"param={getattr(model_param, '_param_name', '') or id(model_param)}"
             )
+        assert_context_parallel_excluded(
+            label="expert TP group",
+            group=group,
+            extra=(
+                f"param={getattr(model_param, '_param_name', '') or id(model_param)} "
+                "CP must not be part of Dion distributed orthogonalization domains."
+            ),
+        )
         return group
     return parallel_state.get_tensor_model_parallel_group(check_initialized=False)
 

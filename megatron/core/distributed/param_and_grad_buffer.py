@@ -597,7 +597,7 @@ class _ParamAndGradBucketGroup:
                 for idx, bucket in enumerate(self.buckets):
                     has_dion = bucket.has_dion_params
                     has_non_dion = bucket.has_non_dion_params
-                    if not has_dion or has_non_dion:
+                    if not has_dion:
                         local_data_view = self._get_standard_local_grad_view(idx, bucket)
                         has_standard_local_grad = (
                             local_data_view is not None and local_data_view.numel() > 0
@@ -609,21 +609,21 @@ class _ParamAndGradBucketGroup:
                                 group=self.inter_distributed_optimizer_instance_group,
                                 async_op=async_op,
                             )
-                    if has_dion:
+                    elif has_non_dion:
                         optimizer = getattr(bucket, "dion_optimizer", None)
-                        if optimizer is None or not hasattr(
-                            optimizer, "_get_dion_bucket_inter_instance_grad_buffer"
+                        if not hasattr(
+                            optimizer, "_get_dion_bucket_inter_instance_non_dion_grad_buffer"
                         ):
                             raise RuntimeError(
-                                "[Dion] missing adapter inter-instance grad hook "
+                                "[Dion] missing adapter inter-instance non-Dion grad hook "
                                 f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                             )
-                        dion_data_view = optimizer._get_dion_bucket_inter_instance_grad_buffer(
-                            bucket
+                        non_dion_data_view = (
+                            optimizer._get_dion_bucket_inter_instance_non_dion_grad_buffer(bucket)
                         )
-                        if dion_data_view is not None and dion_data_view.numel() > 0:
+                        if non_dion_data_view is not None and non_dion_data_view.numel() > 0:
                             torch.distributed.all_reduce(
-                                dion_data_view,
+                                non_dion_data_view,
                                 op=reduce_op,
                                 group=self.inter_distributed_optimizer_instance_group,
                                 async_op=async_op,

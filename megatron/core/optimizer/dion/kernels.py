@@ -179,19 +179,19 @@ def compute_update_batch(
     delta_shape,
 ) -> Tensor:
     """Compute the batched Dion low-rank update tensor before LR scaling."""
-    q_new_f32 = Q_new_batch[:real_batch_size].float()
     p_for_delta = P_batch[:real_batch_size]
+    q_new_for_delta = Q_new_batch[:real_batch_size].to(dtype=p_for_delta.dtype)
     is_transposed = configs[0].is_transposed
     with _dion_math_precision_context():
         if all(c.is_transposed == is_transposed for c in configs[:real_batch_size]):
             if is_transposed:
-                return _compute_update_batch_transposed(q_new_f32, p_for_delta)
-            return _compute_update_batch_regular(q_new_f32, p_for_delta)
+                return _compute_update_batch_transposed(q_new_for_delta, p_for_delta)
+            return _compute_update_batch_regular(q_new_for_delta, p_for_delta)
 
         delta_batch = torch.empty(
             (real_batch_size, *delta_shape),
-            dtype=q_new_f32.dtype,
-            device=q_new_f32.device,
+            dtype=q_new_for_delta.dtype,
+            device=q_new_for_delta.device,
         )
 
         transposed_indices = [
@@ -204,14 +204,14 @@ def compute_update_batch(
         if regular_indices:
             regular_delta = torch.bmm(
                 p_for_delta[regular_indices],
-                q_new_f32[regular_indices].transpose(1, 2),
+                q_new_for_delta[regular_indices].transpose(1, 2),
             )
             delta_batch[regular_indices].copy_(regular_delta)
             del regular_delta
 
         if transposed_indices:
             transposed_delta = torch.bmm(
-                q_new_f32[transposed_indices],
+                q_new_for_delta[transposed_indices],
                 p_for_delta[transposed_indices].transpose(1, 2),
             )
             delta_batch[transposed_indices].copy_(transposed_delta)

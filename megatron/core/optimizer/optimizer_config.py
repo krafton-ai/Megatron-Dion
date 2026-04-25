@@ -489,7 +489,7 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_scalar_optimizer: str = "adamw"
     """Scalar optimizer used for non-Dion parameter surfaces."""
 
-    dion_lr_scaling: str = "moonlight"
+    dion_lr_scaling: str = "dion"
     """Dion 2D learning-rate scaling rule."""
 
     dion_scaling_factor: float = 1.0

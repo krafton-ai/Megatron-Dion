@@ -18,7 +18,6 @@ from .kernels import (
 from .ortho import (
     _dion_math_precision_context,
     distributed_orthogonalize,
-    make_sketch,
     orthogonalize,
     reshard_q_along_tp,
 )
@@ -28,6 +27,23 @@ from .utils import get_global_shape
 
 _REPLICATE_GROUP_UNSET = object()
 logger = logging.getLogger(__name__)
+
+
+def _rank_range_for_dim(size: int, world_size: int, rank: int) -> tuple[int, int]:
+    size = int(size)
+    world_size = int(world_size)
+    rank = int(rank)
+    if size < 0:
+        raise RuntimeError(f"[DION_INVALID_RANGE_SIZE] size={size}")
+    if world_size <= 0:
+        raise RuntimeError(f"[DION_INVALID_WORLD_SIZE] world_size={world_size}")
+    if rank < 0 or rank >= world_size:
+        raise RuntimeError(f"[DION_INVALID_RANK] rank={rank} world_size={world_size}")
+    base = size // world_size
+    remainder = size % world_size
+    start = rank * base + min(rank, remainder)
+    end = start + base + (1 if rank < remainder else 0)
+    return int(start), int(end)
 
 
 class AsyncTask:
@@ -221,6 +237,9 @@ def _validate_batch_update_contract(
 
         optim_group = optim_groups[index]
         lr = float(optim_group.get("lr", optimizer.defaults["lr"]))
+        rank_fraction = float(
+            optim_group.get("rank_fraction", optimizer.defaults.get("rank_fraction", 0.25))
+        )
         wd_mult = float(optim_group.get("wd_mult", 1.0))
         weight_decay = float(
             optim_group.get("weight_decay", optimizer.defaults["weight_decay"] * wd_mult)
@@ -238,6 +257,7 @@ def _validate_batch_update_contract(
                 "m_for_lr": int(m_for_lr),
                 "n_for_lr": int(n_for_lr),
                 "lr": lr,
+                "rank_fraction": rank_fraction,
                 "weight_decay": weight_decay,
                 "mu": mu,
                 "r": int(optimizer_state.get("r", -1)),
@@ -252,6 +272,7 @@ def _validate_batch_update_contract(
             "m_for_lr",
             "n_for_lr",
             "lr",
+            "rank_fraction",
             "weight_decay",
             "mu",
             "r",
@@ -386,8 +407,13 @@ def run_dion_batch_async(
 
 
 def replicate_reduce_op(optimizer):
-    """Replicate-domain collapse must match `dion_reference.py` semantics."""
-    del optimizer
+    """Return the RP collapse op matching MCore's grad-scaling mode."""
+    average_in_collective = bool(optimizer.defaults.get("rp_average_in_collective", True))
+    return dist.ReduceOp.AVG if average_in_collective else dist.ReduceOp.SUM
+
+
+def low_rank_replicate_reduce_op():
+    """Return the reference Dion compressed P/R replica reduction op."""
     return dist.ReduceOp.AVG
 
 
@@ -407,15 +433,15 @@ def collapse_grads_across_replicas(
         return
 
     op = replicate_reduce_op(optimizer)
-    for grad in grads:
-        if grad.is_contiguous():
-            dist.all_reduce(grad, op=op, group=replicate_group)
-            continue
-
-        reduced_grad = grad.contiguous()
-        dist.all_reduce(reduced_grad, op=op, group=replicate_group)
-        grad.copy_(reduced_grad)
+    reduced_grads = funcol.all_reduce_coalesced(
+        [grad if grad.is_contiguous() else grad.contiguous() for grad in grads],
+        reduceOp="avg" if op == dist.ReduceOp.AVG else "sum",
+        group=replicate_group,
+    )
     yield
+    for grad, reduced_grad in zip(grads, reduced_grads):
+        if grad.data_ptr() != reduced_grad.data_ptr():
+            grad.copy_(reduced_grad)
 
 
 def collapse_batch_across_replicas(
@@ -433,11 +459,8 @@ def collapse_batch_across_replicas(
     if replicate_group is None:
         return batch
 
-    reduced_batch = funcol.all_reduce(
-        batch,
-        reduceOp="avg" if replicate_reduce_op(optimizer) == dist.ReduceOp.AVG else "sum",
-        group=replicate_group,
-    )
+    del optimizer
+    reduced_batch = funcol.all_reduce(batch, reduceOp="avg", group=replicate_group)
     yield
     return reduced_batch
 
@@ -457,16 +480,49 @@ def enable_distributed_mode(
     optimizer._route_step_params = route_step_params
 
 
+def _orthogonalize_real_batch(
+    optimizer,
+    P_batch: Tensor,
+    *,
+    real_batch_size: Optional[int],
+    make_sketch=None,
+) -> Tensor:
+    """Orthogonalize real batch entries while preserving inert padded slots."""
+    batch_size = int(P_batch.size(0))
+    real_entry_count = batch_size if real_batch_size is None else int(real_batch_size)
+    if real_entry_count <= 0 or real_entry_count > batch_size:
+        raise RuntimeError(
+            "[DION_INVALID_ORTHO_REAL_BATCH_SIZE] "
+            f"real_batch_size={real_entry_count} batch_size={batch_size}"
+        )
+
+    original_dtype = P_batch.dtype
+    with _dion_math_precision_context():
+        P_real = orthogonalize(
+            P_batch[:real_entry_count],
+            rcqr_oversample=optimizer.defaults["rcqr_oversample"],
+            make_sketch=make_sketch,
+        )
+    P_real = P_real.to(original_dtype).contiguous()
+    if real_entry_count == batch_size:
+        return P_real
+
+    P_ortho = P_batch.clone().contiguous()
+    P_ortho[:real_entry_count].copy_(P_real)
+    return P_ortho
+
+
 def unshard_q_batch(
     optimizer,
     Qs: List[Tensor],
     configs: List[DionParamConfig],
     dist_metas: Optional[List] = None,
+    optimizer_states: Optional[List[dict]] = None,
     batch_collectives: Optional[DionBatchCollectives] = None,
     cache_scope: Optional[int] = None,
 ) -> Generator[List[Tensor], None, None]:
     """All-gather TP-sharded Q blocks needed for local matmul."""
-    del configs, dist_metas
+    del configs
     batch_size = len(Qs)
     q_for_matmul: List[Optional[Tensor]] = [None] * batch_size
     if batch_collectives is None:
@@ -495,38 +551,87 @@ def unshard_q_batch(
                 )
             if not indices:
                 continue
+            if optimizer_states is None:
+                raise RuntimeError(
+                    "[DION_MISSING_Q_UNSHARD_STATE] "
+                    f"step={optimizer._step_count} rank={optimizer._global_rank} indices={indices}"
+                )
+            state_index = next(
+                (
+                    idx
+                    for idx in indices
+                    if idx < len(optimizer_states) and optimizer_states[idx] is not None
+                ),
+                None,
+            )
+            if state_index is None:
+                raise RuntimeError(
+                    "[DION_MISSING_Q_UNSHARD_REAL_STATE] "
+                    f"step={optimizer._step_count} rank={optimizer._global_rank} indices={indices}"
+                )
             q0 = Qs[indices[0]]
             n = q0.size(0)
-            r_local = q0.size(1)
             dtype = q0.dtype
             device = q0.device
+            tp_size = int(collective.world_size)
+            tp_rank = int(collective.rank)
+            r_global = int(optimizer_states[state_index].get("r", -1))
+            if r_global <= 0:
+                raise RuntimeError(
+                    "[DION_INVALID_Q_UNSHARD_RANK] "
+                    f"step={optimizer._step_count} rank={optimizer._global_rank} "
+                    f"param_uid={getattr(dist_metas[state_index], 'param_uid', None) if dist_metas is not None else None} "
+                    f"r={r_global}"
+                )
+            rank_col_ranges = [
+                _rank_range_for_dim(r_global, tp_size, rank) for rank in range(tp_size)
+            ]
+            rank_col_sizes = [end - start for start, end in rank_col_ranges]
+            local_cols = int(rank_col_sizes[tp_rank])
+            if local_cols <= 0:
+                raise RuntimeError(
+                    "[DION_EMPTY_Q_SHARD] "
+                    f"step={optimizer._step_count} rank={optimizer._global_rank} "
+                    f"r_global={r_global} tp_world_size={tp_size} tp_rank={tp_rank}"
+                )
+            if int(q0.size(1)) != local_cols:
+                raise RuntimeError(
+                    "[DION_Q_UNSHARD_LOCAL_RANK_MISMATCH] "
+                    f"step={optimizer._step_count} rank={optimizer._global_rank} "
+                    f"expected_cols={local_cols} local_shape={tuple(q0.shape)} "
+                    f"r_global={r_global} tp_world_size={tp_size} tp_rank={tp_rank}"
+                )
             for idx in indices[1:]:
                 q_local = Qs[idx]
+                idx_state = optimizer_states[idx] if idx < len(optimizer_states) else None
+                idx_r_global = r_global if idx_state is None else int(idx_state.get("r", -1))
                 if (
                     q_local.size(0) != n
-                    or q_local.size(1) != r_local
+                    or q_local.size(1) != local_cols
                     or q_local.dtype != dtype
                     or q_local.device != device
+                    or idx_r_global != r_global
                 ):
                     raise RuntimeError(
                         "[DION_INCONSISTENT_Q_UNSHARD_LAYOUT] "
                         f"step={optimizer._step_count} rank={optimizer._global_rank} indices={indices} "
-                        f"first_shape={(n, r_local)} first_dtype={dtype} idx={idx} "
-                        f"local_shape={tuple(q_local.shape)} local_dtype={q_local.dtype}"
+                        f"first_shape={(n, local_cols)} first_dtype={dtype} first_r={r_global} "
+                        f"idx={idx} local_shape={tuple(q_local.shape)} local_dtype={q_local.dtype} "
+                        f"local_r={idx_r_global}"
                     )
-            tp_size = collective.world_size
             local_batch = optimizer._cached_buffer(
                 f"q_local_batch_{scope}_{group_seq}",
-                (len(indices), n, r_local),
+                (len(indices), n, max(rank_col_sizes)),
                 dtype,
                 device,
+                zero=True,
             )
             for local_index, idx in enumerate(indices):
-                local_batch[local_index].copy_(Qs[idx])
+                local_batch[local_index, :, :local_cols].copy_(Qs[idx])
 
             gathered_batch = optimizer._cached_buffer(
                 f"q_gather_batch_{scope}_{group_seq}",
-                (tp_size, len(indices), n, r_local),
+                (tp_size, len(indices), n, max(rank_col_sizes)),
                 dtype,
                 device,
             )
@@ -536,17 +641,48 @@ def unshard_q_batch(
                 group=tp_group,
                 async_op=True,
             )
-            pending.append((indices, tp_size, n, r_local, local_batch, gathered_batch, handle))
+            pending.append(
+                (
+                    indices,
+                    n,
+                    r_global,
+                    tuple(rank_col_sizes),
+                    local_batch,
+                    gathered_batch,
+                    handle,
+                    group_seq,
+                    scope,
+                )
+            )
 
         yield
 
-        for indices, tp_size, n, r_local, local_batch, gathered_batch, handle in pending:
+        for (
+            indices,
+            n,
+            r_global,
+            rank_col_sizes,
+            local_batch,
+            gathered_batch,
+            handle,
+            group_seq,
+            scope,
+        ) in pending:
             handle.wait()
-            q_full_batch = (
-                gathered_batch.permute(1, 2, 0, 3)
-                .contiguous()
-                .view(len(indices), n, tp_size * r_local)
+            q_full_batch = optimizer._cached_buffer(
+                f"q_full_batch_{scope}_{group_seq}",
+                (len(indices), n, r_global),
+                gathered_batch.dtype,
+                gathered_batch.device,
             )
+            col_start = 0
+            for rank, rank_cols in enumerate(rank_col_sizes):
+                rank_cols = int(rank_cols)
+                col_end = col_start + rank_cols
+                q_full_batch[:, :, col_start:col_end].copy_(
+                    gathered_batch[rank, :, :, :rank_cols]
+                )
+                col_start = col_end
             for local_index, idx in enumerate(indices):
                 q_for_matmul[idx] = q_full_batch[local_index]
             del local_batch
@@ -764,8 +900,11 @@ def apply_batch_updates(
         lr=lr,
         m_for_lr=m_for_lr,
         n_for_lr=n_for_lr,
-        rule=optimizer.defaults.get("lr_scaling_rule", "moonlight"),
-        rank_fraction=optimizer.defaults.get("rank_fraction", 0.25),
+        rule=optimizer.defaults.get("lr_scaling_rule", "dion"),
+        rank_fraction=optim_groups[0].get(
+            "rank_fraction",
+            optimizer.defaults.get("rank_fraction", 0.25),
+        ),
         scaling_factor=optimizer.defaults.get("scaling_factor", 1.0),
     )
 
@@ -836,6 +975,7 @@ def run_compressed_comm_async(
     dist_metas: List,
     batch_group: Optional[DionBatchGroup] = None,
     batch_collectives: Optional[DionBatchCollectives] = None,
+    real_batch_size: Optional[int] = None,
     skip_p_replicate: bool = False,
     skip_r_replicate: bool = False,
 ) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
@@ -855,6 +995,13 @@ def run_compressed_comm_async(
     ortho_group = batch_group.ortho_group
     kernel_kind = batch_group.kernel_kind
     batch_size = P_batch.size(0)
+    original_batch_size = batch_size
+    real_entry_count = int(real_batch_size) if real_batch_size is not None else int(batch_size)
+    if real_entry_count <= 0 or real_entry_count > int(batch_size):
+        raise RuntimeError(
+            "[DION_INVALID_REAL_BATCH_SIZE] "
+            f"real_batch_size={real_entry_count} batch_size={int(batch_size)}"
+        )
     fs_collective = batch_collectives.fs_collective
     if (
         kernel_kind == "fsdp"
@@ -902,7 +1049,7 @@ def run_compressed_comm_async(
         ):
             dist.all_reduce(
                 P_single,
-                op=replicate_reduce_op(optimizer),
+                op=low_rank_replicate_reduce_op(),
                 group=compressed_replicate_group,
             )
             yield
@@ -923,16 +1070,10 @@ def run_compressed_comm_async(
             )
             P_single = torch.zeros_like(P_single).contiguous()
         else:
-            sketch = make_sketch(
-                dist_metas=[rank_meta],
-                contract="fsdp",
-                step_count=optimizer._step_count,
-            )
             with _dion_math_precision_context():
                 P_single = orthogonalize(
                     P_single,
                     rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                    make_sketch=sketch,
                 )
             P_single = P_single.to(P_batch.dtype).contiguous()
 
@@ -980,14 +1121,14 @@ def run_compressed_comm_async(
                 ortho_group=ortho_group,
                 oversample=optimizer.defaults["rcqr_oversample"],
                 dist_metas=dist_metas,
+                real_batch_size=real_entry_count,
             )
         else:
-            with _dion_math_precision_context():
-                P_batch = orthogonalize(
-                    P_batch,
-                    rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                )
-            P_batch = P_batch.to(M_batch.dtype).contiguous()
+            P_batch = _orthogonalize_real_batch(
+                optimizer,
+                P_batch,
+                real_batch_size=real_entry_count,
+            ).to(M_batch.dtype).contiguous()
 
         R_batch = M_batch.mT @ P_batch
         yield from reduce_r_across_tp(
@@ -1001,8 +1142,6 @@ def run_compressed_comm_async(
             optimizer, R_batch, replicate_group=comm_group
         )
         return P_batch, R_batch
-
-    original_batch_size = batch_size
 
     if kernel_kind == "fsdp_tp":
         if skip_p_replicate and (comm_group is None or comm_world_size <= 1):
@@ -1028,14 +1167,14 @@ def run_compressed_comm_async(
                 ortho_group=ortho_group,
                 oversample=optimizer.defaults["rcqr_oversample"],
                 dist_metas=dist_metas,
+                real_batch_size=real_entry_count,
             )
         else:
-            with _dion_math_precision_context():
-                P_batch = orthogonalize(
-                    P_batch,
-                    rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                )
-            P_batch = P_batch.to(M_batch.dtype).contiguous()
+            P_batch = _orthogonalize_real_batch(
+                optimizer,
+                P_batch,
+                real_batch_size=real_entry_count,
+            ).to(M_batch.dtype).contiguous()
         with _dion_math_precision_context():
             R_batch = M_batch.mT @ P_batch
         yield from reduce_r_across_tp(
@@ -1067,16 +1206,14 @@ def run_compressed_comm_async(
 
     if use_replicated_orthogonalize:
         if comm_world_size <= 1:
-            yield
-            with _dion_math_precision_context():
-                P_batch = orthogonalize(
-                    P_batch,
-                    rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                )
-            P_batch = P_batch.to(M_batch.dtype).contiguous()
+            raise RuntimeError(
+                "[DION_INVALID_COMPRESSED_REPLICATED_ORTHO_WORLD_SIZE] "
+                f"step={optimizer._step_count} rank={optimizer._global_rank} "
+                f"comm_world_size={comm_world_size}"
+            )
         else:
-            batch_size = P_batch.size(0)
-            real_batch_size = batch_size
+            unpadded_batch_size = int(P_batch.size(0))
+            batch_size = unpadded_batch_size
             if batch_size % comm_world_size != 0:
                 pad = comm_world_size - (batch_size % comm_world_size)
                 padded_batch_size = batch_size + pad
@@ -1092,7 +1229,8 @@ def run_compressed_comm_async(
                 batch_size = P_batch.size(0)
 
             comm_rank = dist.get_rank(comm_group)
-            P_batch = optimizer._cached_buffer(
+            P_source_batch = P_batch
+            P_ortho_batch = optimizer._cached_buffer(
                 "replicated_p_ortho_full",
                 P_batch.shape,
                 P_batch.dtype,
@@ -1101,7 +1239,7 @@ def run_compressed_comm_async(
 
             for chunk_start in range(0, batch_size, comm_world_size):
                 chunk_end = chunk_start + comm_world_size
-                P_chunk = P_batch[chunk_start:chunk_end].contiguous()
+                P_chunk = P_source_batch[chunk_start:chunk_end].contiguous()
                 P_single = funcol.reduce_scatter_tensor(
                     P_chunk.contiguous(),
                     reduceOp="avg",
@@ -1110,7 +1248,7 @@ def run_compressed_comm_async(
                 )
                 yield
                 batch_index = chunk_start + comm_rank
-                if batch_index >= real_batch_size:
+                if batch_index >= real_entry_count:
                     torch._assert_async(
                         torch.count_nonzero(P_single) == 0,
                         f"[DION_NONZERO_DDP_PADDED_MATRIX] shape={tuple(P_single.shape)}",
@@ -1129,9 +1267,9 @@ def run_compressed_comm_async(
                     group=comm_group,
                 )
                 yield
-                P_batch[chunk_start:chunk_end].copy_(P_chunk)
+                P_ortho_batch[chunk_start:chunk_end].copy_(P_chunk)
 
-            P_batch = P_batch[:real_batch_size]
+            P_batch = P_ortho_batch[:unpadded_batch_size]
     else:
         if ortho_group is not None:
             P_batch = distributed_orthogonalize(
@@ -1243,6 +1381,7 @@ def batch_dion_update_async(
         configs,
         dist_metas,
         batch_collectives=batch_collectives,
+        optimizer_states=optimizer_states,
         cache_scope=global_param_offset,
     )
 
@@ -1251,7 +1390,7 @@ def batch_dion_update_async(
         for momentum, config in zip(momentums, configs)
     ]
     M_batch = torch.stack(M_for_matmul, dim=0)
-    Q_batch = torch.stack(Q_for_matmul, dim=0)
+    Q_batch = torch.stack(Q_for_matmul, dim=0).to(M_batch.dtype)
     del Q_for_matmul
 
     with _dion_math_precision_context():
@@ -1276,6 +1415,7 @@ def batch_dion_update_async(
             dist_metas,
             batch_group,
             batch_collectives,
+            real_batch_size=real_batch_size,
         )
     else:
         use_replicated_orthogonalize = (
@@ -1285,16 +1425,21 @@ def batch_dion_update_async(
         )
         if use_replicated_orthogonalize:
             if replicate_world_size <= 1:
-                yield
-                with _dion_math_precision_context():
-                    P_batch = orthogonalize(
-                        P_batch,
-                        rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                    )
-                P_batch = P_batch.to(dtype).contiguous()
+                raise RuntimeError(
+                    "[DION_INVALID_REPLICATED_ORTHO_WORLD_SIZE] "
+                    f"step={optimizer._step_count} rank={optimizer._global_rank} "
+                    f"replicate_world_size={replicate_world_size}"
+                )
             else:
-                batch_size = P_batch.size(0)
-                real_batch_size = batch_size
+                real_entry_count = int(real_batch_size)
+                unpadded_batch_size = int(P_batch.size(0))
+                if real_entry_count <= 0 or real_entry_count > unpadded_batch_size:
+                    raise RuntimeError(
+                        "[DION_INVALID_REAL_BATCH_SIZE] "
+                        f"real_batch_size={real_entry_count} "
+                        f"batch_size={unpadded_batch_size}"
+                    )
+                batch_size = unpadded_batch_size
                 scope = str(int(global_param_offset))
                 if batch_size % replicate_world_size != 0:
                     pad = replicate_world_size - (batch_size % replicate_world_size)
@@ -1311,7 +1456,8 @@ def batch_dion_update_async(
                     batch_size = P_batch.size(0)
 
                 replicate_rank = dist.get_rank(replicate_group)
-                P_batch = optimizer._cached_buffer(
+                P_source_batch = P_batch
+                P_ortho_batch = optimizer._cached_buffer(
                     f"replicated_p_ortho_full_{scope}",
                     P_batch.shape,
                     P_batch.dtype,
@@ -1320,13 +1466,21 @@ def batch_dion_update_async(
 
                 for chunk_start in range(0, batch_size, replicate_world_size):
                     chunk_end = chunk_start + replicate_world_size
-                    P_chunk = P_batch[chunk_start:chunk_end].contiguous()
+                    P_chunk = P_source_batch[chunk_start:chunk_end].contiguous()
                     P_single = P_chunk[replicate_rank : replicate_rank + 1].clone()
-                    with _dion_math_precision_context():
-                        P_single = orthogonalize(
-                            P_single,
-                            rcqr_oversample=optimizer.defaults["rcqr_oversample"],
+                    batch_index = chunk_start + replicate_rank
+                    if batch_index >= real_entry_count:
+                        torch._assert_async(
+                            torch.count_nonzero(P_single) == 0,
+                            f"[DION_NONZERO_DDP_PADDED_MATRIX] shape={tuple(P_single.shape)}",
                         )
+                        P_single = torch.zeros_like(P_single).contiguous()
+                    else:
+                        with _dion_math_precision_context():
+                            P_single = orthogonalize(
+                                P_single,
+                                rcqr_oversample=optimizer.defaults["rcqr_oversample"],
+                            )
                     P_single = P_single.to(P_chunk.dtype).contiguous()
                     P_chunk = funcol.all_gather_tensor(
                         P_single.contiguous(),
@@ -1334,9 +1488,9 @@ def batch_dion_update_async(
                         group=replicate_group,
                     )
                     yield
-                    P_batch[chunk_start:chunk_end].copy_(P_chunk)
+                    P_ortho_batch[chunk_start:chunk_end].copy_(P_chunk)
 
-                P_batch = P_batch[:real_batch_size]
+                P_batch = P_ortho_batch[:unpadded_batch_size]
         else:
             if configs and all(is_fs_only_config(config) for config in configs):
                 if batch_collectives is None or batch_collectives.fs_collective is None:
@@ -1351,13 +1505,11 @@ def batch_dion_update_async(
                 batch_size = int(P_batch.size(0))
 
                 if fs_group is None or fs_world_size <= 1:
-                    original_dtype = P_batch.dtype
-                    with _dion_math_precision_context():
-                        P_batch = orthogonalize(
-                            P_batch,
-                            rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                        )
-                    P_batch = P_batch.to(original_dtype).contiguous()
+                    P_batch = _orthogonalize_real_batch(
+                        optimizer,
+                        P_batch,
+                        real_batch_size=real_batch_size,
+                    )
                 else:
                     if batch_size != fs_world_size:
                         raise RuntimeError(
@@ -1393,16 +1545,10 @@ def batch_dion_update_async(
                         )
                         P_single = torch.zeros_like(P_single).contiguous()
                     else:
-                        sketch = make_sketch(
-                            dist_metas=[rank_meta],
-                            contract="fsdp",
-                            step_count=optimizer._step_count,
-                        )
                         with _dion_math_precision_context():
                             P_single = orthogonalize(
                                 P_single,
                                 rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                                make_sketch=sketch,
                             )
                     P_single = P_single.to(P_batch.dtype).contiguous()
 
@@ -1432,13 +1578,11 @@ def batch_dion_update_async(
                     real_batch_size=real_batch_size,
                 )
             else:
-                original_dtype = P_batch.dtype
-                with _dion_math_precision_context():
-                    P_batch = orthogonalize(
-                        P_batch,
-                        rcqr_oversample=optimizer.defaults["rcqr_oversample"],
-                    )
-                P_batch = P_batch.to(original_dtype).contiguous()
+                P_batch = _orthogonalize_real_batch(
+                    optimizer,
+                    P_batch,
+                    real_batch_size=real_batch_size,
+                )
         with _dion_math_precision_context():
             R_batch = M_batch.mT @ P_batch
         yield from reduce_r_across_tp(

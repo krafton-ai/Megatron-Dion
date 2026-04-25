@@ -11,9 +11,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from ..optimizer_config import DionOptimizerConfig, OptimizerConfig
 
 
-_DENSE_DION_GROUP_CACHE: dict[tuple[int, ...], torch.distributed.ProcessGroup] = {}
-
-
 def _validate_exact_replica_group(
     *,
     selected_group: Optional[torch.distributed.ProcessGroup],
@@ -27,6 +24,10 @@ def _validate_exact_replica_group(
         return None
 
     selected_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(selected_group))
+    _validate_context_parallel_excluded(
+        selected_ranks=selected_ranks,
+        source=f"{source}:replica",
+    )
     if len(selected_ranks) != int(requested_rp_world_size):
         raise RuntimeError(
             "Dion replica group size mismatch after adapter resolution. "
@@ -50,129 +51,99 @@ def _validate_exact_replica_group(
     return selected_group
 
 
-def _get_or_create_cached_group(ranks: tuple[int, ...]) -> Optional[torch.distributed.ProcessGroup]:
-    """Return a cached process group for one deterministic dense-Dion mesh group."""
-    if len(ranks) <= 1:
-        return None
-    cached_group = _DENSE_DION_GROUP_CACHE.get(ranks)
-    if cached_group is not None:
-        return cached_group
-    group = dist.new_group(ranks=list(ranks))
-    _DENSE_DION_GROUP_CACHE[ranks] = group
-    return group
-
-
-def _resolve_dense_mesh_groups(
+def _validate_context_parallel_excluded(
     *,
+    selected_ranks: tuple[int, ...],
+    source: str,
+) -> None:
+    """Fail fast if a Dion communication group contains the caller's CP peers."""
+    if not dist.is_initialized():
+        return
+    try:
+        cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+    except Exception:
+        cp_group = None
+    if cp_group is None:
+        return
+    cp_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(cp_group))
+    if len(cp_ranks) <= 1:
+        return
+    global_rank = int(dist.get_rank())
+    overlap = tuple(rank for rank in selected_ranks if rank in set(cp_ranks))
+    if overlap != (global_rank,):
+        raise RuntimeError(
+            "Dion communication groups must exclude context-parallel peers. "
+            f"source={source} selected_ranks={selected_ranks} "
+            f"context_parallel_ranks={cp_ranks} overlap={overlap} "
+            f"global_rank={global_rank}"
+        )
+
+
+def _validate_dense_group(
+    *,
+    selected_group: Optional[torch.distributed.ProcessGroup],
     pure_dp_group: Optional[torch.distributed.ProcessGroup],
-    requested_fs_world_size: int,
-    requested_rp_world_size: int,
-) -> tuple[Optional[torch.distributed.ProcessGroup], Optional[torch.distributed.ProcessGroup]]:
-    """Resolve dense Dion FS/RP groups directly from the global dense pure-DP mesh."""
+    requested_world_size: int,
+    source: str,
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Validate an authoritative dense Dion group against the CP-excluded DP domain."""
+    if int(requested_world_size) <= 1:
+        return None
+    if selected_group is None:
+        raise RuntimeError(
+            "Dion dense topology requires an authoritative Megatron-Core process group. "
+            f"source={source} requested_world_size={requested_world_size}"
+        )
+    selected_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(selected_group))
+    _validate_context_parallel_excluded(
+        selected_ranks=selected_ranks,
+        source=f"{source}:dense",
+    )
+    if len(selected_ranks) != int(requested_world_size):
+        raise RuntimeError(
+            "Dion dense group size mismatch. "
+            f"source={source} requested_world_size={requested_world_size} "
+            f"actual_world_size={len(selected_ranks)} selected_ranks={selected_ranks}"
+        )
     if pure_dp_group is None:
         raise RuntimeError(
-            "Dion dense FS/RP mesh requires the pure data-parallel group, but it is not initialized."
+            "Dion dense topology requires the CP-excluded data-parallel group. "
+            f"source={source} selected_ranks={selected_ranks}"
         )
-
-    fs_size = max(int(requested_fs_world_size), 1)
-    rp_size = max(int(requested_rp_world_size), 1)
-    expected_pure_dp_world_size = fs_size * rp_size
-    tp_size = int(parallel_state.get_tensor_model_parallel_world_size())
-    pp_size = int(parallel_state.get_pipeline_model_parallel_world_size())
-    cp_size = int(parallel_state.get_context_parallel_world_size())
-    order = parallel_state.get_parallel_group_order()
-    dense_rank_generator = parallel_state.RankGenerator(
-        tp=tp_size,
-        ep=1,
-        dp=expected_pure_dp_world_size,
-        pp=pp_size,
-        cp=cp_size,
-        order=order,
-        rank_offset=0,
-    )
-    dense_pure_dp_rank_sets = [
-        tuple(int(rank) for rank in rank_set) for rank_set in dense_rank_generator.get_ranks("dp")
-    ]
-    current_pure_dp_ranks = tuple(
-        sorted(int(rank) for rank in dist.get_process_group_ranks(pure_dp_group))
-    )
-    pure_dp_world_size = len(current_pure_dp_ranks)
-    if pure_dp_world_size != expected_pure_dp_world_size:
+    pure_dp_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(pure_dp_group))
+    pure_dp_rank_set = set(pure_dp_ranks)
+    leaked_ranks = tuple(rank for rank in selected_ranks if rank not in pure_dp_rank_set)
+    if leaked_ranks:
         raise RuntimeError(
-            "Dion dense FS/RP topology mismatch while resolving mesh groups. "
-            f"requested_fs={requested_fs_world_size} requested_rp={requested_rp_world_size} "
-            f"expected_pure_dp_group_size={expected_pure_dp_world_size} "
-            f"actual_pure_dp_group_size={pure_dp_world_size} "
-            f"(pure_dp_group_ranks={current_pure_dp_ranks})."
+            "Dion dense group must be contained in the CP-excluded data-parallel domain. "
+            f"source={source} selected_ranks={selected_ranks} "
+            f"pure_dp_ranks={pure_dp_ranks} leaked_ranks={leaked_ranks}"
         )
-
-    global_rank = int(dist.get_rank())
-    if global_rank not in current_pure_dp_ranks:
-        raise RuntimeError(
-            "Current rank is missing from the pure data-parallel group while resolving Dion dense mesh. "
-            f"global_rank={global_rank} pure_dp_group_ranks={current_pure_dp_ranks}"
-        )
-    if current_pure_dp_ranks not in dense_pure_dp_rank_sets:
-        raise RuntimeError(
-            "Current pure data-parallel group is missing from the global dense DP mesh. "
-            f"global_rank={global_rank} pure_dp_group_ranks={current_pure_dp_ranks} "
-            f"dense_dp_rank_sets={dense_pure_dp_rank_sets}"
-        )
-
-    fs_rank_sets: list[tuple[int, ...]] = []
-    rp_rank_sets: list[tuple[int, ...]] = []
-    fs_ranks: tuple[int, ...] | None = None
-    rp_ranks: tuple[int, ...] | None = None
-    for pure_dp_ranks in dense_pure_dp_rank_sets:
-        if global_rank in pure_dp_ranks:
-            pure_dp_rank = pure_dp_ranks.index(global_rank)
-            fs_block = pure_dp_rank // fs_size
-            fs_offset = pure_dp_rank % fs_size
-            fs_ranks = tuple(
-                pure_dp_ranks[(fs_block * fs_size) : ((fs_block + 1) * fs_size)]
-            )
-            rp_ranks = tuple(
-                pure_dp_ranks[fs_offset + replica_idx * fs_size] for replica_idx in range(rp_size)
-            )
-        if fs_size > 1:
-            fs_rank_sets.extend(
-                tuple(pure_dp_ranks[(block_idx * fs_size) : ((block_idx + 1) * fs_size)])
-                for block_idx in range(rp_size)
-            )
-        if rp_size > 1:
-            rp_rank_sets.extend(
-                tuple(pure_dp_ranks[offset_idx + replica_idx * fs_size] for replica_idx in range(rp_size))
-                for offset_idx in range(fs_size)
-            )
-    if global_rank in current_pure_dp_ranks and (fs_ranks is None or rp_ranks is None):
-        raise RuntimeError(
-            "Failed to resolve current dense FS/RP groups from the global dense DP mesh. "
-            f"global_rank={global_rank} pure_dp_group_ranks={current_pure_dp_ranks}"
-        )
-    for rank_set in fs_rank_sets + rp_rank_sets:
-        _get_or_create_cached_group(rank_set)
-
-    return (
-        _get_or_create_cached_group(fs_ranks),
-        _get_or_create_cached_group(rp_ranks),
-    )
+    return selected_group
 
 
 def get_dion_param_override(
     config: OptimizerConfig,
     param: torch.nn.Parameter,
     param_override: Optional[ParamGroupOverride],
+    param_name: Optional[str] = None,
 ) -> Optional[ParamGroupOverride]:
     """Return Dion-specific scalar-surface LR overrides."""
     if not isinstance(config, DionOptimizerConfig):
         return None
 
-    is_text_embedding = bool(getattr(param, "is_text_embedding_parameter", False))
-    is_lm_head = bool(getattr(param, "is_lm_head_parameter", False))
+    name = param_name or getattr(param, "_param_name", "") or ""
+    is_embedding_or_output = bool(getattr(param, "is_embedding_or_output_parameter", False))
+    is_text_embedding = bool(getattr(param, "is_text_embedding_parameter", False)) or (
+        is_embedding_or_output and name.endswith("embedding.word_embeddings.weight")
+    )
+    is_lm_head = bool(getattr(param, "is_lm_head_parameter", False)) or (
+        is_embedding_or_output and name.endswith("output_layer.weight")
+    )
     is_shared_embedding = bool(getattr(param, "shared_embedding", False))
     is_tied_embedding_output = is_shared_embedding or (is_text_embedding and is_lm_head)
 
-    if not is_text_embedding and not is_lm_head:
+    if not is_embedding_or_output and not is_text_embedding and not is_lm_head:
         return None
 
     lr_scaling_rule = getattr(config, "dion_lr_scaling", None)
@@ -186,6 +157,12 @@ def get_dion_param_override(
                 f"[DION_LM_HEAD_INVALID_DIM] expected ndim>=2 for lm_head, got shape={tuple(param.shape)}"
             )
         fan_in = int(param.shape[1])
+        if (
+            bool(getattr(param, "tensor_model_parallel", False))
+            and int(getattr(param, "partition_dim", -1)) == 1
+            and parallel_state.model_parallel_is_initialized()
+        ):
+            fan_in *= int(parallel_state.get_tensor_model_parallel_world_size())
         if fan_in <= 0:
             raise RuntimeError(
                 f"[DION_LM_HEAD_INVALID_FAN_IN] lm_head fan_in must be > 0, got {fan_in}"
@@ -219,21 +196,6 @@ def _get_dion_replica_group(
 ) -> Optional[torch.distributed.ProcessGroup]:
     if requested_rp_world_size <= 1:
         return None
-
-    if (not is_expert_parallel) and pure_dp_group is not None:
-        _, replica_group = _resolve_dense_mesh_groups(
-            pure_dp_group=pure_dp_group,
-            requested_fs_world_size=requested_fs_world_size,
-            requested_rp_world_size=requested_rp_world_size,
-        )
-        if replica_group is not None:
-            return _validate_exact_replica_group(
-                selected_group=replica_group,
-                pure_dp_group=pure_dp_group,
-                requested_rp_world_size=requested_rp_world_size,
-                source="dense_mesh",
-                is_expert_parallel=is_expert_parallel,
-            )
 
     if pg_collection is not None and hasattr(pg_collection, 'inter_dist_opt_group'):
         group = pg_collection.inter_dist_opt_group
@@ -289,16 +251,12 @@ def _get_dense_dion_fs_group(
         )
     except Exception:
         dion_fs_group = None
-    if dion_fs_group is not None:
-        dion_fs_world_size = dist.get_world_size(dion_fs_group)
-        if dion_fs_world_size == requested_fs_world_size:
-            return dion_fs_group
-    dion_fs_group, _ = _resolve_dense_mesh_groups(
+    return _validate_dense_group(
+        selected_group=dion_fs_group,
         pure_dp_group=pure_dp_group,
-        requested_fs_world_size=requested_fs_world_size,
-        requested_rp_world_size=requested_rp_world_size,
+        requested_world_size=requested_fs_world_size,
+        source="intra_dist_opt_data_parallel",
     )
-    return dion_fs_group
 
 
 def _resolve_dion_fs_group(
@@ -309,7 +267,18 @@ def _resolve_dion_fs_group(
     requested_rp_world_size: int,
 ) -> Optional[torch.distributed.ProcessGroup]:
     if is_expert_parallel:
-        return parallel_state.get_expert_data_parallel_group(partial_expert_data_parallel=True)
+        expert_fs_group = parallel_state.get_expert_data_parallel_group(
+            partial_expert_data_parallel=True
+        )
+        if expert_fs_group is not None:
+            expert_fs_ranks = tuple(
+                int(rank) for rank in dist.get_process_group_ranks(expert_fs_group)
+            )
+            _validate_context_parallel_excluded(
+                selected_ranks=expert_fs_ranks,
+                source="expert_partial_data_parallel:fs",
+            )
+        return expert_fs_group
     return _get_dense_dion_fs_group(
         pure_dp_group=pure_data_parallel_group,
         requested_fs_world_size=requested_fs_world_size,

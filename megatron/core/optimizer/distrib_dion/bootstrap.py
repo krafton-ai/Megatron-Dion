@@ -13,6 +13,7 @@ from ..dion.state import (
     get_global_shape,
     q_seed_from_param_key,
     resolve_q_state_layout,
+    should_compress_all_reduce,
 )
 from ..dion.utils import get_local_shape
 from ..dion.types import DionQInit, DionStepParam, ScalarStepParam
@@ -53,6 +54,7 @@ def build_q_init(
     dist_meta,
     rank_fraction_default: float,
     rank_multiple_of_default: int,
+    use_compressed_comm: bool,
     base_training_seed: int,
     get_replicate_group: Callable,
     make_group_broadcast: Callable,
@@ -96,6 +98,7 @@ def build_q_init(
         local_shape[1],
         config,
         tp_world_size=tp_world_size,
+        tp_rank=tp_rank,
         use_q_unshard=use_q_unshard,
         global_shape=get_global_shape(dist_meta, local_shape[0], local_shape[1]),
         rank_fraction=rank_fraction,
@@ -106,6 +109,12 @@ def build_q_init(
         dist_meta=dist_meta,
         q_global_shape=tuple(int(dim) for dim in q_layout.q_global_shape),
         is_transposed=config.is_transposed,
+    )
+    dist_meta.rank_fraction = float(rank_fraction)
+    config.compressed_all_reduce = bool(use_compressed_comm) and should_compress_all_reduce(
+        global_shape=get_global_shape(dist_meta, local_shape[0], local_shape[1]),
+        r_global=int(q_layout.r_global),
+        rank_fraction=float(rank_fraction),
     )
     replicate_group = get_replicate_group()
     return DionQInit(
@@ -343,6 +352,48 @@ def validate_uniform_fs_topology_(
     )
 
 
+def _rp_param_signature(dist_metas_sharded) -> tuple:
+    rows = []
+    for dist_meta in dist_metas_sharded.values():
+        if not bool(getattr(dist_meta, "is_dion_param", False)):
+            continue
+        param_uid = getattr(dist_meta, "param_uid", None)
+        if param_uid is None:
+            raise RuntimeError(
+                "[DION_RP_PARAM_SIGNATURE_MISSING_UID] "
+                f"rank={dist.get_rank()} param={getattr(dist_meta, 'param_name', '')}"
+            )
+        config = getattr(dist_meta, "param_config", None)
+        rows.append(
+            (
+                param_uid,
+                str(getattr(dist_meta, "param_name", "")),
+                tuple(int(dim) for dim in (getattr(dist_meta, "global_shape", None) or ())),
+                tuple(
+                    int(dim)
+                    for dim in (getattr(dist_meta, "per_expert_global_shape", None) or ())
+                ),
+                tuple(int(dim) for dim in (getattr(dist_meta, "shape", None) or ())),
+                tuple(int(dim) for dim in (getattr(dist_meta, "local_shape", None) or ())),
+                int(getattr(dist_meta, "fs_shard_dim", -1)),
+                int(getattr(dist_meta, "tp_shard_dim", -1)),
+                int(getattr(dist_meta, "fs_start_idx", -1)),
+                int(getattr(dist_meta, "fs_end_idx", -1)),
+                int(getattr(dist_meta, "fs_world_size", 1)),
+                int(getattr(dist_meta, "fs_rank", -1)),
+                int(getattr(dist_meta, "tp_world_size", 1)),
+                int(getattr(dist_meta, "tp_rank", -1)),
+                bool(getattr(config, "use_fs_shard", False)) if config is not None else False,
+                bool(getattr(config, "use_tp_shard", False)) if config is not None else False,
+                bool(getattr(config, "is_transposed", False)) if config is not None else False,
+                bool(getattr(config, "compressed_all_reduce", False))
+                if config is not None
+                else False,
+            )
+        )
+    return tuple(sorted(rows, key=lambda row: repr(row[0])))
+
+
 def validate_enabled_rp_topology(
     *,
     expected_rp_size: int,
@@ -374,7 +425,8 @@ def validate_enabled_rp_topology(
             f"This indicates a bug in group creation or collective voting logic."
         )
 
-    my_dion_count = sum(1 for dist_meta in dist_metas_sharded.values() if dist_meta.is_dion_param)
+    my_signature = _rp_param_signature(dist_metas_sharded)
+    my_dion_count = len(my_signature)
     my_cnt_tensor = torch.tensor(
         [my_dion_count],
         device=torch.cuda.current_device(),
@@ -386,16 +438,43 @@ def validate_enabled_rp_topology(
     dist.all_gather(gathered, my_cnt_tensor, group=rp_group)
 
     gathered_counts = [int(t.item()) for t in gathered]
-    if all(count == my_dion_count for count in gathered_counts):
+    if not all(count == my_dion_count for count in gathered_counts):
+        raise RuntimeError(
+            f"CRITICAL: Dion eligibility mismatch within RP group! "
+            f"My Dion count: {my_dion_count}, RP group counts: {gathered_counts}. "
+            f"This will cause collective operation hangs. "
+            f"DistributedOptimizer did uniform sharding across DP (RP×FS), "
+            f"so RP group members have different param chunks. "
+            f"Consider disabling DistributedOptimizer sharding or implementing custom FS-aware sharding."
+        )
+
+    gathered_signatures = [None for _ in range(rp_world_size)]
+    dist.all_gather_object(gathered_signatures, my_signature, group=rp_group)
+    if all(signature == my_signature for signature in gathered_signatures):
         return
 
+    group_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(rp_group))
+    first_mismatch = next(
+        (
+            index
+            for index, signature in enumerate(gathered_signatures)
+            if signature != my_signature
+        ),
+        -1,
+    )
+    mismatch_rank = group_ranks[first_mismatch] if first_mismatch >= 0 else None
+    log_error(
+        "[Dion] RP param signature mismatch rank=%s mismatch_rank=%s local=%s remote=%s",
+        global_rank,
+        mismatch_rank,
+        my_signature,
+        gathered_signatures[first_mismatch] if first_mismatch >= 0 else None,
+    )
     raise RuntimeError(
-        f"CRITICAL: Dion eligibility mismatch within RP group! "
-        f"My Dion count: {my_dion_count}, RP group counts: {gathered_counts}. "
-        f"This will cause collective operation hangs. "
-        f"DistributedOptimizer did uniform sharding across DP (RP×FS), "
-        f"so RP group members have different param chunks. "
-        f"Consider disabling DistributedOptimizer sharding or implementing custom FS-aware sharding."
+        "[DION_RP_PARAM_SIGNATURE_MISMATCH] "
+        f"rank={global_rank} rp_group_ranks={group_ranks} "
+        f"local_count={my_dion_count} counts={gathered_counts} "
+        f"mismatch_rank={mismatch_rank}"
     )
 
 
@@ -465,6 +544,7 @@ def route_step_params(
     require_param_config: Callable,
     use_distributed_dion_update: Callable,
     maybe_expand_split_dion_params: Callable,
+    refresh_dion_step_metadata: Callable | None = None,
     sync_q_replicas: Callable,
     build_dion_batches: Callable,
 ):
@@ -480,6 +560,13 @@ def route_step_params(
 
             optimizer_state = get_or_initialize_optimizer_state(param, optim_group)
             dist_meta = dist_metas.get(param, None)
+            if refresh_dion_step_metadata is not None:
+                refresh_dion_step_metadata(
+                    param=param,
+                    optimizer_state=optimizer_state,
+                    optim_group=optim_group,
+                    dist_meta=dist_meta,
+                )
             config = require_param_config(param, dist_meta)
 
             split_child_params = maybe_expand_split_dion_params(

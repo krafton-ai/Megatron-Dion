@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Callable, FrozenSet, Iterable, List, Optional, Tuple
 
@@ -38,11 +39,17 @@ def is_dion_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool
         return False
     if param.ndim != 2:
         return False
+    if getattr(param, "sequence_parallel", False):
+        return False
+    if getattr(param, "average_gradients_across_tp_domain", False):
+        return False
     if getattr(param, "is_embedding_or_output_parameter", False):
         return False
     if getattr(param, "is_lm_head_parameter", False):
         return False
     if is_float8tensor(param):
+        return False
+    if is_combined_grouped_mlp_param(param, resolved_name):
         return False
     return True
 
@@ -58,6 +65,20 @@ def is_moe_expert_param(param: torch.Tensor, param_name: Optional[str] = None) -
         return True
 
     return False
+
+
+def is_combined_grouped_mlp_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool:
+    """Return whether this is a legacy GroupedMLP tensor containing multiple experts."""
+    num_local_experts = getattr(param, "num_local_experts", None)
+    if num_local_experts is None or int(num_local_experts) <= 1:
+        return False
+    resolved_name = param_name or getattr(param, "_param_name", None) or ""
+    leaf_name = os.path.basename(str(resolved_name).replace(".", os.sep))
+    if leaf_name not in {"weight1", "weight2"}:
+        return False
+    if ".linear_fc" in resolved_name or ".local_experts." in resolved_name:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -123,12 +144,29 @@ class DionBucketLayout:
         return max((int(entry.shard_capacity) for entry in self.entries), default=0)
 
 
+@dataclass(frozen=True)
+class DionBucketNonDionParamRoute:
+    """Bucket all-gather layout for non-Dion params inside a mixed bucket."""
+
+    group_size: int
+    group_rank: int
+    standard_shard_size: int
+    non_dion_size: int
+    rank_segments: Tuple[Tuple[Tuple[int, int, int], ...], ...]
+
+
 def _group_ranks(group) -> Tuple[int, ...]:
     if group is None:
         if not dist.is_initialized():
             return (0,)
         return tuple(int(rank) for rank in range(dist.get_world_size()))
     return tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+
+
+def _groups_have_same_order(first_group, second_group) -> bool:
+    if first_group is None or second_group is None:
+        return first_group is second_group
+    return _group_ranks(first_group) == _group_ranks(second_group)
 
 
 def resolve_grad_rank_to_fs_rank(
@@ -181,26 +219,43 @@ def resolve_grad_rank_to_fs_rank(
     if all(rank in fs_rank_by_global for rank in grad_group_ranks):
         return tuple(int(fs_rank_by_global[rank]) for rank in grad_group_ranks)
 
-    blocks = tuple(
-        grad_group_ranks[start : start + fs_size]
-        for start in range(0, grad_group_size, fs_size)
-    )
-    if fs_group_ranks not in blocks:
+    same_fs_rank_count = grad_group_size // fs_size
+    fs_positions = tuple(int(grad_rank_by_global[rank]) for rank in fs_group_ranks)
+    if len(set(fs_positions)) != fs_size:
         raise RuntimeError(
-            "[Dion] cannot infer FS rank order for multi-replica grad sync "
+            "[Dion] duplicate FS rank position in Dion grad sync group "
             f"bucket={bucket_id} fs_group_ranks={fs_group_ranks} "
-            f"grad_group_ranks={grad_group_ranks} fs_size={fs_size}"
+            f"grad_group_ranks={grad_group_ranks} fs_positions={fs_positions}"
         )
 
-    grad_rank_to_fs_rank = [-1 for _ in grad_group_ranks]
-    for block in blocks:
-        if len(set(block)) != fs_size:
+    contiguous_start = fs_positions[0]
+    contiguous_positions = tuple(contiguous_start + fs_rank for fs_rank in range(fs_size))
+    if fs_positions == contiguous_positions:
+        if contiguous_start % fs_size != 0:
             raise RuntimeError(
-                "[Dion] duplicate rank in Dion FS grad sync block "
-                f"bucket={bucket_id} block_ranks={block}"
+                "[Dion] contiguous FS group is not aligned with the grad sync group "
+                f"bucket={bucket_id} fs_group_ranks={fs_group_ranks} "
+                f"grad_group_ranks={grad_group_ranks} fs_positions={fs_positions}"
             )
-        for fs_rank, global_rank in enumerate(block):
-            grad_rank_to_fs_rank[grad_rank_by_global[global_rank]] = int(fs_rank)
+        grad_rank_to_fs_rank = [
+            int(grad_rank % fs_size) for grad_rank in range(grad_group_size)
+        ]
+    else:
+        fs_position_offset = fs_positions[0]
+        strided_positions = tuple(
+            fs_position_offset + fs_rank * same_fs_rank_count
+            for fs_rank in range(fs_size)
+        )
+        if fs_positions != strided_positions or fs_position_offset >= same_fs_rank_count:
+            raise RuntimeError(
+                "[Dion] cannot prove FS rank order from authoritative grad/FS groups "
+                f"bucket={bucket_id} fs_group_ranks={fs_group_ranks} "
+                f"grad_group_ranks={grad_group_ranks} fs_positions={fs_positions} "
+                f"same_fs_rank_count={same_fs_rank_count}"
+            )
+        grad_rank_to_fs_rank = [
+            int(grad_rank // same_fs_rank_count) for grad_rank in range(grad_group_size)
+        ]
 
     if any(fs_rank < 0 for fs_rank in grad_rank_to_fs_rank):
         raise RuntimeError(
@@ -261,6 +316,13 @@ def build_dion_entries(
         split_size = m if fs_shard_dim == 0 else n
         start_idx, end_idx = compute_fs_shard_range(split_size, fs_size, fs_rank)
         local_split_size = int(end_idx) - int(start_idx)
+        if local_split_size <= 0:
+            raise RuntimeError(
+                "[DION_EMPTY_FS_SHARD] "
+                f"param={getattr(param, '_param_name', f'id_{id(param)}')} "
+                f"global_shape={global_shape} fs_shard_dim={fs_shard_dim} "
+                f"fs_size={fs_size} fs_rank={fs_rank} range=({start_idx}, {end_idx})"
+            )
         size_per_rank = math.ceil(split_size / fs_size)
 
         if fs_shard_dim == 0:
@@ -411,6 +473,34 @@ def serialize_dion_bucket_gather_layout_(dion_layout: DionBucketLayout) -> tuple
             for seg_start, seg_end in rank_segments:
                 payload.extend([int(seg_start), int(seg_end)])
     return tuple(payload)
+
+
+def validate_dion_bucket_gather_layout_(
+    *,
+    bucket,
+    dion_layout: DionBucketLayout,
+    shard_group,
+) -> None:
+    """Validate that all shard ranks agree on one Dion bucket gather layout."""
+    if shard_group is None:
+        return
+    shard_group_size = int(dist.get_world_size(shard_group))
+    if shard_group_size <= 1:
+        return
+
+    local_layout = serialize_dion_bucket_gather_layout_(dion_layout)
+    gathered_layouts = [None for _ in range(shard_group_size)]
+    dist.all_gather_object(gathered_layouts, local_layout, group=shard_group)
+    mismatched_ranks = [
+        rank for rank, gathered_layout in enumerate(gathered_layouts) if gathered_layout != local_layout
+    ]
+    if mismatched_ranks:
+        raise RuntimeError(
+            "[DION_BUCKET_GATHER_LAYOUT_MISMATCH] "
+            f"rank={dist.get_rank()} bucket={getattr(bucket, 'bucket_id', -1)} "
+            f"group_rank={dist.get_rank(shard_group)} mismatched_ranks={tuple(mismatched_ranks)} "
+            f"group_ranks={tuple(dist.get_process_group_ranks(shard_group))}"
+        )
 
 
 def set_dion_local_shard_(
@@ -885,6 +975,11 @@ def init_dion_bucket(
         bucket=bucket,
         dion_bucket_layout=dion_bucket_layout,
     )
+    validate_dion_bucket_gather_layout_(
+        bucket=bucket,
+        dion_layout=dion_bucket_layout,
+        shard_group=fs_group,
+    )
     optimizer._init_bucket_comm(bucket, fs_group)
     bucket.dion_optimizer = optimizer
     bucket._dion_requires_param_sync_check = True
@@ -1048,11 +1143,73 @@ def bucket_local_shard_group(optimizer, bucket):
     return None, None, None
 
 
-def all_gather_non_dion_bucket(optimizer, bucket, async_op=False):
-    """Gather mixed-bucket non-Dion params back into canonical bucket.param_data."""
+def _build_non_dion_param_rank_segments(
+    *,
+    bucket,
+    group_size: int,
+    shard_size: int,
+) -> tuple[Tuple[Tuple[int, int, int], ...], int]:
+    dion_param_ids = bucket.dion_param_ids
+    rank_segments = []
+    max_rank_numel = 0
+    for group_rank in range(int(group_size)):
+        rank_start = int(group_rank) * int(shard_size)
+        rank_end = rank_start + int(shard_size)
+        cursor = 0
+        segments = []
+        for param in bucket.params_list:
+            if id(param) in dion_param_ids:
+                continue
+            param_start, param_end = bucket.param_to_index[param]
+            source_start = max(int(param_start), rank_start)
+            source_end = min(int(param_end), rank_end)
+            if source_end <= source_start:
+                continue
+            target_start = cursor
+            cursor += source_end - source_start
+            segments.append((int(source_start), int(source_end), int(target_start)))
+        max_rank_numel = max(max_rank_numel, cursor)
+        rank_segments.append(tuple(segments))
+    return tuple(rank_segments), int(max_rank_numel)
+
+
+def _get_non_dion_param_route(
+    *,
+    bucket,
+    group_size: int,
+    group_rank: int,
+    standard_shard_size: int,
+) -> DionBucketNonDionParamRoute:
+    cached = getattr(bucket, "_dion_non_dion_param_route", None)
+    if (
+        cached is not None
+        and int(cached.group_size) == int(group_size)
+        and int(cached.group_rank) == int(group_rank)
+        and int(cached.standard_shard_size) == int(standard_shard_size)
+    ):
+        return cached
+
+    rank_segments, non_dion_size = _build_non_dion_param_rank_segments(
+        bucket=bucket,
+        group_size=int(group_size),
+        shard_size=int(standard_shard_size),
+    )
+    route = DionBucketNonDionParamRoute(
+        group_size=int(group_size),
+        group_rank=int(group_rank),
+        standard_shard_size=int(standard_shard_size),
+        non_dion_size=int(non_dion_size),
+        rank_segments=rank_segments,
+    )
+    bucket._dion_non_dion_param_route = route
+    return route
+
+
+def prepare_non_dion_bucket_gather(optimizer, bucket):
+    """Build the minimal non-Dion all-gather input for a mixed bucket."""
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not bucket.has_non_dion_params:
-        return None
+        return None, None, None
 
     dp_group, dp_size, dp_rank = bucket_local_shard_group(optimizer, bucket)
     if dp_group is None:
@@ -1060,49 +1217,101 @@ def all_gather_non_dion_bucket(optimizer, bucket, async_op=False):
             "[Dion] mixed non-Dion all-gather requires the standard local-shard group."
         )
     if dp_size == 1:
-        return None
+        return None, None, dp_group
 
+    if bucket.param_data.numel() % dp_size != 0:
+        raise RuntimeError(
+            "[Dion] mixed non-Dion all-gather requires a padded standard bucket "
+            f"bucket={getattr(bucket, 'bucket_id', -1)} "
+            f"bucket_numel={int(bucket.param_data.numel())} group_size={int(dp_size)}"
+        )
     shard_size = bucket.param_data.numel() // dp_size
     if shard_size <= 0:
-        return None
+        return None, None, dp_group
 
-    input_shard = torch.zeros(
-        shard_size,
+    route = _get_non_dion_param_route(
+        bucket=bucket,
+        group_size=dp_size,
+        group_rank=dp_rank,
+        standard_shard_size=shard_size,
+    )
+    if route.non_dion_size <= 0:
+        return None, route, dp_group
+
+    input_shard = torch.empty(
+        int(route.non_dion_size),
         dtype=bucket.param_data.dtype,
         device=torch.cuda.current_device(),
     )
-    non_dion_params = list(
-        select_non_dion_bucket_params_(
-            bucket_params=bucket.params_list,
-            dion_layout=dion_layout,
+    input_shard.zero_()
+    for source_start, source_end, target_start in route.rank_segments[int(dp_rank)]:
+        source_start = int(source_start)
+        source_end = int(source_end)
+        target_start = int(target_start)
+        target_end = target_start + source_end - source_start
+        input_shard[target_start:target_end].copy_(
+            bucket.param_data.view(-1)[source_start:source_end]
         )
+    return input_shard, route, dp_group
+
+
+def restore_non_dion_bucket_gather(bucket, gathered_buffer: torch.Tensor, route) -> None:
+    """Restore gathered mixed-bucket non-Dion params into canonical bucket.param_data."""
+    if route is None or int(route.non_dion_size) <= 0:
+        return
+    expected_shape = (int(route.group_size), int(route.non_dion_size))
+    if gathered_buffer.dim() == 1:
+        gathered_view = gathered_buffer.view(*expected_shape)
+    elif tuple(gathered_buffer.shape) == expected_shape:
+        gathered_view = gathered_buffer
+    else:
+        raise RuntimeError(
+            "[Dion] mixed non-Dion all-gather output shape mismatch "
+            f"bucket={getattr(bucket, 'bucket_id', -1)} "
+            f"shape={tuple(gathered_buffer.shape)} expected={expected_shape}"
+        )
+    flat_param_data = bucket.param_data.view(-1)
+    for group_rank, segments in enumerate(route.rank_segments):
+        rank_source = gathered_view[int(group_rank)]
+        for source_start, source_end, target_start in segments:
+            source_start = int(source_start)
+            source_end = int(source_end)
+            target_start = int(target_start)
+            target_end = target_start + source_end - source_start
+            flat_param_data[source_start:source_end].copy_(rank_source[target_start:target_end])
+
+
+def all_gather_non_dion_bucket(optimizer, bucket, async_op=False, prepared_gather=None):
+    """Gather mixed-bucket non-Dion params back into canonical bucket.param_data."""
+    if prepared_gather is None:
+        input_shard, route, dp_group = prepare_non_dion_bucket_gather(optimizer, bucket)
+    else:
+        input_shard, route, dp_group = prepared_gather
+
+    if input_shard is None or route is None or int(route.non_dion_size) <= 0:
+        return None
+
+    gathered_buffer = torch.empty(
+        int(route.group_size) * int(route.non_dion_size),
+        dtype=bucket.param_data.dtype,
+        device=torch.cuda.current_device(),
     )
-
-    for param in non_dion_params:
-        full_start, full_end = bucket.param_to_index[param]
-        bucket_start, _ = bucket_rank_range_(full_start, full_end, shard_size, dp_rank)
-        param_start, param_end = param_rank_range_(full_start, full_end, shard_size, dp_rank)
-        actual_size = max(0, int(param_end) - int(param_start))
-        if actual_size <= 0:
-            continue
-
-        full_view = bucket_param_view(bucket, param)
-        if full_view is None:
-            param_name = optimizer._param_name(param)
-            raise RuntimeError(
-                "[Dion] mixed non-Dion all-gather requires canonical bucket.param_data view "
-                f"for param={param_name or f'id_{id(param)}'} "
-                f"bucket={getattr(bucket, 'bucket_id', -1)}"
-            )
-        local_shard = full_view.view(-1)[int(param_start):int(param_end)]
-        input_shard[int(bucket_start) : int(bucket_start) + actual_size].copy_(local_shard)
-
-    return dist.all_gather_into_tensor(
-        output_tensor=bucket.param_data,
+    work = dist.all_gather_into_tensor(
+        output_tensor=gathered_buffer,
         input_tensor=input_shard,
         group=dp_group,
         async_op=async_op,
     )
+
+    def _restore_callback(_input_shard=input_shard):
+        del _input_shard
+        restore_non_dion_bucket_gather(bucket, gathered_buffer, route)
+
+    if async_op:
+        return CallbackHandle(work, _restore_callback)
+
+    _restore_callback()
+    return None
 
 
 def all_gather_dion_bucket(
@@ -1126,7 +1335,8 @@ def all_gather_dion_bucket(
         prepared_buffer, prepared_entries = prepared_gather
 
     if shard_group_size == 1:
-        def _restore_callback():
+        def _restore_callback(_prepared_buffer=prepared_buffer):
+            del _prepared_buffer
             restore_bucket(
                 optimizer,
                 bucket=bucket,
@@ -1143,7 +1353,6 @@ def all_gather_dion_bucket(
     if shard_group is None:
         return None
 
-    layout_len = int(dion_layout.entry_count)
     bucket_shard_size = int(dion_layout.shard_size)
     expected_gathered_numel = int(dion_layout.gathered_numel)
     if expected_gathered_numel != bucket_shard_size * shard_group_size:
@@ -1153,32 +1362,6 @@ def all_gather_dion_bucket(
             f"shard_size={bucket_shard_size} fs_size={shard_group_size} "
             f"expected_total={expected_gathered_numel}"
         )
-
-    if not getattr(bucket, "_dion_ag_invariants_verified", False):
-        local = torch.tensor(
-            [layout_len, bucket_shard_size],
-            device=torch.cuda.current_device(),
-            dtype=torch.int64,
-        )
-        local_min = local.clone()
-        local_max = local.clone()
-        dist.all_reduce(local_min, op=dist.ReduceOp.MIN, group=shard_group)
-        dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=shard_group)
-        if not torch.equal(local_min, local_max):
-            logger.error(
-                "[Dion] FS AG invariants mismatch (bucket_id=%s): local(layout_len=%s, shard_size=%s) "
-                "min=%s max=%s",
-                getattr(bucket, "bucket_id", -1),
-                layout_len,
-                bucket_shard_size,
-                tuple(int(x) for x in local_min.tolist()),
-                tuple(int(x) for x in local_max.tolist()),
-            )
-            raise RuntimeError("Dion FS all-gather invariants mismatch across FS ranks")
-
-        bucket._dion_ag_invariants_verified = True
-        bucket._dion_ag_verified_layout_len = layout_len
-        bucket._dion_ag_verified_shard_size = bucket_shard_size
 
     gathered_buffer = torch.empty(
         expected_gathered_numel,
@@ -1192,13 +1375,106 @@ def all_gather_dion_bucket(
         async_op=async_op,
     )
 
-    def _restore_callback():
+    def _restore_callback(_prepared_buffer=prepared_buffer):
+        del _prepared_buffer
         restore_bucket(
             optimizer,
             bucket=bucket,
             prepared_entries=prepared_entries,
             gathered_buffer=gathered_buffer.view(shard_group_size, bucket_shard_size),
             shard_group_size=shard_group_size,
+        )
+
+    if async_op:
+        return CallbackHandle(work, _restore_callback)
+
+    _restore_callback()
+    return None
+
+
+def all_gather_combined_mixed_bucket(
+    optimizer,
+    bucket,
+    *,
+    async_op: bool,
+    prepared_dion_gather,
+    prepared_non_dion_gather,
+):
+    """Gather Dion and non-Dion mixed-bucket params in one collective."""
+    prepared_buffer, prepared_entries = prepared_dion_gather
+    non_dion_input, non_dion_route, dp_group = prepared_non_dion_gather
+    if non_dion_input is None or non_dion_route is None:
+        return all_gather_dion_bucket(
+            optimizer,
+            bucket,
+            async_op=async_op,
+            prepared_gather=prepared_dion_gather,
+        )
+
+    dion_layout = getattr(bucket, "dion_layout", None)
+    if dion_layout is None or not dion_layout.has_params:
+        return all_gather_non_dion_bucket(
+            optimizer,
+            bucket,
+            async_op=async_op,
+            prepared_gather=prepared_non_dion_gather,
+        )
+
+    group_size = int(non_dion_route.group_size)
+    dion_size = int(dion_layout.shard_size)
+    non_dion_size = int(non_dion_route.non_dion_size)
+    payload_size = dion_size + non_dion_size
+    shard_group = getattr(bucket, "dion_shard_group", None)
+    if shard_group is None:
+        shard_group = optimizer.fs_group
+    if not _groups_have_same_order(dp_group, shard_group):
+        raise RuntimeError(
+            "[Dion] combined mixed-bucket gather requires identical group order "
+            f"bucket={getattr(bucket, 'bucket_id', -1)} "
+            f"standard_group={_group_ranks(dp_group)} dion_group={_group_ranks(shard_group)}"
+        )
+    expected_gathered_numel = int(dion_layout.gathered_numel)
+    if expected_gathered_numel != dion_size * group_size:
+        raise RuntimeError(
+            "[Dion] combined mixed-bucket gather size invariant mismatch "
+            f"bucket={getattr(bucket, 'bucket_id', -1)} "
+            f"shard_size={dion_size} group_size={group_size} "
+            f"expected_total={expected_gathered_numel}"
+        )
+    input_payload = torch.empty(
+        payload_size,
+        dtype=bucket.param_data.dtype,
+        device=torch.cuda.current_device(),
+    )
+    input_payload[:dion_size].copy_(prepared_buffer)
+    input_payload[dion_size:payload_size].copy_(non_dion_input)
+
+    gathered_buffer = torch.empty(
+        group_size * payload_size,
+        dtype=bucket.param_data.dtype,
+        device=torch.cuda.current_device(),
+    )
+    work = dist.all_gather_into_tensor(
+        output_tensor=gathered_buffer,
+        input_tensor=input_payload,
+        group=dp_group,
+        async_op=async_op,
+    )
+
+    def _restore_callback(_input_payload=input_payload):
+        del _input_payload
+        gathered_view = gathered_buffer.view(group_size, payload_size)
+        restore_bucket(
+            optimizer,
+            bucket=bucket,
+            prepared_entries=prepared_entries,
+            gathered_buffer=gathered_view[:, :dion_size],
+            shard_group_size=group_size,
+        )
+        restore_non_dion_bucket_gather(
+            bucket,
+            gathered_view[:, dion_size:payload_size],
+            non_dion_route,
         )
 
     if async_op:
@@ -1217,7 +1493,32 @@ def all_gather_bucket_params(optimizer, bucket, async_op=False):
     prepared_dion_entries = None
     if has_mixed_non_dion:
         prepared_dion_entries = prepare_dion_bucket_gather(optimizer, bucket)
-        mixed_non_dion_handle = all_gather_non_dion_bucket(optimizer, bucket, async_op=async_op)
+        prepared_non_dion_gather = prepare_non_dion_bucket_gather(optimizer, bucket)
+        _, non_dion_route, dp_group = prepared_non_dion_gather
+        shard_group = getattr(bucket, "dion_shard_group", None)
+        if shard_group is None:
+            shard_group = optimizer.fs_group
+        shard_group_size = optimizer._group_size(shard_group) if shard_group is not None else 1
+        if (
+            non_dion_route is not None
+            and int(non_dion_route.non_dion_size) > 0
+            and int(non_dion_route.group_size) == int(shard_group_size)
+            and _groups_have_same_order(dp_group, shard_group)
+        ):
+            return all_gather_combined_mixed_bucket(
+                optimizer,
+                bucket,
+                async_op=async_op,
+                prepared_dion_gather=prepared_dion_entries,
+                prepared_non_dion_gather=prepared_non_dion_gather,
+            )
+
+        mixed_non_dion_handle = all_gather_non_dion_bucket(
+            optimizer,
+            bucket,
+            async_op=async_op,
+            prepared_gather=prepared_non_dion_gather,
+        )
         dion_handle = all_gather_dion_bucket(
             optimizer,
             bucket,

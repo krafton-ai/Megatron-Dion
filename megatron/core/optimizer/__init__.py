@@ -186,7 +186,7 @@ def _get_param_groups(
             else:
                 param_override = None
 
-            dion_param_override = get_dion_param_override(config, param, param_override)
+            dion_param_override = get_dion_param_override(config, param, param_override, name)
             if dion_param_override is not None:
                 if param_override is None:
                     param_override = dion_param_override

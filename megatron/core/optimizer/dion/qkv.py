@@ -179,6 +179,59 @@ def qkv_child_local_shape(
     return (child_rows, local_cols)
 
 
+def qkv_child_has_local_overlap(
+    split_shapes: Tuple[int, int, int],
+    dist_meta,
+    child_kind: str,
+) -> bool:
+    """Return whether one Q/K/V child has a non-empty local shard on this rank."""
+    fs_shard_dim = int(getattr(dist_meta, "fs_shard_dim", -1)) if dist_meta is not None else -1
+    fs_world_size = int(getattr(dist_meta, "fs_world_size", 1)) if dist_meta is not None else 1
+    if fs_shard_dim != 0 or fs_world_size <= 1:
+        return True
+
+    fs_rank = int(getattr(dist_meta, "fs_rank", -1))
+    if fs_rank < 0:
+        return False
+
+    parent_global_shape = getattr(dist_meta, "global_shape", None)
+    if parent_global_shape is None:
+        raise RuntimeError(
+            "[DION_QKV_MISSING_GLOBAL_SHAPE] "
+            f"child_kind={child_kind} "
+            f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+            f"param_name={getattr(dist_meta, 'param_name', '')}"
+        )
+    parent_global_rows = int(parent_global_shape[0])
+    total_per_group = int(sum(int(dim) for dim in split_shapes))
+    if total_per_group <= 0 or parent_global_rows % total_per_group != 0:
+        raise RuntimeError(
+            "[DION_QKV_GLOBAL_LAYOUT_MISMATCH] "
+            f"child_kind={child_kind} parent_global_rows={parent_global_rows} "
+            f"split_shapes={split_shapes}"
+        )
+
+    parent_row_start = int(getattr(dist_meta, "fs_start_idx", -1))
+    parent_row_end = int(getattr(dist_meta, "fs_end_idx", -1))
+    if parent_row_start < 0 or parent_row_end < parent_row_start:
+        raise RuntimeError(
+            "[DION_QKV_MISSING_FS_RANGE] "
+            f"child_kind={child_kind} "
+            f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+            f"param_name={getattr(dist_meta, 'param_name', '')}"
+        )
+    parent_local_rows = parent_row_end - parent_row_start
+    if parent_local_rows <= 0:
+        return False
+    if parent_local_rows % total_per_group != 0:
+        raise RuntimeError(
+            "[DION_QKV_PARENT_FS_LAYOUT_MISMATCH] "
+            f"child_kind={child_kind} parent_local_rows={parent_local_rows} "
+            f"split_shapes={split_shapes}"
+        )
+    return True
+
+
 def _qkv_child_slice_bounds(
     split_shapes: Tuple[int, int, int],
     child_kind: str,

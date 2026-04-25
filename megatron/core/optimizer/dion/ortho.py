@@ -585,31 +585,57 @@ def _make_sharded_sketch(
     r: int,
 ) -> Tensor:
     """Return the local row shard of one distributed sketch batch."""
+    if row_rank < 0 or row_rank >= len(row_sizes):
+        raise RuntimeError(
+            f"[DION_INVALID_SKETCH_ROW_RANK] row_rank={row_rank} row_sizes={tuple(row_sizes)}"
+        )
     local_rows = int(row_sizes[row_rank])
+    if local_rows <= 0:
+        raise RuntimeError(
+            f"[DION_EMPTY_SKETCH_ROW_SHARD] row_rank={row_rank} row_sizes={tuple(row_sizes)}"
+        )
     k = math.ceil(oversample * r / 128.0) * 128
     if k <= 0:
         raise RuntimeError(
             f"[DION_INVALID_SKETCH_RANK] r={r} oversample={oversample} k={k}"
         )
     std = math.sqrt(1.0 / k)
-    rank0_rows = int(row_sizes[0])
-    shard_offset = ((row_rank * k * rank0_rows) + 3) // 4 * 4
+    prior_rows = sum(int(row_size) for row_size in row_sizes[:row_rank])
+    global_rows = sum(int(row_size) for row_size in row_sizes)
+    if global_rows <= 0:
+        raise RuntimeError(f"[DION_EMPTY_SKETCH_GLOBAL_ROWS] row_sizes={tuple(row_sizes)}")
     sketch = torch.empty(
         (len(sketch_seeds), k, local_rows),
         device=device,
         dtype=dtype,
     )
     for index, seed in enumerate(sketch_seeds):
-        sketch[index].copy_(
-            _seeded_normal_tensor(
-                (k, local_rows),
+        if device.type != "cuda":
+            full_sketch = _seeded_normal_tensor(
+                (k, global_rows),
                 seed=seed,
-                offset=shard_offset,
+                offset=0,
                 device=device,
                 dtype=dtype,
                 std=std,
             )
-        )
+            sketch[index].copy_(full_sketch[:, prior_rows : prior_rows + local_rows])
+            continue
+
+        gen = torch.Generator(device=str(device))
+        gen.manual_seed(int(seed))
+        for row in range(k):
+            element_start = int(row) * int(global_rows) + int(prior_rows)
+            aligned_start = (element_start // 4) * 4
+            prefix = element_start - aligned_start
+            gen.set_offset(aligned_start)
+            row_values = torch.empty(
+                prefix + local_rows,
+                device=device,
+                dtype=dtype,
+            )
+            row_values.normal_(mean=0.0, std=std, generator=gen)
+            sketch[index, row].copy_(row_values[prefix:])
     return sketch
 
 
@@ -645,9 +671,15 @@ def distributed_orthogonalize(
     real_batch_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Distributed orthogonalization using plain tensors and explicit collectives."""
-    del real_batch_size
     batch_size = int(P_batch.size(0))
+    active_batch_size = batch_size if real_batch_size is None else int(real_batch_size)
+    if active_batch_size <= 0 or active_batch_size > batch_size:
+        raise RuntimeError(
+            "[DION_INVALID_ORTHO_REAL_BATCH_SIZE] "
+            f"real_batch_size={active_batch_size} batch_size={batch_size}"
+        )
     original_dtype = P_batch.dtype
+    P_active = P_batch[:active_batch_size]
 
     if ortho_group is not None:
         ortho_world_size = dist.get_world_size(ortho_group)
@@ -658,21 +690,26 @@ def distributed_orthogonalize(
 
     if ortho_group is None or ortho_world_size <= 1:
         with _dion_math_precision_context():
-            P_ortho = orthogonalize(
-                P_batch,
+            P_active = orthogonalize(
+                P_active,
                 rcqr_oversample=optimizer.defaults["rcqr_oversample"],
             ).to(torch.float32)
-        return P_ortho.to(original_dtype).contiguous()
+        P_active = P_active.to(original_dtype).contiguous()
+        if active_batch_size == batch_size:
+            return P_active
+        P_ortho = P_batch.clone().contiguous()
+        P_ortho[:active_batch_size].copy_(P_active)
+        return P_ortho
 
     batch_sketch_keys = sketch_keys(
-        dist_metas=dist_metas[:batch_size] if dist_metas is not None else None,
+        dist_metas=dist_metas[:active_batch_size] if dist_metas is not None else None,
         contract="distributed",
         step_count=optimizer._step_count,
     )
-    if batch_sketch_keys is None or len(batch_sketch_keys) != batch_size:
+    if batch_sketch_keys is None or len(batch_sketch_keys) != active_batch_size:
         raise RuntimeError(
             "[DION_MISSING_DISTRIBUTED_SKETCH_KEYS] "
-            f"batch_size={batch_size} sketch_keys="
+            f"batch_size={active_batch_size} sketch_keys="
             f"{0 if batch_sketch_keys is None else len(batch_sketch_keys)}"
         )
     batch_sketch_seeds = [_sketch_seed(seed_key) for seed_key in batch_sketch_keys]
@@ -681,18 +718,18 @@ def distributed_orthogonalize(
     r = int(P_batch.size(2))
     row_sizes, global_rows = _resolve_row_sizes_from_dist_meta(
         dist_metas=dist_metas,
-        batch_size=batch_size,
+        batch_size=active_batch_size,
         ortho_world_size=ortho_world_size,
         ortho_rank=ortho_rank,
         local_rows=local_rows,
     )
     batch_sizes = [
-        _split_range(batch_size, ortho_world_size, rank)[1]
-        - _split_range(batch_size, ortho_world_size, rank)[0]
+        _split_range(active_batch_size, ortho_world_size, rank)[1]
+        - _split_range(active_batch_size, ortho_world_size, rank)[0]
         for rank in range(ortho_world_size)
     ]
     with _dion_math_precision_context():
-        P_local = P_batch.to(dtype=torch.float32)
+        P_local = P_active.to(dtype=torch.float32)
 
         if global_rows <= r:
             P_local = _row_to_batch(
@@ -712,7 +749,12 @@ def distributed_orthogonalize(
                 batch_sizes=batch_sizes,
                 group=ortho_group,
             )
-            return P_local.to(original_dtype).contiguous()
+            P_local = P_local.to(original_dtype).contiguous()
+            if active_batch_size == batch_size:
+                return P_local
+            P_ortho = P_batch.clone().contiguous()
+            P_ortho[:active_batch_size].copy_(P_local)
+            return P_ortho
 
         R_local = _reduce_scatter_batch_shards(
             _make_sharded_sketch(
@@ -766,7 +808,12 @@ def distributed_orthogonalize(
             ),
             P_local,
         )
-        return P_local.to(original_dtype).contiguous()
+        P_local = P_local.to(original_dtype).contiguous()
+        if active_batch_size == batch_size:
+            return P_local
+        P_ortho = P_batch.clone().contiguous()
+        P_ortho[:active_batch_size].copy_(P_local)
+        return P_ortho
 
 
 def _default_sketch_matrix(P: Tensor, oversample: float) -> Tensor:
@@ -820,11 +867,14 @@ def reshard_q_along_tp(
     # Split Q along column dimension
     tp_size = dist.get_world_size(tp_group)
     n, r_total = Q.shape
-    r_per_rank = r_total // tp_size
 
     # Extract this rank's shard
-    start_col = tp_rank * r_per_rank
-    end_col = (tp_rank + 1) * r_per_rank if tp_rank < tp_size - 1 else r_total
+    start_col, end_col = _split_range(r_total, tp_size, tp_rank)
+    if int(end_col - start_col) <= 0:
+        raise RuntimeError(
+            "[DION_EMPTY_Q_SHARD] "
+            f"r_total={int(r_total)} tp_world_size={int(tp_size)} tp_rank={int(tp_rank)}"
+        )
 
     Q_shard = Q[:, start_col:end_col].contiguous()
 

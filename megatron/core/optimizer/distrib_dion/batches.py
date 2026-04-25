@@ -55,18 +55,22 @@ def _build_update_contract_key(
 ) -> tuple:
     if optim_group is None:
         lr = None
+        rank_fraction = None
         weight_decay = None
         wd_mult = None
         mu = None
     else:
         lr = float(optim_group["lr"]) if "lr" in optim_group else None
+        rank_fraction = (
+            float(optim_group["rank_fraction"]) if "rank_fraction" in optim_group else None
+        )
         weight_decay = (
             float(optim_group["weight_decay"]) if "weight_decay" in optim_group else None
         )
         wd_mult = float(optim_group["wd_mult"]) if "wd_mult" in optim_group else None
         mu = float(optim_group["mu"]) if "mu" in optim_group else None
     r = int(optimizer_state.get("r", -1)) if optimizer_state is not None else -1
-    return (lr, weight_decay, wd_mult, mu, r)
+    return (lr, weight_decay, wd_mult, mu, rank_fraction, r)
 
 
 def build_batch_key(
@@ -78,10 +82,11 @@ def build_batch_key(
     per_expert_global_shape=None,
 ) -> tuple:
     """Build the canonical Dion batch key used by local/distributed runtimes."""
-    if len(shape) == 2:
-        resolved_shape = (int(shape[0]), int(shape[1]))
+    key_shape = per_expert_global_shape or true_global_shape or shape
+    if len(key_shape) == 2:
+        resolved_shape = (int(key_shape[0]), int(key_shape[1]))
     else:
-        resolved_shape = tuple(int(dim) for dim in shape)
+        resolved_shape = tuple(int(dim) for dim in key_shape)
     return (
         resolved_shape,
         bool(cfg.has_fs_shard),
@@ -113,6 +118,7 @@ def _sync_group_batch_metadata(
     sync_group,
     local_batch_keys: Sequence[tuple],
     batch_group_by_key: Dict[tuple, DionBatchGroup],
+    batch_key_cache: dict,
 ) -> tuple[list[tuple], dict[tuple, int]]:
     """Return canonical cross-rank batch order plus per-key chunk multiplicity.
 
@@ -133,32 +139,171 @@ def _sync_group_batch_metadata(
         batch_key: len(batch_group_by_key[batch_key].params or [])
         for batch_key in local_batch_keys
     }
+    local_batch_keys_by_sync_key = {}
+    local_counts_by_sync_key = {}
+    for batch_key, count in local_counts.items():
+        sync_key = _batch_key_for_sync(
+            batch_key,
+            sync_group,
+            param_uids=_batch_group_param_uids(batch_group_by_key[batch_key]),
+        )
+        local_batch_keys_by_sync_key.setdefault(sync_key, []).append(batch_key)
+        local_counts_by_sync_key[sync_key] = (
+            int(local_counts_by_sync_key.get(sync_key, 0)) + int(count)
+        )
+    for sync_key in local_batch_keys_by_sync_key:
+        local_batch_keys_by_sync_key[sync_key] = sorted(
+            local_batch_keys_by_sync_key[sync_key],
+            key=_batch_key_sort_key,
+        )
+
+    group_cache_key = ("batch_metadata", _group_ranks_key(sync_group))
+    local_signature = tuple(
+        (sync_key, int(local_counts_by_sync_key[sync_key]))
+        for sync_key in sorted(local_counts_by_sync_key, key=_batch_key_sort_key)
+    )
+    cached = batch_key_cache.get(group_cache_key)
+    if cached is not None:
+        if cached.get("local_signature") == local_signature:
+            return _local_batch_keys_from_sync_order(
+                ordered_sync_keys=list(cached["ordered"]),
+                local_batch_keys_by_sync_key=local_batch_keys_by_sync_key,
+                local_counts_by_key=local_counts,
+            )
+
     gathered = [None] * dist.get_world_size(sync_group)
     dist.all_gather_object(
         gathered,
-        {batch_key: int(count) for batch_key, count in local_counts.items()},
+        {sync_key: int(count) for sync_key, count in local_counts_by_sync_key.items()},
         group=sync_group,
     )
 
-    all_batch_keys = set()
+    all_sync_keys = set()
     for rank_counts in gathered:
-        all_batch_keys.update(rank_counts.keys())
-    ordered = sorted(all_batch_keys, key=_batch_key_sort_key)
+        all_sync_keys.update(rank_counts.keys())
+    ordered = sorted(all_sync_keys, key=_batch_key_sort_key)
 
-    multiplicity = {}
-    for batch_key in ordered:
-        counts = [int(rank_counts.get(batch_key, 0)) for rank_counts in gathered]
+    for sync_key in ordered:
+        counts = [int(rank_counts.get(sync_key, 0)) for rank_counts in gathered]
         max_count = max(counts)
         min_count = min(counts)
         if min_count != max_count:
             raise RuntimeError(
                 "[DION_BATCH_KEY_MULTIPLICITY_MISMATCH] "
-                f"rank={dist.get_rank()} batch_key={batch_key} counts={counts} "
+                f"rank={dist.get_rank()} sync_key={sync_key} counts={counts} "
                 f"group_ranks={tuple(dist.get_process_group_ranks(sync_group))}"
             )
-        multiplicity[batch_key] = max_count
 
-    return ordered, multiplicity
+    batch_key_cache[group_cache_key] = {
+        "local_signature": local_signature,
+        "ordered": tuple(ordered),
+    }
+    return _local_batch_keys_from_sync_order(
+        ordered_sync_keys=ordered,
+        local_batch_keys_by_sync_key=local_batch_keys_by_sync_key,
+        local_counts_by_key=local_counts,
+    )
+
+
+def _group_ranks_key(process_group) -> tuple[int, ...]:
+    if process_group is None:
+        return ()
+    return tuple(int(rank) for rank in dist.get_process_group_ranks(process_group))
+
+
+def _batch_group_key(batch_group: DionBatchGroup) -> tuple:
+    return (
+        str(batch_group.kernel_kind),
+        int(batch_group.batch_world_size),
+        _group_ranks_key(batch_group.replicate_group),
+        _group_ranks_key(batch_group.ortho_group),
+        _group_ranks_key(batch_group.q_norm_group),
+        _group_ranks_key(batch_group.compressed_replicate_group),
+        tuple(_group_ranks_key(group) for group in batch_group.sync_groups),
+    )
+
+
+def _project_group_for_sync(group_ranks: tuple[int, ...], sync_group_ranks: tuple[int, ...]) -> tuple:
+    if not group_ranks:
+        return ()
+    if group_ranks == sync_group_ranks:
+        return ("self", len(group_ranks))
+    return ("other", len(group_ranks))
+
+
+def _optimizer_key_for_sync(optimizer_key: tuple) -> tuple:
+    if isinstance(optimizer_key, tuple) and len(optimizer_key) == 6:
+        _, _, _, _, rank_fraction, r = optimizer_key
+        return (rank_fraction, r)
+    return optimizer_key
+
+
+def _batch_group_param_uids(batch_group: DionBatchGroup) -> tuple:
+    uids = []
+    for dist_meta in batch_group.dist_metas or []:
+        param_uid = getattr(dist_meta, "param_uid", None)
+        uids.append(tuple(param_uid) if param_uid is not None else None)
+    return tuple(uids)
+
+
+def _batch_key_for_sync(batch_key: tuple, sync_group, *, param_uids: tuple = ()) -> tuple:
+    """Project one local full batch key into the contract visible to one sync group."""
+    if sync_group is None:
+        return batch_key
+    update_key, optimizer_key, group_key = batch_key
+    (
+        kernel_kind,
+        batch_world_size,
+        replicate_ranks,
+        ortho_ranks,
+        q_norm_ranks,
+        compressed_replicate_ranks,
+        sync_group_ranks_by_role,
+    ) = group_key
+    sync_group_ranks = _group_ranks_key(sync_group)
+    return (
+        update_key,
+        _optimizer_key_for_sync(optimizer_key),
+        tuple(param_uids),
+        (
+            kernel_kind,
+            batch_world_size,
+            _project_group_for_sync(replicate_ranks, sync_group_ranks),
+            _project_group_for_sync(ortho_ranks, sync_group_ranks),
+            _project_group_for_sync(q_norm_ranks, sync_group_ranks),
+            _project_group_for_sync(compressed_replicate_ranks, sync_group_ranks),
+            tuple(
+                _project_group_for_sync(group_ranks, sync_group_ranks)
+                for group_ranks in sync_group_ranks_by_role
+            ),
+        ),
+    )
+
+
+def _local_batch_keys_from_sync_order(
+    *,
+    ordered_sync_keys: Sequence[tuple],
+    local_batch_keys_by_sync_key: Dict[tuple, List[tuple]],
+    local_counts_by_key: Dict[tuple, int],
+) -> tuple[list[tuple], dict[tuple, int]]:
+    ordered_local_keys = []
+    multiplicity = {}
+    for sync_key in ordered_sync_keys:
+        local_keys = local_batch_keys_by_sync_key.get(sync_key, [])
+        if not local_keys:
+            raise RuntimeError(
+                "[DION_BATCH_SYNC_KEY_MISSING_LOCAL_KEY] "
+                f"sync_key={sync_key}"
+            )
+        if len(local_keys) != 1:
+            raise RuntimeError(
+                "[DION_BATCH_SYNC_KEY_AMBIGUOUS] "
+                f"sync_key={sync_key} local_keys={tuple(local_keys)}"
+            )
+        local_key = local_keys[0]
+        ordered_local_keys.append(local_key)
+        multiplicity[local_key] = int(local_counts_by_key[local_key])
+    return ordered_local_keys, multiplicity
 
 
 def group_items_by_batch_key(
@@ -432,6 +577,7 @@ def build_batch_collectives(
     q_tensors,
     configs,
     dist_metas,
+    real_batch_size: int,
     use_fs_collectives: bool,
     resolve_tp_group: Callable,
     resolve_fs_group: Callable,
@@ -447,8 +593,13 @@ def build_batch_collectives(
 
     dist_metas = dist_metas or []
     q_tensors = q_tensors or []
-    real_dist_meta_count = sum(1 for dist_meta in dist_metas if dist_meta is not None)
     template_dist_meta = next((dist_meta for dist_meta in dist_metas if dist_meta is not None), None)
+    real_batch_size = int(real_batch_size)
+    if real_batch_size < 0 or real_batch_size > len(configs):
+        raise RuntimeError(
+            "[DION_INVALID_REAL_BATCH_SIZE] "
+            f"rank={dist.get_rank()} real_batch_size={real_batch_size} batch_size={len(configs)}"
+        )
 
     def register_ortho_group(process_group, *, idx: int, axis: str) -> None:
         nonlocal ortho_group
@@ -477,10 +628,10 @@ def build_batch_collectives(
     for idx, config in enumerate(configs):
         dist_meta = dist_metas[idx] if idx < len(dist_metas) else None
         if dist_meta is None:
-            if idx < real_dist_meta_count:
+            if idx < real_batch_size:
                 raise RuntimeError(
                     "[DION_UNEXPECTED_MISSING_DIST_META_IN_REAL_ENTRY] "
-                    f"rank={dist.get_rank()} idx={idx} real_dist_meta_count={real_dist_meta_count}"
+                    f"rank={dist.get_rank()} idx={idx} real_batch_size={real_batch_size}"
                 )
             dist_meta = template_dist_meta
         use_tp_shard = bool(getattr(config, "use_tp_shard", False))
@@ -620,7 +771,17 @@ def group_and_order_param_batches(
         per_expert_global_shape = state.get("per_expert_global_shape", None)
         if per_expert_global_shape is None and dist_meta is not None:
             per_expert_global_shape = getattr(dist_meta, "per_expert_global_shape", None)
-        batch_items.append(routed_param)
+        resolved_group = resolve_batch_group(
+            config=config,
+            dist_meta=dist_meta,
+            use_fs_collectives=use_fs_collectives,
+            state_replica_group=state_replica_group,
+            replica_validation_group=replica_validation_group,
+            group_size=group_size,
+            get_replicate_group=get_replicate_group,
+            resolve_ortho_group=resolve_ortho_group,
+        )
+        batch_items.append((routed_param, resolved_group))
         batch_keys.append(
             (
                 build_batch_key(
@@ -634,41 +795,34 @@ def group_and_order_param_batches(
                     routed_param.optim_group,
                     routed_param.optimizer_state,
                 ),
+                _batch_group_key(resolved_group),
             )
         )
 
     for batch_key, grouped_items in group_items_by_batch_key(batch_items, batch_keys):
+        first_group = grouped_items[0][1]
+        params = [item[0] for item in grouped_items]
         batch_group_by_key[batch_key] = DionBatchGroup(
-            params=[item.param for item in grouped_items],
-            grads=[item.grad for item in grouped_items],
-            optimizer_states=[item.optimizer_state for item in grouped_items],
-            optim_groups=[item.optim_group for item in grouped_items],
-            configs=[item.config for item in grouped_items],
-            dist_metas=[item.dist_meta for item in grouped_items],
-            commit_updates=[item.commit_update for item in grouped_items],
+            params=[item.param for item in params],
+            grads=[item.grad for item in params],
+            optimizer_states=[item.optimizer_state for item in params],
+            optim_groups=[item.optim_group for item in params],
+            configs=[item.config for item in params],
+            dist_metas=[item.dist_meta for item in params],
+            commit_updates=[item.commit_update for item in params],
+            sync_groups=first_group.sync_groups,
+            kernel_kind=first_group.kernel_kind,
+            replicate_group=first_group.replicate_group,
+            ortho_group=first_group.ortho_group,
+            q_norm_group=first_group.q_norm_group,
+            compressed_replicate_group=first_group.compressed_replicate_group,
+            batch_world_size=first_group.batch_world_size,
         )
 
     local_batch_keys = list(batch_group_by_key.keys())
     grouped_batch_keys = {}
     for batch_key in local_batch_keys:
         batch_group = batch_group_by_key[batch_key]
-        resolved_group = resolve_batch_group(
-            config=batch_group.configs[0],
-            dist_meta=batch_group.dist_metas[0] if batch_group.dist_metas else None,
-            use_fs_collectives=use_fs_collectives,
-            state_replica_group=state_replica_group,
-            replica_validation_group=replica_validation_group,
-            group_size=group_size,
-            get_replicate_group=get_replicate_group,
-            resolve_ortho_group=resolve_ortho_group,
-        )
-        batch_group.sync_groups = resolved_group.sync_groups
-        batch_group.kernel_kind = resolved_group.kernel_kind
-        batch_group.replicate_group = resolved_group.replicate_group
-        batch_group.ortho_group = resolved_group.ortho_group
-        batch_group.q_norm_group = resolved_group.q_norm_group
-        batch_group.compressed_replicate_group = resolved_group.compressed_replicate_group
-        batch_group.batch_world_size = resolved_group.batch_world_size
         if not batch_group.sync_groups:
             grouped_batch_keys.setdefault(None, (None, []))[1].append(batch_key)
             continue
@@ -682,6 +836,7 @@ def group_and_order_param_batches(
             sync_group=sync_group,
             local_batch_keys=group_keys,
             batch_group_by_key=batch_group_by_key,
+            batch_key_cache=batch_key_cache,
         )
         all_batch_keys.extend(ordered_keys)
         for batch_key, count in multiplicity.items():
@@ -850,6 +1005,7 @@ def build_dion_batches(
                 q_tensors=batch_data["q_tensors"],
                 configs=batch_data["configs"],
                 dist_metas=batch_data["dist_metas"],
+                real_batch_size=batch_data["real_batch_size"],
                 use_fs_collectives=use_fs_collectives,
                 resolve_tp_group=resolve_tp_group,
                 resolve_fs_group=resolve_fs_group,

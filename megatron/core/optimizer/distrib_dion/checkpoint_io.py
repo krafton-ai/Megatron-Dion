@@ -12,8 +12,10 @@ from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 
+from ...fp8_utils import dequantize_fp8_tensor, is_float8tensor
 from ..dion.linear import iter_linear_child_kinds, linear_state_key
 from ..dion.qkv import iter_qkv_child_kinds, qkv_state_key
+from ..dion.utils import str_to_dtype
 from .sharding import (
     DionShardLayout,
     compute_fs_shard_range,
@@ -22,6 +24,10 @@ from .sharding import (
 )
 
 logger = logging.getLogger(__name__)
+
+DION_PARAM_STATE_FORMAT = "dion_dp_rank_state_v3"
+_LEGACY_DION_PARAM_STATE_FORMATS = {"dion_fs_rank_state_v1", "dion_dp_rank_state_v2"}
+_SUPPORTED_DION_PARAM_STATE_FORMATS = {"dp_reshardable", "dion_fs_rank_state"}
 
 
 def _param_name(param: torch.Tensor) -> str:
@@ -35,6 +41,203 @@ def _param_name(param: torch.Tensor) -> str:
         if name is not None:
             return name
     return f"id_{id(param)}"
+
+
+def resolve_dion_checkpoint_sharding_type(sharding_type, metadata) -> str:
+    """Return the checkpoint state format requested for Dion optimizer state."""
+    if sharding_type is not None:
+        logger.warning(
+            "DistributedOptimizerForDion.sharded_state_dict parameter `sharding_type` "
+            "is deprecated; use metadata['distrib_optim_sharding_type'] instead."
+        )
+        requested_type = sharding_type
+    else:
+        requested_type = (metadata or {}).get("distrib_optim_sharding_type", "dp_reshardable")
+
+    if requested_type in {"fully_reshardable", "fully_sharded_model_space", "fsdp_dtensor"}:
+        raise NotImplementedError(
+            "[Dion] optimizer checkpoint format "
+            f"{requested_type!r} requires tensor-level Dion momentum/Q resharding, "
+            "which is not implemented. Use the Dion FS-rank checkpoint state with "
+            "unchanged FS and TP sizes."
+        )
+    if requested_type not in _SUPPORTED_DION_PARAM_STATE_FORMATS:
+        raise NotImplementedError(
+            "[Dion] unsupported optimizer checkpoint format "
+            f"{requested_type!r}; supported formats are "
+            f"{sorted(_SUPPORTED_DION_PARAM_STATE_FORMATS)}"
+        )
+    return str(requested_type)
+
+
+def _normalize_topology_signature(signature: dict) -> dict:
+    """Normalize checkpoint topology signatures for exact equality checks."""
+    if not isinstance(signature, dict):
+        raise RuntimeError(
+            "[Dion] invalid Dion optimizer topology signature: "
+            f"type={type(signature).__name__}"
+        )
+    normalized = {}
+    for key, ranks in signature.items():
+        normalized[str(key)] = tuple(int(rank) for rank in ranks)
+    return normalized
+
+
+def build_dion_checkpoint_metadata(
+    *,
+    dp_size: int,
+    fs_size: int,
+    tp_size: int,
+    rp_size: int,
+    state_replica_size: int,
+    requested_type: str,
+    topology_signature: Optional[dict] = None,
+) -> dict:
+    """Build small checkpoint metadata for Dion optimizer-state compatibility checks."""
+    metadata = {
+        "param_state_format": DION_PARAM_STATE_FORMAT,
+        "requested_type": str(requested_type),
+        "dp_size": int(dp_size),
+        "fs_size": int(fs_size),
+        "tp_size": int(tp_size),
+        "rp_size": int(rp_size),
+        "state_replica_size": int(state_replica_size),
+    }
+    if topology_signature is not None:
+        metadata["topology_signature"] = topology_signature
+    return metadata
+
+
+def validate_dion_checkpoint_metadata(
+    checkpoint_metadata,
+    *,
+    dp_size: int = 1,
+    fs_size: int,
+    tp_size: int,
+    rp_size: int = 1,
+    state_replica_size: int = 1,
+    topology_signature: Optional[dict] = None,
+) -> None:
+    """Fail before restore when the saved Dion tensor layout cannot be resharded."""
+    if checkpoint_metadata is None:
+        if (
+            int(fs_size) == 1
+            and int(tp_size) == 1
+            and int(rp_size) == 1
+            and int(state_replica_size) == 1
+        ):
+            return
+        raise RuntimeError(
+            "[Dion] checkpoint is missing Dion optimizer metadata. "
+            "Older Dion distributed checkpoints did not save all FS-local state; "
+            f"refusing restore for current fs_size={int(fs_size)} "
+            f"tp_size={int(tp_size)} rp_size={int(rp_size)} "
+            f"state_replica_size={int(state_replica_size)}."
+        )
+    if not isinstance(checkpoint_metadata, dict):
+        raise RuntimeError(
+            "[Dion] invalid Dion optimizer checkpoint metadata: "
+            f"type={type(checkpoint_metadata).__name__}"
+        )
+
+    saved_format = checkpoint_metadata.get("param_state_format", None)
+    supported_formats = {DION_PARAM_STATE_FORMAT, *_LEGACY_DION_PARAM_STATE_FORMATS}
+    if saved_format not in supported_formats:
+        raise RuntimeError(
+            "[Dion] unsupported Dion optimizer checkpoint state format: "
+            f"saved={saved_format!r} current={DION_PARAM_STATE_FORMAT!r}"
+        )
+
+    saved_dp_size = int(checkpoint_metadata.get("dp_size", -1))
+    saved_fs_size = int(checkpoint_metadata.get("fs_size", -1))
+    saved_tp_size = int(checkpoint_metadata.get("tp_size", -1))
+    saved_rp_size = int(
+        checkpoint_metadata.get(
+            "rp_size",
+            -1 if saved_format == DION_PARAM_STATE_FORMAT else 1,
+        )
+    )
+    saved_state_replica_size = int(
+        checkpoint_metadata.get(
+            "state_replica_size",
+            -1 if saved_format == DION_PARAM_STATE_FORMAT else 1,
+        )
+    )
+    if saved_format == DION_PARAM_STATE_FORMAT and saved_dp_size != int(dp_size):
+        raise RuntimeError(
+            "[Dion] unsupported Dion checkpoint DP topology change: "
+            f"saved_dp_size={saved_dp_size} current_dp_size={int(dp_size)}. "
+            "Dion optimizer-state resharding across DP ranks is not implemented."
+        )
+    if saved_fs_size != int(fs_size):
+        raise RuntimeError(
+            "[Dion] unsupported Dion checkpoint FS topology change: "
+            f"saved_fs_size={saved_fs_size} current_fs_size={int(fs_size)}. "
+            "Dion momentum/Q resharding across FS is not implemented."
+        )
+    if saved_tp_size != int(tp_size):
+        raise RuntimeError(
+            "[Dion] unsupported Dion checkpoint TP topology change: "
+            f"saved_tp_size={saved_tp_size} current_tp_size={int(tp_size)}. "
+            "Dion Q resharding across TP is not implemented."
+        )
+    if saved_rp_size != int(rp_size):
+        raise RuntimeError(
+            "[Dion] unsupported Dion checkpoint RP topology change: "
+            f"saved_rp_size={saved_rp_size} current_rp_size={int(rp_size)}. "
+            "Dion replica-state remapping across RP is not implemented."
+        )
+    if saved_state_replica_size != int(state_replica_size):
+        raise RuntimeError(
+            "[Dion] unsupported Dion checkpoint state-replica topology change: "
+            f"saved_state_replica_size={saved_state_replica_size} "
+            f"current_state_replica_size={int(state_replica_size)}. "
+            "Dion state-replica remapping is not implemented."
+        )
+    if saved_format == DION_PARAM_STATE_FORMAT:
+        saved_topology_signature = checkpoint_metadata.get("topology_signature", None)
+        if saved_topology_signature is None or topology_signature is None:
+            raise RuntimeError(
+                "[Dion] checkpoint is missing Dion optimizer topology signature. "
+                "Refusing same-size restore because group membership/order cannot be proven."
+            )
+        if _normalize_topology_signature(saved_topology_signature) != _normalize_topology_signature(
+            topology_signature
+        ):
+            raise RuntimeError(
+                "[Dion] unsupported Dion checkpoint topology identity change: "
+                f"saved={saved_topology_signature} current={topology_signature}"
+            )
+
+
+def _is_q_state_key(key: str) -> bool:
+    if key == "Q":
+        return True
+    for child_kind in iter_qkv_child_kinds():
+        if key == qkv_state_key("Q", child_kind):
+            return True
+    for child_kind in iter_linear_child_kinds():
+        if key == linear_state_key("Q", child_kind):
+            return True
+    return False
+
+
+def _target_tensor_dtype(
+    *,
+    key: str,
+    param: torch.Tensor,
+    current_value,
+    mixed_precision_config,
+) -> Optional[torch.dtype]:
+    if isinstance(current_value, torch.Tensor):
+        return current_value.dtype
+    if key == "momentum":
+        dtype = str_to_dtype(getattr(mixed_precision_config, "momentum_dtype", None))
+        return dtype if dtype is not None else param.dtype
+    if _is_q_state_key(key):
+        dtype = str_to_dtype(getattr(mixed_precision_config, "q_dtype", None))
+        return dtype if dtype is not None else param.dtype
+    return None
 
 
 def build_persistent_dion_param_state(param_groups, optimizer_state, get_param_key) -> dict:
@@ -52,13 +255,12 @@ def build_persistent_dion_param_state(param_groups, optimizer_state, get_param_k
             param_key = get_param_key(param)
             if param_key is None:
                 continue
-            persistent_state = {}
+            persistent_state = {"param": param.detach()}
             for key, value in state.items():
                 if key.startswith("_"):
                     continue
                 persistent_state[key] = value
-            if persistent_state:
-                key_to_state[param_key] = persistent_state
+            key_to_state[param_key] = persistent_state
     return key_to_state
 
 
@@ -68,6 +270,7 @@ def restore_persistent_dion_param_state_(
     optimizer_state,
     get_param_key,
     key_to_state: dict,
+    mixed_precision_config=None,
 ) -> dict[str, int]:
     """Restore persistent Dion optimizer state keyed by `param_uid`.
 
@@ -105,17 +308,47 @@ def restore_persistent_dion_param_state_(
             if "_q_gather_buffer" in new_state:
                 new_state["_q_gather_buffer"] = None
 
+            restored_normal_q = False
+            restored_param = False
             for key, value in saved_state.items():
                 if isinstance(value, torch.Tensor):
+                    if key == "param":
+                        if tuple(param.shape) != tuple(value.shape):
+                            raise RuntimeError(
+                                f"[Dion] checkpoint tensor shape mismatch for {param_key}.param: "
+                                f"saved={tuple(value.shape)} current={tuple(param.shape)}"
+                            )
+                        param.data.copy_(value.to(device=param.device, dtype=param.dtype))
+                        restored_param = True
+                        continue
                     current_value = current_state.get(key)
                     if isinstance(current_value, torch.Tensor) and current_value.shape != value.shape:
                         raise RuntimeError(
                             f"[Dion] checkpoint tensor shape mismatch for {param_key}.{key}: "
                             f"saved={tuple(value.shape)} current={tuple(current_value.shape)}"
                         )
-                    new_state[key] = value.to(device=param.device)
+                    target_dtype = _target_tensor_dtype(
+                        key=key,
+                        param=param,
+                        current_value=current_value,
+                        mixed_precision_config=mixed_precision_config,
+                    )
+                    to_kwargs = {"device": param.device}
+                    if target_dtype is not None:
+                        to_kwargs["dtype"] = target_dtype
+                    new_state[key] = value.to(**to_kwargs)
+                    if key == "Q":
+                        restored_normal_q = True
                 else:
                     new_state[key] = value
+
+            if restored_normal_q:
+                new_state["_needs_state_replica_q_sync"] = True
+            if not restored_param:
+                raise RuntimeError(
+                    "[Dion] distributed checkpoint is missing optimizer master param "
+                    f"for {param_key}"
+                )
 
             if bool(new_state.get("qkv_split_qkv", False)):
                 for child_kind in iter_qkv_child_kinds():
@@ -141,7 +374,11 @@ def build_distributed_dion_checkpoint_state(
     optimizer_state,
     get_param_key,
     base_key: str,
-    replica_id,
+    common_replica_id,
+    state_global_shape,
+    state_global_offset,
+    state_replica_id,
+    checkpoint_metadata: dict,
     sharded_object_cls,
 ) -> dict:
     """Build distributed checkpoint state with standard common-state outer layout."""
@@ -151,10 +388,17 @@ def build_distributed_dion_checkpoint_state(
             value,
             (1,),
             (0,),
-            replica_id=replica_id,
+            replica_id=common_replica_id,
         )
         for key, value in common_state.items()
     }
+    state_dict["dion_checkpoint_metadata"] = sharded_object_cls(
+        f"{base_key}.dion_checkpoint_metadata",
+        checkpoint_metadata,
+        (1,),
+        (0,),
+        replica_id=common_replica_id,
+    )
 
     dion_param_state = build_persistent_dion_param_state(
         param_groups,
@@ -164,15 +408,18 @@ def build_distributed_dion_checkpoint_state(
     state_dict["dion_param_state"] = sharded_object_cls(
         f"{base_key}.dion_param_state",
         dion_param_state,
-        (1,),
-        (0,),
-        replica_id=replica_id,
+        tuple(int(dim) for dim in state_global_shape),
+        tuple(int(offset) for offset in state_global_offset),
+        replica_id=state_replica_id,
     )
     return state_dict
 
 
-def split_distributed_dion_checkpoint_state(state_dict: dict) -> tuple[Optional[dict], dict]:
+def split_distributed_dion_checkpoint_state(
+    state_dict: dict,
+) -> tuple[Optional[dict], Optional[dict], dict]:
     """Split Dion payload from the standard common-state outer protocol."""
+    checkpoint_metadata = state_dict.get("dion_checkpoint_metadata", None)
     dion_param_state = state_dict.get("dion_param_state", None)
     if dion_param_state is None and state_dict.get("param_state_sharding_type") == "dion_non_reshardable":
         dion_param_state = state_dict.get("param_state", None)
@@ -180,9 +427,15 @@ def split_distributed_dion_checkpoint_state(state_dict: dict) -> tuple[Optional[
     common_state_dict = {
         key: value
         for key, value in state_dict.items()
-        if key not in ("dion_param_state", "param_state", "param_state_sharding_type")
+        if key
+        not in (
+            "dion_checkpoint_metadata",
+            "dion_param_state",
+            "param_state",
+            "param_state_sharding_type",
+        )
     }
-    return dion_param_state, common_state_dict
+    return checkpoint_metadata, dion_param_state, common_state_dict
 
 
 def ensure_dion_state_initialized_for_load(
@@ -211,6 +464,7 @@ def restore_distributed_dion_checkpoint_state(
     param_groups,
     optimizer_state,
     get_param_key,
+    mixed_precision_config=None,
 ) -> dict[str, int]:
     """Restore Dion-specific distributed checkpoint payload and validate completeness."""
     if not isinstance(dion_param_state, dict) or len(dion_param_state) == 0:
@@ -221,6 +475,7 @@ def restore_distributed_dion_checkpoint_state(
         optimizer_state=optimizer_state,
         get_param_key=get_param_key,
         key_to_state=dion_param_state,
+        mixed_precision_config=mixed_precision_config,
     )
     if restore_summary["unnamed"] > 0 or restore_summary["no_payload_entry"] > 0:
         raise RuntimeError(
@@ -249,10 +504,11 @@ def all_gather_flat_shards_(
     - write them back into the correct ranges
     """
     local_shard_size = flat_end - flat_start
-    if local_shard_size <= 0:
-        return
-
-    local_shard = param_flat[flat_start:flat_end].contiguous()
+    if flat_start < 0 or local_shard_size < 0:
+        raise RuntimeError(
+            f"[Dion] invalid flat shard range for checkpoint gather: "
+            f"start={flat_start} end={flat_end}"
+        )
 
     total_numel = param_flat.numel()
     max_shard_size = (total_numel + world_size - 1) // world_size
@@ -260,7 +516,9 @@ def all_gather_flat_shards_(
     padded_shard = torch.zeros(
         max_shard_size, dtype=param_flat.dtype, device=param_flat.device
     )
-    padded_shard[:local_shard_size].copy_(local_shard)
+    if local_shard_size > 0:
+        local_shard = param_flat[flat_start:flat_end].contiguous()
+        padded_shard[:local_shard_size].copy_(local_shard)
 
     gathered_shards = [torch.empty_like(padded_shard) for _ in range(world_size)]
     dist.all_gather(gathered_shards, padded_shard, group=group)
@@ -293,10 +551,12 @@ def all_gather_fs_shards_2d(
     axis, all_gather, then write each rank's actual shard view back in place.
     """
     local_shard_size = end_idx - start_idx
-    if local_shard_size <= 0:
-        return
+    if start_idx < 0 or local_shard_size < 0:
+        raise RuntimeError(
+            f"[Dion] invalid FS shard range for checkpoint gather: "
+            f"start={start_idx} end={end_idx}"
+        )
 
-    local_shard = fs_shard_view_2d(param_2d, fs_shard_dim, start_idx, end_idx).contiguous()
     other_dim_size = param_2d.shape[1] if fs_shard_dim == 0 else param_2d.shape[0]
 
     split_dim_size = param_2d.shape[fs_shard_dim]
@@ -306,12 +566,20 @@ def all_gather_fs_shards_2d(
         padded_shard = torch.zeros(
             max_shard_size, other_dim_size, dtype=param_2d.dtype, device=param_2d.device
         )
-        padded_shard[:local_shard_size, :].copy_(local_shard)
+        if local_shard_size > 0:
+            local_shard = fs_shard_view_2d(
+                param_2d, fs_shard_dim, start_idx, end_idx
+            ).contiguous()
+            padded_shard[:local_shard_size, :].copy_(local_shard)
     else:
         padded_shard = torch.zeros(
             other_dim_size, max_shard_size, dtype=param_2d.dtype, device=param_2d.device
         )
-        padded_shard[:, :local_shard_size].copy_(local_shard)
+        if local_shard_size > 0:
+            local_shard = fs_shard_view_2d(
+                param_2d, fs_shard_dim, start_idx, end_idx
+            ).contiguous()
+            padded_shard[:, :local_shard_size].copy_(local_shard)
 
     gathered_shards = [torch.empty_like(padded_shard) for _ in range(fs_size)]
     dist.all_gather(gathered_shards, padded_shard, group=fs_group)
@@ -334,8 +602,6 @@ def copy_param_to_shard_main_(
     param_range,
 ) -> None:
     """Copy a source model/state-dict param into the local optimizer shard."""
-    from ...fp8_utils import dequantize_fp8_tensor, is_float8tensor
-
     if is_float8tensor(source_param):
         source_param_fp32 = dequantize_fp8_tensor(source_param)
     else:
@@ -384,17 +650,21 @@ def copy_group_params_to_main_shards_(
     get_source_param: Callable[[torch.nn.Parameter], torch.Tensor],
     get_param_range: Callable[[torch.nn.Parameter], object],
     get_dion_shard_layout: Callable[[torch.nn.Parameter], Optional[DionShardLayout]],
+    dion_params_only: bool = False,
 ) -> None:
     """Copy one or more model param groups into their local optimizer shards."""
     for model_group, shard_main_group in zip(model_groups, shard_main_groups):
         for model_param, shard_main_param in zip(model_group, shard_main_group):
             if shard_main_param is None:
                 continue
+            dion_shard_layout = get_dion_shard_layout(model_param)
+            if dion_params_only and dion_shard_layout is None:
+                continue
 
             copy_param_to_shard_main_(
                 source_param=get_source_param(model_param),
                 shard_main_param=shard_main_param,
-                dion_shard_layout=get_dion_shard_layout(model_param),
+                dion_shard_layout=dion_shard_layout,
                 param_range=get_param_range(model_param),
             )
 
@@ -423,7 +693,7 @@ def copy_model_params_to_main_shards(
         hybrid_optimizer_update()
         return
 
-    if use_megatron_fsdp or use_precision_aware_optimizer:
+    if use_megatron_fsdp:
         return
 
     model_param_to_state_dict_param_map = None
@@ -437,6 +707,25 @@ def copy_model_params_to_main_shards(
     else:
         get_source_param = lambda model_param: model_param
     get_param_range = lambda model_param: get_model_param_range_map(model_param)["param"]
+
+    if use_precision_aware_optimizer:
+        copy_group_params_to_main_shards_(
+            model_groups=model_float16_groups,
+            shard_main_groups=main_shard_groups,
+            get_source_param=get_source_param,
+            get_param_range=get_param_range,
+            get_dion_shard_layout=get_dion_shard_layout,
+            dion_params_only=True,
+        )
+        copy_group_params_to_main_shards_(
+            model_groups=model_fp32_groups,
+            shard_main_groups=shard_fp32_groups,
+            get_source_param=get_source_param,
+            get_param_range=get_param_range,
+            get_dion_shard_layout=get_dion_shard_layout,
+            dion_params_only=True,
+        )
+        return
 
     copy_group_params_to_main_shards_(
         model_groups=model_float16_groups,
@@ -572,6 +861,8 @@ def apply_non_dion_shards_(
         for model_param, shard_param in zip(model_group, shard_param_group):
             if shard_param is None or getattr(model_param, "is_dion_param", False):
                 continue
+            if is_float8tensor(model_param):
+                continue
             if get_bucket_param_data is None:
                 param_name = _param_name(model_param)
                 raise RuntimeError(
@@ -685,6 +976,30 @@ def copy_main_params_to_model_shards(
         return zero_range_warned
 
     if use_precision_aware_optimizer:
+        mark_buckets_full_param_ready(False)
+        check_main_shards(main_shard_groups)
+        restore_model_params_to_canonical_bucket_storage(dion_only=True)
+
+        _, zero_range_warned = apply_group_shards_to_model_params_(
+            model_groups=model_float16_groups,
+            shard_groups=main_shard_groups,
+            shard16_groups=shard_float16_groups,
+            get_data_shard=get_data_shard,
+            get_param_range_map=get_param_range_map,
+            get_dion_shard_layout=get_dion_shard_layout,
+            get_bucket_param_data=get_bucket_param_data,
+            zero_range_warned=zero_range_warned,
+        )
+        _, zero_range_warned = apply_group_shards_to_model_params_(
+            model_groups=model_fp32_groups,
+            shard_groups=shard_fp32_groups,
+            shard16_groups=shard_fp32_groups,
+            get_data_shard=get_data_shard,
+            get_param_range_map=get_param_range_map,
+            get_dion_shard_layout=get_dion_shard_layout,
+            get_bucket_param_data=get_bucket_param_data,
+            zero_range_warned=zero_range_warned,
+        )
         return zero_range_warned
 
     mark_buckets_full_param_ready(False)
@@ -744,8 +1059,6 @@ def restore_full_model_param_(
             return False
         flat_start = param_range.start
         flat_end = param_range.end
-        if flat_end <= flat_start:
-            return False
         param_flat = model_param.data.view(-1)
         all_gather_flat_shards_(
             param_flat,
@@ -759,8 +1072,6 @@ def restore_full_model_param_(
     fs_shard_dim = int(dion_shard_layout.fs_shard_dim)
     start_idx = int(dion_shard_layout.start_idx)
     end_idx = int(dion_shard_layout.end_idx)
-    if start_idx == end_idx:
-        return False
 
     all_gather_fs_shards_2d(
         model_param.data,

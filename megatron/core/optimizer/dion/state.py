@@ -28,6 +28,86 @@ from .types import (
 from .utils import get_global_shape, str_to_dtype
 
 
+def _split_range(size: int, world_size: int, rank: int) -> Tuple[int, int]:
+    """Return the canonical contiguous range for one rank."""
+    size = int(size)
+    world_size = int(world_size)
+    rank = int(rank)
+    if size < 0:
+        raise RuntimeError(f"[DION_INVALID_RANGE_SIZE] size={size}")
+    if world_size <= 0:
+        raise RuntimeError(f"[DION_INVALID_WORLD_SIZE] world_size={world_size}")
+    if rank < 0 or rank >= world_size:
+        raise RuntimeError(f"[DION_INVALID_RANK] rank={rank} world_size={world_size}")
+    base = size // world_size
+    remainder = size % world_size
+    start = rank * base + min(rank, remainder)
+    end = start + base + (1 if rank < remainder else 0)
+    return int(start), int(end)
+
+
+def _normal_q_submatrix(
+    *,
+    q_global_shape: Tuple[int, int],
+    row_start: int,
+    row_end: int,
+    col_start: int,
+    col_end: int,
+    seed: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Generate one local Q block from the seeded full-Q random stream."""
+    rows, cols = (int(q_global_shape[0]), int(q_global_shape[1]))
+    row_start = int(row_start)
+    row_end = int(row_end)
+    col_start = int(col_start)
+    col_end = int(col_end)
+    if rows <= 0 or cols <= 0:
+        raise RuntimeError(f"[DION_INVALID_Q_GLOBAL_SHAPE] q_global_shape={q_global_shape}")
+    if row_start < 0 or row_end < row_start or row_end > rows:
+        raise RuntimeError(
+            "[DION_INVALID_Q_ROW_RANGE] "
+            f"q_global_shape={q_global_shape} row_start={row_start} row_end={row_end}"
+        )
+    if col_start < 0 or col_end < col_start or col_end > cols:
+        raise RuntimeError(
+            "[DION_INVALID_Q_COL_RANGE] "
+            f"q_global_shape={q_global_shape} col_start={col_start} col_end={col_end}"
+        )
+
+    local_rows = row_end - row_start
+    local_cols = col_end - col_start
+    if local_rows <= 0 or local_cols <= 0:
+        raise RuntimeError(
+            "[DION_EMPTY_Q_SHARD] "
+            f"q_global_shape={q_global_shape} row_range=({row_start}, {row_end}) "
+            f"col_range=({col_start}, {col_end})"
+        )
+    q_state = torch.empty((local_rows, local_cols), device=device, dtype=dtype)
+
+    gen = torch.Generator(device=str(device))
+    gen.manual_seed(int(seed))
+
+    if device.type != "cuda":
+        q_full = torch.randn(q_global_shape, device=device, dtype=dtype, generator=gen)
+        return q_full[row_start:row_end, col_start:col_end].contiguous()
+
+    for local_row, global_row in enumerate(range(row_start, row_end)):
+        element_start = int(global_row) * cols + col_start
+        aligned_start = (element_start // 4) * 4
+        prefix = element_start - aligned_start
+        gen.set_offset(aligned_start)
+        row_values = torch.empty(
+            prefix + local_cols,
+            device=device,
+            dtype=dtype,
+        )
+        row_values.normal_(mean=0.0, std=1.0, generator=gen)
+        q_state[local_row].copy_(row_values[prefix:])
+    return q_state
+
+
 def require_2d_local_shape(
     param: Tensor, dist_meta: DionDistMeta
 ) -> Tuple[int, int]:
@@ -80,6 +160,7 @@ def resolve_q_state_layout(
     config: DionParamConfig,
     *,
     tp_world_size: int,
+    tp_rank: int = 0,
     use_q_unshard: bool,
     global_shape: Optional[Tuple[int, int]] = None,
     rank_fraction: float = 1.0,
@@ -105,13 +186,17 @@ def resolve_q_state_layout(
     r_global = max(1, int(r_global))
 
     if use_q_unshard:
-        if r_global < tp_world_size:
-            r_global = tp_world_size
-        elif r_global % tp_world_size != 0:
-            r_global = tp_world_size * math.ceil(r_global / tp_world_size)
-        r_local = r_global // tp_world_size
+        r_start, r_end = _split_range(r_global, tp_world_size, tp_rank)
+        r_local = r_end - r_start
     else:
         r_local = r_global
+    if q_base_local <= 0 or r_local <= 0:
+        raise RuntimeError(
+            "[DION_EMPTY_Q_SHARD] "
+            f"local_shape=({local_m}, {local_n}) global_shape=({m_global}, {n_global}) "
+            f"q_base_local={q_base_local} r_global={r_global} "
+            f"r_local={r_local} tp_world_size={tp_world_size} tp_rank={tp_rank}"
+        )
 
     q_local_layout = (
         "shard(0)" if bool(getattr(config, "use_fs_shard", False)) else "replicate",
@@ -119,12 +204,12 @@ def resolve_q_state_layout(
     )
     return DionQLayout(
         q_global_shape=(int(q_base_global), int(r_global)),
-        q_local_shape=(int(q_base_local), max(1, int(r_local))),
+        q_local_shape=(int(q_base_local), int(r_local)),
         q_gathered_shape=(int(q_base_local), int(r_global)),
         q_base_global=int(q_base_global),
         q_base_local=int(q_base_local),
         r_global=int(r_global),
-        r_local=max(1, int(r_local)),
+        r_local=int(r_local),
         q_local_layout=q_local_layout,
         q_gathered_layout=(q_local_layout[0], "replicate"),
     )
@@ -372,7 +457,7 @@ def init_q_state(
     r_local = int(q_layout.r_local)
     if q_base_local <= 0 or r_local <= 0:
         raise RuntimeError(
-            "[DION_INVALID_Q_LAYOUT] Q init requires positive local Q dimensions "
+            "[DION_EMPTY_Q_SHARD] Q init requires non-empty local Q dimensions "
             f"param_uid={getattr(dist_meta, 'param_uid', None)} "
             f"param_name={getattr(dist_meta, 'param_name', '') if dist_meta is not None else ''} "
             f"q_base_local={q_base_local} r_local={r_local}"
@@ -400,24 +485,33 @@ def init_q_state(
         fs_start = 0
         fs_end = int(q_local_shape[0])
 
-    q_tp_rank = int(tp_rank) if use_q_unshard and int(tp_world_size) > 1 else 0
-    tp_start = q_tp_rank * r_local
-    tp_end = tp_start + q_local_shape[1]
+    q_tp_world_size = int(tp_world_size) if use_q_unshard and int(tp_world_size) > 1 else 1
+    q_tp_rank = int(tp_rank) if q_tp_world_size > 1 else 0
+    tp_start, tp_end = _split_range(q_global_shape[1], q_tp_world_size, q_tp_rank)
+    if int(tp_end - tp_start) != int(q_local_shape[1]):
+        raise RuntimeError(
+            "[DION_Q_TP_RANGE_MISMATCH] "
+            f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+            f"param_name={getattr(dist_meta, 'param_name', '') if dist_meta is not None else ''} "
+            f"q_global_shape={q_global_shape} q_local_shape={q_local_shape} "
+            f"tp_world_size={tp_world_size} tp_rank={q_tp_rank} "
+            f"tp_range=({tp_start}, {tp_end})"
+        )
 
     q_dtype = str_to_dtype(mixed_precision_config.q_dtype)
     if q_dtype is None:
         q_dtype = param.dtype
 
-    q_gen = torch.Generator(device=param.device)
-    q_gen.manual_seed(int(q_seed))
-    q_global_full = torch.randn(
-        q_global_shape,
+    q_state = _normal_q_submatrix(
+        q_global_shape=q_global_shape,
+        row_start=fs_start,
+        row_end=fs_end,
+        col_start=tp_start,
+        col_end=tp_end,
+        seed=int(q_seed),
         device=param.device,
         dtype=q_dtype,
-        generator=q_gen,
-    )
-    q_state = q_global_full[fs_start:fs_end, tp_start:tp_end].contiguous()
-    del q_global_full
+    ).contiguous()
 
     if tuple(q_state.shape) != q_local_shape:
         raise RuntimeError(
