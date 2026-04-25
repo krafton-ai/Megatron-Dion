@@ -754,7 +754,7 @@ def write_shard_to_param_(
     empty_range_warning_count: int,
 ) -> int:
     """Copy an updated optimizer shard into `data_shard` and `model_param.data`."""
-    data_shard.data.copy_(opt_shard.to(data_shard.dtype))
+    data_shard.data.copy_(opt_shard)
     model_param._fs_shard = data_shard
 
     if dion_shard_layout is not None:
@@ -844,7 +844,7 @@ def write_shard_to_param_(
 
     target_view = target_flat.view_as(opt_shard)
     if target_view.data_ptr() != data_shard.data_ptr():
-        target_view.copy_(opt_shard.to(target_view.dtype))
+        target_view.copy_(opt_shard)
     return empty_range_warning_count
 
 

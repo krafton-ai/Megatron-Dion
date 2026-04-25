@@ -1,7 +1,7 @@
 """Dion kernel helpers that do not own Megatron runtime state."""
 
 import math
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from torch import Tensor
@@ -103,28 +103,41 @@ def apply_error_feedback(
     groups: List[Dict],
     *,
     default_mu: float,
+    real_batch_size: Optional[int] = None,
 ) -> None:
     """Apply Dion error feedback to batched momentum buffers."""
+    active_batch_size = len(momentums) if real_batch_size is None else int(real_batch_size)
+    if active_batch_size <= 0:
+        return
+    if active_batch_size > len(momentums):
+        raise RuntimeError(
+            "[DION_INVALID_ERROR_FEEDBACK_BATCH_SIZE] "
+            f"real_batch_size={active_batch_size} batch_size={len(momentums)}"
+        )
+    active_momentums = momentums[:active_batch_size]
+    active_configs = configs[:active_batch_size]
+    active_P = P_batch[:active_batch_size]
+    active_R = R_batch[:active_batch_size]
     mu = groups[0].get("mu", default_mu)
 
-    is_transposed = configs[0].is_transposed
-    if all(c.is_transposed == is_transposed for c in configs):
+    is_transposed = active_configs[0].is_transposed
+    if all(c.is_transposed == is_transposed for c in active_configs):
         apply_batched_matmul(
-            momentums,
-            P_batch,
-            R_batch,
+            active_momentums,
+            active_P,
+            active_R,
             alpha=-(1.0 - mu),
             beta=1.0,
             transpose=is_transposed,
         )
         return
 
-    for i, momentum in enumerate(momentums):
+    for i, momentum in enumerate(active_momentums):
         with _dion_math_precision_context():
-            if configs[i].is_transposed:
-                update = R_batch[i] @ P_batch[i].t()
+            if active_configs[i].is_transposed:
+                update = active_R[i] @ active_P[i].t()
             else:
-                update = P_batch[i] @ R_batch[i].t()
+                update = active_P[i] @ active_R[i].t()
 
         momentum.add_(update, alpha=-(1.0 - mu))
         del update
@@ -135,20 +148,47 @@ def fix_all_zero_or_nan(
     R_batch: Tensor,
     Q_batch: Tensor,
     M_batch: Tensor,
+    *,
+    real_batch_size: int,
 ):
-    """Reference-aligned NaN/zero fix for batched Dion intermediates."""
-    is_all_zero = (M_batch == 0).all(dim=(-2, -1), keepdim=True)
+    """Reference-aligned NaN/zero fix for active Dion batch entries."""
+    batch_size = int(P_batch.size(0))
+    active_batch_size = int(real_batch_size)
+    if active_batch_size < 0 or active_batch_size > batch_size:
+        raise RuntimeError(
+            "[DION_INVALID_FIXUP_REAL_BATCH_SIZE] "
+            f"real_batch_size={active_batch_size} batch_size={batch_size}"
+        )
+    if active_batch_size == 0:
+        return P_batch, R_batch
+
+    P_active = P_batch[:active_batch_size]
+    R_active = R_batch[:active_batch_size]
+    Q_active = Q_batch[:active_batch_size]
+    M_active = M_batch[:active_batch_size]
+
+    is_all_zero = (M_active == 0).all(dim=(-2, -1), keepdim=True)
     not_all_zero = ~is_all_zero
 
-    fixed_p = P_batch.nan_to_num() * not_all_zero
+    fixed_p_active = P_active.nan_to_num() * not_all_zero
 
-    q_clean = Q_batch.nan_to_num()
-    if q_clean.shape != R_batch.shape:
+    q_clean = Q_active.nan_to_num()
+    if q_clean.shape != R_active.shape:
         raise RuntimeError(
             "[DION_BAD_BATCH_Q_SHAPE_MISMATCH] "
-            f"Q_shape={tuple(q_clean.shape)} R_shape={tuple(R_batch.shape)}"
+            f"Q_shape={tuple(q_clean.shape)} R_shape={tuple(R_active.shape)}"
         )
-    fixed_r = R_batch.nan_to_num() * not_all_zero + q_clean * is_all_zero
+    fixed_r_active = R_active.nan_to_num() * not_all_zero + q_clean * is_all_zero
+
+    if active_batch_size == batch_size:
+        return fixed_p_active, fixed_r_active
+
+    fixed_p = torch.empty_like(P_batch)
+    fixed_r = torch.empty_like(R_batch)
+    fixed_p[:active_batch_size].copy_(fixed_p_active)
+    fixed_r[:active_batch_size].copy_(fixed_r_active)
+    fixed_p[active_batch_size:].copy_(P_batch[active_batch_size:])
+    fixed_r[active_batch_size:].copy_(R_batch[active_batch_size:])
 
     return fixed_p, fixed_r
 
@@ -232,10 +272,8 @@ def normalize_columns(
     *,
     epsilon: float,
 ):
-    """Return column-normalized Q_new and its local post-normalize squared sums."""
+    """Return column-normalized Q_new."""
     original_dtype = R_batch.dtype
     safe_denominator = col_sum_sq.sqrt().add_(epsilon)
     q_new = R_batch.to(dtype=torch.float32) / safe_denominator
-    q_new = q_new.to(dtype=original_dtype)
-    post_col_sum_sq = q_new.to(torch.float32).square().sum(dim=1)
-    return q_new, post_col_sum_sq
+    return q_new.to(dtype=original_dtype)

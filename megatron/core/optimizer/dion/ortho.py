@@ -594,6 +594,13 @@ def _make_sharded_sketch(
         device=device,
         dtype=dtype,
     )
+    row_values = None
+    if device.type == "cuda":
+        row_values = torch.empty(
+            local_rows + 3,
+            device=device,
+            dtype=dtype,
+        )
     for index, seed in enumerate(sketch_seeds):
         if device.type != "cuda":
             full_sketch = _seeded_normal_tensor(
@@ -614,13 +621,9 @@ def _make_sharded_sketch(
             aligned_start = (element_start // 4) * 4
             prefix = element_start - aligned_start
             gen.set_offset(aligned_start)
-            row_values = torch.empty(
-                prefix + local_rows,
-                device=device,
-                dtype=dtype,
-            )
-            row_values.normal_(mean=0.0, std=std, generator=gen)
-            sketch[index, row].copy_(row_values[prefix:])
+            row_target = row_values[: prefix + local_rows]
+            row_target.normal_(mean=0.0, std=std, generator=gen)
+            sketch[index, row].copy_(row_target[prefix:])
     return sketch
 
 
@@ -644,6 +647,23 @@ def generate_random_sketch_matrix(
     S = torch.empty((*batch_shape, k, m), device=P.device, dtype=P.dtype)
     S.normal_(std=std)
     return S
+
+
+def _with_inactive_batch_tail(
+    P_batch: Tensor,
+    P_active: Tensor,
+    *,
+    active_batch_size: int,
+) -> Tensor:
+    """Merge active orthogonalized entries with untouched inactive batch entries."""
+    batch_size = int(P_batch.size(0))
+    if active_batch_size == batch_size:
+        return P_active
+
+    P_ortho = torch.empty_like(P_batch)
+    P_ortho[:active_batch_size].copy_(P_active)
+    P_ortho[active_batch_size:].copy_(P_batch[active_batch_size:])
+    return P_ortho
 
 
 def distributed_orthogonalize(
@@ -680,11 +700,11 @@ def distributed_orthogonalize(
                 rcqr_oversample=optimizer.defaults["rcqr_oversample"],
             ).to(torch.float32)
         P_active = P_active.to(original_dtype).contiguous()
-        if active_batch_size == batch_size:
-            return P_active
-        P_ortho = P_batch.clone().contiguous()
-        P_ortho[:active_batch_size].copy_(P_active)
-        return P_ortho
+        return _with_inactive_batch_tail(
+            P_batch,
+            P_active,
+            active_batch_size=active_batch_size,
+        )
 
     batch_sketch_keys = sketch_keys(
         dist_metas=dist_metas[:active_batch_size] if dist_metas is not None else None,
@@ -735,11 +755,11 @@ def distributed_orthogonalize(
                 group=ortho_group,
             )
             P_local = P_local.to(original_dtype).contiguous()
-            if active_batch_size == batch_size:
-                return P_local
-            P_ortho = P_batch.clone().contiguous()
-            P_ortho[:active_batch_size].copy_(P_local)
-            return P_ortho
+            return _with_inactive_batch_tail(
+                P_batch,
+                P_local,
+                active_batch_size=active_batch_size,
+            )
 
         R_local = _reduce_scatter_batch_shards(
             _make_sharded_sketch(
@@ -794,11 +814,11 @@ def distributed_orthogonalize(
             P_local,
         )
         P_local = P_local.to(original_dtype).contiguous()
-        if active_batch_size == batch_size:
-            return P_local
-        P_ortho = P_batch.clone().contiguous()
-        P_ortho[:active_batch_size].copy_(P_local)
-        return P_ortho
+        return _with_inactive_batch_tail(
+            P_batch,
+            P_local,
+            active_batch_size=active_batch_size,
+        )
 
 
 def reshard_q_along_tp(

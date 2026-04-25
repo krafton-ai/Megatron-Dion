@@ -322,34 +322,36 @@ def resolve_grad_rank_to_fs_rank(
             f"grad_group_ranks={grad_group_ranks} fs_positions={fs_positions}"
         )
 
-    contiguous_start = fs_positions[0]
-    contiguous_positions = tuple(contiguous_start + fs_rank for fs_rank in range(fs_size))
-    if fs_positions == contiguous_positions:
-        if contiguous_start % fs_size != 0:
-            raise RuntimeError(
-                "[Dion] contiguous FS group is not aligned with the grad sync group "
-                f"bucket={bucket_id} fs_group_ranks={fs_group_ranks} "
-                f"grad_group_ranks={grad_group_ranks} fs_positions={fs_positions}"
-            )
-        grad_rank_to_fs_rank = [
-            int(grad_rank % fs_size) for grad_rank in range(grad_group_size)
-        ]
-    else:
-        fs_position_offset = fs_positions[0]
-        strided_positions = tuple(
-            fs_position_offset + fs_rank * same_fs_rank_count
-            for fs_rank in range(fs_size)
+    fs_stride = int(fs_positions[1]) - int(fs_positions[0])
+    if fs_stride <= 0:
+        raise RuntimeError(
+            "[Dion] cannot prove FS rank order from authoritative grad/FS groups "
+            f"bucket={bucket_id} fs_group_ranks={fs_group_ranks} "
+            f"grad_group_ranks={grad_group_ranks} fs_positions={fs_positions} "
+            f"same_fs_rank_count={same_fs_rank_count}"
         )
-        if fs_positions != strided_positions or fs_position_offset >= same_fs_rank_count:
-            raise RuntimeError(
-                "[Dion] cannot prove FS rank order from authoritative grad/FS groups "
-                f"bucket={bucket_id} fs_group_ranks={fs_group_ranks} "
-                f"grad_group_ranks={grad_group_ranks} fs_positions={fs_positions} "
-                f"same_fs_rank_count={same_fs_rank_count}"
-            )
-        grad_rank_to_fs_rank = [
-            int(grad_rank // same_fs_rank_count) for grad_rank in range(grad_group_size)
-        ]
+    fs_position_offset = int(fs_positions[0])
+    expected_fs_positions = tuple(
+        fs_position_offset + fs_rank * fs_stride for fs_rank in range(fs_size)
+    )
+    fs_cycle = int(fs_stride) * int(fs_size)
+    cycle_offset = fs_position_offset % fs_cycle
+    if (
+        fs_positions != expected_fs_positions
+        or cycle_offset >= fs_stride
+        or grad_group_size % fs_cycle != 0
+    ):
+        raise RuntimeError(
+            "[Dion] cannot prove FS rank order from authoritative grad/FS groups "
+            f"bucket={bucket_id} fs_group_ranks={fs_group_ranks} "
+            f"grad_group_ranks={grad_group_ranks} fs_positions={fs_positions} "
+            f"same_fs_rank_count={same_fs_rank_count}"
+        )
+    fs_cycle_start = fs_position_offset - (fs_position_offset % fs_stride)
+    grad_rank_to_fs_rank = [
+        int(((grad_rank - fs_cycle_start) // fs_stride) % fs_size)
+        for grad_rank in range(grad_group_size)
+    ]
 
     if any(fs_rank < 0 for fs_rank in grad_rank_to_fs_rank):
         raise RuntimeError(
@@ -1147,8 +1149,9 @@ def fill_dion_shard_buffer(
             f"param={optimizer._param_name(entry.param) or f'id_{id(entry.param)}'} "
             f"source={int(canonical_local_source.numel())} expected={local_numel}"
         )
-    shard_buffer.zero_()
     shard_buffer[:local_numel].copy_(canonical_local_source.reshape(-1)[:local_numel])
+    if local_numel < shard_buffer.numel():
+        shard_buffer[local_numel:].zero_()
 
 
 def prepare_dion_param_gather(optimizer, bucket) -> Tuple[torch.Tensor, List[Tuple[DionShardEntry, torch.Tensor]]]:
@@ -1301,8 +1304,7 @@ def _get_standard_param_gather_route(
     return route
 
 
-def prepare_standard_param_gather(optimizer, bucket):
-    """Build the minimal standard all-gather input for a mixed bucket."""
+def _standard_param_gather_route(optimizer, bucket):
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not bucket.has_standard_params:
         return None, None, None
@@ -1313,7 +1315,7 @@ def prepare_standard_param_gather(optimizer, bucket):
             "[Dion] mixed standard all-gather requires the standard local-shard group."
         )
     if dp_size == 1:
-        return None, None, dp_group
+        return None, dp_group, dp_size
 
     if bucket.param_data.numel() % dp_size != 0:
         raise RuntimeError(
@@ -1323,7 +1325,7 @@ def prepare_standard_param_gather(optimizer, bucket):
         )
     shard_size = bucket.param_data.numel() // dp_size
     if shard_size <= 0:
-        return None, None, dp_group
+        return None, dp_group, dp_size
 
     route = _get_standard_param_gather_route(
         bucket=bucket,
@@ -1331,7 +1333,25 @@ def prepare_standard_param_gather(optimizer, bucket):
         group_rank=dp_rank,
         standard_shard_size=shard_size,
     )
-    if route.standard_numel <= 0:
+    return route, dp_group, dp_size
+
+
+def fill_standard_param_gather(bucket, target: torch.Tensor, route: StandardParamGatherRoute) -> None:
+    target.zero_()
+    for source_start, source_end, target_start in route.rank_segments[int(route.group_rank)]:
+        source_start = int(source_start)
+        source_end = int(source_end)
+        target_start = int(target_start)
+        target_end = target_start + source_end - source_start
+        target[target_start:target_end].copy_(
+            bucket.param_data.view(-1)[source_start:source_end]
+        )
+
+
+def prepare_standard_param_gather(optimizer, bucket):
+    """Build the minimal standard all-gather input for a mixed bucket."""
+    route, dp_group, _ = _standard_param_gather_route(optimizer, bucket)
+    if route is None or int(route.standard_numel) <= 0:
         return None, route, dp_group
 
     input_shard = _acquire_param_gather_tensor(
@@ -1346,16 +1366,8 @@ def prepare_standard_param_gather(optimizer, bucket):
             int(route.standard_shard_size),
             int(route.standard_numel),
         ),
-        zero=True,
     )
-    for source_start, source_end, target_start in route.rank_segments[int(dp_rank)]:
-        source_start = int(source_start)
-        source_end = int(source_end)
-        target_start = int(target_start)
-        target_end = target_start + source_end - source_start
-        input_shard[target_start:target_end].copy_(
-            bucket.param_data.view(-1)[source_start:source_end]
-        )
+    fill_standard_param_gather(bucket, input_shard, route)
     return input_shard, route, dp_group
 
 
@@ -1530,60 +1542,17 @@ def all_gather_dion_params_(
     return None
 
 
-def all_gather_mixed_params_(
+def prepare_mixed_param_gather(
     optimizer,
     bucket,
     *,
-    async_op: bool,
-    prepared_dion_gather,
-    prepared_standard_gather,
+    dion_layout: DionBucketLayout,
+    standard_route: StandardParamGatherRoute,
 ):
-    """Gather Dion and standard mixed-bucket params in one collective."""
-    prepared_buffer, prepared_entries = prepared_dion_gather
-    standard_input, standard_route, dp_group = prepared_standard_gather
-    if standard_input is None or standard_route is None:
-        return all_gather_dion_params_(
-            optimizer,
-            bucket,
-            async_op=async_op,
-            prepared_gather=prepared_dion_gather,
-        )
-
-    dion_layout = getattr(bucket, "dion_layout", None)
-    if dion_layout is None or not dion_layout.has_params:
-        _release_param_gather_tensor(bucket, prepared_buffer)
-        return all_gather_standard_params_(
-            optimizer,
-            bucket,
-            async_op=async_op,
-            prepared_gather=prepared_standard_gather,
-        )
-
     group_size = int(standard_route.group_size)
     dion_size = int(dion_layout.shard_size)
     standard_numel = int(standard_route.standard_numel)
     payload_size = dion_size + standard_numel
-    shard_group = getattr(bucket, "dion_shard_group", None)
-    if shard_group is None:
-        shard_group = optimizer.fs_group
-    if not _groups_have_same_order(dp_group, shard_group):
-        _release_param_gather_tensor(bucket, prepared_buffer)
-        _release_param_gather_tensor(bucket, standard_input)
-        raise RuntimeError(
-            "[Dion] combined mixed-bucket gather requires identical group order "
-            f"bucket={getattr(bucket, 'bucket_id', -1)} "
-            f"standard_group={_group_ranks(dp_group)} dion_group={_group_ranks(shard_group)}"
-        )
-    expected_gathered_numel = int(dion_layout.gathered_numel)
-    if expected_gathered_numel != dion_size * group_size:
-        _release_param_gather_tensor(bucket, prepared_buffer)
-        _release_param_gather_tensor(bucket, standard_input)
-        raise RuntimeError(
-            "[Dion] combined mixed-bucket gather size invariant mismatch "
-            f"bucket={getattr(bucket, 'bucket_id', -1)} "
-            f"shard_size={dion_size} group_size={group_size} "
-            f"expected_total={expected_gathered_numel}"
-        )
     input_payload = _acquire_param_gather_tensor(
         bucket,
         name="mixed_input",
@@ -1592,21 +1561,49 @@ def all_gather_mixed_params_(
         device=bucket.param_data.device,
         route_key=(int(group_size), int(dion_size), int(standard_numel)),
     )
+    prepared_entries = []
     try:
-        input_payload[:dion_size].copy_(prepared_buffer)
-        input_payload[dion_size:payload_size].copy_(standard_input)
+        for entry in dion_layout.entries:
+            full_view_2d = bucket_dion_param_view(optimizer, bucket, entry)
+            shard_start = int(entry.shard_offset)
+            shard_end = shard_start + int(entry.shard_capacity)
+            fill_dion_shard_buffer(
+                optimizer,
+                entry=entry,
+                full_view_2d=full_view_2d,
+                shard_buffer=input_payload[shard_start:shard_end],
+            )
+            prepared_entries.append((entry, full_view_2d))
+        fill_standard_param_gather(
+            bucket,
+            input_payload[dion_size:payload_size],
+            standard_route,
+        )
     except Exception:
-        _release_param_gather_tensor(bucket, prepared_buffer)
-        _release_param_gather_tensor(bucket, standard_input)
         _release_param_gather_tensor(bucket, input_payload)
         raise
-    _release_param_gather_tensor(bucket, prepared_buffer)
-    _release_param_gather_tensor(bucket, standard_input)
+    return input_payload, prepared_entries
 
+
+def _all_gather_mixed_payload_(
+    optimizer,
+    bucket,
+    *,
+    async_op: bool,
+    input_payload: torch.Tensor,
+    prepared_entries,
+    standard_route: StandardParamGatherRoute,
+    dp_group,
+    group_size: int,
+    dion_size: int,
+    standard_numel: int,
+):
+    dion_end = int(dion_size)
+    payload_size = dion_end + int(standard_numel)
     gathered_buffer = _acquire_param_gather_tensor(
         bucket,
         name="mixed_output",
-        shape=(group_size * payload_size,),
+        shape=(int(group_size) * payload_size,),
         dtype=bucket.param_data.dtype,
         device=bucket.param_data.device,
         route_key=(int(group_size), int(dion_size), int(standard_numel)),
@@ -1625,17 +1622,17 @@ def all_gather_mixed_params_(
 
     def _restore_callback(_input_payload=input_payload, _gathered_buffer=gathered_buffer):
         try:
-            gathered_view = _gathered_buffer.view(group_size, payload_size)
+            gathered_view = _gathered_buffer.view(int(group_size), payload_size)
             restore_bucket_param_data_(
                 optimizer,
                 bucket=bucket,
                 prepared_entries=prepared_entries,
-                gathered_buffer=gathered_view[:, :dion_size],
-                shard_group_size=group_size,
+                gathered_buffer=gathered_view[:, :dion_end],
+                shard_group_size=int(group_size),
             )
             restore_standard_param_gather_(
                 bucket,
-                gathered_view[:, dion_size:payload_size],
+                gathered_view[:, dion_end:payload_size],
                 standard_route,
             )
         finally:
@@ -1657,9 +1654,7 @@ def all_gather_bucket_params_(optimizer, bucket, async_op=False):
 
     prepared_dion_entries = None
     if has_mixed_standard_params:
-        prepared_dion_entries = prepare_dion_param_gather(optimizer, bucket)
-        prepared_standard_gather = prepare_standard_param_gather(optimizer, bucket)
-        _, standard_route, dp_group = prepared_standard_gather
+        standard_route, dp_group, _ = _standard_param_gather_route(optimizer, bucket)
         shard_group = getattr(bucket, "dion_shard_group", None)
         if shard_group is None:
             shard_group = optimizer.fs_group
@@ -1670,14 +1665,37 @@ def all_gather_bucket_params_(optimizer, bucket, async_op=False):
             and int(standard_route.group_size) == int(shard_group_size)
             and _groups_have_same_order(dp_group, shard_group)
         ):
-            return all_gather_mixed_params_(
+            dion_size = int(dion_layout.shard_size)
+            standard_numel = int(standard_route.standard_numel)
+            expected_gathered_numel = int(dion_layout.gathered_numel)
+            if expected_gathered_numel != dion_size * int(standard_route.group_size):
+                raise RuntimeError(
+                    "[Dion] combined mixed-bucket gather size invariant mismatch "
+                    f"bucket={getattr(bucket, 'bucket_id', -1)} "
+                    f"shard_size={dion_size} group_size={int(standard_route.group_size)} "
+                    f"expected_total={expected_gathered_numel}"
+                )
+            input_payload, prepared_entries = prepare_mixed_param_gather(
+                optimizer,
+                bucket,
+                dion_layout=dion_layout,
+                standard_route=standard_route,
+            )
+            return _all_gather_mixed_payload_(
                 optimizer,
                 bucket,
                 async_op=async_op,
-                prepared_dion_gather=prepared_dion_entries,
-                prepared_standard_gather=prepared_standard_gather,
+                input_payload=input_payload,
+                prepared_entries=prepared_entries,
+                standard_route=standard_route,
+                dp_group=dp_group,
+                group_size=int(standard_route.group_size),
+                dion_size=dion_size,
+                standard_numel=standard_numel,
             )
 
+        prepared_dion_entries = prepare_dion_param_gather(optimizer, bucket)
+        prepared_standard_gather = prepare_standard_param_gather(optimizer, bucket)
         standard_handle = all_gather_standard_params_(
             optimizer,
             bucket,

@@ -399,13 +399,50 @@ def read_linear_child(
             "[DION_LINEAR_EMPTY_CHILD_LOCAL_SHAPE] "
             f"child_kind={child_kind} tensor_shape={tuple(int(dim) for dim in tensor.shape)}"
         )
-    pieces = [
-        tensor.narrow(0, source_start, source_end - source_start)
-        for source_start, source_end, _, _ in segments
-    ]
-    if len(pieces) == 1:
-        return pieces[0].contiguous()
-    return torch.cat([piece.contiguous() for piece in pieces], dim=0)
+    if len(segments) == 1:
+        source_start, source_end, _, _ = segments[0]
+        return tensor.narrow(0, source_start, source_end - source_start).contiguous()
+
+    child_rows = sum(int(source_end - source_start) for source_start, source_end, _, _ in segments)
+    child = tensor.new_empty((child_rows, int(tensor.size(1))))
+    child_cursor = 0
+    for source_start, source_end, _, _ in segments:
+        rows_in_segment = int(source_end - source_start)
+        child.narrow(0, child_cursor, rows_in_segment).copy_(
+            tensor.narrow(0, source_start, rows_in_segment)
+        )
+        child_cursor += rows_in_segment
+    return child
+
+
+def _shares_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    if lhs.numel() == 0 or rhs.numel() == 0:
+        return False
+    return lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr()
+
+
+def _uses_same_parent_range(
+    dest: torch.Tensor,
+    child: torch.Tensor,
+    segments: list[tuple[int, int, int, int]],
+) -> bool:
+    if len(segments) != 1 or dest.numel() == 0 or child.numel() == 0:
+        return False
+    source_start, source_end, _, _ = segments[0]
+    if int(source_end - source_start) != int(child.size(0)):
+        return False
+    if int(child.size(1)) != int(dest.size(1)):
+        return False
+    if child.dtype != dest.dtype or child.device != dest.device:
+        return False
+    if child.untyped_storage().data_ptr() != dest.untyped_storage().data_ptr():
+        return False
+    if tuple(int(stride) for stride in child.stride()) != tuple(
+        int(stride) for stride in dest.stride()
+    ):
+        return False
+    expected_offset = int(dest.storage_offset()) + int(source_start) * int(dest.stride(0))
+    return int(child.storage_offset()) == expected_offset
 
 
 def write_linear_child_(
@@ -444,6 +481,10 @@ def write_linear_child_(
         context=f"write:{child_kind}",
     )
     child_source = child.contiguous()
+    if _uses_same_parent_range(dest, child_source, segments):
+        return
+    if _shares_storage(dest, child_source):
+        child_source = child_source.clone()
     child_cursor = 0
     for source_start, source_end, _, _ in segments:
         rows_in_segment = int(source_end - source_start)

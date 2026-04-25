@@ -690,8 +690,52 @@ def scale_dion_local_grads(
                 )
             local_grads.append(local_grad)
 
+    grads_by_dtype_device = {}
     for local_grad in local_grads:
-        local_grad.mul_(scaling_factor)
+        grads_by_dtype_device.setdefault((local_grad.dtype, local_grad.device), []).append(local_grad)
+    for local_grad_group in grads_by_dtype_device.values():
+        torch._foreach_mul_(local_grad_group, scaling_factor)
+
+
+def scale_dion_bucket_grads(
+    optimizer,
+    *,
+    bucket,
+    local_data_view: torch.Tensor | None,
+    communication_group,
+    scaling_factor: float,
+    use_distributed_optimizer: bool,
+) -> None:
+    """Scale only the active standard and Dion grad surfaces for one Dion bucket."""
+    if bucket.has_standard_params:
+        if use_distributed_optimizer:
+            if local_data_view is None or local_data_view.numel() == 0:
+                raise RuntimeError(
+                    "[Dion] mixed bucket grad scaling requires a standard local grad view "
+                    f"bucket={getattr(bucket, 'bucket_id', -1)}"
+                )
+            route = _get_grad_route(
+                bucket=bucket,
+                local_data_view=local_data_view,
+                communication_group=communication_group,
+            )
+            for source_start, source_end, local_start in route.standard_local_segments:
+                local_start = int(local_start)
+                local_end = local_start + int(source_end) - int(source_start)
+                local_data_view[local_start:local_end].mul_(scaling_factor)
+        else:
+            dion_param_ids = bucket.dion_param_ids
+            for param in bucket.params_list:
+                if id(param) in dion_param_ids:
+                    continue
+                start, end = bucket.param_to_index[param]
+                bucket.grad_data[int(start) : int(end)].mul_(scaling_factor)
+
+    scale_dion_local_grads(
+        optimizer,
+        [entry.param for entry in bucket.dion_layout.entries],
+        scaling_factor,
+    )
 
 
 def gather_fs_grad(
@@ -791,21 +835,27 @@ def set_local_grad(optimizer, model_param: torch.nn.Parameter, local_grad: torch
             False,
         )
     )
-    stored_source = (
-        local_grad
+    stored_dtype = (
+        local_grad.dtype
         if use_precision_aware_optimizer or local_grad.dtype == torch.float32
-        else local_grad.float()
+        else torch.float32
     )
+    stored_shape = tuple(local_grad.shape)
+    stored_device = local_grad.device
     stored_local_grad = optimizer._dion_local_grad_by_param.get(model_param)
     if (
         stored_local_grad is None
-        or tuple(stored_local_grad.shape) != tuple(stored_source.shape)
-        or stored_local_grad.dtype != stored_source.dtype
-        or stored_local_grad.device != stored_source.device
+        or tuple(stored_local_grad.shape) != stored_shape
+        or stored_local_grad.dtype != stored_dtype
+        or stored_local_grad.device != stored_device
     ):
-        stored_local_grad = torch.empty_like(stored_source)
+        stored_local_grad = torch.empty(
+            stored_shape,
+            dtype=stored_dtype,
+            device=stored_device,
+        )
         optimizer._dion_local_grad_by_param[model_param] = stored_local_grad
-    stored_local_grad.copy_(stored_source)
+    stored_local_grad.copy_(local_grad)
 
 
 def get_local_grad(

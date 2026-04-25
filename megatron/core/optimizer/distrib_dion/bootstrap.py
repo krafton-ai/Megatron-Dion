@@ -143,7 +143,7 @@ def sync_q_replicas(
                 continue
             if state.get("_needs_state_replica_q_sync", False):
                 state["_needs_state_replica_q_sync"] = False
-            post_q_sync = state.get("_post_q_sync", None)
+            post_q_sync = step_param.post_q_sync
             if callable(post_q_sync):
                 post_q_sync()
         return
@@ -167,7 +167,7 @@ def sync_q_replicas(
             )
         broadcast_q(q_state)
         state["_needs_state_replica_q_sync"] = False
-        post_q_sync = state.get("_post_q_sync", None)
+        post_q_sync = step_param.post_q_sync
         if callable(post_q_sync):
             post_q_sync()
 

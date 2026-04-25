@@ -1074,19 +1074,33 @@ class _ParamAndGradBuffer:
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
-        self.grad_data *= scaling_factor
-        for bucket in self.buckets:
+        for idx, bucket in enumerate(self.buckets):
             if not bucket.has_dion_params:
+                bucket.grad_data *= scaling_factor
                 continue
+
             optimizer = getattr(bucket, "dion_optimizer", None)
-            if optimizer is None or not hasattr(optimizer, "_scale_dion_local_grads"):
+            if optimizer is None or not hasattr(optimizer, "_scale_dion_bucket_grads"):
                 raise RuntimeError(
                     "[Dion] missing adapter grad scaling hook "
                     f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                 )
-            optimizer._scale_dion_local_grads(
-                [entry.param for entry in bucket.dion_layout.entries],
-                scaling_factor,
+            local_data_view = (
+                self._get_standard_local_grad_view(idx, bucket)
+                if self.ddp_config.use_distributed_optimizer and bucket.has_standard_params
+                else None
+            )
+            communication_group = (
+                self.intra_distributed_optimizer_instance_group
+                if self.ddp_config.use_distributed_optimizer
+                else getattr(self, "data_parallel_group", None)
+            )
+            optimizer._scale_dion_bucket_grads(
+                bucket=bucket,
+                local_data_view=local_data_view,
+                communication_group=communication_group,
+                scaling_factor=scaling_factor,
+                use_distributed_optimizer=bool(self.ddp_config.use_distributed_optimizer),
             )
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:

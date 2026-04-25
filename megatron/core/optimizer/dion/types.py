@@ -52,6 +52,7 @@ class DionStepParam:
     optim_group: dict | None = None
     config: Optional[DionParamConfig] = None
     dist_meta: Any = None
+    post_q_sync: Optional[Callable[[], None]] = None
     commit_update: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
 
@@ -161,7 +162,7 @@ class DionBatch:
     batch_key: tuple = ()
     entries: Tuple[DionBatchEntry, ...] = ()
     real_batch_size: int = 0
-    global_param_offset: int = 0
+    batch_cache_key: int = 0
     batch_group: Optional["DionBatchGroup"] = None
     batch_collectives: Optional[DionBatchCollectives] = None
     _params: Tuple[torch.Tensor | None, ...] = field(init=False, repr=False)

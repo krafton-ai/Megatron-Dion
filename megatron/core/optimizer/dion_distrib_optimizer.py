@@ -7,7 +7,6 @@ Supports orthogonal TP x FS sharding:
 """
 
 import logging
-import traceback
 import torch
 import torch.distributed as dist
 from typing import Dict, List, Tuple, Optional
@@ -89,6 +88,7 @@ from .distrib_dion.gradients import (
     apply_bucket_grads,
     clear_grad_transport,
     clear_dion_local_grads,
+    scale_dion_bucket_grads,
     scale_dion_local_grads,
     set_optimizer_shard_grads,
     finish_bucket_group_grad_sync,
@@ -144,6 +144,17 @@ from ..fp8_utils import is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
 logger = logging.getLogger(__name__)
+
+
+def _clear_split_child_q_sync(parent_state, sync_key: str) -> None:
+    parent_state[sync_key] = False
+
+
+def _make_split_child_q_sync_hook(parent_state, sync_key: str):
+    def hook() -> None:
+        _clear_split_child_q_sync(parent_state, sync_key)
+
+    return hook
 
 
 _CHILD_GROUP_CACHE: dict[tuple[int, ...], Optional[torch.distributed.ProcessGroup]] = {}
@@ -719,10 +730,11 @@ class DionDistributedOptimizer(DistributedOptimizer):
                     try:
                         self._enable_dion_runtime()
                     except Exception as error:
-                        logger.error(
-                            f"[Dion] Global rank {self._global_rank}: Failed in _enable_dion_runtime: {error}"
+                        logger.exception(
+                            "[Dion] Global rank %s: Failed in _enable_dion_runtime: %s",
+                            self._global_rank,
+                            error,
                         )
-                        logger.error(traceback.format_exc())
                         raise
 
         if dist.is_initialized() and hasattr(self, 'data_parallel_group'):
@@ -1010,13 +1022,11 @@ class DionDistributedOptimizer(DistributedOptimizer):
         # resolves its CP-excluded RP/FS domains separately from MCore groups.
         super().__init__(*args, **kwargs)
 
-        # Cache global rank for logging (avoid repeated dist.get_rank() calls)
         self._global_rank = dist.get_rank() if dist.is_initialized() else 0
 
         self._init_groups()
         self._configure_dion_runtime_policy()
 
-        # Unified shard mapping.
         self._setup_dion_path()
 
     def _all_gather_bucket_params_(self, bucket, async_op=False):
@@ -1227,7 +1237,6 @@ class DionDistributedOptimizer(DistributedOptimizer):
             shard_fp32_params_this_group = []
             main_shard_params = []
 
-            # Add to main groups
             model_fp16_groups.append(model_fp16_params)
             model_fp32_groups.append(model_fp32_params_this_group)
             shard_float16_groups.append(shard_float16_params_this_group)
@@ -1248,17 +1257,17 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 )
             except Exception as e:
                 global_rank = self._global_rank
-                logger.error(
-                    f"[Dion] Global rank {global_rank}: Failed in _process_param_group "
-                    f"for group of {len(group_range['params'])} params: {e}"
+                logger.exception(
+                    "[Dion] Global rank %s: Failed in _process_param_group "
+                    "for group of %s params: %s",
+                    global_rank,
+                    len(group_range["params"]),
+                    e,
                 )
                 for i, p in enumerate(group_range["params"]):
                     logger.error(f"  Param {i}: shape={p.shape}, ndim={p.ndim}, requires_grad={p.requires_grad}")
-                import traceback
-                logger.error(traceback.format_exc())
                 raise
 
-            # Update optimizer's params
             if not use_precision_aware_optimizer:
                 group_range["orig_group"]["params"] = [
                     *shard_fp32_params_this_group,
@@ -1361,6 +1370,25 @@ class DionDistributedOptimizer(DistributedOptimizer):
         """Scale the active adapter-stored Dion local grad surface."""
         return scale_dion_local_grads(self, params, scaling_factor)
 
+    def _scale_dion_bucket_grads(
+        self,
+        *,
+        bucket,
+        local_data_view: torch.Tensor | None,
+        communication_group,
+        scaling_factor: float,
+        use_distributed_optimizer: bool,
+    ) -> None:
+        """Scale the active standard and Dion grad surfaces for one Dion bucket."""
+        return scale_dion_bucket_grads(
+            self,
+            bucket=bucket,
+            local_data_view=local_data_view,
+            communication_group=communication_group,
+            scaling_factor=scaling_factor,
+            use_distributed_optimizer=use_distributed_optimizer,
+        )
+
     def _set_local_grad(
         self, model_param: torch.nn.Parameter, local_grad: torch.Tensor
     ) -> None:
@@ -1462,24 +1490,21 @@ class DionDistributedOptimizer(DistributedOptimizer):
         )
         if dion_shard_layout is not None:
             try:
-                # Create FS shard using helper
                 shard_model_param = self._create_fs_shard(model_param, dion_shard_layout)
-
-                # Prepare FS shard (attach to model_param)
                 self._attach_fs_shard_(model_param, shard_model_param)
-
-                # Verify is_dion_param flag
                 self._check_dion_param(model_param, "FP16")
             except Exception as e:
                 global_rank = self._global_rank
-                logger.error(f"[Dion] Global rank {global_rank}: Failed for Dion param")
-                logger.error(f"  model_param.shape: {model_param.shape}")
-                logger.error(f"  dion_shard_layout: {dion_shard_layout}")
-                import traceback
-                logger.error(traceback.format_exc())
+                logger.exception(
+                    "[Dion] Global rank %s: Failed for Dion param "
+                    "shape=%s dion_shard_layout=%s: %s",
+                    global_rank,
+                    tuple(model_param.shape),
+                    dion_shard_layout,
+                    e,
+                )
                 raise
 
-            # Copy metadata
             tensor_parallel.copy_tensor_model_parallel_attributes(
                 shard_model_param, model_param
             )
@@ -1545,7 +1570,6 @@ class DionDistributedOptimizer(DistributedOptimizer):
             else:
                 shard_main_param = None
 
-        # Copy metadata to main param
         if shard_main_param is not None:
             tensor_parallel.copy_tensor_model_parallel_attributes(
                 shard_main_param, model_param
@@ -1554,13 +1578,9 @@ class DionDistributedOptimizer(DistributedOptimizer):
             if hasattr(model_param, 'shared'):
                 shard_main_param.shared = model_param.shared
 
-        # Store handle
         model_param.main_param = shard_main_param
         model_param.main_param_sharded = True
 
-            # Note: standard params use standard DO path, not registered in shard state
-
-        # Add to groups
         model_fp16_params.append(model_param)
         if use_precision_aware_optimizer and dion_shard_layout is not None:
             shard_float16_params.append(shard_main_param)
@@ -1573,13 +1593,9 @@ class DionDistributedOptimizer(DistributedOptimizer):
                               model_fp32_params, shard_fp32_params):
         """Process float32 parameters."""
         if dion_shard_layout is not None:
-            # Create FS shard using helper
             shard_model_param = self._create_fs_shard(model_param, dion_shard_layout)
-
-            # Prepare FS shard (attach to model_param)
             self._attach_fs_shard_(model_param, shard_model_param)
 
-            # Copy metadata
             tensor_parallel.copy_tensor_model_parallel_attributes(
                 shard_model_param, model_param
             )
@@ -1591,7 +1607,6 @@ class DionDistributedOptimizer(DistributedOptimizer):
             model_param.main_param = shard_model_param
             model_param.main_param_sharded = True
 
-            # Verify is_dion_param flag
             self._check_dion_param(model_param, "FP32")
 
             # Register shard state/layout for Dion params.
@@ -2738,11 +2753,6 @@ class DionDistributedOptimizer(DistributedOptimizer):
                     int(dim) for dim in optimizer_state[global_shape_key]
                 ),
                 "_needs_state_replica_q_sync": bool(optimizer_state.get(sync_key, False)),
-                "_post_q_sync": (
-                    lambda *, parent_state=optimizer_state, sync_key=sync_key: parent_state.__setitem__(
-                        sync_key, False
-                    )
-                ),
             }
 
             def _commit_update(
@@ -2777,6 +2787,10 @@ class DionDistributedOptimizer(DistributedOptimizer):
                     optim_group=optim_group,
                     config=child_dist_meta.param_config,
                     dist_meta=child_dist_meta,
+                    post_q_sync=_make_split_child_q_sync_hook(
+                        optimizer_state,
+                        sync_key,
+                    ),
                     commit_update=_commit_update,
                 )
             )
@@ -2901,11 +2915,6 @@ class DionDistributedOptimizer(DistributedOptimizer):
                     int(dim) for dim in optimizer_state[global_shape_key]
                 ),
                 "_needs_state_replica_q_sync": bool(optimizer_state.get(sync_key, False)),
-                "_post_q_sync": (
-                    lambda *, parent_state=optimizer_state, sync_key=sync_key: parent_state.__setitem__(
-                        sync_key, False
-                    )
-                ),
             }
 
             def _commit_update(
@@ -2941,6 +2950,10 @@ class DionDistributedOptimizer(DistributedOptimizer):
                     optim_group=optim_group,
                     config=child_dist_meta.param_config,
                     dist_meta=child_dist_meta,
+                    post_q_sync=_make_split_child_q_sync_hook(
+                        optimizer_state,
+                        sync_key,
+                    ),
                     commit_update=_commit_update,
                 )
             )

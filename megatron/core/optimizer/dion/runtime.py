@@ -22,6 +22,12 @@ from .ortho import (
     reshard_q_along_tp,
 )
 from .state import is_tp_active, is_fs_without_tp
+from .dense_grad_cache import (
+    delete_dense_grad_entries,
+    dense_cache_entries,
+    find_dense_grad_entry,
+    tensor_region as _tensor_region,
+)
 from .types import DionBatch, DionBatchCollectives, DionBatchGroup, DionParamConfig
 from .utils import get_global_shape
 
@@ -266,7 +272,7 @@ def run_dion_batch_async(
     param_shapes = list(dion_batch.param_shapes)
     real_batch_size = int(dion_batch.real_batch_size)
     batch_collectives = dion_batch.batch_collectives
-    global_param_offset = int(dion_batch.global_param_offset)
+    batch_cache_key = int(dion_batch.batch_cache_key)
 
     if params:
         yield from batch_dion_update_async(
@@ -281,7 +287,7 @@ def run_dion_batch_async(
             optimizer_states,
             param_shapes,
             real_batch_size,
-            global_param_offset,
+            batch_cache_key,
             batch_group,
             batch_collectives,
             commit_updates=[entry.commit_update for entry in dion_batch.entries[:real_batch_size]],
@@ -297,6 +303,62 @@ def replicate_reduce_op(optimizer):
 def low_rank_replicate_reduce_op():
     """Return the reference Dion low-rank P/R replica reduction op."""
     return dist.ReduceOp.AVG
+
+
+def _dist_is_initialized() -> bool:
+    return not hasattr(dist, "is_initialized") or bool(dist.is_initialized())
+
+
+def _try_use_dense_grad_reduction_cache(
+    optimizer,
+    grads: List[Tensor],
+    *,
+    replicate_group,
+    op,
+) -> bool:
+    if not grads:
+        return False
+
+    before_step = int(getattr(optimizer, "_step_count", 0)) - 1
+    entries = dense_cache_entries(
+        optimizer,
+        before_step,
+        create=False,
+        delete_empty=True,
+    )
+    if not entries:
+        return False
+
+    matched_indices = []
+    saw_missing = False
+    for grad in grads:
+        state, index = find_dense_grad_entry(
+            entries,
+            grad,
+            replica_group=replicate_group,
+            op=op,
+            before_step=before_step,
+        )
+        if state == "match":
+            matched_indices.append(index)
+        elif state == "mismatch":
+            raise RuntimeError(
+                "[DION_DENSE_RP_GRAD_CACHE_MISMATCH] "
+                f"step={optimizer._step_count} rank={optimizer._global_rank}"
+            )
+        else:
+            saw_missing = True
+
+    if saw_missing:
+        if matched_indices:
+            raise RuntimeError(
+                "[DION_DENSE_RP_GRAD_CACHE_PARTIAL] "
+                f"step={optimizer._step_count} rank={optimizer._global_rank}"
+            )
+        return False
+
+    delete_dense_grad_entries(optimizer, matched_indices)
+    return True
 
 
 def all_reduce_grads_across_replicas(
@@ -315,6 +377,30 @@ def all_reduce_grads_across_replicas(
         return
 
     op = replicate_reduce_op(optimizer)
+    if _try_use_dense_grad_reduction_cache(
+        optimizer,
+        grads,
+        replicate_group=replicate_group,
+        op=op,
+    ):
+        return
+
+    if (
+        _dist_is_initialized()
+        and all(grad.is_contiguous() for grad in grads)
+        and hasattr(dist, "all_reduce_coalesced")
+    ):
+        handle = dist.all_reduce_coalesced(
+            grads,
+            op=op,
+            group=replicate_group,
+            async_op=True,
+        )
+        yield
+        if handle is not None:
+            handle.wait()
+        return
+
     reduced_grads = funcol.all_reduce_coalesced(
         [grad if grad.is_contiguous() else grad.contiguous() for grad in grads],
         reduceOp="avg" if op == dist.ReduceOp.AVG else "sum",
@@ -331,6 +417,7 @@ def all_reduce_batch_across_replicas(
     batch: Tensor,
     *,
     replicate_group=_REPLICATE_GROUP_UNSET,
+    allow_in_place: bool = False,
 ) -> Generator[Tensor, None, None]:
     """Collapse true Dion replicate replicas on a batched tensor."""
     if replicate_group is _REPLICATE_GROUP_UNSET:
@@ -342,9 +429,120 @@ def all_reduce_batch_across_replicas(
         return batch
 
     del optimizer
+    if allow_in_place and batch.is_contiguous() and _dist_is_initialized():
+        handle = dist.all_reduce(
+            batch,
+            op=dist.ReduceOp.AVG,
+            group=replicate_group,
+            async_op=True,
+        )
+        yield
+        if handle is not None:
+            handle.wait()
+        return batch
+
     reduced_batch = funcol.all_reduce(batch, reduceOp="avg", group=replicate_group)
     yield
     return reduced_batch
+
+
+def _stack_tensors_as_dtype(tensors: List[Tensor], dtype: torch.dtype) -> Tensor:
+    """Stack homogeneous tensors, casting directly into the final dtype if needed."""
+    if not tensors:
+        raise RuntimeError("[DION_EMPTY_STACK_INPUT]")
+    if all(tensor.dtype == dtype for tensor in tensors):
+        return torch.stack(tensors, dim=0)
+    shape = (len(tensors), *tuple(tensors[0].shape))
+    result = torch.empty(shape, dtype=dtype, device=tensors[0].device)
+    for index, tensor in enumerate(tensors):
+        if tuple(tensor.shape) != tuple(tensors[0].shape) or tensor.device != tensors[0].device:
+            raise RuntimeError(
+                "[DION_INCONSISTENT_STACK_INPUT] "
+                f"index={index} first_shape={tuple(tensors[0].shape)} "
+                f"shape={tuple(tensor.shape)} first_device={tensors[0].device} device={tensor.device}"
+            )
+        result[index].copy_(tensor)
+    return result
+
+
+def _q_batch_from_inputs(
+    q_inputs: List[Tensor],
+    direct_q_batch: Optional[Tensor],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tensor:
+    if (
+        direct_q_batch is not None
+        and direct_q_batch.dtype == dtype
+        and direct_q_batch.device == device
+    ):
+        return direct_q_batch
+    return _stack_tensors_as_dtype(q_inputs, dtype)
+
+
+def _common_matmul_layout(
+    momentums: List[Tensor],
+    configs: List[DionParamConfig],
+) -> tuple[Optional[torch.dtype], Optional[torch.device], Optional[int]]:
+    dtype = None
+    device = None
+    q_rows = None
+    for momentum, config in zip(momentums, configs):
+        tensor = momentum.mT if config.is_transposed else momentum
+        tensor_q_rows = int(tensor.size(-1))
+        if dtype is None:
+            dtype = tensor.dtype
+            device = tensor.device
+            q_rows = tensor_q_rows
+        elif tensor.dtype != dtype or tensor.device != device or tensor_q_rows != q_rows:
+            return None, None, None
+    return dtype, device, q_rows
+
+
+def _is_split_child_meta(dist_meta) -> bool:
+    return (
+        dist_meta is not None
+        and (
+            getattr(dist_meta, "parent_param_uid", None) is not None
+            or bool(getattr(dist_meta, "is_qkv_child", False))
+            or bool(getattr(dist_meta, "is_linear_child", False))
+        )
+    )
+
+
+def _can_use_direct_q_batch(
+    *,
+    q_full_batch: Tensor,
+    batch_size: int,
+    real_batch_size: Optional[int],
+    indices: List[int],
+    total_gather_count: int,
+    target_dtype: Optional[torch.dtype],
+    target_device: Optional[torch.device],
+    target_q_rows: Optional[int],
+    batch_cache_key: Optional[int],
+    dist_metas: Optional[List],
+) -> bool:
+    if batch_cache_key is None:
+        return False
+    if real_batch_size is None or int(real_batch_size) != int(batch_size):
+        return False
+    if int(total_gather_count) != 1:
+        return False
+    if tuple(int(index) for index in indices) != tuple(range(int(batch_size))):
+        return False
+    if target_dtype is None or target_device is None:
+        return False
+    if q_full_batch.dtype != target_dtype or q_full_batch.device != target_device:
+        return False
+    if target_q_rows is None or int(q_full_batch.size(1)) != int(target_q_rows):
+        return False
+    if dist_metas is not None and any(
+        _is_split_child_meta(dist_metas[index] if index < len(dist_metas) else None)
+        for index in indices
+    ):
+        return False
+    return True
 
 
 def enable_distributed_mode(
@@ -389,8 +587,9 @@ def _orthogonalize_real_batch(
     if real_entry_count == batch_size:
         return P_real
 
-    P_ortho = P_batch.clone().contiguous()
+    P_ortho = torch.empty_like(P_batch)
     P_ortho[:real_entry_count].copy_(P_real)
+    P_ortho[real_entry_count:].copy_(P_batch[real_entry_count:])
     return P_ortho
 
 
@@ -401,12 +600,17 @@ def unshard_q_batch(
     dist_metas: Optional[List] = None,
     optimizer_states: Optional[List[dict]] = None,
     batch_collectives: Optional[DionBatchCollectives] = None,
-    cache_scope: Optional[int] = None,
-) -> Generator[List[Tensor], None, None]:
+    batch_cache_key: Optional[int] = None,
+    real_batch_size: Optional[int] = None,
+    direct_batch_dtype: Optional[torch.dtype] = None,
+    direct_batch_device: Optional[torch.device] = None,
+    direct_batch_q_rows: Optional[int] = None,
+) -> Generator[tuple[List[Tensor], Optional[Tensor]], None, None]:
     """All-gather TP-sharded Q blocks needed for local matmul."""
     del configs
     batch_size = len(Qs)
     q_for_matmul: List[Optional[Tensor]] = [None] * batch_size
+    direct_q_batch = None
     if batch_collectives is None:
         raise RuntimeError(
             "[DION_MISSING_BATCH_COLLECTIVES] "
@@ -422,7 +626,7 @@ def unshard_q_batch(
 
     if batch_collectives.tp_q_gathers:
         pending = []
-        scope = "global" if cache_scope is None else str(int(cache_scope))
+        scope = "global" if batch_cache_key is None else str(int(batch_cache_key))
         for group_seq, collective in enumerate(batch_collectives.tp_q_gathers):
             indices = list(collective.indices)
             tp_group = collective.process_group
@@ -567,9 +771,22 @@ def unshard_q_batch(
                 col_start = col_end
             for local_index, idx in enumerate(indices):
                 q_for_matmul[idx] = q_full_batch[local_index]
+            if _can_use_direct_q_batch(
+                q_full_batch=q_full_batch,
+                batch_size=batch_size,
+                real_batch_size=real_batch_size,
+                indices=indices,
+                total_gather_count=len(batch_collectives.tp_q_gathers),
+                target_dtype=direct_batch_dtype,
+                target_device=direct_batch_device,
+                target_q_rows=direct_batch_q_rows,
+                batch_cache_key=batch_cache_key,
+                dist_metas=dist_metas,
+            ):
+                direct_q_batch = q_full_batch
             del local_batch
 
-    return [q for q in q_for_matmul]
+    return [q for q in q_for_matmul], direct_q_batch
 
 
 def reduce_p_across_fs_groups(
@@ -667,7 +884,6 @@ def normalize_cols_async(
     configs: List[DionParamConfig],
     dist_metas: List,
     real_batch_size: int = None,
-    global_param_offset: int = 0,
     batch_group: Optional[DionBatchGroup] = None,
 ) -> Generator[Tensor, None, None]:
     """Async batch column normalization with yields for communication."""
@@ -675,10 +891,9 @@ def normalize_cols_async(
     if real_batch_size is None:
         real_batch_size = batch_size
 
-    result = torch.empty_like(R_batch)
     epsilon = optimizer.defaults['epsilon']
     if real_batch_size <= 0:
-        return result
+        return torch.empty_like(R_batch)
 
     col_sum_sq_real = local_column_sum_sq(R_batch[:real_batch_size])
 
@@ -697,16 +912,19 @@ def normalize_cols_async(
         )
         yield
 
-    q_new_real, _ = normalize_columns(
+    q_new_real = normalize_columns(
         R_batch[:real_batch_size],
         col_sum_sq_real,
         epsilon=epsilon,
     )
     del dist_metas
+    if real_batch_size == batch_size:
+        return q_new_real
+
+    result = torch.empty_like(R_batch)
     result[:real_batch_size].copy_(q_new_real)
 
-    if real_batch_size < batch_size:
-        result[real_batch_size:].copy_(R_batch[real_batch_size:])
+    result[real_batch_size:].copy_(R_batch[real_batch_size:])
 
     return result
 
@@ -726,13 +944,12 @@ def apply_batch_updates(
     dist_metas: List,
     param_shapes: List[Tuple[int, int]],
     real_batch_size: int,
-    global_param_offset: int,
     batch_group: DionBatchGroup,
     batch_collectives: Optional[DionBatchCollectives] = None,
     commit_updates: Optional[List[Callable[[Tensor, Tensor], None]]] = None,
 ) -> None:
     """Apply weight decay, Dion delta update, and TP re-sharding for Q."""
-    del global_param_offset, R_batch
+    del R_batch
     if real_batch_size <= 0:
         return
     validate_update_contract(
@@ -811,7 +1028,7 @@ def apply_batch_updates(
             param.mul_(1 - lr * weight_decay)
         param.add_(delta.to(param.dtype), alpha=-scaled_lr)
 
-        q_state = Q_state_batch[index].to(Qs[index].dtype)
+        q_state = Q_state_batch[index]
         tp_q_reshard = tp_q_reshard_by_index.get(index)
         if tp_q_reshard is not None:
             tp_group = tp_q_reshard.process_group
@@ -987,12 +1204,13 @@ def run_low_rank_sync_async(
                 optimizer,
                 R_batch,
                 replicate_group=low_rank_replicate_group,
+                allow_in_place=True,
             )
         return P_batch, R_batch
 
     if comm_group is None or comm_world_size <= 1:
         P_batch = yield from all_reduce_batch_across_replicas(
-            optimizer, P_batch, replicate_group=comm_group
+            optimizer, P_batch, replicate_group=comm_group, allow_in_place=True
         )
         if ortho_group is not None:
             P_batch = distributed_orthogonalize(
@@ -1019,7 +1237,7 @@ def run_low_rank_sync_async(
             batch_collectives=batch_collectives,
         )
         R_batch = yield from all_reduce_batch_across_replicas(
-            optimizer, R_batch, replicate_group=comm_group
+            optimizer, R_batch, replicate_group=comm_group, allow_in_place=True
         )
         return P_batch, R_batch
 
@@ -1039,6 +1257,7 @@ def run_low_rank_sync_async(
                 optimizer,
                 P_batch,
                 replicate_group=comm_group,
+                allow_in_place=True,
             )
         if ortho_group is not None:
             P_batch = distributed_orthogonalize(
@@ -1069,6 +1288,7 @@ def run_low_rank_sync_async(
                 optimizer,
                 R_batch,
                 replicate_group=comm_group,
+                allow_in_place=True,
             )
         return P_batch[:original_batch_size], R_batch[:original_batch_size]
 
@@ -1082,6 +1302,7 @@ def run_low_rank_sync_async(
             optimizer,
             P_batch,
             replicate_group=comm_group,
+            allow_in_place=True,
         )
 
     if use_replicated_orthogonalize:
@@ -1182,6 +1403,7 @@ def run_low_rank_sync_async(
             optimizer,
             R_batch,
             replicate_group=comm_group,
+            allow_in_place=True,
         )
 
     P_batch = P_batch[:original_batch_size]
@@ -1202,7 +1424,7 @@ def batch_dion_update_async(
     optimizer_states: Optional[List[dict]] = None,
     param_shapes: Optional[List[Tuple[int, int]]] = None,
     real_batch_size: Optional[int] = None,
-    global_param_offset: int = 0,
+    batch_cache_key: int = 0,
     batch_group: Optional[DionBatchGroup] = None,
     batch_collectives: Optional[DionBatchCollectives] = None,
     commit_updates: Optional[List[Callable[[Tensor, Tensor], None]]] = None,
@@ -1241,28 +1463,39 @@ def batch_dion_update_async(
         and any(config.use_low_rank_sync for config in configs)
     )
 
+    active_grads = grads[:real_batch_size] if grads is not None else []
+
     if not use_low_rank:
         yield from all_reduce_grads_across_replicas(
             optimizer,
-            grads,
+            active_grads,
             replicate_group=replicate_group,
         )
 
-    if grads:
-        if momentums[0].dtype == grads[0].dtype:
-            torch._foreach_add_(momentums, grads)
+    active_momentums = momentums[:real_batch_size]
+    if active_grads:
+        if active_momentums[0].dtype == active_grads[0].dtype:
+            torch._foreach_add_(active_momentums, active_grads)
         else:
-            for momentum, grad in zip(momentums, grads):
+            for momentum, grad in zip(active_momentums, active_grads):
                 momentum.add_(grad.to(momentum.dtype))
 
-    Q_for_matmul = yield from unshard_q_batch(
+    direct_q_dtype, direct_q_device, direct_q_rows = _common_matmul_layout(
+        momentums,
+        configs,
+    )
+    q_inputs, direct_q_batch = yield from unshard_q_batch(
         optimizer,
         Qs,
         configs,
         dist_metas,
         batch_collectives=batch_collectives,
         optimizer_states=optimizer_states,
-        cache_scope=global_param_offset,
+        batch_cache_key=batch_cache_key,
+        real_batch_size=real_batch_size,
+        direct_batch_dtype=direct_q_dtype,
+        direct_batch_device=direct_q_device,
+        direct_batch_q_rows=direct_q_rows,
     )
 
     M_for_matmul = [
@@ -1270,8 +1503,13 @@ def batch_dion_update_async(
         for momentum, config in zip(momentums, configs)
     ]
     M_batch = torch.stack(M_for_matmul, dim=0)
-    Q_batch = torch.stack(Q_for_matmul, dim=0).to(M_batch.dtype)
-    del Q_for_matmul
+    Q_batch = _q_batch_from_inputs(
+        q_inputs,
+        direct_q_batch,
+        M_batch.dtype,
+        M_batch.device,
+    )
+    del q_inputs, direct_q_batch
 
     with _dion_math_precision_context():
         P_batch = M_batch @ Q_batch
@@ -1320,7 +1558,7 @@ def batch_dion_update_async(
                         f"batch_size={unpadded_batch_size}"
                     )
                 batch_size = unpadded_batch_size
-                scope = str(int(global_param_offset))
+                scope = str(int(batch_cache_key))
                 if batch_size % replicate_world_size != 0:
                     pad = replicate_world_size - (batch_size % replicate_world_size)
                     padded_batch_size = batch_size + pad
@@ -1477,6 +1715,7 @@ def batch_dion_update_async(
         R_batch,
         Q_batch,
         M_batch,
+        real_batch_size=real_batch_size,
     )
 
     apply_error_feedback(
@@ -1486,6 +1725,7 @@ def batch_dion_update_async(
         configs,
         optim_groups,
         default_mu=optimizer.defaults["mu"],
+        real_batch_size=real_batch_size,
     )
 
     Q_new_batch = yield from normalize_cols_async(
@@ -1494,7 +1734,6 @@ def batch_dion_update_async(
         configs,
         dist_metas,
         real_batch_size,
-        global_param_offset,
         batch_group=batch_group,
     )
     Q_state_batch = Q_new_batch
@@ -1515,7 +1754,6 @@ def batch_dion_update_async(
         dist_metas,
         param_shapes,
         real_batch_size,
-        global_param_offset,
         batch_group,
         batch_collectives,
         commit_updates,

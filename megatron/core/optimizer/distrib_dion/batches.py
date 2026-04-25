@@ -24,6 +24,7 @@ from ..dion.types import (
     DionStepParam,
 )
 
+
 def _missing_local_shard_error(*, batch_key, batch_group, global_rank: int) -> None:
     raise RuntimeError(
         "[DION_MISSING_LOCAL_SHARD] "
@@ -116,6 +117,12 @@ def _batch_key_sort_key(batch_key: tuple) -> str:
     return repr(batch_key)
 
 
+def _rank_tuple_cache(batch_key_cache: dict | None) -> dict | None:
+    if batch_key_cache is None:
+        return None
+    return batch_key_cache.setdefault("process_group_ranks", {})
+
+
 def _sync_group_batch_metadata(
     *,
     sync_group,
@@ -149,6 +156,7 @@ def _sync_group_batch_metadata(
             batch_key,
             sync_group,
             param_uids=_batch_group_param_uids(batch_group_by_key[batch_key]),
+            rank_cache=_rank_tuple_cache(batch_key_cache),
         )
         local_batch_keys_by_sync_key.setdefault(sync_key, []).append(batch_key)
         local_counts_by_sync_key[sync_key] = (
@@ -160,7 +168,7 @@ def _sync_group_batch_metadata(
             key=_batch_key_sort_key,
         )
 
-    group_cache_key = ("batch_metadata", _group_ranks_key(sync_group))
+    group_cache_key = ("batch_metadata", _group_ranks_key(sync_group, _rank_tuple_cache(batch_key_cache)))
     local_signature = tuple(
         (sync_key, int(local_counts_by_sync_key[sync_key]))
         for sync_key in sorted(local_counts_by_sync_key, key=_batch_key_sort_key)
@@ -208,21 +216,29 @@ def _sync_group_batch_metadata(
     )
 
 
-def _group_ranks_key(process_group) -> tuple[int, ...]:
+def _group_ranks_key(process_group, rank_cache: dict | None = None) -> tuple[int, ...]:
     if process_group is None:
         return ()
-    return tuple(int(rank) for rank in dist.get_process_group_ranks(process_group))
+    if rank_cache is None:
+        return tuple(int(rank) for rank in dist.get_process_group_ranks(process_group))
+    cache_key = id(process_group)
+    cached = rank_cache.get(cache_key)
+    if cached is not None and cached[0] is process_group:
+        return cached[1]
+    ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(process_group))
+    rank_cache[cache_key] = (process_group, ranks)
+    return ranks
 
 
-def _batch_group_key(batch_group: DionBatchGroup) -> tuple:
+def _batch_group_key(batch_group: DionBatchGroup, rank_cache: dict | None = None) -> tuple:
     return (
         str(batch_group.kernel_kind),
         int(batch_group.batch_world_size),
-        _group_ranks_key(batch_group.replicate_group),
-        _group_ranks_key(batch_group.ortho_group),
-        _group_ranks_key(batch_group.q_norm_group),
-        _group_ranks_key(batch_group.low_rank_replicate_group),
-        tuple(_group_ranks_key(group) for group in batch_group.sync_groups),
+        _group_ranks_key(batch_group.replicate_group, rank_cache),
+        _group_ranks_key(batch_group.ortho_group, rank_cache),
+        _group_ranks_key(batch_group.q_norm_group, rank_cache),
+        _group_ranks_key(batch_group.low_rank_replicate_group, rank_cache),
+        tuple(_group_ranks_key(group, rank_cache) for group in batch_group.sync_groups),
     )
 
 
@@ -249,7 +265,13 @@ def _batch_group_param_uids(batch_group: DionBatchGroup) -> tuple:
     return tuple(uids)
 
 
-def _batch_key_for_sync(batch_key: tuple, sync_group, *, param_uids: tuple = ()) -> tuple:
+def _batch_key_for_sync(
+    batch_key: tuple,
+    sync_group,
+    *,
+    param_uids: tuple = (),
+    rank_cache: dict | None = None,
+) -> tuple:
     """Project one local full batch key into the contract visible to one sync group."""
     if sync_group is None:
         return batch_key
@@ -263,7 +285,7 @@ def _batch_key_for_sync(batch_key: tuple, sync_group, *, param_uids: tuple = ())
         low_rank_replicate_ranks,
         sync_group_ranks_by_role,
     ) = group_key
-    sync_group_ranks = _group_ranks_key(sync_group)
+    sync_group_ranks = _group_ranks_key(sync_group, rank_cache)
     return (
         update_key,
         _optimizer_key_for_sync(optimizer_key),
@@ -324,12 +346,17 @@ def group_items_by_batch_key(
     return list(grouped.items())
 
 
-def pad_batch(batch: List[torch.Tensor], batch_size: int) -> List[torch.Tensor]:
-    """Pad with inert zero tensors so partial distributed batches remain numerically stable."""
+def pad_batch(
+    batch: List[torch.Tensor],
+    batch_size: int,
+    *,
+    item: torch.Tensor | None = None,
+) -> List[torch.Tensor]:
+    """Extend one tensor batch to the required runtime size."""
     assert len(batch) > 0
     assert len(batch) <= batch_size
     while len(batch) < batch_size:
-        batch.append(torch.zeros_like(batch[0]))
+        batch.append(item if item is not None else torch.zeros_like(batch[0]))
     return batch
 
 
@@ -801,7 +828,7 @@ def group_and_order_param_batches(
                     routed_param.optim_group,
                     routed_param.optimizer_state,
                 ),
-                _batch_group_key(resolved_group),
+                _batch_group_key(resolved_group, _rank_tuple_cache(batch_key_cache)),
             )
         )
 
@@ -894,7 +921,7 @@ def _build_batch_entries(
     optimizer_states = [entry.optimizer_state for entry in entries]
     param_shapes = [entry.param_shape for entry in entries]
 
-    params = pad_batch(params, batch_size)
+    params = pad_batch(params, batch_size, item=params[0])
     grads = pad_batch(grads, batch_size)
     momentums = pad_batch(momentums, batch_size)
     q_tensors = pad_batch(q_tensors, batch_size)
@@ -969,7 +996,7 @@ def build_dion_batches(
     )
 
     dion_batches: List[DionBatch] = []
-    global_param_offset = 0
+    batch_cache_key = 0
     for batch_key, batch_group in ordered_batches:
         batch_size = batch_group.batch_world_size
         local_num_params = int(getattr(batch_group, "local_param_count", len(batch_group.params or [])))
@@ -1021,12 +1048,12 @@ def build_dion_batches(
                     batch_key=batch_key,
                     entries=batch_data["entries"],
                     real_batch_size=batch_data["real_batch_size"],
-                    global_param_offset=global_param_offset,
+                    batch_cache_key=batch_cache_key,
                     batch_group=batch_group,
                     batch_collectives=batch_collectives,
                 )
             )
-            global_param_offset += batch_data["real_batch_size"]
+            batch_cache_key += batch_data["real_batch_size"]
 
         batch_group.params = []
         batch_group.grads = []
