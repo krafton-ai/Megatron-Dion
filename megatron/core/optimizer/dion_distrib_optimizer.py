@@ -1067,8 +1067,8 @@ class DionDistributedOptimizer(DistributedOptimizer):
         return local_param_group_map, group_ranges
 
     def __init__(self, *args, **kwargs):
-        """Initialize with improved Dion support."""
-        # Initialize Dion param info before parent init
+        """Initialize Dion distributed optimizer state."""
+        # Initialize Dion param info before parent init.
         self._shard_layouts_by_param = {}
         self._replica_group = kwargs.pop("replica_group", kwargs.pop("replica_group_override", None))
         self._dion_fs_group = kwargs.pop("dion_fs_group", None)
@@ -1132,24 +1132,16 @@ class DionDistributedOptimizer(DistributedOptimizer):
         return get_bucket_shard_group(self, bucket)
 
     def _check_dion_params(self):
-        """
-        Improved annotation with batch processing for efficiency.
-        Uses original model parameters directly (independent of FS sharding).
-        """
-        # Use FS group for annotation (each FS group operates independently)
-        # Parameters are sharded at annotation phase
-        # Each FS group will split parameters uniformly across FS ranks
-        # RP groups replicate the same FS sharding pattern
-
-        # Use the wrapper FS runtime group for annotation.
+        """Validate Dion shard metadata and build optimizer lookup tables."""
+        # Use the runtime FS group that owns Dion sharding. Single-instance DO
+        # may not expose a separate FS group, so it falls back to the DP group.
         fs_group = self.fs_group
 
         if fs_group is not None:
-            annotation_group = fs_group  # FS group (size=2)
+            annotation_group = fs_group
             fs_rank = dist.get_rank(fs_group)
             fs_size = dist.get_world_size(fs_group)
         else:
-            # Standard single-instance DO may not create a separate fs_group.
             annotation_group = self.data_parallel_group
             fs_rank = annotation_group.rank()
             fs_size = dist.get_world_size(annotation_group)
@@ -1307,16 +1299,13 @@ class DionDistributedOptimizer(DistributedOptimizer):
         use_precision_aware_optimizer = (
             config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
         )
-        # Initialize parameter groups
         model_fp16_groups = []
         model_fp32_groups = []
         shard_float16_groups = []
         shard_fp32_groups = []
         main_shard_groups = []
 
-        # Process each optimizer group
         for group_range in opt_group_ranges:
-            # Initialize group lists
             model_fp16_params = []
             model_fp32_params_this_group = []
             shard_float16_params_this_group = []
@@ -1395,7 +1384,6 @@ class DionDistributedOptimizer(DistributedOptimizer):
             param_range = param_range_info["param"]
             dion_shard_layout = param_range_info.get("dion_shard_layout", None)
 
-            # Handle different parameter types
             if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                 self._process_float16_param(
                     model_param, param_range, dion_shard_layout,
@@ -1612,14 +1600,10 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 shard_layout=dion_shard_layout,
             )
         else:
-            # Standard 1D handling (standard params)
             # Standard params are always DP-sharded via reduce-scatter.
-
             if is_float8tensor(model_param) and config.fp8_recipe != "delayed":
                 shard_model_param = None
             else:
-                # Always use DP shard for standard params
-                # param_range contains the DP shard range in the resized bucket layout
                 shard_model_param = model_param.detach().view(-1)[
                     param_range.start : param_range.end
                 ]
@@ -1632,10 +1616,8 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 if hasattr(model_param, 'shared'):
                     shard_model_param.shared = model_param.shared
 
-            # Generate main param
             if not use_precision_aware_optimizer:
                 if is_float8tensor(model_param):
-                    # Handle FP8 tensors - always use DP shard
                     if hasattr(model_param, 'get_high_precision_init_val'):
                         shard_main_param = (
                             model_param.get_high_precision_init_val()
@@ -1689,7 +1671,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
             if hasattr(model_param, 'shared'):
                 shard_model_param.shared = model_param.shared
 
-            # Add forward backlink for bucket-wise communication
+            # Expose the optimizer shard through MCore's main_param convention.
             model_param.main_param = shard_model_param
             model_param.main_param_sharded = True
 
@@ -1704,7 +1686,6 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 shard_layout=dion_shard_layout,
             )
         else:
-            # Standard 1D handling
             shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
             shard_model_param._model_param = model_param
 
@@ -1721,7 +1702,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
         shard_fp32_params.append(shard_model_param)
 
     def _enable_dion_runtime(self):
-        """Enable distributed mode with improved batch processing."""
+        """Enable the distributed Dion runtime."""
         if not isinstance(self.optimizer, (MegatronDion,)):
             return
         runtime_tp_group = self._resolve_dion_tp_group()
@@ -3457,7 +3438,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
         Copy updated optimizer shards into local model-param shards.
 
         Stock DO treats bucket.param_data as the canonical post-step restore / gather
-        surface. Rebind forward-visible model params to that bucket storage before
+        surface. Point forward-visible model params to that bucket storage before
         writing local shards so the subsequent param-gather path never depends on
         stale lingering aliases.
         """

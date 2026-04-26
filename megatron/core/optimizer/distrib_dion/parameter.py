@@ -1121,22 +1121,23 @@ def fill_dion_shard_buffer(
     full_view_2d: torch.Tensor,
     shard_buffer: torch.Tensor,
 ) -> None:
-    """Pack one Dion local shard into a gather input buffer."""
+    """Copy one Dion local shard into a gather input buffer."""
     canonical_local_source = fs_shard_view_2d(
         full_view_2d,
         int(entry.fs_shard_dim),
         int(entry.start_idx),
         int(entry.end_idx),
     )
-    bound_data_shard = optimizer._get_data_shard(entry.param)
-    if bound_data_shard is not None:
-        if bound_data_shard.numel() != canonical_local_source.numel():
+    registered_data_shard = optimizer._get_data_shard(entry.param)
+    if registered_data_shard is not None:
+        if registered_data_shard.numel() != canonical_local_source.numel():
             raise RuntimeError(
                 "[Dion] canonical FS gather source size mismatch "
                 f"param={optimizer._param_name(entry.param) or f'id_{id(entry.param)}'} "
-                f"bound={int(bound_data_shard.numel())} canonical={int(canonical_local_source.numel())}"
+                f"registered={int(registered_data_shard.numel())} "
+                f"canonical={int(canonical_local_source.numel())}"
             )
-        if bound_data_shard.data_ptr() != canonical_local_source.data_ptr():
+        if registered_data_shard.data_ptr() != canonical_local_source.data_ptr():
             raise RuntimeError(
                 "[Dion] canonical FS gather source mismatch "
                 f"for param={optimizer._param_name(entry.param) or f'id_{id(entry.param)}'}: "

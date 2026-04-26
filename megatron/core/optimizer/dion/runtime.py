@@ -1,4 +1,4 @@
-"""Package-private distributed runtime helpers for Dion."""
+"""Internal distributed runtime helpers for Dion."""
 import logging
 from typing import Callable, Generator, List, Optional, Tuple
 
@@ -114,7 +114,7 @@ def resolve_async_task_limit(
 ) -> int:
     """Resolve async runtime width without relying on hidden global defaults."""
     if max_concurrent_tasks is None:
-        # Reference Dion hard-codes AsyncRuntime(..., max_concurrent_tasks=3).
+        # Reference Dion uses AsyncRuntime(..., max_concurrent_tasks=3).
         limit = 3
     else:
         if int(max_concurrent_tasks) <= 0:
