@@ -147,6 +147,16 @@ def _validate_qkv_layout_rows(*, rows: int, split_shapes: Tuple[int, int, int], 
     return rows // total_per_group
 
 
+def validate_qkv_split_shapes_for_rows(
+    split_shapes: Tuple[int, int, int],
+    *,
+    rows: int,
+    context: str,
+) -> None:
+    """Validate that a row count can represent grouped QKV with these split sizes."""
+    _validate_qkv_layout_rows(rows=int(rows), split_shapes=split_shapes, context=context)
+
+
 def _split_range(size: int, world_size: int, rank: int) -> Tuple[int, int]:
     if world_size <= 0:
         raise RuntimeError(f"[DION_INVALID_QKV_WORLD_SIZE] world_size={world_size}")
@@ -502,11 +512,6 @@ def scatter_qkv_child_(
             "[DION_QKV_SCATTER_CHILD_SHAPE_MISMATCH] "
             f"child_kind={child_kind} expected_child_shape={expected_child_shape} "
             f"child_shape={tuple(int(dim) for dim in child.shape)}"
-        )
-    if not dest.is_contiguous():
-        raise RuntimeError(
-            "[DION_QKV_SCATTER_REQUIRES_CONTIGUOUS_DEST] "
-            f"child_kind={child_kind} dest_shape={tuple(int(dim) for dim in dest.shape)}"
         )
     child_source = child.contiguous()
     if _uses_same_parent_range(dest, child_source, segments):

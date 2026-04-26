@@ -7,6 +7,7 @@ Supports orthogonal TP x FS sharding:
 """
 
 import logging
+from dataclasses import replace
 import torch
 import torch.distributed as dist
 from typing import Dict, List, Tuple, Optional
@@ -141,7 +142,10 @@ from .distrib_dion.sharding import (
 )
 from .. import parallel_state, tensor_parallel
 from ..fp8_utils import is_float8tensor, quantize_param_shard
-from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
+from ..transformer.fsdp_dtensor_checkpoint import (
+    get_expert_index_from_key,
+    get_global_unique_param_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +159,88 @@ def _make_split_child_q_sync_hook(parent_state, sync_key: str):
         _clear_split_child_q_sync(parent_state, sync_key)
 
     return hook
+
+
+def _local_expert_tensor_view(
+    tensor: torch.Tensor,
+    *,
+    axis: int,
+    num_local_experts: int,
+    local_expert_index: int,
+    local_shape: tuple[int, int],
+    context: str,
+) -> torch.Tensor:
+    if axis not in (0, 1):
+        raise RuntimeError(f"[DION_INVALID_EXPERT_AXIS] context={context} axis={axis}")
+    if int(num_local_experts) <= 1:
+        return tensor
+    if int(local_expert_index) < 0 or int(local_expert_index) >= int(num_local_experts):
+        raise RuntimeError(
+            "[DION_INVALID_EXPERT_LOCAL_INDEX] "
+            f"context={context} axis={axis} num_local_experts={num_local_experts} "
+            f"local_expert_index={local_expert_index}"
+        )
+
+    local_extent = int(local_shape[axis])
+    expected_axis_size = local_extent * int(num_local_experts)
+    current_axis_size = int(tensor.size(axis))
+    other_axis = 1 - axis
+    if int(tensor.size(other_axis)) != int(local_shape[other_axis]):
+        raise RuntimeError(
+            "[DION_EXPERT_SPLIT_TENSOR_SHAPE_MISMATCH] "
+            f"context={context} axis={axis} tensor_shape={tuple(int(dim) for dim in tensor.shape)} "
+            f"local_shape={local_shape} num_local_experts={num_local_experts}"
+        )
+    if current_axis_size == local_extent:
+        return tensor
+    if current_axis_size != expected_axis_size:
+        raise RuntimeError(
+            "[DION_EXPERT_SPLIT_TENSOR_SHAPE_MISMATCH] "
+            f"context={context} axis={axis} tensor_shape={tuple(int(dim) for dim in tensor.shape)} "
+            f"local_shape={local_shape} num_local_experts={num_local_experts}"
+        )
+    start = int(local_expert_index) * local_extent
+    if axis == 0:
+        return tensor.narrow(0, start, local_extent)
+    return tensor.narrow(1, start, local_extent)
+
+
+def _expert_split_token(dist_meta: DionDistMeta) -> tuple[str, int]:
+    if getattr(dist_meta, "per_expert_global_shape", None) is None:
+        return ("expert", -1)
+    param_name = getattr(dist_meta, "param_name", "") or ""
+    try:
+        expert_index = get_expert_index_from_key(param_name) if param_name else None
+    except AssertionError:
+        expert_index = None
+    if expert_index is not None:
+        return ("expert", int(expert_index))
+    local_expert_index = int(getattr(dist_meta, "local_expert_index", -1))
+    if local_expert_index < 0:
+        raise RuntimeError(
+            "[DION_EXPERT_SPLIT_MISSING_EXPERT_IDENTITY] "
+            f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+            f"param_name={getattr(dist_meta, 'param_name', '')}"
+        )
+    return ("local_expert", local_expert_index)
+
+
+def _with_expert_token(parent_uid, expert_token: tuple[str, int]):
+    if parent_uid is None:
+        raise RuntimeError("[DION_EXPERT_SPLIT_UID_REQUIRES_PARENT_UID]")
+    if expert_token[1] < 0:
+        return parent_uid
+    if isinstance(parent_uid, tuple):
+        return (*parent_uid, expert_token)
+    return (parent_uid, expert_token)
+
+
+def _has_active_expert_layout(dist_meta: DionDistMeta) -> bool:
+    return (
+        getattr(dist_meta, "per_expert_global_shape", None) is not None
+        and int(getattr(dist_meta, "expert_axis", -1)) in (0, 1)
+        and int(getattr(dist_meta, "num_local_experts", 1)) > 1
+    )
 
 
 _CHILD_GROUP_CACHE: dict[tuple[int, ...], Optional[torch.distributed.ProcessGroup]] = {}
@@ -1985,6 +2071,144 @@ class DionDistributedOptimizer(DistributedOptimizer):
             global_rank=self._global_rank,
         )
 
+    def _split_parent_dist_meta(self, parent_dist_meta: DionDistMeta) -> DionDistMeta:
+        """Return metadata for the single expert matrix that split children consume."""
+        if not _has_active_expert_layout(parent_dist_meta):
+            return parent_dist_meta
+
+        per_expert_global_shape = tuple(
+            int(dim) for dim in parent_dist_meta.per_expert_global_shape
+        )
+        expert_local_shape = getattr(parent_dist_meta, "local_shape", None)
+        if expert_local_shape is None:
+            raise RuntimeError(
+                "[DION_EXPERT_SPLIT_MISSING_LOCAL_SHAPE] "
+                f"param_uid={getattr(parent_dist_meta, 'param_uid', None)} "
+                f"param_name={getattr(parent_dist_meta, 'param_name', '')}"
+            )
+        expert_local_shape = tuple(int(dim) for dim in expert_local_shape)
+        expert_token = _expert_split_token(parent_dist_meta)
+        parent_name = getattr(parent_dist_meta, "param_name", "")
+        expert_name = (
+            f"{parent_name}::{expert_token[0]}{expert_token[1]}"
+            if expert_token[1] >= 0
+            else parent_name
+        )
+        fs_start_idx = int(getattr(parent_dist_meta, "fs_start_idx", -1))
+        fs_end_idx = int(getattr(parent_dist_meta, "fs_end_idx", -1))
+        fs_shard_dim = int(getattr(parent_dist_meta, "fs_shard_dim", -1))
+        fs_world_size = int(getattr(parent_dist_meta, "fs_world_size", 1))
+        fs_rank = int(getattr(parent_dist_meta, "fs_rank", -1))
+        if fs_shard_dim in (0, 1) and fs_world_size > 1 and fs_rank >= 0:
+            fs_start_idx, fs_end_idx = compute_fs_shard_range(
+                int(per_expert_global_shape[fs_shard_dim]),
+                fs_world_size,
+                fs_rank,
+            )
+        return replace(
+            parent_dist_meta,
+            shape=expert_local_shape,
+            global_shape=per_expert_global_shape,
+            fs_start_idx=int(fs_start_idx),
+            fs_end_idx=int(fs_end_idx),
+            per_expert_global_shape=None,
+            local_shape=expert_local_shape,
+            param_uid=_with_expert_token(parent_dist_meta.param_uid, expert_token),
+            param_name=expert_name,
+            expert_axis=-1,
+            num_local_experts=1,
+            local_expert_index=-1,
+        )
+
+    def _split_parent_views(
+        self,
+        *,
+        param,
+        grad,
+        momentum,
+        dist_meta: DionDistMeta,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, int], DionDistMeta]:
+        """Return the single-expert parent tensor views used by split-child routing."""
+        physical_shape = tuple(int(dim) for dim in require_2d_local_shape(param, dist_meta))
+        param_2d = param.view(*physical_shape)
+        grad_2d = grad.reshape(*physical_shape)
+        momentum_2d = momentum.reshape(*physical_shape)
+        split_dist_meta = self._split_parent_dist_meta(dist_meta)
+
+        if not _has_active_expert_layout(dist_meta):
+            return param_2d, grad_2d, momentum_2d, physical_shape, split_dist_meta
+
+        expert_axis = int(getattr(dist_meta, "expert_axis", -1))
+        num_local_experts = int(getattr(dist_meta, "num_local_experts", 1))
+        local_expert_index = int(getattr(dist_meta, "local_expert_index", -1))
+        expert_local_shape = tuple(int(dim) for dim in split_dist_meta.local_shape)
+        context = (
+            f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+            f"param_name={getattr(dist_meta, 'param_name', '')}"
+        )
+        return (
+            _local_expert_tensor_view(
+                param_2d,
+                axis=expert_axis,
+                num_local_experts=num_local_experts,
+                local_expert_index=local_expert_index,
+                local_shape=expert_local_shape,
+                context=f"param:{context}",
+            ),
+            _local_expert_tensor_view(
+                grad_2d,
+                axis=expert_axis,
+                num_local_experts=num_local_experts,
+                local_expert_index=local_expert_index,
+                local_shape=expert_local_shape,
+                context=f"grad:{context}",
+            ),
+            _local_expert_tensor_view(
+                momentum_2d,
+                axis=expert_axis,
+                num_local_experts=num_local_experts,
+                local_expert_index=local_expert_index,
+                local_shape=expert_local_shape,
+                context=f"momentum:{context}",
+            ),
+            expert_local_shape,
+            split_dist_meta,
+        )
+
+    @staticmethod
+    def _normalize_linear_split_rows_for_meta(
+        split_rows: tuple[int, int],
+        dist_meta: DionDistMeta,
+    ) -> tuple[int, int]:
+        """Return split-linear row sizes in the active single-expert coordinate space."""
+        split_rows = tuple(int(dim) for dim in split_rows)
+        per_expert_shape = getattr(dist_meta, "per_expert_global_shape", None)
+        if per_expert_shape is None:
+            return split_rows
+        per_expert_rows = int(per_expert_shape[0])
+        if sum(split_rows) == per_expert_rows:
+            return split_rows
+        parent_global_shape = getattr(dist_meta, "global_shape", None)
+        parent_rows = int(parent_global_shape[0]) if parent_global_shape is not None else 0
+        expert_axis = int(getattr(dist_meta, "expert_axis", -1))
+        num_local_experts = int(getattr(dist_meta, "num_local_experts", 1))
+        if (
+            expert_axis == 0
+            and num_local_experts > 1
+            and sum(split_rows) == parent_rows
+            and all(int(row) % num_local_experts == 0 for row in split_rows)
+        ):
+            converted = tuple(int(row) // num_local_experts for row in split_rows)
+            if sum(converted) == per_expert_rows:
+                return converted
+        raise RuntimeError(
+            "[DION_EXPERT_LINEAR_SPLIT_ROWS_MISMATCH] "
+            f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+            f"param_name={getattr(dist_meta, 'param_name', '')} "
+            f"split_rows={split_rows} per_expert_global_shape={per_expert_shape} "
+            f"global_shape={getattr(dist_meta, 'global_shape', None)}"
+        )
+
     def _build_qkv_child_dist_meta(
         self,
         *,
@@ -2540,12 +2764,8 @@ class DionDistributedOptimizer(DistributedOptimizer):
         split_rows: tuple[int, int],
     ) -> None:
         """Create deterministic split-child subgroups on all ranks before step-time routing."""
-        if getattr(dist_meta, "per_expert_global_shape", None) is not None:
-            raise RuntimeError(
-                "[DION_LINEAR_SPLIT_DOES_NOT_SUPPORT_EXPERT_LAYOUT] "
-                f"param_uid={getattr(dist_meta, 'param_uid', None)} "
-                f"param_name={getattr(dist_meta, 'param_name', '')}"
-            )
+        split_rows = self._normalize_linear_split_rows_for_meta(split_rows, dist_meta)
+        dist_meta = self._split_parent_dist_meta(dist_meta)
         for child_kind in iter_linear_child_kinds():
             self._resolve_linear_child_fs_shard_layout(
                 parent_dist_meta=dist_meta,
@@ -2567,12 +2787,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
         split_shapes: tuple[int, int, int],
     ) -> None:
         """Create deterministic split-child subgroups on all ranks before step-time routing."""
-        if getattr(dist_meta, "per_expert_global_shape", None) is not None:
-            raise RuntimeError(
-                "[DION_QKV_SPLIT_DOES_NOT_SUPPORT_EXPERT_LAYOUT] "
-                f"param_uid={getattr(dist_meta, 'param_uid', None)} "
-                f"param_name={getattr(dist_meta, 'param_name', '')}"
-            )
+        dist_meta = self._split_parent_dist_meta(dist_meta)
         for child_kind in iter_qkv_child_kinds():
             self._resolve_qkv_child_fs_shard_layout(
                 parent_dist_meta=dist_meta,
@@ -2674,14 +2889,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
         )
         if split_shapes is None:
             return None
-        if getattr(dist_meta, "per_expert_global_shape", None) is not None:
-            raise RuntimeError(
-                "[DION_QKV_SPLIT_DOES_NOT_SUPPORT_EXPERT_LAYOUT] "
-                f"param_uid={getattr(dist_meta, 'param_uid', None)} "
-                f"param_name={getattr(dist_meta, 'param_name', '')}"
-            )
 
-        parent_local_shape = tuple(int(dim) for dim in require_2d_local_shape(param, dist_meta))
         momentum = optimizer_state.get("momentum", None)
         if momentum is None:
             raise RuntimeError(
@@ -2689,24 +2897,36 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 f"param_uid={getattr(dist_meta, 'param_uid', None)} "
                 f"param_name={getattr(dist_meta, 'param_name', '')}"
             )
+        (
+            parent_param_view,
+            parent_grad_view,
+            parent_momentum_view,
+            parent_local_shape,
+            split_parent_dist_meta,
+        ) = self._split_parent_views(
+            param=param,
+            grad=grad,
+            momentum=momentum,
+            dist_meta=dist_meta,
+        )
 
         child_step_params: list[DionStepParam] = []
         for child_kind in iter_qkv_child_kinds():
-            if not qkv_child_has_local_overlap(split_shapes, dist_meta, child_kind):
+            if not qkv_child_has_local_overlap(split_shapes, split_parent_dist_meta, child_kind):
                 continue
             child_local_shape = qkv_child_local_shape(
                 parent_local_shape,
                 split_shapes,
                 child_kind,
-                dist_meta=dist_meta,
+                dist_meta=split_parent_dist_meta,
             )
             child_global_shape = qkv_child_global_shape(
-                tuple(int(dim) for dim in dist_meta.global_shape),
+                tuple(int(dim) for dim in split_parent_dist_meta.global_shape),
                 split_shapes,
                 child_kind,
             )
             child_dist_meta = self._build_qkv_child_dist_meta(
-                parent_dist_meta=dist_meta,
+                parent_dist_meta=split_parent_dist_meta,
                 child_kind=child_kind,
                 split_shapes=split_shapes,
                 child_local_shape=child_local_shape,
@@ -2719,18 +2939,23 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 child_dist_meta=child_dist_meta,
             )
 
-            child_param = extract_qkv_child(param, split_shapes, child_kind, dist_meta=dist_meta)
-            child_grad = extract_qkv_child(
-                grad.reshape(*parent_local_shape),
+            child_param = extract_qkv_child(
+                parent_param_view,
                 split_shapes,
                 child_kind,
-                dist_meta=dist_meta,
+                dist_meta=split_parent_dist_meta,
+            )
+            child_grad = extract_qkv_child(
+                parent_grad_view,
+                split_shapes,
+                child_kind,
+                dist_meta=split_parent_dist_meta,
             )
             child_momentum = extract_qkv_child(
-                momentum.reshape(*parent_local_shape),
+                parent_momentum_view,
                 split_shapes,
                 child_kind,
-                dist_meta=dist_meta,
+                dist_meta=split_parent_dist_meta,
             )
             q_key = qkv_state_key("Q", child_kind)
             r_key = qkv_state_key("r", child_kind)
@@ -2759,24 +2984,23 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 updated_param,
                 updated_momentum,
                 *,
-                parent_param=param,
-                parent_state=optimizer_state,
+                parent_dist_meta=split_parent_dist_meta,
                 split_shapes=split_shapes,
                 child_kind=child_kind,
             ):
                 scatter_qkv_child_(
-                    parent_param,
+                    parent_param_view,
                     updated_param,
                     split_shapes,
                     child_kind,
-                    dist_meta=dist_meta,
+                    dist_meta=parent_dist_meta,
                 )
                 scatter_qkv_child_(
-                    parent_state["momentum"],
+                    parent_momentum_view,
                     updated_momentum,
                     split_shapes,
                     child_kind,
-                    dist_meta=dist_meta,
+                    dist_meta=parent_dist_meta,
                 )
 
             child_step_params.append(
@@ -2830,20 +3054,8 @@ class DionDistributedOptimizer(DistributedOptimizer):
         )
         if split_rows is None:
             return None
-        if getattr(dist_meta, "per_expert_global_shape", None) is not None:
-            raise RuntimeError(
-                "[DION_LINEAR_SPLIT_DOES_NOT_SUPPORT_EXPERT_LAYOUT] "
-                f"param_uid={getattr(dist_meta, 'param_uid', None)} "
-                f"param_name={getattr(dist_meta, 'param_name', '')}"
-            )
+        split_rows = self._normalize_linear_split_rows_for_meta(split_rows, dist_meta)
 
-        parent_local_shape = tuple(int(dim) for dim in require_2d_local_shape(param, dist_meta))
-        m_local, n_local = parent_local_shape
-        parent_global_shape = get_global_shape(
-            dist_meta,
-            m_local,
-            n_local,
-        )
         momentum = optimizer_state.get("momentum", None)
         if momentum is None:
             raise RuntimeError(
@@ -2851,15 +3063,33 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 f"param_uid={getattr(dist_meta, 'param_uid', None)} "
                 f"param_name={getattr(dist_meta, 'param_name', '')}"
             )
+        (
+            parent_param_view,
+            parent_grad_view,
+            parent_momentum_view,
+            parent_local_shape,
+            split_parent_dist_meta,
+        ) = self._split_parent_views(
+            param=param,
+            grad=grad,
+            momentum=momentum,
+            dist_meta=dist_meta,
+        )
+        m_local, n_local = parent_local_shape
+        parent_global_shape = get_global_shape(
+            split_parent_dist_meta,
+            m_local,
+            n_local,
+        )
 
         child_step_params: list[DionStepParam] = []
         for child_kind in iter_linear_child_kinds():
-            if not linear_child_has_local_overlap(split_rows, dist_meta, child_kind):
+            if not linear_child_has_local_overlap(split_rows, split_parent_dist_meta, child_kind):
                 continue
             child_local_shape = linear_child_local_shape(
                 parent_local_shape,
                 split_rows,
-                dist_meta,
+                split_parent_dist_meta,
                 child_kind,
             )
             child_global_shape = linear_child_global_shape(
@@ -2868,7 +3098,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 child_kind,
             )
             child_dist_meta = self._build_linear_child_dist_meta(
-                parent_dist_meta=dist_meta,
+                parent_dist_meta=split_parent_dist_meta,
                 child_kind=child_kind,
                 split_rows=split_rows,
                 child_local_shape=child_local_shape,
@@ -2881,17 +3111,22 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 child_dist_meta=child_dist_meta,
             )
 
-            child_param = read_linear_child(param, split_rows, dist_meta, child_kind)
-            child_grad = read_linear_child(
-                grad.reshape(*parent_local_shape),
+            child_param = read_linear_child(
+                parent_param_view,
                 split_rows,
-                dist_meta,
+                split_parent_dist_meta,
+                child_kind,
+            )
+            child_grad = read_linear_child(
+                parent_grad_view,
+                split_rows,
+                split_parent_dist_meta,
                 child_kind,
             )
             child_momentum = read_linear_child(
-                momentum.reshape(*parent_local_shape),
+                parent_momentum_view,
                 split_rows,
-                dist_meta,
+                split_parent_dist_meta,
                 child_kind,
             )
             q_key = linear_state_key("Q", child_kind)
@@ -2921,21 +3156,19 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 updated_param,
                 updated_momentum,
                 *,
-                parent_param=param,
-                parent_state=optimizer_state,
-                parent_dist_meta=dist_meta,
+                parent_dist_meta=split_parent_dist_meta,
                 split_rows=split_rows,
                 child_kind=child_kind,
             ):
                 write_linear_child_(
-                    parent_param,
+                    parent_param_view,
                     updated_param,
                     split_rows,
                     parent_dist_meta,
                     child_kind,
                 )
                 write_linear_child_(
-                    parent_state["momentum"],
+                    parent_momentum_view,
                     updated_momentum,
                     split_rows,
                     parent_dist_meta,

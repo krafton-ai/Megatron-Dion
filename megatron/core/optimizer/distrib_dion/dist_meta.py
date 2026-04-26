@@ -8,7 +8,7 @@ import torch.distributed as dist
 
 from ... import parallel_state
 from ..dion.linear import get_linear_split_rows, is_linear_fc1_param
-from ..dion.qkv import get_qkv_split_shapes, is_qkv_param
+from ..dion.qkv import get_qkv_split_shapes, is_qkv_param, validate_qkv_split_shapes_for_rows
 from ..dion.state import build_param_config
 from ..dion.types import DionDistMeta
 from ..dion.utils import get_local_shape
@@ -94,6 +94,46 @@ def get_group_ranks(group):
     if group is None:
         return None
     return tuple(dist.get_process_group_ranks(group))
+
+
+def _linear_split_rows_for_layout(*, model_param, param_name: str, dion_shard_layout, expert_layout):
+    if not is_linear_fc1_param(model_param):
+        return None
+    split_rows = get_linear_split_rows(model_param)
+    if split_rows is None:
+        return None
+
+    global_rows = int(dion_shard_layout.global_shape[0])
+    per_expert_shape = dion_shard_layout.per_expert_global_shape
+    if per_expert_shape is None:
+        if int(sum(split_rows)) != global_rows:
+            raise RuntimeError(
+                "[DION_LINEAR_SPLIT_ROWS_MISMATCH] "
+                f"param={param_name or id(model_param)} "
+                f"split_rows={split_rows} global_rows={global_rows}"
+            )
+        return split_rows
+
+    per_expert_rows = int(per_expert_shape[0])
+    if int(sum(split_rows)) == per_expert_rows:
+        return split_rows
+
+    if expert_layout is not None and int(expert_layout["expert_axis"]) == 0:
+        num_local_experts = int(expert_layout["num_local_experts"])
+        if (
+            num_local_experts > 1
+            and int(sum(split_rows)) == global_rows
+            and all(int(row) % num_local_experts == 0 for row in split_rows)
+        ):
+            converted = tuple(int(row) // num_local_experts for row in split_rows)
+            if int(sum(converted)) == per_expert_rows:
+                return converted
+
+    raise RuntimeError(
+        "[DION_EXPERT_LINEAR_SPLIT_ROWS_MISMATCH] "
+        f"param={param_name or id(model_param)} split_rows={split_rows} "
+        f"per_expert_global_shape={per_expert_shape} global_shape={dion_shard_layout.global_shape}"
+    )
 
 
 def assert_context_parallel_excluded(*, label: str, group, extra: str = "") -> None:
@@ -266,6 +306,21 @@ def build_param_dist_meta(
         dion_shard_layout=dion_shard_layout,
     )
 
+    qkv_split_shapes = get_qkv_split_shapes(model_param) if is_qkv_param(model_param) else None
+    if qkv_split_shapes is not None:
+        qkv_global_rows = int(
+            (
+                dion_shard_layout.per_expert_global_shape
+                if dion_shard_layout.per_expert_global_shape is not None
+                else dion_shard_layout.global_shape
+            )[0]
+        )
+        validate_qkv_split_shapes_for_rows(
+            qkv_split_shapes,
+            rows=qkv_global_rows,
+            context=f"param={param_name or id(model_param)}",
+        )
+
     dist_meta = DionDistMeta(
         shape=shard_param.shape,
         global_shape=dion_shard_layout.global_shape,
@@ -305,14 +360,12 @@ def build_param_dist_meta(
         local_expert_index=(
             int(expert_layout["local_expert_index"]) if expert_layout is not None else -1
         ),
-        qkv_split_shapes=(
-            get_qkv_split_shapes(model_param)
-            if is_qkv_param(model_param)
-            else None
-        ),
-        linear_split_rows=get_linear_split_rows(
-            model_param,
-            global_rows=int(dion_shard_layout.global_shape[0]),
+        qkv_split_shapes=qkv_split_shapes,
+        linear_split_rows=_linear_split_rows_for_layout(
+            model_param=model_param,
+            param_name=param_name,
+            dion_shard_layout=dion_shard_layout,
+            expert_layout=expert_layout,
         ),
         linear_partition_stride=(
             int(getattr(model_param, "partition_stride", 1))
