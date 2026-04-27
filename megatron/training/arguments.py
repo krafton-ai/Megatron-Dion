@@ -661,6 +661,8 @@ def validate_args(args, defaults={}):
         args.dion_momentum_dtype = map_dtype(args.dion_momentum_dtype)
     if hasattr(args, "dion_q_dtype") and args.dion_q_dtype is not None:
         args.dion_q_dtype = map_dtype(args.dion_q_dtype)
+    if hasattr(args, "dion_variance_dtype") and args.dion_variance_dtype is not None:
+        args.dion_variance_dtype = map_dtype(args.dion_variance_dtype)
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
@@ -1211,6 +1213,14 @@ def validate_args(args, defaults={}):
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+
+    if args.optimizer == "dion" and args.use_distributed_optimizer:
+        if not args.no_save_optim or not args.no_load_optim:
+            assert args.ckpt_format == "torch_dist", (
+                "Dion distributed optimizer supports optimizer checkpointing only with "
+                "--ckpt-format torch_dist. Use --no-save-optim/--no-load-optim for "
+                "model-only checkpoints."
+            )
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -2127,6 +2137,9 @@ def _add_training_args(parser):
     group.add_argument('--dion-q-dtype', type=str, default=None,
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
                        help='Dtype for Dion Q state.')
+    group.add_argument('--dion-variance-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for Dion elementwise second-moment state.')
     group.add_argument('--fully-shard-model-parallel-size', type=int, default=1,
                        help='Dion fully-sharded optimizer axis size.')
     group.add_argument('--replicate-model-parallel-size', type=int, default=1,

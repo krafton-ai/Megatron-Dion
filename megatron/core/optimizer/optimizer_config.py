@@ -516,7 +516,8 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_q_dtype: Optional[torch.dtype] = None
     """Dtype for Dion right-factor state."""
 
-    """Optional Dion local batching hint."""
+    dion_variance_dtype: Optional[torch.dtype] = None
+    """Dtype for Dion elementwise second-moment state."""
 
     dion_max_concurrent_tasks: Optional[int] = 3
     """Dion async task width. Defaults to the reference runtime width of 3."""

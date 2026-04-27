@@ -52,6 +52,8 @@ def is_dion_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool
         return False
     if is_combined_grouped_mlp_param(param, resolved_name):
         return False
+    if is_unindexed_multi_local_expert_param(param, resolved_name):
+        return False
     return True
 
 
@@ -83,6 +85,19 @@ def is_combined_grouped_mlp_param(param: torch.Tensor, param_name: Optional[str]
     if ".linear_fc" in resolved_name or ".local_experts." in resolved_name:
         return False
     return True
+
+
+def is_unindexed_multi_local_expert_param(
+    param: torch.Tensor,
+    param_name: Optional[str] = None,
+) -> bool:
+    """Return whether this multi-local-expert tensor lacks a stable expert index."""
+    num_local_experts = getattr(param, "num_local_experts", None)
+    return (
+        num_local_experts is not None
+        and int(num_local_experts) > 1
+        and not has_explicit_expert_index(param_name or getattr(param, "_param_name", None))
+    )
 
 
 def has_explicit_expert_index(param_name: Optional[str]) -> bool:
@@ -842,8 +857,12 @@ def build_bucket_param_map(
 
 def mark_dion_bucket_params(cls, param_map, param_to_name, fs_size):
     """Classify bucket params and build static Dion metadata once."""
-    del cls, fs_size
+    del cls
     from .. import parallel_state
+
+    fs_size = int(fs_size)
+    if fs_size <= 0:
+        raise RuntimeError(f"[Dion] invalid FS size while marking bucket params: {fs_size}")
 
     dion_param_count = 0
     dion_info_by_param = {}
@@ -855,7 +874,13 @@ def mark_dion_bucket_params(cls, param_map, param_to_name, fs_size):
         if param_name:
             param._param_name = param_name
 
+        fallback_to_elementwise = (
+            is_combined_grouped_mlp_param(param, param_name)
+            or is_unindexed_multi_local_expert_param(param, param_name)
+        )
         param.is_dion_param = is_dion_param(param, param_name)
+        if not param.is_dion_param and fallback_to_elementwise:
+            param.dion_candidate = False
 
         is_expert = is_moe_expert_param(param, param_name)
         raw_tp_split_dim = get_tp_split_dim(param)
@@ -869,9 +894,15 @@ def mark_dion_bucket_params(cls, param_map, param_to_name, fs_size):
         if not param.is_dion_param:
             continue
 
-        dion_param_count += 1
-        m_local, n_local = param.shape
+        m_local, n_local = (int(dim) for dim in param.shape)
         fs_shard_dim = get_fs_split_dim(tp_shard_dim)
+        split_size = m_local if fs_shard_dim == 0 else n_local
+        if fs_size > 1 and split_size < fs_size:
+            param.is_dion_param = False
+            param.dion_candidate = False
+            continue
+
+        dion_param_count += 1
 
         if tp_shard_dim == 0:
             m_global = m_local * tp_world_size

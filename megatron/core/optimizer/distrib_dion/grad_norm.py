@@ -66,6 +66,20 @@ def _grad_sum_sq_fp64(tensor: torch.Tensor) -> torch.Tensor:
     return total_sq
 
 
+def _grad_stats_device(*collections) -> torch.device:
+    for collection in collections:
+        for item in collection:
+            if isinstance(item, torch.Tensor):
+                return item.device
+            if isinstance(item, (list, tuple)):
+                for tensor in item:
+                    if isinstance(tensor, torch.Tensor):
+                        return tensor.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
 def dion_replica_grads(
     optimizer,
     dion_params: List[Tuple[torch.nn.Parameter, torch.nn.Parameter]],
@@ -346,7 +360,11 @@ def grad_norm_inputs(optimizer) -> List[torch.Tensor]:
 @torch.no_grad()
 def compute_grad_norm(optimizer):
     grads_for_norm, dion_params, count_dion_grad = _grad_norm_routes(optimizer)
-    total_sq = torch.zeros(1, dtype=torch.float64, device=torch.cuda.current_device())
+    total_sq = torch.zeros(
+        1,
+        dtype=torch.float64,
+        device=_grad_stats_device(grads_for_norm, dion_params),
+    )
     data_parallel_group = None
     for grad in grads_for_norm:
         data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)

@@ -241,6 +241,12 @@ def ensure_optimizer_state(
     return state
 
 
+def _collective_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
 def validate_step_groups(
     *,
     replica_group,
@@ -258,19 +264,20 @@ def validate_step_groups(
     global_rank = dist.get_rank()
 
     if dist.is_initialized() and replica_group is not None:
+        device = _collective_device()
         have_rp_arg = torch.tensor(
             [1 if rp_group is not None else 0],
-            device=torch.cuda.current_device(),
+            device=device,
             dtype=torch.int64,
         )
         have_fs_arg = torch.tensor(
             [1 if fs_group is not None else 0],
-            device=torch.cuda.current_device(),
+            device=device,
             dtype=torch.int64,
         )
         have_state_replica_arg = torch.tensor(
             [1 if state_replica_group is not None else 0],
-            device=torch.cuda.current_device(),
+            device=device,
             dtype=torch.int64,
         )
         dist.all_reduce(have_rp_arg, op=dist.ReduceOp.MIN, group=replica_group)

@@ -366,6 +366,21 @@ class DionDistributedOptimizer(DistributedOptimizer):
             ),
         }
 
+    def save_parameter_state(self, filename: str):
+        raise NotImplementedError(
+            "Dion distributed optimizer does not support legacy torch optimizer "
+            f"checkpoint parameter state ({filename}). Use --ckpt-format torch_dist "
+            "for optimizer checkpointing, or --no-save-optim for model-only checkpoints."
+        )
+
+    def load_parameter_state(self, filename: str, *, update_legacy_format=False):
+        del update_legacy_format
+        raise NotImplementedError(
+            "Dion distributed optimizer does not support legacy torch optimizer "
+            f"checkpoint parameter state ({filename}). Use --ckpt-format torch_dist "
+            "for optimizer checkpointing, or --no-load-optim for model-only checkpoints."
+        )
+
     @classmethod
     def _get_bucket_shard_group(cls, param_and_grad_buffer, bucket):
         """Return the standard local-shard group that owns this bucket."""

@@ -119,6 +119,37 @@ def _validate_dense_group(
     return selected_group
 
 
+def _validate_expert_fs_group(
+    *,
+    selected_group: Optional[torch.distributed.ProcessGroup],
+    requested_world_size: int,
+    source: str,
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Validate the expert-local FS group selected by MCore."""
+    if selected_group is None:
+        if int(requested_world_size) <= 1:
+            return None
+        raise RuntimeError(
+            "Dion expert topology requires an authoritative Megatron-Core process group. "
+            f"source={source} requested_world_size={requested_world_size}"
+        )
+
+    selected_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(selected_group))
+    _validate_context_parallel_excluded(
+        selected_ranks=selected_ranks,
+        source=f"{source}:expert_fs",
+    )
+    if len(selected_ranks) != int(requested_world_size):
+        raise RuntimeError(
+            "Dion expert FS group size mismatch. "
+            f"source={source} requested_fs={requested_world_size} "
+            f"actual_fs={len(selected_ranks)} selected_ranks={selected_ranks}. "
+            "Choose FS/RP/EP/ETP sizes whose expert data-parallel shard domain matches "
+            "the requested Dion FS topology."
+        )
+    return selected_group
+
+
 def get_dion_param_override(
     config: OptimizerConfig,
     param: torch.nn.Parameter,
@@ -268,15 +299,11 @@ def _resolve_fs_group(
         expert_fs_group = parallel_state.get_expert_data_parallel_group(
             partial_expert_data_parallel=True
         )
-        if expert_fs_group is not None:
-            expert_fs_ranks = tuple(
-                int(rank) for rank in dist.get_process_group_ranks(expert_fs_group)
-            )
-            _validate_context_parallel_excluded(
-                selected_ranks=expert_fs_ranks,
-                source="expert_partial_data_parallel:fs",
-            )
-        return expert_fs_group
+        return _validate_expert_fs_group(
+            selected_group=expert_fs_group,
+            requested_world_size=requested_fs_world_size,
+            source="expert_partial_data_parallel",
+        )
     return _get_dense_fs_group(
         dense_fs_group=dense_fs_group,
         pure_dp_group=pure_data_parallel_group,
@@ -303,6 +330,7 @@ def build_dion_optimizer(
     mixed_precision_config = DionMixedPrecisionConfig(
         momentum_dtype=config.dion_momentum_dtype,
         q_dtype=config.dion_q_dtype,
+        variance_dtype=config.dion_variance_dtype,
     )
 
     user_fs_world_size = getattr(config, 'fully_shard_model_parallel_size', 1) or 1
