@@ -37,7 +37,7 @@ def _dion_math_precision_context():
 
 @torch.compile(fullgraph=True)
 def _qr_r_factor(X: Tensor) -> Tensor:
-    return torch.linalg.qr(X, mode="r")[1].to(dtype=torch.float32)
+    return torch.linalg.qr(X.to(dtype=torch.float32), mode="r")[1].to(dtype=torch.float32)
 
 
 @torch.compile(fullgraph=True)
@@ -78,34 +78,37 @@ def orthogonalize(
     """
     assert P.ndim >= 3, "Expected P to have batch dimension"
     original_dtype = P.dtype
-    P_local = P
+    P_local = P.to(dtype=torch.float32)
 
     if P.size(-2) <= P.size(-1):
-        P_local = torch.linalg.qr(P_local.to(dtype=torch.float32), mode="reduced")[0]
+        P_local = torch.linalg.qr(P_local, mode="reduced")[0].to(dtype=torch.float32)
     else:
         S = generate_random_sketch_matrix(
-            P,
+            P_local,
             oversample=rcqr_oversample,
             make_sketch=make_sketch,
-        )
+        ).to(dtype=torch.float32)
         R = torch.linalg.qr(
             S @ P_local,
             mode="r",
         )[1].to(dtype=torch.float32)
         P_local = torch.linalg.solve_triangular(
             R,
-            P_local.to(dtype=torch.float32),
+            P_local,
             upper=True,
             left=False,
-        )
+        ).to(dtype=torch.float32)
 
-        R = torch.linalg.cholesky_ex(P_local.mT @ P_local, upper=True)[0]
+        R = torch.linalg.cholesky_ex(
+            (P_local.mT @ P_local).to(dtype=torch.float32),
+            upper=True,
+        )[0].to(dtype=torch.float32)
         P_local = torch.linalg.solve_triangular(
             R,
             P_local,
             upper=True,
             left=False,
-        )
+        ).to(dtype=torch.float32)
 
     return P_local.to(original_dtype).contiguous()
 

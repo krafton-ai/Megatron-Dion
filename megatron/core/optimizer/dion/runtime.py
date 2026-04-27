@@ -309,6 +309,17 @@ def _dist_is_initialized() -> bool:
     return not hasattr(dist, "is_initialized") or bool(dist.is_initialized())
 
 
+def _process_group_world_size(process_group) -> Optional[int]:
+    if process_group is None:
+        return 1
+    if not _dist_is_initialized():
+        return None
+    try:
+        return int(dist.get_world_size(process_group))
+    except (AttributeError, RuntimeError, ValueError):
+        return None
+
+
 def _try_use_dense_grad_reduction_cache(
     optimizer,
     grads: List[Tensor],
@@ -377,6 +388,10 @@ def all_reduce_grads_across_replicas(
         return
 
     op = replicate_reduce_op(optimizer)
+    replicate_world_size = _process_group_world_size(replicate_group)
+    if replicate_world_size is not None and replicate_world_size <= 1:
+        return
+
     if _try_use_dense_grad_reduction_cache(
         optimizer,
         grads,
@@ -429,6 +444,10 @@ def all_reduce_batch_across_replicas(
         return batch
 
     del optimizer
+    replicate_world_size = _process_group_world_size(replicate_group)
+    if replicate_world_size is not None and replicate_world_size <= 1:
+        return batch
+
     if allow_in_place and batch.is_contiguous() and _dist_is_initialized():
         handle = dist.all_reduce(
             batch,

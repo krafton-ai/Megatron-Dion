@@ -263,7 +263,11 @@ def validate_step_groups(
     """Validate distributed bootstrap inputs and return the step-routing callback."""
     global_rank = dist.get_rank()
 
-    if dist.is_initialized() and replica_group is not None:
+    if (
+        dist.is_initialized()
+        and replica_group is not None
+        and group_size(replica_group) > 1
+    ):
         device = _collective_device()
         have_rp_arg = torch.tensor(
             [1 if rp_group is not None else 0],
@@ -479,9 +483,6 @@ def enable_distributed_dion(
     log_error: Callable,
 ):
     """Enable distributed Dion mode and return the final distributed metadata."""
-    if dist.is_initialized() and dist.get_world_size() == 1:
-        return None
-
     try:
         dist_metas_sharded = build_all_dist_metas()
     except Exception as exc:

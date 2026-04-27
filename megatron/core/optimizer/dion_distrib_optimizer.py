@@ -656,9 +656,36 @@ class DionDistributedOptimizer(DistributedOptimizer):
         param_uid = getattr(shard_param, "_dion_param_uid", None)
         if param_uid is not None:
             return param_uid
-        dist_meta = getattr(self, "dist_metas", {}).get(shard_param)
+
+        dist_metas = getattr(self, "dist_metas", {})
+        dist_meta = dist_metas.get(shard_param)
         if dist_meta is not None and getattr(dist_meta, "param_uid", None) is not None:
+            shard_param._dion_param_uid = dist_meta.param_uid
             return dist_meta.param_uid
+
+        model_param = getattr(shard_param, "_model_param", None)
+        if model_param is not None:
+            for candidate in (
+                self._get_opt_shard(model_param),
+                self._get_data_shard(model_param),
+                model_param,
+            ):
+                if candidate is None:
+                    continue
+                param_uid = getattr(candidate, "_dion_param_uid", None)
+                if param_uid is not None:
+                    shard_param._dion_param_uid = param_uid
+                    candidate_meta = getattr(self, "_dion_dist_meta_by_uid", {}).get(param_uid)
+                    if candidate_meta is not None:
+                        dist_metas[shard_param] = candidate_meta
+                    return param_uid
+
+                candidate_meta = dist_metas.get(candidate)
+                if candidate_meta is not None and getattr(candidate_meta, "param_uid", None) is not None:
+                    shard_param._dion_param_uid = candidate_meta.param_uid
+                    dist_metas[shard_param] = candidate_meta
+                    return candidate_meta.param_uid
+
         raise RuntimeError(
             "[Dion] missing param_uid for optimizer shard "
             f"name={self._param_name(shard_param) or f'id_{id(shard_param)}'} "
