@@ -227,6 +227,15 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    sliding_window_num_attention_heads: Optional[int] = None
+    """If set, sliding-window-attention layers override ``num_attention_heads`` with this value.
+    Full-attention layers continue to use ``num_attention_heads``. Requires ``window_size`` set.
+    The override is skipped for layers with ``layer_number > num_layers`` (e.g. MTP heads)."""
+
+    sliding_window_num_query_groups: Optional[int] = None
+    """If set, sliding-window-attention layers override ``num_query_groups`` with this value.
+    See ``sliding_window_num_attention_heads`` for activation rules."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -1555,6 +1564,48 @@ class TransformerConfig(ModelParallelConfig):
             if self.attention_output_gate:
                 raise ValueError("fused_single_qkv_rope does not support gated attention for now.")
 
+        if (
+            self.sliding_window_num_attention_heads is not None
+            or self.sliding_window_num_query_groups is not None
+        ):
+            if self.window_size is None:
+                raise ValueError(
+                    "sliding_window_num_attention_heads / sliding_window_num_query_groups can "
+                    "only be set when window_size is configured."
+                )
+            tp_size = max(int(self.tensor_model_parallel_size or 1), 1)
+            if self.sliding_window_num_attention_heads is not None:
+                if self.sliding_window_num_attention_heads % tp_size != 0:
+                    raise ValueError(
+                        f"sliding_window_num_attention_heads "
+                        f"({self.sliding_window_num_attention_heads}) must be a multiple of "
+                        f"tensor_model_parallel_size ({tp_size})."
+                    )
+                effective_groups = (
+                    self.sliding_window_num_query_groups
+                    if self.sliding_window_num_query_groups is not None
+                    else self.num_query_groups
+                )
+                if (
+                    effective_groups is not None
+                    and self.sliding_window_num_attention_heads % effective_groups != 0
+                ):
+                    raise ValueError(
+                        f"sliding_window_num_attention_heads "
+                        f"({self.sliding_window_num_attention_heads}) must be a multiple of the "
+                        f"effective sliding-layer num_query_groups ({effective_groups})."
+                    )
+            if self.sliding_window_num_query_groups is not None:
+                if (
+                    self.sliding_window_num_query_groups % tp_size != 0
+                    and tp_size % self.sliding_window_num_query_groups != 0
+                ):
+                    raise ValueError(
+                        f"sliding_window_num_query_groups "
+                        f"({self.sliding_window_num_query_groups}) must be a multiple or divisor "
+                        f"of tensor_model_parallel_size ({tp_size})."
+                    )
+
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
@@ -2070,6 +2121,11 @@ class MLATransformerConfig(TransformerConfig):
 
         if self.attention_output_gate:
             raise NotImplementedError("Output gate is not supported for MLA yet.")
+        if (
+            self.sliding_window_num_attention_heads is not None
+            or self.sliding_window_num_query_groups is not None
+        ):
+            raise NotImplementedError("Sliding-window head overrides are not supported for MLA yet.")
 
         if self.cache_mla_latents:
             assert (

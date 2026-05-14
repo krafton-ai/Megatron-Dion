@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import inspect
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,7 @@ from ..models.common.embeddings.yarn_rotary_pos_embedding import (
 )
 from .enums import AttnMaskType, CudaGraphScope
 from .transformer_config import TransformerConfig
+from .utils import is_layer_window_attention
 
 try:
     from einops import rearrange
@@ -121,10 +123,62 @@ except ImportError:
 
 _ATTN_PROBE_CALL_IDX = {}
 _ATTN_PROBE_SEEN_WEIGHTS = set()
+_ATTN_PHASE_PROFILE_COUNTS = {}
 
 
 def _attn_probe_enabled() -> bool:
     return os.getenv("DION_DEBUG_ATTN_PROBE", "0") == "1"
+
+
+def _attn_phase_profile_enabled() -> bool:
+    return os.getenv("DION_PROFILE_ATTN_PHASES", "0") == "1"
+
+
+def _parse_int_set(raw: str) -> set[int] | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    return {int(token.strip()) for token in raw.split(",") if token.strip()}
+
+
+def _begin_attn_phase_profile(
+    *,
+    layer_number: int,
+    tag: str,
+    pg_collection: ProcessGroupCollection | None,
+) -> tuple[int, int, str, float] | None:
+    if not _attn_phase_profile_enabled():
+        return None
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    selected_ranks = _parse_int_set(os.getenv("DION_PROFILE_ATTN_PHASE_RANKS", "0"))
+    if selected_ranks is not None and rank not in selected_ranks:
+        return None
+    selected_layers = _parse_int_set(os.getenv("DION_PROFILE_ATTN_PHASE_LAYERS", "1"))
+    if selected_layers is not None and int(layer_number) not in selected_layers:
+        return None
+    max_calls = int(os.getenv("DION_PROFILE_ATTN_PHASE_MAX_CALLS", "4"))
+    key = (rank, int(layer_number), tag)
+    count = _ATTN_PHASE_PROFILE_COUNTS.get(key, 0)
+    if count >= max_calls:
+        return None
+    _ATTN_PHASE_PROFILE_COUNTS[key] = count + 1
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return (rank, int(layer_number), tag, time.perf_counter())
+
+
+def _end_attn_phase_profile(token: tuple[int, int, str, float] | None) -> None:
+    if token is None:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    rank, layer_number, tag, start_time = token
+    elapsed = time.perf_counter() - start_time
+    print(
+        f"[DION_ATTN_PHASE] rank={rank} layer={layer_number} tag={tag} "
+        f"elapsed={elapsed:.6f}s",
+        flush=True,
+    )
 
 
 def _attn_probe_selected_ranks() -> set[int] | None:
@@ -1083,6 +1137,11 @@ class Attention(MegatronModule, ABC):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
+        _attn_phase_token = _begin_attn_phase_profile(
+            layer_number=self.layer_number,
+            tag="qkv",
+            pg_collection=self.pg_collection,
+        )
         nvtx_range_push(suffix="qkv")
         split_qkv = (self.attention_type == "cross") or not all(
             [
@@ -1135,6 +1194,7 @@ class Attention(MegatronModule, ABC):
             ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
             mixed_qkv, qkv_split_arg_list = qkv_output
         nvtx_range_pop(suffix="qkv")
+        _end_attn_phase_profile(_attn_phase_token)
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -1261,6 +1321,11 @@ class Attention(MegatronModule, ABC):
         # core attention computation
         # ==================================
 
+        _attn_phase_token = _begin_attn_phase_profile(
+            layer_number=self.layer_number,
+            tag="core_attention",
+            pg_collection=self.pg_collection,
+        )
         nvtx_range_push(suffix="core_attention")
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
@@ -1324,6 +1389,7 @@ class Attention(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
+        _end_attn_phase_profile(_attn_phase_token)
         _maybe_dump_attn_probe_tensor(
             core_attn_out,
             layer_number=self.layer_number,
@@ -1333,13 +1399,24 @@ class Attention(MegatronModule, ABC):
 
         # Output gate
         if gate is not None:
+            _attn_phase_token = _begin_attn_phase_profile(
+                layer_number=self.layer_number,
+                tag="output_gate",
+                pg_collection=self.pg_collection,
+            )
             nvtx_range_push(suffix="output_gate")
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
+            _end_attn_phase_profile(_attn_phase_token)
 
         # =================
         # Output. [sq, b, h]
         # =================
+        _attn_phase_token = _begin_attn_phase_profile(
+            layer_number=self.layer_number,
+            tag="linear_proj",
+            pg_collection=self.pg_collection,
+        )
         nvtx_range_push(suffix="linear_proj")
         _maybe_dump_attn_probe_weight(
             self.linear_proj,
@@ -1354,6 +1431,7 @@ class Attention(MegatronModule, ABC):
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
         nvtx_range_pop(suffix="linear_proj")
+        _end_attn_phase_profile(_attn_phase_token)
         if _attn_probe_enabled():
             proj_bias = getattr(self.linear_proj, "bias", None)
             if proj_bias is not None and proj_bias.numel() == 0:
@@ -1427,6 +1505,22 @@ class SelfAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
     ):
+        if (
+            (
+                config.sliding_window_num_attention_heads is not None
+                or config.sliding_window_num_query_groups is not None
+            )
+            and layer_number <= (config.num_layers or 0)
+            and is_layer_window_attention(
+                config.window_size, config.window_attn_skip_freq, layer_number
+            )
+        ):
+            config = copy.deepcopy(config)
+            if config.sliding_window_num_attention_heads is not None:
+                config.num_attention_heads = config.sliding_window_num_attention_heads
+            if config.sliding_window_num_query_groups is not None:
+                config.num_query_groups = config.sliding_window_num_query_groups
+
         super().__init__(
             config=config,
             submodules=submodules,
@@ -1452,6 +1546,7 @@ class SelfAttention(Attention):
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
         )
+        self._tag_linear_qkv_split_metadata()
 
         if submodules.q_layernorm is not None:
             self.q_layernorm = build_module(
@@ -1472,6 +1567,42 @@ class SelfAttention(Attention):
             )
         else:
             self.k_layernorm = None
+
+    def _tag_linear_qkv_split_metadata(self) -> None:
+        """Attach Dion/Muon split metadata to the actual layer-local QKV weight."""
+        if not hasattr(self.linear_qkv, "weight"):
+            return
+        weight = self.linear_qkv.weight
+        if self.config.num_query_groups is None:
+            return
+        q_per_group = (
+            int(self.config.num_attention_heads)
+            // int(self.config.num_query_groups)
+            * int(self.config.kv_channels)
+        )
+        kv_per_group = int(self.config.kv_channels)
+        if self.config.attention_output_gate:
+            weight.is_qkvg = True
+            weight.qkvg_split_shapes = (
+                q_per_group,
+                q_per_group,
+                kv_per_group,
+                kv_per_group,
+            )
+            weight.is_qkv = False
+            if hasattr(weight, "qkv_split_shapes"):
+                delattr(weight, "qkv_split_shapes")
+            return
+
+        weight.is_qkv = True
+        weight.qkv_split_shapes = (
+            q_per_group,
+            kv_per_group,
+            kv_per_group,
+        )
+        weight.is_qkvg = False
+        if hasattr(weight, "qkvg_split_shapes"):
+            delattr(weight, "qkvg_split_shapes")
 
     def run_realtime_tests(self):
         """Performs a consistency check.
@@ -1674,6 +1805,14 @@ class SelfAttention(Attention):
         if output_gate:
             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
+            if self.config.num_query_groups < self.world_size:
+                idx = get_tensor_model_parallel_rank() % (
+                    self.world_size // self.config.num_query_groups
+                )
+                size = self.num_attention_heads_per_partition // (
+                    self.world_size // self.config.num_query_groups
+                )
+                gate = gate[:, :, idx * size : (idx + 1) * size, :]
             return query, key, value, gate
 
         return query, key, value
