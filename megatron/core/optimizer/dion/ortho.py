@@ -3,6 +3,7 @@
 import contextlib
 import hashlib
 import math
+import os
 from typing import List, Optional, Sequence
 
 import torch
@@ -10,6 +11,15 @@ import torch.distributed as dist
 from torch import Tensor
 
 from .utils import format_meta_id, get_global_shape
+
+
+def _dion_compile(**kwargs):
+    def decorator(fn):
+        if os.environ.get("DION_DISABLE_TORCH_COMPILE", "").lower() in ("1", "true", "yes"):
+            return fn
+        return torch.compile(**kwargs)(fn)
+
+    return decorator
 
 
 @contextlib.contextmanager
@@ -35,12 +45,12 @@ def _dion_math_precision_context():
         torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
 
 
-@torch.compile(fullgraph=True)
+@_dion_compile(fullgraph=True)
 def _qr_r_factor(X: Tensor) -> Tensor:
     return torch.linalg.qr(X.to(dtype=torch.float32), mode="r")[1].to(dtype=torch.float32)
 
 
-@torch.compile(fullgraph=True)
+@_dion_compile(fullgraph=True)
 def _solve_triangular_right(R: Tensor, X: Tensor) -> Tensor:
     return torch.linalg.solve_triangular(
         R.to(dtype=torch.float32),
@@ -50,7 +60,7 @@ def _solve_triangular_right(R: Tensor, X: Tensor) -> Tensor:
     ).to(dtype=torch.float32)
 
 
-@torch.compile(fullgraph=True)
+@_dion_compile(fullgraph=True)
 def _cholesky_upper_factor(X: Tensor) -> Tensor:
     return torch.linalg.cholesky_ex(
         X.to(dtype=torch.float32),
@@ -58,7 +68,7 @@ def _cholesky_upper_factor(X: Tensor) -> Tensor:
     )[0].to(dtype=torch.float32)
 
 
-@torch.compile()
+@_dion_compile()
 def orthogonalize(
     P: Tensor,
     rcqr_oversample: float = 1.25,

@@ -128,6 +128,9 @@ class DionDistMeta:
     is_qkv_child: bool = False
     qkv_child_kind: str = ""
     qkv_split_shapes: Optional[Tuple[int, int, int]] = None
+    is_qkvg_child: bool = False
+    qkvg_child_kind: str = ""
+    qkvg_split_shapes: Optional[Tuple[int, int, int, int]] = None
     linear_split_rows: Optional[Tuple[int, int]] = None
     linear_partition_stride: int = 1
     is_linear_child: bool = False

@@ -1,5 +1,7 @@
 """Dion optimizer main class for Megatron-LM."""
 from collections import OrderedDict
+import os
+import time
 from typing import Dict, Generator, List, Optional, Tuple
 
 import torch
@@ -158,6 +160,17 @@ class MegatronDion(Optimizer):
                 "[DION_STEP_REQUIRES_DISTRIBUTED_MODE] "
                 f"step={self._step_count} rank={self._global_rank}"
             )
+        profile_enabled = os.environ.get("DION_PROFILE_SPLIT", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self._profile_enabled = profile_enabled
+        if profile_enabled:
+            self._profile_records = []
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            profile_step_start = time.perf_counter()
         dion_tasks = iter_dist_tasks(self)
 
         # Execute all tasks with the explicit runtime width from config.
@@ -168,6 +181,34 @@ class MegatronDion(Optimizer):
         runtime = AsyncRuntime(dion_tasks, max_concurrent_tasks=max_tasks)
         runtime.run()
         del runtime
+        if profile_enabled:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - profile_step_start
+            if self._global_rank == 0:
+                records = getattr(self, "_profile_records", [])
+                by_label = OrderedDict()
+                by_desc = {}
+                for label, seconds, desc in records:
+                    by_label[label] = by_label.get(label, 0.0) + float(seconds)
+                    if desc:
+                        by_desc[desc] = by_desc.get(desc, 0.0) + float(seconds)
+                label_summary = ", ".join(
+                    f"{label}={seconds:.3f}s" for label, seconds in by_label.items()
+                )
+                print(
+                    f"[DION_PROFILE] step={self._step_count} total={elapsed:.3f}s "
+                    f"{label_summary}",
+                    flush=True,
+                )
+                for desc, seconds in sorted(
+                    by_desc.items(), key=lambda item: item[1], reverse=True
+                )[:12]:
+                    print(
+                        f"[DION_PROFILE_BATCH] step={self._step_count} "
+                        f"time={seconds:.3f}s {desc}",
+                        flush=True,
+                    )
         self._buffer_cache.clear()
 
         return loss

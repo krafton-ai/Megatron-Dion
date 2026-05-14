@@ -299,9 +299,14 @@ def _resolve_fs_group(
         expert_fs_group = parallel_state.get_expert_data_parallel_group(
             partial_expert_data_parallel=True
         )
+        expert_fs_world_size = (
+            requested_fs_world_size
+            if expert_fs_group is None
+            else len(dist.get_process_group_ranks(expert_fs_group))
+        )
         return _validate_expert_fs_group(
             selected_group=expert_fs_group,
-            requested_world_size=requested_fs_world_size,
+            requested_world_size=expert_fs_world_size,
             source="expert_partial_data_parallel",
         )
     return _get_dense_fs_group(

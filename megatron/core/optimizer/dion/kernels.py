@@ -1,6 +1,7 @@
 """Dion kernel helpers that do not own Megatron runtime state."""
 
 import math
+import os
 from typing import Dict, List, Optional
 
 import torch
@@ -10,6 +11,15 @@ from .ortho import (
     _dion_math_precision_context,
 )
 from .types import DionParamConfig
+
+
+def _dion_compile(**kwargs):
+    def decorator(fn):
+        if os.environ.get("DION_DISABLE_TORCH_COMPILE", "").lower() in ("1", "true", "yes"):
+            return fn
+        return torch.compile(**kwargs)(fn)
+
+    return decorator
 
 
 def scaled_lr_for_shape(
@@ -40,7 +50,7 @@ def scaled_lr_for_shape(
     raise RuntimeError(f"[DION_INVALID_SCALE_MODE] scale_mode={scale_mode!r}")
 
 
-@torch.compile(fullgraph=True)
+@_dion_compile(fullgraph=True)
 def _apply_batched_matmul_regular(
     X: List[Tensor],
     A: Tensor,
@@ -56,7 +66,7 @@ def _apply_batched_matmul_regular(
     torch._foreach_add_(X, update)
 
 
-@torch.compile(fullgraph=True)
+@_dion_compile(fullgraph=True)
 def _apply_batched_matmul_transposed(
     X: List[Tensor],
     A: Tensor,
@@ -199,7 +209,7 @@ def local_column_sum_sq(X: Tensor) -> Tensor:
     return X.to(dtype=torch.float32).square().sum(dim=-2, keepdim=True)
 
 
-@torch.compile(fullgraph=True)
+@_dion_compile(fullgraph=True)
 def _compute_update_batch_regular(
     q_new_f32: Tensor,
     p_for_delta: Tensor,
@@ -207,7 +217,7 @@ def _compute_update_batch_regular(
     return torch.bmm(p_for_delta, q_new_f32.transpose(1, 2))
 
 
-@torch.compile(fullgraph=True)
+@_dion_compile(fullgraph=True)
 def _compute_update_batch_transposed(
     q_new_f32: Tensor,
     p_for_delta: Tensor,

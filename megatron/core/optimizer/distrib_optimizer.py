@@ -59,6 +59,7 @@ from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_s
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .dion.qkv import copy_qkv_split_metadata
+from .dion.qkvg import copy_qkvg_split_metadata
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
@@ -379,6 +380,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             shard_model_param, model_param
                         )
                         copy_qkv_split_metadata(shard_model_param, model_param)
+                        copy_qkvg_split_metadata(shard_model_param, model_param)
                         if hasattr(model_param, 'shared'):
                             shard_model_param.shared = model_param.shared
 
@@ -410,6 +412,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             shard_main_param, model_param
                         )
                         copy_qkv_split_metadata(shard_main_param, model_param)
+                        copy_qkvg_split_metadata(shard_main_param, model_param)
                         if hasattr(model_param, 'shared'):
                             shard_main_param.shared = model_param.shared
                     else:
@@ -434,6 +437,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         shard_model_param, model_param
                     )
                     copy_qkv_split_metadata(shard_model_param, model_param)
+                    copy_qkvg_split_metadata(shard_model_param, model_param)
                     if hasattr(model_param, 'shared'):
                         shard_model_param.shared = model_param.shared
 

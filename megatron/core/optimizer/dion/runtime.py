@@ -1,5 +1,6 @@
 """Internal distributed runtime helpers for Dion."""
 import logging
+import time
 from typing import Callable, Generator, List, Optional, Tuple
 
 import torch
@@ -33,6 +34,69 @@ from .utils import get_global_shape
 
 _REPLICATE_GROUP_UNSET = object()
 logger = logging.getLogger(__name__)
+
+
+def _profile_desc(batch_group, dist_metas, real_batch_size: int) -> str:
+    if batch_group is None:
+        return ""
+    dist_metas = dist_metas or []
+    meta = next(
+        (dist_meta for dist_meta in dist_metas[: int(real_batch_size)] if dist_meta is not None),
+        None,
+    )
+    if meta is None:
+        return (
+            f"kernel={getattr(batch_group, 'kernel_kind', '')} "
+            f"real={int(real_batch_size)}"
+        )
+    shape = getattr(meta, "global_shape", None)
+    child = ""
+    if getattr(meta, "is_qkvg_child", False):
+        child = f" qkvg={getattr(meta, 'qkvg_child_kind', '')}"
+    elif getattr(meta, "is_qkv_child", False):
+        child = f" qkv={getattr(meta, 'qkv_child_kind', '')}"
+    elif getattr(meta, "is_linear_child", False):
+        child = f" linear={getattr(meta, 'linear_child_kind', '')}"
+    return (
+        f"kernel={getattr(batch_group, 'kernel_kind', '')} "
+        f"real={int(real_batch_size)} shape={tuple(shape) if shape is not None else None}"
+        f"{child} name={getattr(meta, 'param_name', '')}"
+    )
+
+
+def _profile_start(optimizer):
+    if not bool(getattr(optimizer, "_profile_enabled", False)):
+        return None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _profile_mark(
+    optimizer,
+    start,
+    label: str,
+    *,
+    batch_group=None,
+    dist_metas=None,
+    real_batch_size: int = 0,
+):
+    if start is None:
+        return None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    now = time.perf_counter()
+    if int(getattr(optimizer, "_global_rank", -1)) == 0:
+        records = getattr(optimizer, "_profile_records", None)
+        if records is not None:
+            records.append(
+                (
+                    label,
+                    now - start,
+                    _profile_desc(batch_group, dist_metas, int(real_batch_size)),
+                )
+            )
+    return now
 
 
 def _rank_range_for_dim(size: int, world_size: int, rank: int) -> tuple[int, int]:
@@ -524,6 +588,7 @@ def _is_split_child_meta(dist_meta) -> bool:
         and (
             getattr(dist_meta, "parent_param_uid", None) is not None
             or bool(getattr(dist_meta, "is_qkv_child", False))
+            or bool(getattr(dist_meta, "is_qkvg_child", False))
             or bool(getattr(dist_meta, "is_linear_child", False))
         )
     )
@@ -1452,6 +1517,7 @@ def batch_dion_update_async(
     batch_size = len(params)
     if real_batch_size is None:
         real_batch_size = batch_size
+    profile_t0 = _profile_start(optimizer)
 
     if batch_group is None:
         raise RuntimeError(
@@ -1498,6 +1564,14 @@ def batch_dion_update_async(
         else:
             for momentum, grad in zip(active_momentums, active_grads):
                 momentum.add_(grad.to(momentum.dtype))
+    profile_t0 = _profile_mark(
+        optimizer,
+        profile_t0,
+        "grad_momentum",
+        batch_group=batch_group,
+        dist_metas=dist_metas,
+        real_batch_size=real_batch_size,
+    )
 
     direct_q_dtype, direct_q_device, direct_q_rows = _common_matmul_layout(
         momentums,
@@ -1516,6 +1590,14 @@ def batch_dion_update_async(
         direct_batch_device=direct_q_device,
         direct_batch_q_rows=direct_q_rows,
     )
+    profile_t0 = _profile_mark(
+        optimizer,
+        profile_t0,
+        "q_unshard",
+        batch_group=batch_group,
+        dist_metas=dist_metas,
+        real_batch_size=real_batch_size,
+    )
 
     M_for_matmul = [
         (momentum.mT if config.is_transposed else momentum)
@@ -1532,6 +1614,14 @@ def batch_dion_update_async(
 
     with _dion_math_precision_context():
         P_batch = M_batch @ Q_batch
+    profile_t0 = _profile_mark(
+        optimizer,
+        profile_t0,
+        "p_matmul",
+        batch_group=batch_group,
+        dist_metas=dist_metas,
+        real_batch_size=real_batch_size,
+    )
 
     if not (configs and all(is_fs_without_tp(config) for config in configs)):
         yield from reduce_p_across_fs_groups(
@@ -1541,6 +1631,14 @@ def batch_dion_update_async(
             dist_metas,
             batch_collectives=batch_collectives,
         )
+    profile_t0 = _profile_mark(
+        optimizer,
+        profile_t0,
+        "p_reduce",
+        batch_group=batch_group,
+        dist_metas=dist_metas,
+        real_batch_size=real_batch_size,
+    )
 
     if use_low_rank:
         P_batch, R_batch = yield from run_low_rank_sync_async(
@@ -1729,6 +1827,14 @@ def batch_dion_update_async(
             dist_metas,
             batch_collectives=batch_collectives,
         )
+    profile_t0 = _profile_mark(
+        optimizer,
+        profile_t0,
+        "ortho_r",
+        batch_group=batch_group,
+        dist_metas=dist_metas,
+        real_batch_size=real_batch_size,
+    )
     P_batch, R_batch = fix_all_zero_or_nan(
         P_batch,
         R_batch,
@@ -1746,6 +1852,14 @@ def batch_dion_update_async(
         default_mu=optimizer.defaults["mu"],
         real_batch_size=real_batch_size,
     )
+    profile_t0 = _profile_mark(
+        optimizer,
+        profile_t0,
+        "error_feedback",
+        batch_group=batch_group,
+        dist_metas=dist_metas,
+        real_batch_size=real_batch_size,
+    )
 
     Q_new_batch = yield from normalize_cols_async(
         optimizer,
@@ -1756,6 +1870,14 @@ def batch_dion_update_async(
         batch_group=batch_group,
     )
     Q_state_batch = Q_new_batch
+    profile_t0 = _profile_mark(
+        optimizer,
+        profile_t0,
+        "q_normalize",
+        batch_group=batch_group,
+        dist_metas=dist_metas,
+        real_batch_size=real_batch_size,
+    )
 
     apply_batch_updates(
         optimizer,
@@ -1776,6 +1898,14 @@ def batch_dion_update_async(
         batch_group,
         batch_collectives,
         commit_updates,
+    )
+    _profile_mark(
+        optimizer,
+        profile_t0,
+        "apply_update",
+        batch_group=batch_group,
+        dist_metas=dist_metas,
+        real_batch_size=real_batch_size,
     )
 
     del M_batch, Q_batch, P_batch, R_batch, Q_new_batch, Q_state_batch

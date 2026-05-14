@@ -21,6 +21,14 @@ from megatron.core.optimizer.dion.qkv import (
     qkv_state_key,
     scatter_qkv_child_,
 )
+from megatron.core.optimizer.dion.qkvg import (
+    extract_qkvg_child,
+    qkvg_child_has_local_overlap,
+    qkvg_child_local_shape,
+    qkvg_child_row_range,
+    qkvg_state_key,
+    scatter_qkvg_child_,
+)
 from megatron.core.optimizer.dion.types import DionBatchGroup, DionDistMeta, DionQInit, DionQLayout
 from megatron.core.optimizer.dion_distrib_optimizer import (
     _CHILD_GROUP_CACHE,
@@ -71,6 +79,29 @@ def split_range(size, world_size, rank):
 
 def expected_qkv_child(global_tensor, parent_start, parent_end, split_shapes, child_kind):
     child_index = {"q": 0, "k": 1, "v": 2}[child_kind]
+    total = sum(split_shapes)
+    child_rows = split_shapes[child_index]
+    child_offset = sum(split_shapes[:child_index])
+    rows = []
+    for row in range(parent_start, parent_end):
+        group = row // total
+        row_in_group = row % total
+        if child_offset <= row_in_group < child_offset + child_rows:
+            rows.append(group * child_rows + row_in_group - child_offset)
+    child_global = torch.cat(
+        [
+            global_tensor[group_start + child_offset : group_start + child_offset + child_rows]
+            for group_start in range(0, int(global_tensor.size(0)), total)
+        ],
+        dim=0,
+    )
+    if not rows:
+        return None
+    return child_global[rows]
+
+
+def expected_qkvg_child(global_tensor, parent_start, parent_end, split_shapes, child_kind):
+    child_index = {"q": 0, "gate": 1, "k": 2, "v": 3}[child_kind]
     total = sum(split_shapes)
     child_rows = split_shapes[child_index]
     child_offset = sum(split_shapes[:child_index])
@@ -306,8 +337,8 @@ def test_dense_fs_group_uses_authoritative_cp_excluded_group(monkeypatch):
     assert group is fs_group
 
 
-def test_dion_split_qkv_rejects_attention_output_gate():
-    param = torch.nn.Parameter(torch.empty(16, 8))
+def test_dion_split_qkv_tags_gated_qkvg_shapes():
+    param = torch.nn.Parameter(torch.empty(80, 8))
 
     class ModelChunk:
         config = SimpleNamespace(
@@ -327,8 +358,42 @@ def test_dion_split_qkv_rejects_attention_output_gate():
         min_lr=0.0,
     )
 
-    with pytest.raises(RuntimeError, match="DION_QKV_SPLIT_OUTPUT_GATE_UNSUPPORTED"):
-        _get_param_groups([ModelChunk()], config=config, config_overrides={})
+    param_groups = _get_param_groups([ModelChunk()], config=config, config_overrides={})
+
+    assert param.is_qkvg
+    assert not param.is_qkv
+    assert param.qkvg_split_shapes == (16, 16, 4, 4)
+    assert not hasattr(param, "qkv_split_shapes")
+    assert any(param_in_group is param for group in param_groups for param_in_group in group["params"])
+
+
+def test_dion_split_qkv_preserves_layer_local_qkvg_shapes():
+    param = torch.nn.Parameter(torch.empty(144, 8))
+    param.is_qkvg = True
+    param.qkvg_split_shapes = (32, 32, 4, 4)
+
+    class ModelChunk:
+        config = SimpleNamespace(
+            attention_output_gate=True,
+            num_attention_heads=4,
+            num_query_groups=1,
+            kv_channels=4,
+            ffn_hidden_size=16,
+        )
+
+        def named_parameters(self):
+            yield "decoder.layers.1.self_attention.linear_qkv.weight", param
+
+    config = SimpleNamespace(
+        dion_split_qkv=True,
+        lr=1.0,
+        min_lr=0.0,
+    )
+
+    _get_param_groups([ModelChunk()], config=config, config_overrides={})
+
+    assert param.is_qkvg
+    assert param.qkvg_split_shapes == (32, 32, 4, 4)
 
 
 def test_dion_split_qkv_tags_qwen_style_grouped_qkv_shapes(monkeypatch):
@@ -613,6 +678,89 @@ def test_qkv_child_split_handles_qwen_style_tp_shard_crossing_kv_boundary():
     assert torch.equal(updated_parent[16:20], torch.full((4, 2), -7.0))
 
 
+def test_qkvg_child_split_handles_tp_shard_crossing_gate_kv_boundary():
+    split_shapes = (32, 32, 4, 4)
+    dist_meta = SimpleNamespace(
+        tp_shard_dim=0,
+        tp_world_size=4,
+        tp_rank=1,
+        fs_shard_dim=1,
+        fs_world_size=1,
+        global_shape=(144, 2),
+        shape=(36, 2),
+        local_shape=(36, 2),
+        param_uid=("qwen_gqa_qkvg",),
+        param_name="attention.linear_qkv.weight",
+    )
+    global_parent = torch.arange(144 * 2, dtype=torch.float32).view(144, 2)
+    parent = global_parent[36:72].clone()
+
+    assert qkvg_child_row_range(
+        parent_row_start=36,
+        parent_row_end=72,
+        split_shapes=split_shapes,
+        child_kind="q",
+    ) is None
+    assert qkvg_child_row_range(
+        parent_row_start=36,
+        parent_row_end=72,
+        split_shapes=split_shapes,
+        child_kind="gate",
+    ) == (4, 32)
+    assert qkvg_child_row_range(
+        parent_row_start=36,
+        parent_row_end=72,
+        split_shapes=split_shapes,
+        child_kind="k",
+    ) == (0, 4)
+    assert qkvg_child_row_range(
+        parent_row_start=36,
+        parent_row_end=72,
+        split_shapes=split_shapes,
+        child_kind="v",
+    ) == (0, 4)
+
+    assert not qkvg_child_has_local_overlap(split_shapes, dist_meta, "q")
+    assert qkvg_child_has_local_overlap(split_shapes, dist_meta, "gate")
+    assert qkvg_child_has_local_overlap(split_shapes, dist_meta, "k")
+    assert qkvg_child_has_local_overlap(split_shapes, dist_meta, "v")
+    assert qkvg_child_local_shape((36, 2), split_shapes, "gate", dist_meta=dist_meta) == (28, 2)
+    assert qkvg_child_local_shape((36, 2), split_shapes, "k", dist_meta=dist_meta) == (4, 2)
+    assert qkvg_child_local_shape((36, 2), split_shapes, "v", dist_meta=dist_meta) == (4, 2)
+
+    for child_kind in ("gate", "k", "v"):
+        assert torch.equal(
+            extract_qkvg_child(parent, split_shapes, child_kind, dist_meta=dist_meta),
+            expected_qkvg_child(global_parent, 36, 72, split_shapes, child_kind),
+        )
+
+    updated_parent = parent.clone()
+    scatter_qkvg_child_(
+        updated_parent,
+        torch.full((28, 2), -4.0),
+        split_shapes,
+        "gate",
+        dist_meta=dist_meta,
+    )
+    scatter_qkvg_child_(
+        updated_parent,
+        torch.full((4, 2), -5.0),
+        split_shapes,
+        "k",
+        dist_meta=dist_meta,
+    )
+    scatter_qkvg_child_(
+        updated_parent,
+        torch.full((4, 2), -6.0),
+        split_shapes,
+        "v",
+        dist_meta=dist_meta,
+    )
+    assert torch.equal(updated_parent[:28], torch.full((28, 2), -4.0))
+    assert torch.equal(updated_parent[28:32], torch.full((4, 2), -5.0))
+    assert torch.equal(updated_parent[32:36], torch.full((4, 2), -6.0))
+
+
 def test_qkv_child_tp_layout_compacts_owner_subgroup(monkeypatch):
     _CHILD_GROUP_CACHE.clear()
     created = []
@@ -797,6 +945,84 @@ def test_expand_split_qkv_expert_param_routes_and_commits_selected_expert():
         )
         assert torch.equal(
             extract_qkv_child(state["momentum"][8:16], split_shapes, child_kind),
+            torch.full((rows, 4), -9.0),
+        )
+
+
+def test_expand_split_qkvg_routes_and_commits_gated_children():
+    optimizer = make_optimizer_stub()
+    optimizer.optimizer.defaults["split_qkv"] = True
+    optimizer.optimizer.defaults["split_linear"] = False
+    parent = torch.nn.Parameter(torch.arange(12 * 4, dtype=torch.float32).view(12, 4))
+    grad = torch.arange(1000, 1000 + 12 * 4, dtype=torch.float32).view(12, 4)
+    momentum = torch.arange(2000, 2000 + 12 * 4, dtype=torch.float32).view(12, 4)
+    split_shapes = (2, 2, 1, 1)
+    dist_meta = DionDistMeta(
+        shape=(12, 4),
+        local_shape=(12, 4),
+        global_shape=(12, 4),
+        fs_shard_dim=1,
+        fs_world_size=1,
+        fs_rank=-1,
+        fs_start_idx=0,
+        fs_end_idx=4,
+        tp_shard_dim=-1,
+        tp_world_size=1,
+        is_dion_param=True,
+        param_uid=("qkvg_parent",),
+        param_name="decoder.layers.0.self_attention.linear_qkv.weight",
+        qkvg_split_shapes=split_shapes,
+    )
+    state = {
+        "momentum": momentum.clone(),
+        "qkvg_split_qkvg": True,
+        "qkvg_split_shapes": split_shapes,
+    }
+    for child_kind, rows in {"q": 4, "gate": 4, "k": 2, "v": 2}.items():
+        state[qkvg_state_key("Q", child_kind)] = torch.zeros(4, 1)
+        state[qkvg_state_key("r", child_kind)] = 1
+        state[qkvg_state_key("local_shape", child_kind)] = (rows, 4)
+        state[qkvg_state_key("global_shape", child_kind)] = (rows, 4)
+
+    children = optimizer._expand_split_qkvg_params(
+        param=parent,
+        grad=grad,
+        optimizer_state=state,
+        optim_group={"algorithm": "dion"},
+        config=None,
+        dist_meta=dist_meta,
+    )
+
+    assert [child.dist_meta.qkvg_child_kind for child in children] == ["q", "gate", "k", "v"]
+    for child in children:
+        child_kind = child.dist_meta.qkvg_child_kind
+        assert torch.equal(
+            child.param,
+            expected_qkvg_child(parent.detach(), 0, 12, split_shapes, child_kind),
+        )
+        assert torch.equal(
+            child.grad,
+            expected_qkvg_child(grad, 0, 12, split_shapes, child_kind),
+        )
+        assert torch.equal(
+            child.optimizer_state["momentum"],
+            expected_qkvg_child(state["momentum"], 0, 12, split_shapes, child_kind),
+        )
+
+    with torch.no_grad():
+        for child in children:
+            child.commit_update(
+                torch.full_like(child.param, -7.0),
+                torch.full_like(child.optimizer_state["momentum"], -9.0),
+            )
+
+    for child_kind, rows in {"q": 4, "gate": 4, "k": 2, "v": 2}.items():
+        assert torch.equal(
+            extract_qkvg_child(parent.detach(), split_shapes, child_kind),
+            torch.full((rows, 4), -7.0),
+        )
+        assert torch.equal(
+            extract_qkvg_child(state["momentum"], split_shapes, child_kind),
             torch.full((rows, 4), -9.0),
         )
 

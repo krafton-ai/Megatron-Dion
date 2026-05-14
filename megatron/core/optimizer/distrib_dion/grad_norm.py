@@ -41,6 +41,8 @@ def _can_reuse_dense_rp_grad(optimizer, shard_param) -> bool:
         return False
     if getattr(dist_meta, "qkv_split_shapes", None) is not None:
         return False
+    if getattr(dist_meta, "qkvg_split_shapes", None) is not None:
+        return False
     if getattr(dist_meta, "linear_split_rows", None) is not None:
         return False
     config = getattr(dist_meta, "param_config", None)

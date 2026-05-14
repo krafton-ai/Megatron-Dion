@@ -18,6 +18,7 @@ from torch import Tensor
 
 from .linear import get_linear_split_rows_from_dist_meta
 from .qkv import get_qkv_split_shapes_from_dist_meta
+from .qkvg import get_qkvg_split_shapes_from_dist_meta
 from .types import (
     DionMixedPrecisionConfig,
     DionParamConfig,
@@ -547,6 +548,11 @@ def init_param_state(
 
     algorithm = optim_group.get("algorithm", "dion")
     if algorithm != "dion" or not is_dion_eligible or local_shape is None:
+        return
+    qkvg_split_shapes = get_qkvg_split_shapes_from_dist_meta(dist_meta)
+    if bool(split_qkv_default) and qkvg_split_shapes is not None:
+        state["qkvg_split_qkvg"] = True
+        state["qkvg_split_shapes"] = qkvg_split_shapes
         return
     split_shapes = get_qkv_split_shapes_from_dist_meta(dist_meta)
     if bool(split_qkv_default) and split_shapes is not None:

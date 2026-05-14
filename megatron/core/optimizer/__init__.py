@@ -155,24 +155,35 @@ def _get_param_groups(
                 continue
 
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                if bool(getattr(model_chunk.config, 'attention_output_gate', False)):
-                    if bool(getattr(config, 'dion_split_qkv', False)):
-                        raise RuntimeError(
-                            "[DION_QKV_SPLIT_OUTPUT_GATE_UNSUPPORTED] "
-                            f"param={name} uses attention_output_gate=True, whose "
-                            "linear_qkv layout is [Q, gate, K, V]. Dion split_qkv "
-                            "currently supports only the standard [Q, K, V] layout."
-                        )
-                    continue
                 num_attention_heads = int(model_chunk.config.num_attention_heads)
                 num_query_groups = int(model_chunk.config.num_query_groups)
                 kv_channels = int(model_chunk.config.kv_channels)
-                param.is_qkv = True
-                param.qkv_split_shapes = (
-                    num_attention_heads // num_query_groups * kv_channels,
-                    kv_channels,
-                    kv_channels,
-                )
+                q_rows_per_group = num_attention_heads // num_query_groups * kv_channels
+                if hasattr(param, "qkvg_split_shapes") or bool(
+                    getattr(model_chunk.config, 'attention_output_gate', False)
+                ):
+                    param.is_qkvg = True
+                    param.is_qkv = False
+                    if not hasattr(param, "qkvg_split_shapes"):
+                        param.qkvg_split_shapes = (
+                            q_rows_per_group,
+                            q_rows_per_group,
+                            kv_channels,
+                            kv_channels,
+                        )
+                    if hasattr(param, "qkv_split_shapes"):
+                        delattr(param, "qkv_split_shapes")
+                else:
+                    param.is_qkv = True
+                    param.is_qkvg = False
+                    if not hasattr(param, "qkv_split_shapes"):
+                        param.qkv_split_shapes = (
+                            q_rows_per_group,
+                            kv_channels,
+                            kv_channels,
+                        )
+                    if hasattr(param, "qkvg_split_shapes"):
+                        delattr(param, "qkvg_split_shapes")
 
             if (
                 '.linear_fc1.weight' in name
@@ -180,8 +191,22 @@ def _get_param_groups(
                 and int(getattr(param, 'partition_stride', 1)) == 2
             ):
                 param.is_linear_fc1 = True
-                ffn_hidden_size = int(model_chunk.config.ffn_hidden_size)
-                param.linear_split_rows = (ffn_hidden_size, ffn_hidden_size)
+                global_rows = int(param.shape[0])
+                if (
+                    bool(getattr(param, 'tensor_model_parallel', False))
+                    and int(getattr(param, 'partition_dim', 0)) == 0
+                ):
+                    if not getattr(param, 'allreduce', True):
+                        global_rows *= int(parallel_state.get_expert_tensor_parallel_world_size())
+                    else:
+                        global_rows *= int(parallel_state.get_tensor_model_parallel_world_size())
+                if global_rows % 2 != 0:
+                    raise RuntimeError(
+                        "[DION_LINEAR_FC1_INVALID_ROWS] "
+                        f"param={name} global_rows={global_rows}"
+                    )
+                split_rows = global_rows // 2
+                param.linear_split_rows = (split_rows, split_rows)
 
             # Get optimizer config overrides for this parameter.
             matching_param_overrides: list[ParamGroupOverride] = []

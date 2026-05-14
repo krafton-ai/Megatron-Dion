@@ -54,6 +54,20 @@ from .dion.qkv import (
     resolve_qkv_split_shapes,
     scatter_qkv_child_,
 )
+from .dion.qkvg import (
+    copy_qkvg_split_metadata,
+    extract_qkvg_child,
+    iter_qkvg_child_kinds,
+    qkvg_child_global_shape,
+    qkvg_child_has_local_overlap,
+    qkvg_child_local_shape,
+    qkvg_child_name,
+    qkvg_child_param_uid,
+    qkvg_child_row_range,
+    qkvg_state_key,
+    resolve_qkvg_split_shapes,
+    scatter_qkvg_child_,
+)
 from .dion.utils import get_global_shape, get_local_shape
 from .distrib_dion.parameter import (
     all_gather_bucket_params_,
@@ -1625,6 +1639,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 shard_model_param, model_param
             )
             copy_qkv_split_metadata(shard_model_param, model_param)
+            copy_qkvg_split_metadata(shard_model_param, model_param)
             if hasattr(model_param, 'shared'):
                 shard_model_param.shared = model_param.shared
 
@@ -1655,6 +1670,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
                     shard_model_param, model_param
                 )
                 copy_qkv_split_metadata(shard_model_param, model_param)
+                copy_qkvg_split_metadata(shard_model_param, model_param)
                 if hasattr(model_param, 'shared'):
                     shard_model_param.shared = model_param.shared
 
@@ -1685,6 +1701,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 shard_main_param, model_param
             )
             copy_qkv_split_metadata(shard_main_param, model_param)
+            copy_qkvg_split_metadata(shard_main_param, model_param)
             if hasattr(model_param, 'shared'):
                 shard_main_param.shared = model_param.shared
 
@@ -1710,6 +1727,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 shard_model_param, model_param
             )
             copy_qkv_split_metadata(shard_model_param, model_param)
+            copy_qkvg_split_metadata(shard_model_param, model_param)
             if hasattr(model_param, 'shared'):
                 shard_model_param.shared = model_param.shared
 
@@ -1735,6 +1753,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 shard_model_param, model_param
             )
             copy_qkv_split_metadata(shard_model_param, model_param)
+            copy_qkvg_split_metadata(shard_model_param, model_param)
             if hasattr(model_param, 'shared'):
                 shard_model_param.shared = model_param.shared
 
@@ -1810,6 +1829,17 @@ class DionDistributedOptimizer(DistributedOptimizer):
                     )
                     continue
             if split_qkv_enabled:
+                split_shapes = resolve_qkvg_split_shapes(
+                    param=None,
+                    optimizer_state=None,
+                    dist_meta=dist_meta,
+                )
+                if split_shapes is not None:
+                    self._init_qkvg_child_groups(
+                        dist_meta=dist_meta,
+                        split_shapes=split_shapes,
+                    )
+                    continue
                 split_shapes = resolve_qkv_split_shapes(
                     param=None,
                     optimizer_state=None,
@@ -1993,6 +2023,11 @@ class DionDistributedOptimizer(DistributedOptimizer):
         q_init = None
         split_qkv_enabled = bool(self.optimizer.defaults.get("split_qkv", False))
         split_linear_enabled = bool(self.optimizer.defaults.get("split_linear", False))
+        split_qkvg_shapes = (
+            resolve_qkvg_split_shapes(param=param, optimizer_state=state, dist_meta=dist_meta)
+            if split_qkv_enabled
+            else None
+        )
         split_qkv_shapes = (
             resolve_qkv_split_shapes(param=param, optimizer_state=state, dist_meta=dist_meta)
             if split_qkv_enabled
@@ -2008,12 +2043,22 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 dist_meta=dist_meta,
                 split_rows=split_linear_rows,
             )
+        if is_dion_eligible and split_qkvg_shapes is not None and dist_meta is not None:
+            self._init_qkvg_child_groups(
+                dist_meta=dist_meta,
+                split_shapes=split_qkvg_shapes,
+            )
         if is_dion_eligible and split_qkv_shapes is not None and dist_meta is not None:
             self._init_qkv_child_groups(
                 dist_meta=dist_meta,
                 split_shapes=split_qkv_shapes,
             )
-        if is_dion_eligible and split_qkv_shapes is None and split_linear_rows is None:
+        if (
+            is_dion_eligible
+            and split_qkvg_shapes is None
+            and split_qkv_shapes is None
+            and split_linear_rows is None
+        ):
             q_init = build_q_init(
                 param=param,
                 optim_group=optim_group,
@@ -2231,6 +2276,300 @@ class DionDistributedOptimizer(DistributedOptimizer):
             f"split_rows={split_rows} per_expert_global_shape={per_expert_shape} "
             f"global_shape={getattr(dist_meta, 'global_shape', None)}"
         )
+
+    def _build_qkvg_child_dist_meta(
+        self,
+        *,
+        parent_dist_meta: DionDistMeta,
+        child_kind: str,
+        split_shapes: tuple[int, int, int, int],
+        child_local_shape: tuple[int, int],
+        child_global_shape: tuple[int, int],
+    ) -> DionDistMeta:
+        """Build optimizer-only child metadata for one fused QKVG child."""
+        child_uid = qkvg_child_param_uid(parent_dist_meta.param_uid, child_kind)
+        child_name = qkvg_child_name(parent_dist_meta.param_name, child_kind)
+        (
+            child_fs_group,
+            child_fs_world_size,
+            child_fs_rank,
+            child_fs_start_idx,
+            child_fs_end_idx,
+            fs_row_shard_sizes,
+        ) = self._resolve_qkvg_child_fs_shard_layout(
+            parent_dist_meta=parent_dist_meta,
+            split_shapes=split_shapes,
+            child_kind=child_kind,
+            create_group=False,
+        )
+        (
+            child_tp_group,
+            child_tp_world_size,
+            child_tp_rank,
+            tp_row_shard_start_idx,
+            tp_row_shard_end_idx,
+            tp_row_shard_sizes,
+        ) = self._resolve_qkvg_child_tp_shard_layout(
+            parent_dist_meta=parent_dist_meta,
+            split_shapes=split_shapes,
+            child_kind=child_kind,
+            create_group=False,
+        )
+        return build_split_child_dist_meta(
+            parent_dist_meta=parent_dist_meta,
+            child_uid=child_uid,
+            child_name=child_name,
+            child_local_shape=child_local_shape,
+            child_global_shape=child_global_shape,
+            fs_layout=(
+                child_fs_group,
+                child_fs_world_size,
+                child_fs_rank,
+                child_fs_start_idx,
+                child_fs_end_idx,
+                fs_row_shard_sizes,
+            ),
+            tp_layout=(
+                child_tp_group,
+                child_tp_world_size,
+                child_tp_rank,
+                tp_row_shard_start_idx,
+                tp_row_shard_end_idx,
+                tp_row_shard_sizes,
+            ),
+            child_fields={
+                "is_transposed": False,
+                "is_qkvg_child": True,
+                "qkvg_child_kind": child_kind,
+                "qkvg_split_shapes": tuple(int(dim) for dim in split_shapes),
+            },
+            error_prefix="QKVG_CHILD",
+            use_low_rank_sync=bool(self.optimizer.use_low_rank_sync),
+            rank_fraction_default=self.optimizer.defaults["rank_fraction"],
+            rank_multiple_of_default=self.optimizer.defaults["rank_multiple_of"],
+        )
+
+    def _resolve_qkvg_child_row_group_layout(
+        self,
+        *,
+        parent_dist_meta: DionDistMeta,
+        split_shapes: tuple[int, int, int, int],
+        child_kind: str,
+        parent_group,
+        parent_world_size: int,
+        parent_rank: int,
+        label: str,
+        create_group: bool,
+    ) -> tuple[
+        Optional[torch.distributed.ProcessGroup],
+        int,
+        int,
+        int,
+        int,
+        tuple[int, ...],
+    ]:
+        """Return child-local ownership for a parent row-sharded QKVG group."""
+        child_index = {"q": 0, "gate": 1, "k": 2, "v": 3}.get(child_kind, None)
+        if child_index is None:
+            raise RuntimeError(
+                "[DION_INVALID_QKVG_CHILD_KIND] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"child_kind={child_kind!r}"
+            )
+
+        parent_global_shape = tuple(int(dim) for dim in parent_dist_meta.global_shape)
+        parent_global_rows = int(parent_global_shape[0])
+        total_per_group = int(sum(int(dim) for dim in split_shapes))
+        if total_per_group <= 0 or parent_global_rows % total_per_group != 0:
+            raise RuntimeError(
+                "[DION_QKVG_CHILD_INVALID_PARENT_GROUP_LAYOUT] "
+                f"param_uid={parent_dist_meta.param_uid} param_name={parent_dist_meta.param_name} "
+                f"parent_global_rows={parent_global_rows} split_shapes={split_shapes}"
+            )
+        child_global_rows = qkvg_child_global_shape(
+            parent_global_shape,
+            split_shapes,
+            child_kind,
+        )[0]
+
+        child_ranges = []
+        for rank_idx in range(parent_world_size):
+            parent_rank_start, parent_rank_end = compute_fs_shard_range(
+                parent_global_rows,
+                parent_world_size,
+                rank_idx,
+            )
+            child_range = qkvg_child_row_range(
+                parent_row_start=parent_rank_start,
+                parent_row_end=parent_rank_end,
+                split_shapes=split_shapes,
+                child_kind=child_kind,
+            )
+            child_ranges.append(child_range)
+
+        return resolve_row_child_layout(
+            parent_group=parent_group,
+            parent_world_size=parent_world_size,
+            parent_rank=parent_rank,
+            child_rows=child_global_rows,
+            child_ranges=tuple(child_ranges),
+            label=label,
+            detail=(
+                f"param_uid={parent_dist_meta.param_uid} "
+                f"param_name={parent_dist_meta.param_name} "
+                f"child_kind={child_kind} split_shapes={split_shapes}"
+            ),
+            error_prefix="QKVG_CHILD",
+            create_group=create_group,
+            make_group=_ensure_child_group,
+        ).as_tuple()
+
+    def _resolve_qkvg_child_fs_shard_layout(
+        self,
+        *,
+        parent_dist_meta: DionDistMeta,
+        split_shapes: tuple[int, int, int, int],
+        child_kind: str,
+        create_group: bool,
+    ) -> tuple[
+        Optional[torch.distributed.ProcessGroup],
+        int,
+        int,
+        int,
+        int,
+        Optional[tuple[int, ...]],
+    ]:
+        """Return child-local FS ownership for one split QKVG child."""
+        parent_fs_world_size = int(getattr(parent_dist_meta, "fs_world_size", 1))
+        parent_fs_rank = int(getattr(parent_dist_meta, "fs_rank", -1))
+        parent_fs_shard_dim = int(getattr(parent_dist_meta, "fs_shard_dim", -1))
+        parent_fs_group = getattr(parent_dist_meta, "fs_group", None)
+
+        if parent_fs_shard_dim != 0 or parent_fs_world_size <= 1:
+            return (
+                parent_fs_group,
+                parent_fs_world_size,
+                parent_fs_rank,
+                int(parent_dist_meta.fs_start_idx),
+                int(parent_dist_meta.fs_end_idx),
+                None,
+            )
+
+        return self._resolve_qkvg_child_row_group_layout(
+            parent_dist_meta=parent_dist_meta,
+            split_shapes=split_shapes,
+            child_kind=child_kind,
+            parent_group=parent_fs_group,
+            parent_world_size=parent_fs_world_size,
+            parent_rank=parent_fs_rank,
+            label="FS",
+            create_group=create_group,
+        )
+
+    def _resolve_qkvg_child_tp_shard_layout(
+        self,
+        *,
+        parent_dist_meta: DionDistMeta,
+        split_shapes: tuple[int, int, int, int],
+        child_kind: str,
+        create_group: bool,
+    ) -> tuple[
+        Optional[torch.distributed.ProcessGroup],
+        int,
+        int,
+        int,
+        int,
+        Optional[tuple[int, ...]],
+    ]:
+        """Return child-local TP ownership for one split QKVG child."""
+        parent_tp_world_size = int(getattr(parent_dist_meta, "tp_world_size", 1))
+        parent_tp_rank = int(getattr(parent_dist_meta, "tp_rank", -1))
+        parent_tp_shard_dim = int(getattr(parent_dist_meta, "tp_shard_dim", -1))
+        parent_tp_group = getattr(parent_dist_meta, "tp_group", None)
+
+        if parent_tp_shard_dim != 0 or parent_tp_world_size <= 1:
+            return (
+                parent_tp_group,
+                parent_tp_world_size,
+                parent_tp_rank,
+                -1,
+                -1,
+                None,
+            )
+
+        return self._resolve_qkvg_child_row_group_layout(
+            parent_dist_meta=parent_dist_meta,
+            split_shapes=split_shapes,
+            child_kind=child_kind,
+            parent_group=parent_tp_group,
+            parent_world_size=parent_tp_world_size,
+            parent_rank=parent_tp_rank,
+            label="TP",
+            create_group=create_group,
+        )
+
+    def _ensure_qkvg_child_state_(
+        self,
+        *,
+        parent_param,
+        parent_state: dict,
+        optim_group: dict,
+        child_dist_meta: DionDistMeta,
+    ) -> None:
+        """Initialize child-specific Q state for one fused QKVG child when needed."""
+        child_kind = child_dist_meta.qkvg_child_kind
+        q_key = qkvg_state_key("Q", child_kind)
+        if q_key in parent_state:
+            return
+
+        child_q_init = build_q_init(
+            param=parent_param,
+            optim_group=optim_group,
+            dist_meta=child_dist_meta,
+            rank_fraction_default=self.optimizer.defaults["rank_fraction"],
+            rank_multiple_of_default=self.optimizer.defaults["rank_multiple_of"],
+            use_low_rank_sync=bool(getattr(self.optimizer, "use_low_rank_sync", False)),
+            base_training_seed=resolve_base_training_seed(),
+            get_replicate_group=self._get_replicate_group,
+            make_group_broadcast=lambda process_group: make_group_broadcast(
+                process_group,
+                group_size=self._group_size,
+            ),
+        )
+        q_layout = child_q_init.q_layout
+        if q_layout is None:
+            raise RuntimeError(
+                "[DION_MISSING_QKVG_CHILD_Q_LAYOUT] "
+                f"param_uid={child_dist_meta.param_uid} param_name={child_dist_meta.param_name}"
+            )
+        q_state = init_q_state(
+            param=parent_param,
+            mixed_precision_config=self.optimizer._mixed_precision_config,
+            config=child_dist_meta.param_config,
+            dist_meta=child_dist_meta,
+            q_layout=q_layout,
+            q_seed=child_q_init.q_seed,
+            tp_world_size=int(child_q_init.tp_world_size),
+            tp_rank=int(child_q_init.tp_rank),
+            use_q_unshard=bool(child_q_init.use_q_unshard),
+        )
+        broadcast_q = child_q_init.broadcast_q
+        if broadcast_q is None:
+            raise RuntimeError(
+                "[DION_MISSING_QKVG_CHILD_BROADCAST] "
+                f"param_uid={child_dist_meta.param_uid} param_name={child_dist_meta.param_name}"
+            )
+        broadcast_q(q_state)
+
+        parent_state[q_key] = q_state
+        parent_state[qkvg_state_key("r", child_kind)] = int(q_layout.r_global)
+        parent_state[qkvg_state_key("local_shape", child_kind)] = tuple(
+            int(dim) for dim in child_dist_meta.local_shape
+        )
+        parent_state[qkvg_state_key("global_shape", child_kind)] = tuple(
+            int(dim) for dim in child_dist_meta.global_shape
+        )
+        parent_state[f"_qkvg_{child_kind}_needs_state_replica_q_sync"] = True
 
     def _build_qkv_child_dist_meta(
         self,
@@ -2803,6 +3142,28 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 create_group=True,
             )
 
+    def _init_qkvg_child_groups(
+        self,
+        *,
+        dist_meta: DionDistMeta,
+        split_shapes: tuple[int, int, int, int],
+    ) -> None:
+        """Create deterministic split-child subgroups on all ranks before step-time routing."""
+        dist_meta = self._split_parent_dist_meta(dist_meta)
+        for child_kind in iter_qkvg_child_kinds():
+            self._resolve_qkvg_child_fs_shard_layout(
+                parent_dist_meta=dist_meta,
+                split_shapes=split_shapes,
+                child_kind=child_kind,
+                create_group=True,
+            )
+            self._resolve_qkvg_child_tp_shard_layout(
+                parent_dist_meta=dist_meta,
+                split_shapes=split_shapes,
+                child_kind=child_kind,
+                create_group=True,
+            )
+
     def _init_qkv_child_groups(
         self,
         *,
@@ -2887,6 +3248,171 @@ class DionDistributedOptimizer(DistributedOptimizer):
             int(dim) for dim in child_dist_meta.global_shape
         )
         parent_state[f"_linear_{child_kind}_needs_state_replica_q_sync"] = True
+
+    def _expand_split_qkvg_params(
+        self,
+        *,
+        param,
+        grad,
+        optimizer_state,
+        optim_group,
+        config,
+        dist_meta,
+    ):
+        """Expand one fused QKVG parent into optimizer-only child Dion step params."""
+        if not bool(self.optimizer.defaults.get("split_qkv", False)):
+            return None
+        if optim_group.get("algorithm", "dion") != "dion":
+            return None
+        if dist_meta is None or not bool(getattr(dist_meta, "is_dion_param", False)):
+            return None
+        split_shapes = resolve_qkvg_split_shapes(
+            param=param,
+            optimizer_state=optimizer_state,
+            dist_meta=dist_meta,
+        )
+        if split_shapes is None:
+            return None
+
+        momentum = optimizer_state.get("momentum", None)
+        if momentum is None:
+            raise RuntimeError(
+                "[DION_QKVG_SPLIT_MISSING_MOMENTUM] "
+                f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+                f"param_name={getattr(dist_meta, 'param_name', '')}"
+            )
+        (
+            parent_param_view,
+            parent_grad_view,
+            parent_momentum_view,
+            parent_local_shape,
+            split_parent_dist_meta,
+        ) = self._split_parent_views(
+            param=param,
+            grad=grad,
+            momentum=momentum,
+            dist_meta=dist_meta,
+        )
+
+        child_step_params: list[DionStepParam] = []
+        for child_kind in iter_qkvg_child_kinds():
+            if not qkvg_child_has_local_overlap(split_shapes, split_parent_dist_meta, child_kind):
+                continue
+            child_local_shape = qkvg_child_local_shape(
+                parent_local_shape,
+                split_shapes,
+                child_kind,
+                dist_meta=split_parent_dist_meta,
+            )
+            child_global_shape = qkvg_child_global_shape(
+                tuple(int(dim) for dim in split_parent_dist_meta.global_shape),
+                split_shapes,
+                child_kind,
+            )
+            child_dist_meta = self._build_qkvg_child_dist_meta(
+                parent_dist_meta=split_parent_dist_meta,
+                child_kind=child_kind,
+                split_shapes=split_shapes,
+                child_local_shape=child_local_shape,
+                child_global_shape=child_global_shape,
+            )
+            self._ensure_qkvg_child_state_(
+                parent_param=param,
+                parent_state=optimizer_state,
+                optim_group=optim_group,
+                child_dist_meta=child_dist_meta,
+            )
+
+            child_param = extract_qkvg_child(
+                parent_param_view,
+                split_shapes,
+                child_kind,
+                dist_meta=split_parent_dist_meta,
+            )
+            child_grad = extract_qkvg_child(
+                parent_grad_view,
+                split_shapes,
+                child_kind,
+                dist_meta=split_parent_dist_meta,
+            )
+            child_momentum = extract_qkvg_child(
+                parent_momentum_view,
+                split_shapes,
+                child_kind,
+                dist_meta=split_parent_dist_meta,
+            )
+            q_key = qkvg_state_key("Q", child_kind)
+            r_key = qkvg_state_key("r", child_kind)
+            local_shape_key = qkvg_state_key("local_shape", child_kind)
+            global_shape_key = qkvg_state_key("global_shape", child_kind)
+            sync_key = f"_qkvg_{child_kind}_needs_state_replica_q_sync"
+            self._refresh_dion_param_config(
+                dist_meta=child_dist_meta,
+                optim_group=optim_group,
+                local_shape=tuple(int(dim) for dim in optimizer_state[local_shape_key]),
+                r_global_override=optimizer_state[r_key],
+            )
+
+            child_state = {
+                "momentum": child_momentum,
+                "Q": optimizer_state[q_key],
+                "r": int(optimizer_state[r_key]),
+                "local_shape": tuple(int(dim) for dim in optimizer_state[local_shape_key]),
+                "global_shape": tuple(
+                    int(dim) for dim in optimizer_state[global_shape_key]
+                ),
+                "_needs_state_replica_q_sync": bool(optimizer_state.get(sync_key, False)),
+            }
+
+            def _commit_update(
+                updated_param,
+                updated_momentum,
+                *,
+                parent_dist_meta=split_parent_dist_meta,
+                split_shapes=split_shapes,
+                child_kind=child_kind,
+            ):
+                scatter_qkvg_child_(
+                    parent_param_view,
+                    updated_param,
+                    split_shapes,
+                    child_kind,
+                    dist_meta=parent_dist_meta,
+                )
+                scatter_qkvg_child_(
+                    parent_momentum_view,
+                    updated_momentum,
+                    split_shapes,
+                    child_kind,
+                    dist_meta=parent_dist_meta,
+                )
+
+            child_step_params.append(
+                DionStepParam(
+                    param=child_param,
+                    grad=child_grad,
+                    optimizer_state=child_state,
+                    optim_group=optim_group,
+                    config=child_dist_meta.param_config,
+                    dist_meta=child_dist_meta,
+                    post_q_sync=_make_split_child_q_sync_hook(
+                        optimizer_state,
+                        sync_key,
+                    ),
+                    commit_update=_commit_update,
+                )
+            )
+
+        if not child_step_params:
+            raise RuntimeError(
+                "[DION_QKVG_SPLIT_NO_LOCAL_CHILDREN] "
+                f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+                f"param_name={getattr(dist_meta, 'param_name', '')} "
+                f"split_shapes={split_shapes} "
+                f"parent_local_shape={parent_local_shape}"
+            )
+
+        return child_step_params
 
     def _expand_split_qkv_params(
         self,
@@ -3236,6 +3762,16 @@ class DionDistributedOptimizer(DistributedOptimizer):
         dist_meta,
     ):
         """Expand optimizer-only Dion children when one parent carries a fused update surface."""
+        qkvg_children = self._expand_split_qkvg_params(
+            param=param,
+            grad=grad,
+            optimizer_state=optimizer_state,
+            optim_group=optim_group,
+            config=config,
+            dist_meta=dist_meta,
+        )
+        if qkvg_children is not None:
+            return qkvg_children
         qkv_children = self._expand_split_qkv_params(
             param=param,
             grad=grad,

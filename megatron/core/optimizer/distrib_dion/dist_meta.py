@@ -9,6 +9,11 @@ import torch.distributed as dist
 from ... import parallel_state
 from ..dion.linear import get_linear_split_rows, is_linear_fc1_param
 from ..dion.qkv import get_qkv_split_shapes, is_qkv_param, validate_qkv_split_shapes_for_rows
+from ..dion.qkvg import (
+    get_qkvg_split_shapes,
+    is_qkvg_param,
+    validate_qkvg_split_shapes_for_rows,
+)
 from ..dion.state import build_param_config
 from ..dion.types import DionDistMeta
 from ..dion.utils import get_local_shape
@@ -306,7 +311,26 @@ def build_param_dist_meta(
         dion_shard_layout=dion_shard_layout,
     )
 
+    qkvg_split_shapes = get_qkvg_split_shapes(model_param) if is_qkvg_param(model_param) else None
     qkv_split_shapes = get_qkv_split_shapes(model_param) if is_qkv_param(model_param) else None
+    if qkvg_split_shapes is not None and qkv_split_shapes is not None:
+        raise RuntimeError(
+            "[DION_QKV_LAYOUT_AMBIGUOUS] "
+            f"param={param_name or id(model_param)} is tagged as both QKV and QKVG."
+        )
+    if qkvg_split_shapes is not None:
+        qkvg_global_rows = int(
+            (
+                dion_shard_layout.per_expert_global_shape
+                if dion_shard_layout.per_expert_global_shape is not None
+                else dion_shard_layout.global_shape
+            )[0]
+        )
+        validate_qkvg_split_shapes_for_rows(
+            qkvg_split_shapes,
+            rows=qkvg_global_rows,
+            context=f"param={param_name or id(model_param)}",
+        )
     if qkv_split_shapes is not None:
         qkv_global_rows = int(
             (
@@ -360,6 +384,7 @@ def build_param_dist_meta(
         local_expert_index=(
             int(expert_layout["local_expert_index"]) if expert_layout is not None else -1
         ),
+        qkvg_split_shapes=qkvg_split_shapes,
         qkv_split_shapes=qkv_split_shapes,
         linear_split_rows=_linear_split_rows_for_layout(
             model_param=model_param,
@@ -448,6 +473,11 @@ def add_standard_metas(
                 qkv_split_shapes=(
                     get_qkv_split_shapes(model_param)
                     if is_qkv_param(model_param)
+                    else None
+                ),
+                qkvg_split_shapes=(
+                    get_qkvg_split_shapes(model_param)
+                    if is_qkvg_param(model_param)
                     else None
                 ),
                 linear_split_rows=None,

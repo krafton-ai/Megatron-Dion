@@ -15,6 +15,7 @@ import torch.distributed as dist
 from ...fp8_utils import dequantize_fp8_tensor, is_float8tensor
 from ..dion.linear import iter_linear_child_kinds, linear_state_key
 from ..dion.qkv import iter_qkv_child_kinds, qkv_state_key
+from ..dion.qkvg import iter_qkvg_child_kinds, qkvg_state_key
 from ..dion.utils import str_to_dtype
 from .sharding import (
     DionShardLayout,
@@ -216,6 +217,9 @@ def _is_q_state_key(key: str) -> bool:
     for child_kind in iter_qkv_child_kinds():
         if key == qkv_state_key("Q", child_kind):
             return True
+    for child_kind in iter_qkvg_child_kinds():
+        if key == qkvg_state_key("Q", child_kind):
+            return True
     for child_kind in iter_linear_child_kinds():
         if key == linear_state_key("Q", child_kind):
             return True
@@ -355,6 +359,11 @@ def restore_persistent_param_state_(
                     q_key = qkv_state_key("Q", child_kind)
                     if q_key in new_state:
                         new_state[f"_qkv_{child_kind}_needs_state_replica_q_sync"] = True
+            if bool(new_state.get("qkvg_split_qkvg", False)):
+                for child_kind in iter_qkvg_child_kinds():
+                    q_key = qkvg_state_key("Q", child_kind)
+                    if q_key in new_state:
+                        new_state[f"_qkvg_{child_kind}_needs_state_replica_q_sync"] = True
             if bool(new_state.get("linear_split_linear", False)):
                 for child_kind in iter_linear_child_kinds():
                     q_key = linear_state_key("Q", child_kind)
