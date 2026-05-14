@@ -3,6 +3,8 @@
 import functools
 import logging
 import math
+import os
+import time
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -61,6 +63,46 @@ class _HandleGroup:
             if hasattr(handle, "wait"):
                 handle.wait()
         self._handles = []
+
+
+def _dion_profile_param_sync_enabled() -> bool:
+    return os.getenv("DION_PROFILE_PARAM_SYNC", "0") == "1"
+
+
+def _dion_profile_param_sync_rank_selected() -> bool:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    ranks = os.getenv("DION_PROFILE_PARAM_SYNC_RANKS", "0").strip()
+    if not ranks:
+        return True
+    rank = torch.distributed.get_rank()
+    return rank in {int(token) for token in ranks.split(",") if token.strip()}
+
+
+def _dion_bucket_summary(bucket) -> str:
+    dion_layout = getattr(bucket, "dion_layout", None)
+    entries = tuple(getattr(dion_layout, "entries", ()) or ())
+    qkvg = sum(1 for entry in entries if getattr(getattr(entry, "dist_meta", None), "qkvg_split_shapes", None) is not None)
+    qkv = sum(1 for entry in entries if getattr(getattr(entry, "dist_meta", None), "qkv_split_shapes", None) is not None)
+    names = []
+    for entry in entries[:3]:
+        meta = getattr(entry, "dist_meta", None)
+        names.append(getattr(meta, "param_name", "") or getattr(entry, "param_name", ""))
+    return (
+        f"id={getattr(bucket, 'bucket_id', -1)} "
+        f"numel={int(getattr(getattr(bucket, 'param_data', None), 'numel', lambda: 0)())} "
+        f"dion={int(bool(getattr(bucket, 'has_dion_params', False)))} "
+        f"standard={int(bool(getattr(bucket, 'has_standard_params', False)))} "
+        f"entries={len(entries)} qkvg={qkvg} qkv={qkv} "
+        f"names={names}"
+    )
+
+
+def _dion_profile_param_sync_log(message: str) -> None:
+    if not _dion_profile_param_sync_enabled() or not _dion_profile_param_sync_rank_selected():
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    print(f"[DION_PARAM_SYNC] rank={rank} {message}", flush=True)
 
 
 def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
@@ -388,6 +430,7 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
         self._mark_dion_param_sync_ready(False)
+        profile_start = time.perf_counter() if _dion_profile_param_sync_enabled() else None
         pure_standard_indices, dion_handles = self._collect_param_gather_launches(
             async_op=async_op,
         )
@@ -419,6 +462,16 @@ class _ParamAndGradBucketGroup:
             self.param_gather_handle = None
             self._check_dion_param_sync_ready()
         self.param_gather_dispatched = True
+        if profile_start is not None:
+            elapsed = time.perf_counter() - profile_start
+            bucket_desc = "; ".join(_dion_bucket_summary(bucket) for bucket in self.buckets[:4])
+            if len(self.buckets) > 4:
+                bucket_desc += f"; ... total_buckets={len(self.buckets)}"
+            _dion_profile_param_sync_log(
+                f"start async={int(async_op)} force={int(force_sync)} "
+                f"standard_buckets={len(pure_standard_indices)} dion_handles={len(dion_handles)} "
+                f"elapsed={elapsed:.6f}s buckets=[{bucket_desc}]"
+            )
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """
@@ -444,7 +497,16 @@ class _ParamAndGradBucketGroup:
             self.start_param_sync()
 
         if self.param_gather_handle is not None:
+            profile_start = time.perf_counter() if _dion_profile_param_sync_enabled() else None
             self.param_gather_handle.wait()
+            if profile_start is not None:
+                elapsed = time.perf_counter() - profile_start
+                bucket_desc = "; ".join(_dion_bucket_summary(bucket) for bucket in self.buckets[:4])
+                if len(self.buckets) > 4:
+                    bucket_desc += f"; ... total_buckets={len(self.buckets)}"
+                _dion_profile_param_sync_log(
+                    f"finish wait={elapsed:.6f}s buckets=[{bucket_desc}]"
+                )
             self.param_gather_handle = None
             self._check_dion_param_sync_ready()
 

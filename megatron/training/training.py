@@ -208,6 +208,42 @@ stimer = StragglerDetector()
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
 
+_TRAIN_PHASE_DEBUG_RANKS = None
+
+
+def _debug_train_phases_enabled() -> bool:
+    return os.getenv("DION_DEBUG_TRAIN_PHASES", "").lower() in ("1", "true", "yes")
+
+
+def _debug_train_phase_selected(rank: int) -> bool:
+    global _TRAIN_PHASE_DEBUG_RANKS
+    if _TRAIN_PHASE_DEBUG_RANKS is None:
+        raw = os.getenv("DION_DEBUG_TRAIN_PHASE_RANKS", "").strip()
+        if raw:
+            _TRAIN_PHASE_DEBUG_RANKS = {
+                int(token.strip()) for token in raw.split(",") if token.strip()
+            }
+        else:
+            _TRAIN_PHASE_DEBUG_RANKS = set()
+    return not _TRAIN_PHASE_DEBUG_RANKS or int(rank) in _TRAIN_PHASE_DEBUG_RANKS
+
+
+def _debug_train_phase(label: str, iteration: Optional[int]) -> None:
+    if not _debug_train_phases_enabled():
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if not _debug_train_phase_selected(rank):
+        return
+    if torch.cuda.is_available() and os.getenv("DION_DEBUG_TRAIN_PHASE_SYNC", "1") == "1":
+        torch.cuda.synchronize()
+    step = (int(iteration) + 1) if iteration is not None else -1
+    print(
+        f"[DION_TRAIN_PHASE] rank={rank} step={step} label={label} "
+        f"time={time.perf_counter():.6f}",
+        flush=True,
+    )
+
+
 def destroy_global_state():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -1625,6 +1661,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        _debug_train_phase("zero_grad:start", iteration)
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -1661,6 +1698,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                         optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
+        _debug_train_phase("forward_backward:start", iteration)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
         losses_reduced = forward_backward_func(
@@ -1678,6 +1716,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if save_dgrads_in_this_iteration:
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
+
+        _debug_train_phase("forward_backward:end", iteration)
 
         # Reset force_all_reduce field.
         for model_chunk in model:
@@ -1713,7 +1753,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    _debug_train_phase("optimizer:start", iteration)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    _debug_train_phase("optimizer:end", iteration)
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step

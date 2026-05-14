@@ -439,10 +439,21 @@ class GPTDataset(MegatronDataset):
         else:
             cache_hit = False
 
-        if not path_to_cache or (
+        should_build_cache = not path_to_cache or (
             not cache_hit
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+        )
+        if (
+            should_build_cache
+            and path_to_cache
+            and not cache_hit
+            and os.environ.get("MEGATRON_DATA_CACHE_READ_ONLY", "").lower() in ("1", "true", "yes")
         ):
+            raise RuntimeError(
+                f"GPTDataset cache miss while MEGATRON_DATA_CACHE_READ_ONLY=1: {path_to_cache}"
+            )
+
+        if should_build_cache:
             log_single_rank(
                 logger,
                 logging.INFO,

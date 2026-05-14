@@ -211,6 +211,18 @@ class BlendedMegatronDatasetBuilder(object):
                         raise ValueError(
                             "Using client-specified weights requires client-specified size"
                         )
+                    datasets_i = megatron_datasets[i]
+                    nonzero_datasets_and_weights = [
+                        (dataset, weight)
+                        for dataset, weight in zip(datasets_i, weights_i)
+                        if dataset is not None and len(dataset) > 0 and weight > 0
+                    ]
+                    if len(nonzero_datasets_and_weights) != len(datasets_i):
+                        if not nonzero_datasets_and_weights:
+                            raise ValueError(
+                                f"No non-empty datasets remain for split {Split(i).name}"
+                            )
+                        datasets_i, weights_i = map(list, zip(*nonzero_datasets_and_weights))
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
@@ -222,7 +234,7 @@ class BlendedMegatronDatasetBuilder(object):
                             )
                             else True
                         ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
-                        megatron_datasets[i],
+                        datasets_i,
                         weights_i,
                         size_i,
                         self.config,
