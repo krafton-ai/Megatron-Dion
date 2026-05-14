@@ -1,4 +1,4 @@
-"""Foreach-style elementwise optimizer helpers for Dion elementwise buckets."""
+"""Foreach-style elementwise optimizer helpers for Dion scalar buckets."""
 
 from __future__ import annotations
 
@@ -126,7 +126,7 @@ def adamw_update_foreach(
         return
     if batch_size != len(grads) or batch_size != len(first_moments) or batch_size != len(second_moments):
         raise RuntimeError(
-            "[DION_ELEMENTWISE_ADAMW_BUCKET_MISMATCH] "
+            "[DION_SCALAR_ADAMW_BUCKET_MISMATCH] "
             f"params={batch_size} grads={len(grads)} first_moments={len(first_moments)} second_moments={len(second_moments)}"
         )
     if step <= 0:
@@ -166,7 +166,7 @@ def lion_update_foreach(
         return
     if batch_size != len(grads) or batch_size != len(first_moments):
         raise RuntimeError(
-            "[DION_ELEMENTWISE_LION_BUCKET_MISMATCH] "
+            "[DION_SCALAR_LION_BUCKET_MISMATCH] "
             f"params={batch_size} grads={len(grads)} first_moments={len(first_moments)}"
         )
 

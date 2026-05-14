@@ -289,7 +289,7 @@ class MegatronDion(Optimizer):
         def _ensure_elementwise_first_moment(param, state) -> torch.Tensor:
             if 'first_moment' in state and 'exp_avg' in state:
                 raise RuntimeError(
-                    "[DION_ELEMENTWISE_STATE_LAYOUT_CONFLICT] found both first_moment and exp_avg"
+                    "[DION_SCALAR_STATE_LAYOUT_CONFLICT] found both first_moment and exp_avg"
                 )
             if 'first_moment' not in state:
                 if 'exp_avg' in state:
@@ -308,7 +308,7 @@ class MegatronDion(Optimizer):
         def _ensure_elementwise_second_moment(param, state) -> torch.Tensor:
             if 'second_moment' in state and 'exp_avg_sq' in state:
                 raise RuntimeError(
-                    "[DION_ELEMENTWISE_STATE_LAYOUT_CONFLICT] found both second_moment and exp_avg_sq"
+                    "[DION_SCALAR_STATE_LAYOUT_CONFLICT] found both second_moment and exp_avg_sq"
                 )
             if 'second_moment' not in state:
                 if 'exp_avg_sq' in state:

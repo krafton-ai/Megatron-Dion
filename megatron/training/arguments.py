@@ -2108,20 +2108,20 @@ def _add_training_args(parser):
     group.add_argument('--dion-use-low-rank-sync', action=argparse.BooleanOptionalAction,
                        default=True,
                        help='Use Dion low-rank P/R synchronization when its contract applies.')
-    group.add_argument('--dion-elementwise-optimizer', type=str, default='adamw',
+    group.add_argument('--dion-scalar-optimizer', type=str, default='adamw',
                        choices=['lion', 'adamw'],
-                       help='Elementwise optimizer used for non-2D Dion parameters.')
+                       help='Scalar optimizer used for non-2D Dion parameters.')
     group.add_argument('--dion-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
                        help='2D Dion scale mode.')
     group.add_argument('--dion-extra-scale-factor', type=float, default=0.2,
                        help='Additional multiplicative constant used by Dion 2D scaling.')
     group.add_argument('--dion-beta1', type=float, default=0.9,
-                       help='Beta1 for the Dion elementwise optimizer.')
+                       help='Beta1 for the Dion scalar optimizer.')
     group.add_argument('--dion-beta2', type=float, default=0.95,
-                       help='Beta2 for the Dion elementwise optimizer.')
-    group.add_argument('--dion-elementwise-eps', type=float, default=1e-8,
-                       help='Epsilon for the Dion elementwise optimizer.')
+                       help='Beta2 for the Dion scalar optimizer.')
+    group.add_argument('--dion-scalar-eps', type=float, default=1e-8,
+                       help='Epsilon for the Dion scalar optimizer.')
     group.add_argument('--dion-split-qkv', action='store_true', dest='dion_split_qkv',
                        help='Treat fused QKV weights as optimizer-only Q/K/V children for Dion.')
     group.add_argument('--no-dion-split-qkv', action='store_false', dest='dion_split_qkv',
@@ -2139,7 +2139,7 @@ def _add_training_args(parser):
                        help='Dtype for Dion Q state.')
     group.add_argument('--dion-variance-dtype', type=str, default=None,
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
-                       help='Dtype for Dion elementwise second-moment state.')
+                       help='Dtype for Dion scalar second-moment state.')
     group.add_argument('--fully-shard-model-parallel-size', type=int, default=1,
                        help='Dion fully-sharded optimizer axis size.')
     group.add_argument('--replicate-model-parallel-size', type=int, default=1,

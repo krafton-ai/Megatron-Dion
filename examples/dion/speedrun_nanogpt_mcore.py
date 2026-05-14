@@ -404,7 +404,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         str(args.ortho_fraction),
         "--dion-oversample",
         str(args.rcqr_oversample),
-        "--dion-elementwise-optimizer",
+        "--dion-scalar-optimizer",
         args.scalar_opt,
         "--dion-beta1",
         "0.95",
