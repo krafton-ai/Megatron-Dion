@@ -1027,7 +1027,7 @@ def test_elementwise_state_defaults_follow_param_dtype(monkeypatch):
     optimizer = dion_algorithm.MegatronDion(
         [param],
         mixed_precision_config=DionMixedPrecisionConfig(),
-        elementwise_optimizer="adamw",
+        elementwise_optimizer="adam",
     )
     optimizer.param_groups[0]["step"] = 1
 
@@ -1047,6 +1047,41 @@ def test_elementwise_state_defaults_follow_param_dtype(monkeypatch):
 
     assert state["first_moment"].dtype == torch.float16
     assert state["second_moment"].dtype == torch.float16
+
+
+def test_elementwise_lr_scale_scales_scalar_update_lr(monkeypatch):
+    captured_lrs = []
+
+    def capture_adamw_update(*args, **kwargs):
+        captured_lrs.append(kwargs["lr"])
+
+    monkeypatch.setattr(dion_algorithm, "adamw_update_foreach", capture_adamw_update)
+    param = torch.nn.Parameter(torch.ones(2, dtype=torch.float32))
+    grad = torch.ones_like(param)
+    state = {}
+    optimizer = dion_algorithm.MegatronDion(
+        [param],
+        lr=2.0,
+        elementwise_lr_scale=0.2,
+        elementwise_optimizer="adam",
+    )
+    optimizer.param_groups[0]["step"] = 1
+
+    with torch.no_grad():
+        list(
+            optimizer._apply_elementwise_batches(
+                [
+                    ElementwiseStepParam(
+                        param=param,
+                        grad=grad,
+                        optimizer_state=state,
+                        optim_group=optimizer.param_groups[0],
+                    )
+                ]
+            )
+        )
+
+    assert captured_lrs == [pytest.approx(0.4)]
 
 
 def test_elementwise_weight_decay_respects_wd_mult_without_scheduler():
@@ -1388,9 +1423,11 @@ def test_dion_scale_mode_defaults_match_muon_style_naming():
 
     assert config.dion_scale_mode == "spectral"
     assert config.dion_extra_scale_factor == 0.2
+    assert config.dion_scalar_optimizer == "adam"
+    assert config.dion_scalar_lr_scale == 1.0
 
 
-def test_scaled_lr_uses_rank_fraction_for_all_scale_modes():
+def test_scaled_lr_uses_rank_fraction_for_non_spectral_scale_modes():
     spectral_lr = dion_kernels.scaled_lr_for_shape(
         lr=1.0,
         m_global=16,
@@ -1416,7 +1453,7 @@ def test_scaled_lr_uses_rank_fraction_for_all_scale_modes():
         extra_scale_factor=0.2,
     )
 
-    assert spectral_lr == pytest.approx(1.6)
+    assert spectral_lr == pytest.approx(0.8)
     assert unit_rms_lr == pytest.approx(0.8)
     assert shape_lr == pytest.approx(0.4)
 

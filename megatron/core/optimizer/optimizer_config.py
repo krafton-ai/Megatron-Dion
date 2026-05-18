@@ -486,8 +486,15 @@ class DionOptimizerConfig(OptimizerConfig):
     dion_use_low_rank_sync: bool = True
     """Enable Dion low-rank P/R synchronization."""
 
-    dion_scalar_optimizer: str = "adamw"
-    """Scalar optimizer used for standard parameter surfaces."""
+    dion_scalar_optimizer: str = "adam"
+    """Scalar optimizer used for standard parameter surfaces.
+
+    The ``adam`` spelling matches Muon scalar optimizer naming while using
+    decoupled AdamW-style weight decay internally.
+    """
+
+    dion_scalar_lr_scale: float = 1.0
+    """Additional multiplicative constant used by Dion scalar optimizer updates."""
 
     dion_scale_mode: str = "spectral"
     """Dion 2D scale mode."""

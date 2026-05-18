@@ -2108,9 +2108,12 @@ def _add_training_args(parser):
     group.add_argument('--dion-use-low-rank-sync', action=argparse.BooleanOptionalAction,
                        default=True,
                        help='Use Dion low-rank P/R synchronization when its contract applies.')
-    group.add_argument('--dion-scalar-optimizer', type=str, default='adamw',
-                       choices=['lion', 'adamw'],
-                       help='Scalar optimizer used for non-2D Dion parameters.')
+    group.add_argument('--dion-scalar-optimizer', type=str, default='adam',
+                       choices=['adam', 'lion'],
+                       help='Scalar optimizer used for non-2D Dion parameters. '
+                       'The adam option uses decoupled AdamW-style weight decay.')
+    group.add_argument('--dion-scalar-lr-scale', type=float, default=1.0,
+                       help='Additional multiplicative constant used by Dion scalar optimizer updates.')
     group.add_argument('--dion-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
                        help='2D Dion scale mode.')

@@ -63,7 +63,8 @@ class MegatronDion(Optimizer):
         mixed_precision_config: Optional[DionMixedPrecisionConfig] = None,
         enable_async: bool = True,  # Enable async execution where possible
         use_low_rank_sync: bool = True,  # Enable low-rank P/R replica sync
-        elementwise_optimizer: str = "adamw",  # Elementwise optimizer for standard params ("adamw" or "lion")
+        elementwise_optimizer: str = "adam",  # Scalar optimizer for standard params ("adam" or "lion")
+        elementwise_lr_scale: float = 1.0,  # Extra lr multiplier for standard params
         scale_mode: str = "spectral",  # 2D Dion scale mode
         extra_scale_factor: float = 0.2,
         split_qkv: bool = False,
@@ -92,7 +93,8 @@ class MegatronDion(Optimizer):
             use_fs_collectives=use_fs_collectives,
             enable_async=enable_async,
             use_low_rank_sync=use_low_rank_sync,
-            elementwise_optimizer=elementwise_optimizer,  # "adamw" or "lion"
+            elementwise_optimizer=elementwise_optimizer,  # "adam" or "lion"
+            elementwise_lr_scale=elementwise_lr_scale,
             scale_mode=scale_mode,
             extra_scale_factor=extra_scale_factor,
             split_qkv=bool(split_qkv),
@@ -106,6 +108,11 @@ class MegatronDion(Optimizer):
                 "[DION_INVALID_SCALE_MODE] "
                 f"expected one of ('spectral', 'unit_rms_norm', 'shape_scaling'), "
                 f"got {scale_mode!r}"
+            )
+        if float(elementwise_lr_scale) < 0.0:
+            raise RuntimeError(
+                "[DION_INVALID_ELEMENTWISE_LR_SCALE] "
+                f"elementwise_lr_scale={elementwise_lr_scale}"
             )
         super().__init__(params, defaults)
 
@@ -242,7 +249,8 @@ class MegatronDion(Optimizer):
         elementwise_params: List[ElementwiseStepParam],
     ) -> Generator[None, None, None]:
         """Process standard params with grouped foreach-style elementwise updates."""
-        default_elementwise_opt = self.defaults.get('elementwise_optimizer', 'adamw')
+        default_elementwise_opt = self.defaults.get('elementwise_optimizer', 'adam')
+        default_elementwise_lr_scale = float(self.defaults.get('elementwise_lr_scale', 1.0))
         default_betas = self.defaults.get('betas', (0.9, 0.95))
         default_eps = self.defaults.get('elementwise_eps', 1e-8)
         elementwise_contract_order: list[tuple] = []
@@ -330,7 +338,13 @@ class MegatronDion(Optimizer):
             state = elementwise_param.optimizer_state
             optim_group = elementwise_param.optim_group
             elementwise_opt = _resolve_elementwise_algorithm(optim_group)
-            lr = float(optim_group.get('lr', self.defaults['lr']))
+            lr_scale = float(optim_group.get('elementwise_lr_scale', default_elementwise_lr_scale))
+            if lr_scale < 0.0:
+                raise RuntimeError(
+                    "[DION_INVALID_ELEMENTWISE_LR_SCALE] "
+                    f"elementwise_lr_scale={lr_scale}"
+                )
+            lr = float(optim_group.get('lr', self.defaults['lr'])) * lr_scale
             weight_decay = _effective_weight_decay(p, optim_group)
             step = int(optim_group.get('step', 0))
             eps = float(

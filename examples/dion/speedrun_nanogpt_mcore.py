@@ -46,7 +46,7 @@ DION_160M_DEFAULTS: dict[str, Any] = {
     "val_loss_every": 125,
     "val_tokens": 10485760,
     "optimizer": "dion",
-    "scalar_opt": "adamw",
+    "scalar_opt": "adam",
     "mu": 0.95,
     "weight_decay": 0.01,
     "ortho_fraction": 0.25,
@@ -161,8 +161,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scalar-opt",
         "--scalar_opt",
-        default=defaults.get("scalar_opt", "adamw"),
-        choices=("adamw", "lion"),
+        default=defaults.get("scalar_opt", "adam"),
+        choices=("adam", "lion"),
         help="Elementwise optimizer for embedding/output surfaces.",
     )
     parser.add_argument(

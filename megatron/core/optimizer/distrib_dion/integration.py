@@ -413,6 +413,7 @@ def build_dion_optimizer(
         betas=(config.dion_beta1, config.dion_beta2),
         elementwise_eps=config.dion_scalar_eps,
         elementwise_optimizer=config.dion_scalar_optimizer,
+        elementwise_lr_scale=config.dion_scalar_lr_scale,
         scale_mode=config.dion_scale_mode,
         extra_scale_factor=config.dion_extra_scale_factor,
         split_qkv=config.dion_split_qkv,
