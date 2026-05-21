@@ -18,8 +18,8 @@ from megatron.core.optimizer.dion.types import (
     DionParamConfig,
     DionDistMeta,
 )
-from megatron.core.optimizer.distrib_dion.batches import build_batch_collectives, build_batch_key
-from megatron.core.optimizer.distrib_dion.parameter import build_dion_shard_entries
+from megatron.core.optimizer.dion.distributed.batches import build_batch_collectives, build_batch_key
+from megatron.core.optimizer.dion.distributed.parameter import build_dion_shard_entries
 
 
 def test_resolve_q_state_layout_keeps_reference_rank_with_uneven_tp():
@@ -266,11 +266,11 @@ def test_batch_collectives_keep_padded_tp_entries_for_batched_shapes(monkeypatch
     group = DummyGroup()
 
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.batches.dist.get_world_size",
+        "megatron.core.optimizer.dion.distributed.batches.dist.get_world_size",
         lambda process_group=None: process_group.size if process_group is not None else 1,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.batches.dist.get_rank",
+        "megatron.core.optimizer.dion.distributed.batches.dist.get_rank",
         lambda process_group=None: process_group.rank if process_group is not None else 0,
     )
 
@@ -308,11 +308,11 @@ def test_batch_collectives_keep_padded_fs_only_entries_for_reduce_scatter(monkey
     group = DummyGroup()
 
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.batches.dist.get_world_size",
+        "megatron.core.optimizer.dion.distributed.batches.dist.get_world_size",
         lambda process_group=None: process_group.size if process_group is not None else 1,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.batches.dist.get_rank",
+        "megatron.core.optimizer.dion.distributed.batches.dist.get_rank",
         lambda process_group=None: process_group.rank if process_group is not None else 0,
     )
 

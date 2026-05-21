@@ -5,6 +5,8 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 
+from ..matrix.types import MatrixDistMeta, MatrixStepParam
+
 
 @dataclass
 class DionMixedPrecisionConfig:
@@ -33,27 +35,12 @@ class DionParamConfig:
 
 
 @dataclass
-class ElementwiseStepParam:
-    """One standard-param elementwise step item routed by the distributed adapter."""
+class DionStepParam(MatrixStepParam):
+    """One Dion matrix step item routed by the distributed adapter."""
 
-    param: torch.Tensor | None = None
-    grad: torch.Tensor | None = None
-    optimizer_state: dict | None = None
-    optim_group: dict | None = None
-
-
-@dataclass
-class DionStepParam:
-    """One Dion step item routed by the distributed adapter."""
-
-    param: torch.Tensor | None = None
-    grad: torch.Tensor | None = None
-    optimizer_state: dict | None = None
-    optim_group: dict | None = None
     config: Optional[DionParamConfig] = None
     dist_meta: Any = None
     post_q_sync: Optional[Callable[[], None]] = None
-    commit_update: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
 
 @dataclass
@@ -93,38 +80,12 @@ class DionBatchGroup:
 
 
 @dataclass
-class DionDistMeta:
-    """Minimal distributed metadata consumed by the Dion algorithm."""
+class DionDistMeta(MatrixDistMeta):
+    """Dion-specific metadata layered on the matrix distributed contract."""
 
-    shape: Tuple[int, ...] | None = None
-    global_shape: Tuple[int, int] | None = None
-    fs_start_idx: int = -1
-    fs_end_idx: int = -1
-    tp_shard_dim: int = -1
-    fs_shard_dim: int = -1
     rank_fraction: float = 0.25
-    is_transposed: bool = False
-    param_uid: Tuple | None = None
     is_dion_param: bool = False
-    param_name: str = ""
-    fs_group: Optional[torch.distributed.ProcessGroup] = None
-    fs_world_size: int = 1
-    fs_rank: int = -1
-    tp_group: Optional[torch.distributed.ProcessGroup] = None
-    tp_world_size: int = 1
-    tp_rank: int = -1
-    per_expert_global_shape: Optional[Tuple[int, int]] = None
-    local_shape: Optional[Tuple[int, int]] = None
-    tensor_row_shard_sizes: Optional[Tuple[int, ...]] = None
-    row_shard_start_idx: int = -1
-    row_shard_end_idx: int = -1
-    row_shard_sizes: Optional[Tuple[int, ...]] = None
-    expert_axis: int = -1
-    num_local_experts: int = 1
-    local_expert_index: int = -1
     param_config: Optional[DionParamConfig] = None
-    parent_param_uid: Tuple | None = None
-    parent_param_name: str = ""
     is_qkv_child: bool = False
     qkv_child_kind: str = ""
     qkv_split_shapes: Optional[Tuple[int, int, int]] = None
@@ -135,6 +96,10 @@ class DionDistMeta:
     linear_partition_stride: int = 1
     is_linear_child: bool = False
     linear_child_kind: str = ""
+
+    def __post_init__(self) -> None:
+        if self.is_dion_param and not self.is_matrix_param:
+            self.is_matrix_param = True
 
 
 @dataclass

@@ -40,10 +40,10 @@ def scaled_lr_for_shape(
     if rank_fraction <= 0.0:
         raise RuntimeError(f"[DION_INVALID_RANK_FRACTION] rank_fraction={rank_fraction}")
 
-    if scale_mode == "spectral":
-        return lr * extra_scale_factor * math.sqrt(float(max(m_global, n_global)))
-
     rank_scale = extra_scale_factor / math.sqrt(float(rank_fraction))
+    if scale_mode == "spectral":
+        return lr * rank_scale * math.sqrt(float(max(m_global, n_global)))
+
     if scale_mode == "unit_rms_norm":
         return lr * rank_scale * math.sqrt(float(m_global) / float(n_global))
     if scale_mode == "shape_scaling":

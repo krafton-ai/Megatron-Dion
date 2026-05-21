@@ -8,15 +8,15 @@ from typing import Callable, List
 import torch
 import torch.distributed as dist
 
-from ... import parallel_state
-from ..dion.state import (
+from .... import parallel_state
+from ..state import (
     get_global_shape,
     q_seed_from_param_key,
     resolve_q_state_layout,
     should_use_low_rank_sync,
 )
-from ..dion.utils import get_local_shape
-from ..dion.types import DionQInit, DionStepParam, ElementwiseStepParam
+from ..utils import get_local_shape
+from ..types import DionQInit, DionStepParam
 
 
 def make_group_broadcast(process_group, *, group_size: Callable):
@@ -143,7 +143,7 @@ def sync_q_replicas(
                 continue
             if state.get("_needs_state_replica_q_sync", False):
                 state["_needs_state_replica_q_sync"] = False
-            post_q_sync = step_param.post_q_sync
+            post_q_sync = getattr(step_param, "post_q_sync", None)
             if callable(post_q_sync):
                 post_q_sync()
         return
@@ -167,7 +167,7 @@ def sync_q_replicas(
             )
         broadcast_q(q_state)
         state["_needs_state_replica_q_sync"] = False
-        post_q_sync = step_param.post_q_sync
+        post_q_sync = getattr(step_param, "post_q_sync", None)
         if callable(post_q_sync):
             post_q_sync()
 
@@ -257,8 +257,6 @@ def validate_step_groups(
     route_step_params: Callable,
     group_size: Callable,
     group_rank: Callable,
-    use_low_rank_sync: bool,
-    use_fs_collectives: bool,
 ) -> Callable:
     """Validate distributed bootstrap inputs and return the step-routing callback."""
     global_rank = dist.get_rank()
@@ -317,21 +315,10 @@ def validate_step_groups(
             )
         return world_size, rank
 
-    fs_world_size, _ = _validate_group_membership(fs_group, "fs_group")
-    rp_world_size, _ = _validate_group_membership(rp_group, "rp_group")
+    _validate_group_membership(fs_group, "fs_group")
+    _validate_group_membership(rp_group, "rp_group")
     _validate_group_membership(state_replica_group, "state_replica_group")
     _validate_group_membership(tp_group, "tp_group")
-
-    if dist.is_initialized() and replica_group is not None:
-        world_size = dist.get_world_size(replica_group)
-        if world_size > 1:
-            local_config = {
-                "use_low_rank_sync": bool(use_low_rank_sync),
-                "use_fs_collectives": bool(use_fs_collectives),
-                "rp_group_size": rp_world_size if rp_group is not None else 0,
-                "fs_group_size": fs_world_size if fs_group is not None else 0,
-            }
-            del local_config
 
     return route_step_params
 
@@ -477,8 +464,6 @@ def enable_distributed_dion(
     route_step_params: Callable,
     group_size: Callable,
     group_rank: Callable,
-    use_low_rank_sync: bool,
-    use_fs_collectives: bool,
     validate_enabled_rp_topology: Callable,
     log_error: Callable,
 ):
@@ -501,8 +486,6 @@ def enable_distributed_dion(
             route_step_params=route_step_params,
             group_size=group_size,
             group_rank=group_rank,
-            use_low_rank_sync=use_low_rank_sync,
-            use_fs_collectives=use_fs_collectives,
         ),
     )
     validate_enabled_rp_topology(
@@ -514,93 +497,3 @@ def enable_distributed_dion(
         log_error=log_error,
     )
     return dist_metas_sharded
-
-
-def route_step_params(
-    *,
-    param_groups,
-    dist_metas,
-    get_step_param_grad: Callable,
-    ensure_optimizer_state: Callable,
-    require_param_config: Callable,
-    should_use_distributed_dion_update: Callable,
-    expand_split_dion_params: Callable,
-    refresh_dion_step_metadata: Callable | None = None,
-    sync_q_replicas: Callable,
-    build_dion_batches: Callable,
-):
-    """Route one optimizer step into Dion batches and elementwise updates."""
-    elementwise_params: list[ElementwiseStepParam] = []
-    dion_params: list[DionStepParam] = []
-
-    for optim_group in param_groups:
-        for param in optim_group["params"]:
-            grad = get_step_param_grad(param)
-            if grad is None:
-                continue
-
-            optimizer_state = ensure_optimizer_state(param, optim_group)
-            dist_meta = dist_metas.get(param, None)
-            if refresh_dion_step_metadata is not None:
-                refresh_dion_step_metadata(
-                    param=param,
-                    optimizer_state=optimizer_state,
-                    optim_group=optim_group,
-                    dist_meta=dist_meta,
-                )
-            config = require_param_config(param, dist_meta)
-
-            split_child_params = expand_split_dion_params(
-                param=param,
-                grad=grad,
-                optimizer_state=optimizer_state,
-                optim_group=optim_group,
-                config=config,
-                dist_meta=dist_meta,
-            )
-            if split_child_params is not None:
-                dion_params.extend(split_child_params)
-                continue
-
-            if should_use_distributed_dion_update(param, optimizer_state, optim_group, dist_meta):
-                dion_params.append(
-                    DionStepParam(
-                        param=param,
-                        grad=grad,
-                        optimizer_state=optimizer_state,
-                        optim_group=optim_group,
-                        config=config,
-                        dist_meta=dist_meta,
-                    )
-                )
-                continue
-
-            elementwise_params.append(
-                ElementwiseStepParam(
-                    param=param,
-                    grad=grad,
-                    optimizer_state=optimizer_state,
-                    optim_group=optim_group,
-                )
-            )
-
-    dion_batches = []
-    if dion_params:
-        ordered_dion_params = []
-        for step_param in dion_params:
-            param = step_param.param
-            dist_meta = step_param.dist_meta
-            param_uid = getattr(dist_meta, "param_uid", None) if dist_meta is not None else None
-            if param_uid is None:
-                raise RuntimeError(
-                    "[DION_MISSING_PARAM_UID] distributed Dion param is missing param_uid: "
-                    f"name={getattr(dist_meta, 'param_name', '') if dist_meta is not None else ''} "
-                    f"shape={tuple(param.shape)}"
-                )
-            ordered_dion_params.append((param_uid, step_param))
-        ordered_dion_params.sort(key=lambda entry: entry[0])
-        dion_params = [step_param for _, step_param in ordered_dion_params]
-        sync_q_replicas(dion_params)
-        dion_batches = build_dion_batches(dion_params)
-
-    return dion_batches, elementwise_params

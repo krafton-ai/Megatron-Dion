@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.optimizer import dion_distrib_optimizer as dion_do
+from megatron.core.optimizer.dion.distributed import optimizer as dion_do
 from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
 from megatron.core.optimizer.dion import algorithm as dion_algorithm
 from megatron.core.optimizer.dion import kernels as dion_kernels
@@ -14,12 +14,12 @@ from megatron.core.optimizer.dion.types import (
     DionBatchGroup,
     DionMixedPrecisionConfig,
     DionParamConfig,
-    ElementwiseStepParam,
 )
-from megatron.core.optimizer.distrib_dion import checkpoint_io
-from megatron.core.optimizer.distrib_dion import grad_norm as dion_grad_norm
-from megatron.core.optimizer.distrib_dion import gradients as dion_gradients
-from megatron.core.optimizer.distrib_dion.integration import get_dion_param_override
+from megatron.core.optimizer.matrix.types import ScalarStepParam
+from megatron.core.optimizer.dion.distributed import checkpoint_io
+from megatron.core.optimizer.dion.distributed import grad_norm as dion_grad_norm
+from megatron.core.optimizer.dion.distributed import gradients as dion_gradients
+from megatron.core.optimizer.dion.distributed.integration import get_dion_param_override
 from megatron.core.optimizer.optimizer_config import DionOptimizerConfig
 from megatron.core.distributed.param_and_grad_buffer import (
     _ParamAndGradBucketGroup,
@@ -51,7 +51,7 @@ class _ParamSyncChunk:
 
 
 def _make_dion_distributed_optimizer_stub(*, overlap_param_gather, use_megatron_fsdp):
-    optimizer = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    optimizer = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     optimizer.is_stub_optimizer = True
     optimizer.config = SimpleNamespace(
         timers=None,
@@ -104,7 +104,7 @@ def test_step_with_ready_grads_starts_sync_for_megatron_fsdp():
 def test_bucket_group_info_accepts_mcore_group_tuple():
     group = object()
 
-    resolved_group, group_size, group_rank = dion_do.DionDistributedOptimizer._normalize_group_info(
+    resolved_group, group_size, group_rank = dion_do.DistributedDionOptimizer._normalize_group_info(
         (group, 8, 3),
         bucket_id=7,
         label="bucket shard",
@@ -117,10 +117,10 @@ def test_bucket_group_info_accepts_mcore_group_tuple():
 
 def test_bucket_group_info_fills_missing_tuple_size_rank(monkeypatch):
     group = object()
-    monkeypatch.setattr(dion_do.DionDistributedOptimizer, "_group_size", lambda *_args: 4)
-    monkeypatch.setattr(dion_do.DionDistributedOptimizer, "_group_rank", lambda *_args: 2)
+    monkeypatch.setattr(dion_do.DistributedDionOptimizer, "_group_size", lambda *_args: 4)
+    monkeypatch.setattr(dion_do.DistributedDionOptimizer, "_group_rank", lambda *_args: 2)
 
-    resolved_group, group_size, group_rank = dion_do.DionDistributedOptimizer._normalize_group_info(
+    resolved_group, group_size, group_rank = dion_do.DistributedDionOptimizer._normalize_group_info(
         (group, None, None),
         bucket_id=7,
         label="bucket shard",
@@ -173,7 +173,7 @@ def test_bucket_shard_group_prefers_bucket_group_metadata(monkeypatch):
         lambda **_kwargs: fallback_group,
     )
 
-    group, size, rank = dion_do.DionDistributedOptimizer._bucket_shard_get_group_size_rank(
+    group, size, rank = dion_do.DistributedDionOptimizer._bucket_shard_get_group_size_rank(
         buffer,
         bucket,
     )
@@ -200,7 +200,7 @@ def test_state_replica_group_is_independent_from_dion_rp_override(monkeypatch):
         lambda check_initialized=False: None,
     )
 
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     wrapper._global_rank = 0
     wrapper._pure_data_parallel_group = pure_dp_group
     wrapper.data_parallel_group = standard_dp_group
@@ -233,7 +233,7 @@ def test_init_groups_does_not_infer_dion_topology_from_standard_dp(monkeypatch):
         lambda check_initialized=False: None,
     )
 
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     wrapper._global_rank = 0
     wrapper._pure_data_parallel_group = pure_dp_group
     wrapper.data_parallel_group = standard_dp_group
@@ -273,7 +273,7 @@ def test_enable_dion_runtime_validates_expert_tp_group(monkeypatch):
         lambda check_initialized=False: expert_tp_group,
     )
 
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     wrapper.optimizer = dion_algorithm.MegatronDion([torch.nn.Parameter(torch.ones(1))])
     wrapper._is_expert_dion = True
     wrapper._global_rank = 0
@@ -300,7 +300,7 @@ def test_expert_checkpoint_topology_uses_expert_tp_group(monkeypatch):
         lambda check_initialized=False: None,
     )
 
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     wrapper._is_expert_dion = True
     wrapper._dion_tp_group = expert_tp_group
     wrapper.tp_group = dense_tp_group
@@ -477,7 +477,7 @@ def test_replicate_reduce_op_matches_mcore_ddp_scaling_mode():
 
 
 def test_distributed_optimizer_configures_dion_rp_reduce_policy():
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     wrapper.optimizer = dion_algorithm.MegatronDion(
         [torch.nn.Parameter(torch.ones(1))],
     )
@@ -528,7 +528,7 @@ def test_step_clears_runtime_buffer_cache(monkeypatch):
 
 
 def test_dion_grad_norm_uses_runtime_rp_reduce_policy(monkeypatch):
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     wrapper.optimizer = SimpleNamespace(defaults={"rp_average_in_collective": False})
     replica_group = object()
     model_param_a = torch.nn.Parameter(torch.ones(1))
@@ -574,7 +574,7 @@ def test_dion_grad_norm_uses_runtime_rp_reduce_policy(monkeypatch):
 
 
 def test_dion_grad_norm_sq_does_not_materialize_reduced_views(monkeypatch):
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     wrapper.optimizer = SimpleNamespace(defaults={"rp_average_in_collective": False})
     replica_group = object()
     model_param_a = torch.nn.Parameter(torch.ones(1))
@@ -623,7 +623,7 @@ def test_dion_grad_norm_sq_does_not_materialize_reduced_views(monkeypatch):
 
 
 def test_dion_grad_norm_reuses_only_dense_reduced_rp_surface(monkeypatch):
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     base_optimizer = SimpleNamespace(defaults={"rp_average_in_collective": False}, _step_count=3)
     wrapper.optimizer = base_optimizer
     replica_group = object()
@@ -693,7 +693,7 @@ def test_dion_grad_norm_reuses_only_dense_reduced_rp_surface(monkeypatch):
 
 
 def test_dense_rp_step_consumes_grad_norm_reduced_surface_after_clipping(monkeypatch):
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     base_optimizer = SimpleNamespace(
         defaults={"rp_average_in_collective": False},
         _step_count=0,
@@ -744,7 +744,7 @@ def test_dense_rp_step_consumes_grad_norm_reduced_surface_after_clipping(monkeyp
 
 
 def test_dense_rp_step_rejects_partial_grad_norm_reuse(monkeypatch):
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     base_optimizer = SimpleNamespace(
         defaults={"rp_average_in_collective": False},
         _step_count=0,
@@ -916,7 +916,7 @@ def test_low_rank_replicated_ortho_uses_reference_avg_reduce(monkeypatch):
 
 
 def test_dion_rejects_disabled_fs_collectives_when_fs_sharded():
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     wrapper.optimizer = dion_algorithm.MegatronDion(
         [torch.nn.Parameter(torch.ones(1))],
         use_fs_collectives=False,
@@ -929,7 +929,7 @@ def test_dion_rejects_disabled_fs_collectives_when_fs_sharded():
 
 
 def test_copy_main_params_quantizes_fp8_before_model_writeback(monkeypatch):
-    optimizer = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    optimizer = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     optimizer.is_stub_optimizer = False
     optimizer.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
     optimizer.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False)
@@ -988,7 +988,7 @@ def test_standard_writeback_skips_fp8_after_quantize(monkeypatch):
 
 
 def test_precision_aware_dion_float16_uses_fp32_optimizer_shard():
-    optimizer = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    optimizer = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
     optimizer._param_name = lambda param: "param"
     optimizer._create_fs_shard = lambda model_param, shard_layout: model_param.detach()
     optimizer._attach_fs_shard_ = lambda model_param, shard: None
@@ -1019,7 +1019,7 @@ def test_precision_aware_dion_float16_uses_fp32_optimizer_shard():
     assert registered["opt_shard"] is main_shard_params[0]
 
 
-def test_elementwise_state_defaults_follow_param_dtype(monkeypatch):
+def test_scalar_state_defaults_follow_param_dtype(monkeypatch):
     monkeypatch.setattr(dion_algorithm, "adamw_update_foreach", lambda *args, **kwargs: None)
     param = torch.nn.Parameter(torch.ones(2, dtype=torch.float16))
     grad = torch.ones_like(param)
@@ -1027,15 +1027,15 @@ def test_elementwise_state_defaults_follow_param_dtype(monkeypatch):
     optimizer = dion_algorithm.MegatronDion(
         [param],
         mixed_precision_config=DionMixedPrecisionConfig(),
-        elementwise_optimizer="adam",
+        scalar_optimizer="adam",
     )
     optimizer.param_groups[0]["step"] = 1
 
     with torch.no_grad():
         list(
-            optimizer._apply_elementwise_batches(
+            optimizer._apply_scalar_batches(
                 [
-                    ElementwiseStepParam(
+                    ScalarStepParam(
                         param=param,
                         grad=grad,
                         optimizer_state=state,
@@ -1049,7 +1049,7 @@ def test_elementwise_state_defaults_follow_param_dtype(monkeypatch):
     assert state["second_moment"].dtype == torch.float16
 
 
-def test_elementwise_lr_scale_scales_scalar_update_lr(monkeypatch):
+def test_scalar_lr_scale_scales_scalar_update_lr(monkeypatch):
     captured_lrs = []
 
     def capture_adamw_update(*args, **kwargs):
@@ -1062,16 +1062,16 @@ def test_elementwise_lr_scale_scales_scalar_update_lr(monkeypatch):
     optimizer = dion_algorithm.MegatronDion(
         [param],
         lr=2.0,
-        elementwise_lr_scale=0.2,
-        elementwise_optimizer="adam",
+        scalar_lr_scale=0.2,
+        scalar_optimizer="adam",
     )
     optimizer.param_groups[0]["step"] = 1
 
     with torch.no_grad():
         list(
-            optimizer._apply_elementwise_batches(
+            optimizer._apply_scalar_batches(
                 [
-                    ElementwiseStepParam(
+                    ScalarStepParam(
                         param=param,
                         grad=grad,
                         optimizer_state=state,
@@ -1084,7 +1084,7 @@ def test_elementwise_lr_scale_scales_scalar_update_lr(monkeypatch):
     assert captured_lrs == [pytest.approx(0.4)]
 
 
-def test_elementwise_weight_decay_respects_wd_mult_without_scheduler():
+def test_scalar_weight_decay_respects_wd_mult_without_scheduler():
     param = torch.nn.Parameter(torch.ones(1, dtype=torch.float32))
     grad = torch.zeros_like(param)
     state = {}
@@ -1092,15 +1092,15 @@ def test_elementwise_weight_decay_respects_wd_mult_without_scheduler():
         [{"params": [param], "wd_mult": 0.0}],
         lr=1.0,
         weight_decay=0.1,
-        elementwise_optimizer="adamw",
+        scalar_optimizer="adamw",
     )
     optimizer.param_groups[0]["step"] = 1
 
     with torch.no_grad():
         list(
-            optimizer._apply_elementwise_batches(
+            optimizer._apply_scalar_batches(
                 [
-                    ElementwiseStepParam(
+                    ScalarStepParam(
                         param=param,
                         grad=grad,
                         optimizer_state=state,
@@ -1114,7 +1114,7 @@ def test_elementwise_weight_decay_respects_wd_mult_without_scheduler():
     assert optimizer.param_groups[0]["weight_decay"] == 0.0
 
 
-def test_elementwise_weight_decay_respects_wd_mult_with_explicit_group_weight_decay():
+def test_scalar_weight_decay_respects_wd_mult_with_explicit_group_weight_decay():
     param = torch.nn.Parameter(torch.ones(1, dtype=torch.float32))
     grad = torch.zeros_like(param)
     state = {}
@@ -1122,15 +1122,15 @@ def test_elementwise_weight_decay_respects_wd_mult_with_explicit_group_weight_de
         [{"params": [param], "weight_decay": 0.1, "wd_mult": 0.0}],
         lr=1.0,
         weight_decay=0.1,
-        elementwise_optimizer="adamw",
+        scalar_optimizer="adamw",
     )
     optimizer.param_groups[0]["step"] = 1
 
     with torch.no_grad():
         list(
-            optimizer._apply_elementwise_batches(
+            optimizer._apply_scalar_batches(
                 [
-                    ElementwiseStepParam(
+                    ScalarStepParam(
                         param=param,
                         grad=grad,
                         optimizer_state=state,
@@ -1391,9 +1391,9 @@ def test_zero_numel_dion_shard_is_rejected_in_local_optimizer_maps():
     param_groups = [{"params": [param]}]
 
     with pytest.raises(RuntimeError, match="invalid empty Dion local shard"):
-        dion_do.DionDistributedOptimizer._build_model_param_gbuf_map(gbuf_ranges)
+        dion_do.DistributedDionOptimizer._build_model_param_gbuf_map(gbuf_ranges)
     with pytest.raises(RuntimeError, match="invalid empty Dion local shard"):
-        dion_do.DionDistributedOptimizer._build_optimizer_group_ranges(
+        dion_do.DistributedDionOptimizer._build_optimizer_group_ranges(
             param_groups,
             gbuf_ranges,
         )

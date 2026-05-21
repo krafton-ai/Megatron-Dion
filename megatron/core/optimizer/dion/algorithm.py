@@ -14,12 +14,12 @@ from .runtime import (
     resolve_async_task_limit,
     AsyncRuntime,
 )
-from .elementwise_opts import adamw_update_foreach, lion_update_foreach
+from .scalar_opts import adamw_update_foreach, lion_update_foreach
 from .types import (
     DionMixedPrecisionConfig,
     DionParamConfig,
-    ElementwiseStepParam,
 )
+from ..matrix.types import ScalarStepParam
 
 DEFAULT_LR = 0.01
 DEFAULT_MU = 0.95
@@ -56,15 +56,15 @@ class MegatronDion(Optimizer):
         epsilon: float = 1e-8,
         rcqr_oversample: float = 1.25,
         betas: tuple = (0.9, 0.95),
-        elementwise_eps: float = 1e-8,
+        scalar_eps: float = 1e-8,
         # Configuration flags
         rp_average_in_collective: bool = True,
         use_fs_collectives: bool = True,  # Enable FS collectives in Distributed mode
         mixed_precision_config: Optional[DionMixedPrecisionConfig] = None,
         enable_async: bool = True,  # Enable async execution where possible
         use_low_rank_sync: bool = True,  # Enable low-rank P/R replica sync
-        elementwise_optimizer: str = "adam",  # Scalar optimizer for standard params ("adam" or "lion")
-        elementwise_lr_scale: float = 1.0,  # Extra lr multiplier for standard params
+        scalar_optimizer: str = "adam",
+        scalar_lr_scale: float = 1.0,
         scale_mode: str = "spectral",  # 2D Dion scale mode
         extra_scale_factor: float = 0.2,
         split_qkv: bool = False,
@@ -88,13 +88,13 @@ class MegatronDion(Optimizer):
             epsilon=epsilon,
             rcqr_oversample=rcqr_oversample,
             betas=betas,
-            elementwise_eps=elementwise_eps,
+            scalar_eps=scalar_eps,
             rp_average_in_collective=rp_average_in_collective,
             use_fs_collectives=use_fs_collectives,
             enable_async=enable_async,
             use_low_rank_sync=use_low_rank_sync,
-            elementwise_optimizer=elementwise_optimizer,  # "adam" or "lion"
-            elementwise_lr_scale=elementwise_lr_scale,
+            scalar_optimizer=scalar_optimizer,
+            scalar_lr_scale=scalar_lr_scale,
             scale_mode=scale_mode,
             extra_scale_factor=extra_scale_factor,
             split_qkv=bool(split_qkv),
@@ -109,10 +109,10 @@ class MegatronDion(Optimizer):
                 f"expected one of ('spectral', 'unit_rms_norm', 'shape_scaling'), "
                 f"got {scale_mode!r}"
             )
-        if float(elementwise_lr_scale) < 0.0:
+        if float(scalar_lr_scale) < 0.0:
             raise RuntimeError(
-                "[DION_INVALID_ELEMENTWISE_LR_SCALE] "
-                f"elementwise_lr_scale={elementwise_lr_scale}"
+                "[DION_INVALID_SCALAR_LR_SCALE] "
+                f"scalar_lr_scale={scalar_lr_scale}"
             )
         super().__init__(params, defaults)
 
@@ -140,7 +140,7 @@ class MegatronDion(Optimizer):
 
         # Update counters
         self._dion_update_count = 0
-        self._elementwise_update_count = 0
+        self._scalar_update_count = 0
         self._step_count = 0
 
         self._buffer_cache: Dict[str, torch.Tensor] = {}
@@ -155,7 +155,7 @@ class MegatronDion(Optimizer):
 
         # Reset counters at the beginning of each step
         self._dion_update_count = 0
-        self._elementwise_update_count = 0
+        self._scalar_update_count = 0
 
         # Increment per-group step counters
         for optim_group in self.param_groups:
@@ -244,17 +244,17 @@ class MegatronDion(Optimizer):
             buffer.zero_()
         return buffer
 
-    def _apply_elementwise_batches(
+    def _apply_scalar_batches(
         self,
-        elementwise_params: List[ElementwiseStepParam],
+        scalar_params: List[ScalarStepParam],
     ) -> Generator[None, None, None]:
-        """Process standard params with grouped foreach-style elementwise updates."""
-        default_elementwise_opt = self.defaults.get('elementwise_optimizer', 'adam')
-        default_elementwise_lr_scale = float(self.defaults.get('elementwise_lr_scale', 1.0))
+        """Process standard params with grouped foreach-style scalar updates."""
+        default_scalar_opt = self.defaults.get('scalar_optimizer', 'adam')
+        default_scalar_lr_scale = float(self.defaults.get('scalar_lr_scale', 1.0))
         default_betas = self.defaults.get('betas', (0.9, 0.95))
-        default_eps = self.defaults.get('elementwise_eps', 1e-8)
-        elementwise_contract_order: list[tuple] = []
-        elementwise_batches = OrderedDict()
+        default_eps = self.defaults.get('scalar_eps', 1e-8)
+        scalar_contract_order: list[tuple] = []
+        scalar_batches = OrderedDict()
 
         def _effective_weight_decay(param, optim_group) -> float:
             wd_mult = optim_group.get('wd_mult', 1.0)
@@ -265,20 +265,20 @@ class MegatronDion(Optimizer):
                 )
             )
 
-        def _resolve_elementwise_algorithm(optim_group) -> str:
+        def _resolve_scalar_algorithm(optim_group) -> str:
             group_algorithm = optim_group.get('algorithm', None)
             if group_algorithm is None or group_algorithm == "dion":
-                elementwise_opt = optim_group.get('elementwise_optimizer', default_elementwise_opt)
+                scalar_opt = optim_group.get('scalar_optimizer', default_scalar_opt)
             else:
-                elementwise_opt = group_algorithm
-            if elementwise_opt == "adam":
+                scalar_opt = group_algorithm
+            if scalar_opt == "adam":
                 return "adamw"
-            if elementwise_opt not in {"adamw", "lion"}:
+            if scalar_opt not in {"adamw", "lion"}:
                 raise RuntimeError(
-                    "[DION_INVALID_ELEMENTWISE_OPT] "
-                    f"elementwise_optimizer={elementwise_opt}"
+                    "[DION_INVALID_SCALAR_OPT] "
+                    f"scalar_optimizer={scalar_opt}"
                 )
-            return str(elementwise_opt)
+            return str(scalar_opt)
 
         def _effective_betas(optim_group) -> tuple[float, float]:
             if 'betas' in optim_group:
@@ -294,7 +294,7 @@ class MegatronDion(Optimizer):
         def _state_tensor_dtype(state_tensor, default_dtype: torch.dtype) -> torch.dtype:
             return state_tensor.dtype if state_tensor is not None else default_dtype
 
-        def _ensure_elementwise_first_moment(param, state) -> torch.Tensor:
+        def _ensure_scalar_first_moment(param, state) -> torch.Tensor:
             if 'first_moment' in state and 'exp_avg' in state:
                 raise RuntimeError(
                     "[DION_SCALAR_STATE_LAYOUT_CONFLICT] found both first_moment and exp_avg"
@@ -313,7 +313,7 @@ class MegatronDion(Optimizer):
                     state['first_moment'] = torch.zeros_like(param, dtype=momentum_dtype)
             return state['first_moment']
 
-        def _ensure_elementwise_second_moment(param, state) -> torch.Tensor:
+        def _ensure_scalar_second_moment(param, state) -> torch.Tensor:
             if 'second_moment' in state and 'exp_avg_sq' in state:
                 raise RuntimeError(
                     "[DION_SCALAR_STATE_LAYOUT_CONFLICT] found both second_moment and exp_avg_sq"
@@ -332,39 +332,39 @@ class MegatronDion(Optimizer):
                     state['second_moment'] = torch.zeros_like(param, dtype=variance_dtype)
             return state['second_moment']
 
-        for elementwise_param in elementwise_params:
-            p = elementwise_param.param
-            grad = elementwise_param.grad
-            state = elementwise_param.optimizer_state
-            optim_group = elementwise_param.optim_group
-            elementwise_opt = _resolve_elementwise_algorithm(optim_group)
-            lr_scale = float(optim_group.get('elementwise_lr_scale', default_elementwise_lr_scale))
+        for scalar_param in scalar_params:
+            p = scalar_param.param
+            grad = scalar_param.grad
+            state = scalar_param.optimizer_state
+            optim_group = scalar_param.optim_group
+            scalar_opt = _resolve_scalar_algorithm(optim_group)
+            lr_scale = float(optim_group.get('scalar_lr_scale', default_scalar_lr_scale))
             if lr_scale < 0.0:
                 raise RuntimeError(
-                    "[DION_INVALID_ELEMENTWISE_LR_SCALE] "
-                    f"elementwise_lr_scale={lr_scale}"
+                    "[DION_INVALID_SCALAR_LR_SCALE] "
+                    f"scalar_lr_scale={lr_scale}"
                 )
             lr = float(optim_group.get('lr', self.defaults['lr'])) * lr_scale
             weight_decay = _effective_weight_decay(p, optim_group)
             step = int(optim_group.get('step', 0))
             eps = float(
                 optim_group.get(
-                    'elementwise_eps',
+                    'scalar_eps',
                     optim_group.get('eps', optim_group.get('epsilon', default_eps)),
                 )
             )
             beta1, beta2 = _effective_betas(optim_group)
             if step <= 0:
-                raise RuntimeError(f"[DION_INVALID_ELEMENTWISE_STEP] step={step}")
+                raise RuntimeError(f"[DION_INVALID_SCALAR_STEP] step={step}")
 
-            first_moment = _ensure_elementwise_first_moment(p, state)
+            first_moment = _ensure_scalar_first_moment(p, state)
             state['step'] = step
             second_moment = None
-            if elementwise_opt == "adamw":
-                second_moment = _ensure_elementwise_second_moment(p, state)
+            if scalar_opt == "adamw":
+                second_moment = _ensure_scalar_second_moment(p, state)
 
-            elementwise_contract_key = (
-                elementwise_opt,
+            scalar_contract_key = (
+                scalar_opt,
                 id(optim_group),
                 str(p.device),
                 str(p.dtype),
@@ -377,9 +377,9 @@ class MegatronDion(Optimizer):
                 float(beta2),
                 int(step),
             )
-            if elementwise_contract_key not in elementwise_batches:
-                elementwise_batches[elementwise_contract_key] = {
-                    "elementwise_optimizer": elementwise_opt,
+            if scalar_contract_key not in scalar_batches:
+                scalar_batches[scalar_contract_key] = {
+                    "scalar_optimizer": scalar_opt,
                     "params": [],
                     "grads": [],
                     "first_moments": [],
@@ -391,39 +391,39 @@ class MegatronDion(Optimizer):
                     "beta1": beta1,
                     "beta2": beta2,
                 }
-                elementwise_contract_order.append(elementwise_contract_key)
-            elementwise_batch = elementwise_batches[elementwise_contract_key]
-            elementwise_batch["params"].append(p)
-            elementwise_batch["grads"].append(grad)
-            elementwise_batch["first_moments"].append(first_moment)
+                scalar_contract_order.append(scalar_contract_key)
+            scalar_batch = scalar_batches[scalar_contract_key]
+            scalar_batch["params"].append(p)
+            scalar_batch["grads"].append(grad)
+            scalar_batch["first_moments"].append(first_moment)
             if second_moment is not None:
-                elementwise_batch["second_moments"].append(second_moment)
+                scalar_batch["second_moments"].append(second_moment)
 
-        for elementwise_contract_key in elementwise_contract_order:
-            elementwise_batch = elementwise_batches[elementwise_contract_key]
-            if elementwise_batch["elementwise_optimizer"] == "lion":
+        for scalar_contract_key in scalar_contract_order:
+            scalar_batch = scalar_batches[scalar_contract_key]
+            if scalar_batch["scalar_optimizer"] == "lion":
                 lion_update_foreach(
-                    elementwise_batch["params"],
-                    elementwise_batch["grads"],
-                    elementwise_batch["first_moments"],
-                    lr=elementwise_batch["lr"],
-                    beta1=elementwise_batch["beta1"],
-                    beta2=elementwise_batch["beta2"],
-                    weight_decay=elementwise_batch["weight_decay"],
+                    scalar_batch["params"],
+                    scalar_batch["grads"],
+                    scalar_batch["first_moments"],
+                    lr=scalar_batch["lr"],
+                    beta1=scalar_batch["beta1"],
+                    beta2=scalar_batch["beta2"],
+                    weight_decay=scalar_batch["weight_decay"],
                 )
                 continue
 
             adamw_update_foreach(
-                elementwise_batch["params"],
-                elementwise_batch["grads"],
-                elementwise_batch["first_moments"],
-                elementwise_batch["second_moments"],
-                lr=elementwise_batch["lr"],
-                beta1=elementwise_batch["beta1"],
-                beta2=elementwise_batch["beta2"],
-                weight_decay=elementwise_batch["weight_decay"],
-                step=elementwise_batch["step"],
-                epsilon=elementwise_batch["eps"],
+                scalar_batch["params"],
+                scalar_batch["grads"],
+                scalar_batch["first_moments"],
+                scalar_batch["second_moments"],
+                lr=scalar_batch["lr"],
+                beta1=scalar_batch["beta1"],
+                beta2=scalar_batch["beta2"],
+                weight_decay=scalar_batch["weight_decay"],
+                step=scalar_batch["step"],
+                epsilon=scalar_batch["eps"],
             )
         if False:
             yield

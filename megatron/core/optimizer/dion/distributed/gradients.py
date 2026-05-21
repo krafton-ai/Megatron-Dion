@@ -8,7 +8,7 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 
-from .sharding import compute_fs_shard_range, fs_shard_view_2d
+from ...matrix.sharding import compute_fs_shard_range, fs_shard_view_2d
 
 
 @dataclass
@@ -556,6 +556,7 @@ def install_dion_shard_grad_(
     )
 
     shard_param.is_dion_param = True
+    shard_param.is_matrix_param = True
     shard_param.main_grad = None
     if use_precision_aware_optimizer:
         shard_param.decoupled_grad = optimizer_shard_grad
@@ -596,12 +597,14 @@ def install_standard_shard_grad_(
         shard_param.decoupled_grad = shard_grad
         shard_param.grad = None
         shard_param.is_dion_param = False
+        shard_param.is_matrix_param = False
         return
 
     shard_param.main_grad = None
     shard_param.decoupled_grad = None
     shard_param.grad = shard_grad.float()
     shard_param.is_dion_param = False
+    shard_param.is_matrix_param = False
 
 
 def install_standard_optimizer_grads_(

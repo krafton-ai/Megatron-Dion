@@ -12,23 +12,30 @@ import torch
 import torch.distributed as dist
 from typing import Dict, List, Tuple, Optional
 
-from .distrib_optimizer import (
-    DistributedOptimizer,
-)
-from .megatron_dion import MegatronDion
-from .dion.types import (
+from ...matrix.distrib_optimizer import DistributedMatrixOptimizer
+from ..algorithm import MegatronDion
+from ..backend import DionBackend
+from ..types import (
     DionBatch,
     DionDistMeta,
     DionParamConfig,
     DionStepParam,
 )
-from .dion.state import (
+from ...matrix.types import (
+    MatrixBucketLayout,
+    MatrixShardEntry,
+    MatrixShardLayout,
+)
+from ..state import (
     build_param_config,
     init_q_state,
     init_param_state,
+    is_p_fs_sharded,
+    is_p_tp_sharded,
     require_2d_local_shape,
 )
-from .dion.linear import (
+from ...clip_grads import clip_grad_by_total_norm_fp32
+from ...matrix.splits.linear import (
     iter_linear_child_kinds,
     linear_child_global_shape,
     linear_child_has_local_overlap,
@@ -40,7 +47,7 @@ from .dion.linear import (
     resolve_linear_split_rows,
     write_linear_child_,
 )
-from .dion.qkv import (
+from ...matrix.splits.qkv import (
     copy_qkv_split_metadata,
     extract_qkv_child,
     iter_qkv_child_kinds,
@@ -54,7 +61,7 @@ from .dion.qkv import (
     resolve_qkv_split_shapes,
     scatter_qkv_child_,
 )
-from .dion.qkvg import (
+from ...matrix.splits.qkvg import (
     copy_qkvg_split_metadata,
     extract_qkvg_child,
     iter_qkvg_child_kinds,
@@ -68,15 +75,14 @@ from .dion.qkvg import (
     resolve_qkvg_split_shapes,
     scatter_qkvg_child_,
 )
-from .dion.utils import get_global_shape, get_local_shape
-from .distrib_dion.parameter import (
+from ..utils import get_global_shape, get_local_shape, local_expert_tensor_view
+from ...optimizer import param_group_identifier_keys
+from .parameter import (
     all_gather_bucket_params_,
     bucket_dion_param_view,
     get_bucket_shard_group,
     build_bucket_param_map,
     check_bucket_param_views,
-    DionShardEntry,
-    DionBucketLayout,
     init_dion_bucket,
     init_standard_bucket,
     build_dion_shard_entries,
@@ -87,19 +93,18 @@ from .distrib_dion.parameter import (
     resolve_grad_rank_to_fs_rank,
     set_bucket_param_views,
 )
-from .distrib_dion.batches import build_dion_batches
-from .distrib_dion.checkpoint_io import (
+from .batches import build_dion_batches
+from .checkpoint_io import (
     copy_main_params_to_model_shards,
     build_dion_checkpoint_metadata,
     build_distributed_checkpoint_state,
     copy_model_params_to_main_shards,
-    ensure_state_initialized_for_load,
     resolve_dion_checkpoint_sharding_type,
     restore_distributed_checkpoint_state,
     split_distributed_checkpoint_state,
     validate_dion_checkpoint_metadata,
 )
-from .distrib_dion.gradients import (
+from .gradients import (
     apply_bucket_grads,
     clear_grad_transport,
     clear_dion_local_grads,
@@ -113,25 +118,24 @@ from .distrib_dion.gradients import (
     set_local_grad,
     start_dion_grad_sync,
 )
-from .distrib_dion.grad_norm import (
+from .grad_norm import (
     compute_grad_norm,
     dion_replica_grads,
     grad_norm_inputs,
 )
-from .distrib_dion.row_child import resolve_row_child_layout
-from .distrib_dion.split_child import build_split_child_dist_meta
-from .distrib_dion.bootstrap import (
+from .row_child import resolve_row_child_layout
+from .split_child import build_split_child_dist_meta
+from .bootstrap import (
     build_q_init,
     enable_distributed_dion,
     ensure_optimizer_state,
     make_group_broadcast,
     resolve_base_training_seed,
-    route_step_params,
     sync_q_replicas,
     should_use_distributed_dion_update,
     validate_enabled_rp_topology,
 )
-from .distrib_dion.dist_meta import (
+from .dist_meta import (
     add_standard_metas,
     assert_same_group_ranks,
     build_param_dist_meta,
@@ -139,27 +143,23 @@ from .distrib_dion.dist_meta import (
     get_expected_expert_fs_group,
     validate_dist_meta_uids,
 )
-from .distrib_dion.sharding import (
-    DionShardLayout,
+from ...matrix.sharding import (
     compute_fs_shard_range,
     create_fs_shard,
     get_data_shard,
     get_opt_shard,
     param_shard_layout,
     attach_fs_shard_,
-    register_dion_shard,
+    register_matrix_shard,
     resolve_fs_group_from_meta,
     resolve_ortho_group,
     resolve_tp_group,
     update_data_shard,
     update_opt_shard,
 )
-from .. import parallel_state, tensor_parallel
-from ..fp8_utils import is_float8tensor, quantize_param_shard
-from ..transformer.fsdp_dtensor_checkpoint import (
-    get_expert_index_from_key,
-    get_global_unique_param_name,
-)
+from .... import parallel_state, tensor_parallel
+from ....fp8_utils import is_float8tensor, quantize_param_shard
+from ....transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
 
 logger = logging.getLogger(__name__)
 
@@ -173,50 +173,6 @@ def _make_split_child_q_sync_hook(parent_state, sync_key: str):
         _clear_split_child_q_sync(parent_state, sync_key)
 
     return hook
-
-
-def _local_expert_tensor_view(
-    tensor: torch.Tensor,
-    *,
-    axis: int,
-    num_local_experts: int,
-    local_expert_index: int,
-    local_shape: tuple[int, int],
-    context: str,
-) -> torch.Tensor:
-    if axis not in (0, 1):
-        raise RuntimeError(f"[DION_INVALID_EXPERT_AXIS] context={context} axis={axis}")
-    if int(num_local_experts) <= 1:
-        return tensor
-    if int(local_expert_index) < 0 or int(local_expert_index) >= int(num_local_experts):
-        raise RuntimeError(
-            "[DION_INVALID_EXPERT_LOCAL_INDEX] "
-            f"context={context} axis={axis} num_local_experts={num_local_experts} "
-            f"local_expert_index={local_expert_index}"
-        )
-
-    local_extent = int(local_shape[axis])
-    expected_axis_size = local_extent * int(num_local_experts)
-    current_axis_size = int(tensor.size(axis))
-    other_axis = 1 - axis
-    if int(tensor.size(other_axis)) != int(local_shape[other_axis]):
-        raise RuntimeError(
-            "[DION_EXPERT_SPLIT_TENSOR_SHAPE_MISMATCH] "
-            f"context={context} axis={axis} tensor_shape={tuple(int(dim) for dim in tensor.shape)} "
-            f"local_shape={local_shape} num_local_experts={num_local_experts}"
-        )
-    if current_axis_size == local_extent:
-        return tensor
-    if current_axis_size != expected_axis_size:
-        raise RuntimeError(
-            "[DION_EXPERT_SPLIT_TENSOR_SHAPE_MISMATCH] "
-            f"context={context} axis={axis} tensor_shape={tuple(int(dim) for dim in tensor.shape)} "
-            f"local_shape={local_shape} num_local_experts={num_local_experts}"
-        )
-    start = int(local_expert_index) * local_extent
-    if axis == 0:
-        return tensor.narrow(0, start, local_extent)
-    return tensor.narrow(1, start, local_extent)
 
 
 def _expert_split_token(dist_meta: DionDistMeta) -> tuple[str, int]:
@@ -284,9 +240,9 @@ def _ensure_child_group(
     return group
 
 
-class DionDistributedOptimizer(DistributedOptimizer):
+class DistributedDionOptimizer(DistributedMatrixOptimizer):
     """
-    Distributed optimizer for MegatronDion with true parameter sharding.
+    Dion-specific adapter on top of the generic distributed matrix optimizer.
 
     Architecture:
     - True parameter sharding: Only local shards stored on GPU
@@ -294,58 +250,13 @@ class DionDistributedOptimizer(DistributedOptimizer):
     - Bucket-wise all-gather/reduce-scatter via standard Megatron-Core DO
     - FSDP-style memory efficiency: Full params only during forward/backward
 
-    Extends DistributedOptimizer to support Dion's 2D parallelism model:
+    Extends DistributedMatrixOptimizer to support Dion's 2D parallelism model:
     - RP (Replicate Process): Gradient averaging across replicas with same FS shard
     - FS (Fully Shard): True row-wise sharding for 2D params (GPU memory saved)
     - TP (Tensor Parallel): Column-wise tensor sharding
 
     Provides automatic configuration of 2D process groups and FS-aware annotation.
     """
-
-    @staticmethod
-    def _group_size(group) -> int:
-        return group.size() if hasattr(group, "size") else dist.get_world_size(group)
-
-    @staticmethod
-    def _group_rank(group) -> int:
-        return group.rank() if hasattr(group, "rank") else dist.get_rank(group)
-
-    @staticmethod
-    def _assert_group_excludes_context_parallel(group, *, label: str) -> None:
-        if group is None or not dist.is_initialized():
-            return
-        cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
-        if cp_group is None:
-            return
-        cp_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(cp_group))
-        if len(cp_ranks) <= 1:
-            return
-        group_ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(group))
-        global_rank = int(dist.get_rank())
-        overlap = tuple(rank for rank in group_ranks if rank in set(cp_ranks))
-        if overlap != (global_rank,):
-            raise RuntimeError(
-                "[DION_CP_GROUP_LEAK] "
-                f"{label} must exclude context-parallel peers: "
-                f"group_ranks={group_ranks} context_parallel_ranks={cp_ranks} "
-                f"overlap={overlap} global_rank={global_rank}"
-            )
-
-    def _resolve_state_replica_group(self):
-        """Return the standard DO state-replica group, independent of Dion RP."""
-        try:
-            state_group = parallel_state.get_inter_distributed_optimizer_instance_group(
-                check_initialized=False
-            )
-        except Exception:
-            state_group = None
-        if state_group is None or self._group_size(state_group) <= 1:
-            return None
-        self._assert_group_excludes_context_parallel(
-            state_group,
-            label="state_replica_group",
-        )
-        return state_group
 
     def _resolve_dion_tp_group(self):
         """Return the TP group used by Dion math and optimizer state."""
@@ -360,113 +271,14 @@ class DionDistributedOptimizer(DistributedOptimizer):
             self._assert_group_excludes_context_parallel(group, label="tp_group")
         return group
 
-    @staticmethod
-    def _get_group_ranks_for_checkpoint(group) -> tuple[int, ...]:
-        if group is None:
-            return ()
-        if hasattr(group, "ranks"):
-            return tuple(int(rank) for rank in group.ranks)
-        return tuple(int(rank) for rank in dist.get_process_group_ranks(group))
-
     def _dion_checkpoint_topology_signature(self) -> dict:
         tp_group = self._resolve_dion_tp_group()
-        return {
-            "data_parallel": self._get_group_ranks_for_checkpoint(self.data_parallel_group),
-            "fs": self._get_group_ranks_for_checkpoint(getattr(self, "fs_group", None)),
-            "tp": self._get_group_ranks_for_checkpoint(tp_group),
-            "rp": self._get_group_ranks_for_checkpoint(getattr(self, "rp_group", None)),
-            "state_replica": self._get_group_ranks_for_checkpoint(
-                getattr(self, "state_replica_group", None)
-            ),
-        }
-
-    def save_parameter_state(self, filename: str):
-        raise NotImplementedError(
-            "Dion distributed optimizer does not support legacy torch optimizer "
-            f"checkpoint parameter state ({filename}). Use --ckpt-format torch_dist "
-            "for optimizer checkpointing, or --no-save-optim for model-only checkpoints."
+        return self._matrix_checkpoint_topology_signature(
+            fs_group=getattr(self, "fs_group", None),
+            tp_group=tp_group,
+            rp_group=getattr(self, "rp_group", None),
+            state_replica_group=getattr(self, "state_replica_group", None),
         )
-
-    def load_parameter_state(self, filename: str, *, update_legacy_format=False):
-        del update_legacy_format
-        raise NotImplementedError(
-            "Dion distributed optimizer does not support legacy torch optimizer "
-            f"checkpoint parameter state ({filename}). Use --ckpt-format torch_dist "
-            "for optimizer checkpointing, or --no-load-optim for model-only checkpoints."
-        )
-
-    @classmethod
-    def _get_bucket_shard_group(cls, param_and_grad_buffer, bucket):
-        """Return the standard local-shard group that owns this bucket."""
-        bucket_group = getattr(bucket, "intra_distributed_optimizer_instance_group", None)
-        if bucket_group is not None:
-            return (
-                bucket_group,
-                getattr(bucket, "intra_distributed_optimizer_instance_size", None),
-                getattr(bucket, "intra_distributed_optimizer_instance_rank", None),
-            )
-
-        expert_flags = [not getattr(param, "allreduce", True) for param in bucket.params]
-        if any(expert_flags):
-            if not all(expert_flags):
-                raise RuntimeError(
-                    f"[Dion][EP] mixed dense/expert bucket is invalid: bucket_id={bucket.bucket_id}"
-                )
-            group = parallel_state.get_expert_data_parallel_group(
-                check_initialized=False,
-                partial_expert_data_parallel=True,
-            )
-            if group is None:
-                raise RuntimeError(
-                    f"[Dion][EP] missing expert local-shard group for bucket {bucket.bucket_id}"
-                )
-            return group
-
-        group = getattr(param_and_grad_buffer, "data_parallel_group", None)
-        if group is None:
-            raise RuntimeError(
-                f"[Dion] missing standard local-shard group for bucket {bucket.bucket_id}"
-            )
-        return group
-
-    @classmethod
-    def _normalize_group_info(cls, group_or_info, *, bucket_id: int, label: str):
-        """Return ``(group, size, rank)`` from a group or MCore group-info tuple."""
-        if (
-            isinstance(group_or_info, tuple)
-            and len(group_or_info) == 3
-        ):
-            group, group_size, group_rank = group_or_info
-            if isinstance(group, (int, str, tuple, list)):
-                raise RuntimeError(
-                    f"[Dion] invalid {label} process group for bucket {bucket_id}: "
-                    f"type={type(group).__name__}"
-                )
-            if group_size is None:
-                group_size = cls._group_size(group)
-            if group_rank is None:
-                group_rank = cls._group_rank(group)
-            return group, int(group_size), int(group_rank)
-        if isinstance(group_or_info, tuple):
-            raise RuntimeError(
-                f"[Dion] invalid {label} group info for bucket {bucket_id}: "
-                f"type={type(group_or_info).__name__} len={len(group_or_info)}"
-            )
-        return group_or_info, cls._group_size(group_or_info), cls._group_rank(group_or_info)
-
-    @classmethod
-    def _bucket_shard_get_group_size_rank(cls, param_and_grad_buffer, bucket) -> Tuple[object, int, int]:
-        """Return the standard bucket shard group and this rank's position in it."""
-        shard_group, shard_size, shard_rank = cls._normalize_group_info(
-            cls._get_bucket_shard_group(param_and_grad_buffer, bucket),
-            bucket_id=bucket.bucket_id,
-            label="bucket shard",
-        )
-        if shard_size <= 0:
-            raise RuntimeError(
-                f"[Dion] invalid shard group size for bucket {bucket.bucket_id}: {shard_size}"
-            )
-        return shard_group, shard_size, shard_rank
 
     @classmethod
     def _bucket_fs_get_group_size_rank(cls, param_and_grad_buffer, bucket) -> Tuple[object, int, int]:
@@ -591,79 +403,17 @@ class DionDistributedOptimizer(DistributedOptimizer):
         if self.rp_group is not None:
             self._assert_group_excludes_context_parallel(self.rp_group, label="rp_group")
         self.state_replica_group = self._resolve_state_replica_group()
-
-    @staticmethod
-    def _lookup_param_name(name_map, param) -> Optional[str]:
-        """Best-effort name lookup for maps keyed by either param or id(param)."""
-        if not name_map:
-            return None
-        try:
-            name = name_map.get(id(param))
-            if name is not None:
-                return name
-        except Exception:
-            pass
-        try:
-            return name_map.get(param)
-        except Exception:
-            return None
-
-    def _find_param_name(self, param) -> Optional[str]:
-        """Slow-path runtime param-name lookup for current module objects."""
-        if hasattr(self, "model_chunks"):
-            for model in self.model_chunks:
-                try:
-                    for name, model_param in model.named_parameters():
-                        if id(model_param) == id(param):
-                            return name
-                except Exception:
-                    continue
-        elif hasattr(self, "module") and isinstance(self.module, torch.nn.Module):
-            for name, model_param in self.module.named_parameters():
-                if id(model_param) == id(param):
-                    return name
-        return None
-
-    def _param_name(self, param) -> Optional[str]:
-        """Return the most direct stable name available for a model or shard param."""
-        if param is None:
-            return None
-
-        name = self._lookup_param_name(getattr(self, "param_to_name", None), param)
-        if name is not None:
-            return name
-
-        model_param = getattr(param, "_model_param", None)
-        if model_param is not None:
-            name = self._lookup_param_name(getattr(self, "param_to_name", None), model_param)
-            if name is not None:
-                return name
-            name = getattr(model_param, "_param_name", None)
-            if name is not None:
-                return name
-
-        name = getattr(param, "_param_name", None)
-        if name is not None:
-            return name
-
-        return self._find_param_name(model_param if model_param is not None else param)
-
-    def _global_param_name(self, param) -> Optional[str]:
-        """Return a PP/EP-invariant parameter name when available."""
-        if param is None:
-            return None
-
-        model_param = getattr(param, "_model_param", None)
-        if model_param is None:
-            model_param = param
-
-        if hasattr(self, "model_chunks"):
-            try:
-                return get_global_unique_param_name(self.model_chunks, model_param)
-            except Exception:
-                pass
-
-        return self._param_name(param)
+        tp_group = self._resolve_dion_tp_group()
+        tp_size = 1 if tp_group is None else self._group_size(tp_group)
+        self._validate_matrix_topology(
+            fs_size=int(self.fs_size),
+            rp_size=int(configured_rp_size),
+            tp_size=int(tp_size),
+            is_expert=bool(self._is_expert_dion),
+            split_qkv=bool(getattr(self.optimizer, "defaults", {}).get("split_qkv", False)),
+            split_qkvg=bool(getattr(self.optimizer, "defaults", {}).get("split_qkv", False)),
+            split_linear=bool(getattr(self.optimizer, "defaults", {}).get("split_linear", False)),
+        )
 
     def _shard_param_uid(self, shard_param):
         """Return the checkpoint/state identity for one optimizer shard."""
@@ -727,13 +477,8 @@ class DionDistributedOptimizer(DistributedOptimizer):
         return check_bucket_param_views(self, bucket, context=context, params=params)
 
     def _mark_buckets_full_param_ready(self, ready: bool) -> None:
-        """Track whether full param views are ready for forward."""
-        if not hasattr(self, "buffers"):
-            return
-        for buffer in self.buffers:
-            for bucket in buffer.buckets:
-                if hasattr(bucket, "_dion_full_param_ready"):
-                    bucket._dion_full_param_ready = ready
+        """Track whether Dion full param views are ready for forward."""
+        self._set_bucket_runtime_flag("_dion_full_param_ready", ready)
 
     def _init_bucket_comm(self, bucket, fs_group) -> None:
         """Attach the Dion shard group to a bucket."""
@@ -762,7 +507,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
         gbuf_idx: int,
         buffer,
         bucket,
-        dion_layout: DionBucketLayout,
+        dion_layout: MatrixBucketLayout,
         fs_group,
     ) -> None:
         """Configure one bucket that contains at least one Dion param."""
@@ -913,7 +658,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
         Returns: Parent DO structure + optional typed Dion shard layout per param
         """
         # STEP 1: Call parent to get DO standard bucket structure
-        from .distrib_optimizer import DistributedOptimizer
+        from ...distrib_optimizer import DistributedOptimizer
         parent_result = DistributedOptimizer._build_model_gbuf_range(
             param_and_grad_buffer, bucket_index
         )
@@ -1125,6 +870,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
     def __init__(self, *args, **kwargs):
         """Initialize Dion distributed optimizer state."""
         # Initialize Dion param info before parent init.
+        self.set_matrix_backend(DionBackend())
         self._shard_layouts_by_param = {}
         self._replica_group = kwargs.pop("replica_group", kwargs.pop("replica_group_override", None))
         self._dion_fs_group = kwargs.pop("dion_fs_group", None)
@@ -1146,8 +892,8 @@ class DionDistributedOptimizer(DistributedOptimizer):
             self._rp_size = 1
         if self._pure_data_parallel_group is None:
             raise RuntimeError(
-                "DionDistributedOptimizer requires pure_data_parallel_group "
-                "from distrib_dion.integration; direct construction without the canonical builder is unsupported."
+                "DistributedDionOptimizer requires pure_data_parallel_group "
+                "from dion.distributed.integration; direct construction without the canonical builder is unsupported."
             )
 
         per_model_buffers = kwargs.get("per_model_buffers", None)
@@ -1179,7 +925,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
             async_op=async_op,
         )
 
-    def _bucket_dion_param_view(self, bucket, entry: DionShardEntry) -> torch.Tensor:
+    def _bucket_dion_param_view(self, bucket, entry: MatrixShardEntry) -> torch.Tensor:
         """Return the canonical full-param view for one Dion entry."""
         return bucket_dion_param_view(self, bucket, entry)
 
@@ -1291,7 +1037,11 @@ class DionDistributedOptimizer(DistributedOptimizer):
                             unique_two_d_manual_disabled += 1
                             continue
 
-                        if not getattr(param, "dion_candidate", False):
+                        if not getattr(
+                            param,
+                            "matrix_optimizer_candidate",
+                            getattr(param, "dion_candidate", False),
+                        ):
                             unique_two_d_not_candidate += 1
                             continue
 
@@ -1456,7 +1206,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
             else:
                 raise TypeError(f'Unsupported parameter type: {model_param.type()}')
 
-    def _create_fs_shard(self, model_param, shard_layout: DionShardLayout):
+    def _create_fs_shard(self, model_param, shard_layout: MatrixShardLayout):
         """Create the local FS shard view from `model_param`."""
         return create_fs_shard(self, model_param, shard_layout)
 
@@ -1471,10 +1221,10 @@ class DionDistributedOptimizer(DistributedOptimizer):
         model_param: torch.nn.Parameter,
         data_shard: torch.Tensor,
         opt_shard: torch.Tensor,
-        shard_layout: DionShardLayout,
+        shard_layout: MatrixShardLayout,
     ) -> None:
         """Register all shard info for a Dion parameter in one call."""
-        return register_dion_shard(self, model_param, data_shard, opt_shard, shard_layout)
+        return register_matrix_shard(self, model_param, data_shard, opt_shard, shard_layout)
 
     def _get_data_shard(self, model_param: torch.nn.Parameter) -> Optional[torch.Tensor]:
         """Get data shard (FP16) for a model parameter."""
@@ -1583,7 +1333,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
         """Update optimizer shard for a model parameter."""
         return update_opt_shard(self, model_param, new_opt_shard)
 
-    def _param_shard_layout(self, model_param: torch.nn.Parameter) -> Optional[DionShardLayout]:
+    def _param_shard_layout(self, model_param: torch.nn.Parameter) -> Optional[MatrixShardLayout]:
         """Return typed Dion shard layout for one model param, if any."""
         return param_shard_layout(self, model_param)
 
@@ -1781,8 +1531,6 @@ class DionDistributedOptimizer(DistributedOptimizer):
             route_step_params=self._route_step_params,
             group_size=self._group_size,
             group_rank=self._group_rank,
-            use_low_rank_sync=bool(getattr(self.optimizer, "use_low_rank_sync", False)),
-            use_fs_collectives=bool(getattr(self.optimizer, "use_fs_collectives", False)),
             validate_enabled_rp_topology=validate_enabled_rp_topology,
             log_error=logger.error,
         )
@@ -1915,6 +1663,8 @@ class DionDistributedOptimizer(DistributedOptimizer):
                     expect_group=expect_group,
                     group_size=self._group_size,
                 ),
+                is_tp_sharded=is_p_tp_sharded,
+                is_fs_sharded=is_p_fs_sharded,
             ),
             resolve_tp_group=lambda meta, expect_group: resolve_tp_group(
                 meta,
@@ -1924,6 +1674,18 @@ class DionDistributedOptimizer(DistributedOptimizer):
             resolve_fs_group_from_meta=lambda meta, expect_group: resolve_fs_group_from_meta(
                 meta,
                 expect_group=expect_group,
+                group_size=self._group_size,
+            ),
+        )
+
+    def _sync_dion_state(self, dion_params: List[Tuple]) -> None:
+        """Synchronize Dion-owned state before batch construction."""
+        sync_q_replicas(
+            dion_params=dion_params,
+            state_replica_group=self.state_replica_group,
+            group_size=self._group_size,
+            make_group_broadcast=lambda process_group: make_group_broadcast(
+                process_group,
                 group_size=self._group_size,
             ),
         )
@@ -2090,32 +1852,23 @@ class DionDistributedOptimizer(DistributedOptimizer):
         )
 
     def _route_step_params(self):
-        """Route one distributed optimizer step into Dion batches and elementwise params."""
-        return route_step_params(
+        """Route one distributed optimizer step into Dion batches and scalar params."""
+        return self._route_matrix_step_params(
             param_groups=self.optimizer.param_groups,
             dist_metas=self.optimizer.dist_metas,
             get_step_param_grad=self._get_step_param_grad,
             ensure_optimizer_state=self._ensure_optimizer_state,
             require_param_config=self._require_param_config,
-            should_use_distributed_dion_update=self._should_use_distributed_dion_update,
-            expand_split_dion_params=self._expand_split_dion_params,
-            refresh_dion_step_metadata=self._refresh_dion_step_metadata,
-            sync_q_replicas=lambda dion_params: sync_q_replicas(
-                dion_params=dion_params,
-                state_replica_group=self.state_replica_group,
-                group_size=self._group_size,
-                make_group_broadcast=lambda process_group: make_group_broadcast(
-                    process_group,
-                    group_size=self._group_size,
-                ),
-            ),
-            build_dion_batches=self._build_dion_batches,
         )
 
     def _get_step_param_grad(self, param):
         """Return the step grad tensor chosen at the adapter boundary."""
         model_param = getattr(param, "_model_param", None)
-        if model_param is not None and getattr(model_param, "is_dion_param", False):
+        if model_param is not None and getattr(
+            model_param,
+            "is_matrix_param",
+            getattr(model_param, "is_dion_param", False),
+        ):
             return self._get_local_grad(model_param, param)
         dg = getattr(param, 'decoupled_grad', None)
         if dg is not None:
@@ -2215,7 +1968,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
             f"param_name={getattr(dist_meta, 'param_name', '')}"
         )
         return (
-            _local_expert_tensor_view(
+            local_expert_tensor_view(
                 param_2d,
                 axis=expert_axis,
                 num_local_experts=num_local_experts,
@@ -2223,7 +1976,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 local_shape=expert_local_shape,
                 context=f"param:{context}",
             ),
-            _local_expert_tensor_view(
+            local_expert_tensor_view(
                 grad_2d,
                 axis=expert_axis,
                 num_local_experts=num_local_experts,
@@ -2231,7 +1984,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 local_shape=expert_local_shape,
                 context=f"grad:{context}",
             ),
-            _local_expert_tensor_view(
+            local_expert_tensor_view(
                 momentum_2d,
                 axis=expert_axis,
                 num_local_experts=num_local_experts,
@@ -3802,6 +3555,227 @@ class DionDistributedOptimizer(DistributedOptimizer):
             init_optimizer_state=self._init_optimizer_state,
         )
 
+    def _ensure_dion_checkpoint_state(self) -> None:
+        """Initialize Dion optimizer state before distributed checkpoint load templates."""
+        for optim_group in self.optimizer.param_groups:
+            for param in optim_group["params"]:
+                state = self._ensure_optimizer_state(param, optim_group)
+                dist_meta = self.optimizer.dist_metas.get(param, None)
+                if dist_meta is None or not bool(getattr(dist_meta, "is_dion_param", False)):
+                    self._ensure_scalar_checkpoint_state(param, state, optim_group)
+                else:
+                    self._ensure_split_checkpoint_state(param, state, optim_group, dist_meta)
+
+    def _checkpoint_split_parent_layout(self, dist_meta):
+        """Return parent split metadata and shapes for checkpoint templates."""
+        split_parent_dist_meta = self._split_parent_dist_meta(dist_meta)
+        parent_local_shape = getattr(split_parent_dist_meta, "local_shape", None)
+        if parent_local_shape is None:
+            parent_local_shape = getattr(split_parent_dist_meta, "shape", None)
+        parent_global_shape = getattr(split_parent_dist_meta, "global_shape", None)
+        if parent_local_shape is None or parent_global_shape is None:
+            return None
+        return (
+            split_parent_dist_meta,
+            tuple(int(dim) for dim in parent_local_shape),
+            tuple(int(dim) for dim in parent_global_shape),
+        )
+
+    def _iter_split_child_dist_metas(self, *, param, state, dist_meta):
+        """Yield split child metadata needed to initialize checkpoint load templates."""
+        parent_layout = self._checkpoint_split_parent_layout(dist_meta)
+        if parent_layout is None:
+            return
+        split_parent_dist_meta, parent_local_shape, parent_global_shape = parent_layout
+
+        if bool(self.optimizer.defaults.get("split_qkv", False)):
+            qkvg_shapes = resolve_qkvg_split_shapes(
+                param=param,
+                optimizer_state=state,
+                dist_meta=dist_meta,
+            )
+            if qkvg_shapes is not None:
+                for child_kind in iter_qkvg_child_kinds():
+                    if not qkvg_child_has_local_overlap(
+                        qkvg_shapes, split_parent_dist_meta, child_kind
+                    ):
+                        continue
+                    child_local_shape = qkvg_child_local_shape(
+                        parent_local_shape,
+                        qkvg_shapes,
+                        child_kind,
+                        dist_meta=split_parent_dist_meta,
+                    )
+                    child_global_shape = qkvg_child_global_shape(
+                        parent_global_shape,
+                        qkvg_shapes,
+                        child_kind,
+                    )
+                    yield (
+                        "qkvg",
+                        self._build_qkvg_child_dist_meta(
+                            parent_dist_meta=split_parent_dist_meta,
+                            child_kind=child_kind,
+                            split_shapes=qkvg_shapes,
+                            child_local_shape=child_local_shape,
+                            child_global_shape=child_global_shape,
+                        ),
+                    )
+                return
+
+            qkv_shapes = resolve_qkv_split_shapes(
+                param=param,
+                optimizer_state=state,
+                dist_meta=dist_meta,
+            )
+            if qkv_shapes is not None:
+                for child_kind in iter_qkv_child_kinds():
+                    if not qkv_child_has_local_overlap(
+                        qkv_shapes, split_parent_dist_meta, child_kind
+                    ):
+                        continue
+                    child_local_shape = qkv_child_local_shape(
+                        parent_local_shape,
+                        qkv_shapes,
+                        child_kind,
+                        dist_meta=split_parent_dist_meta,
+                    )
+                    child_global_shape = qkv_child_global_shape(
+                        parent_global_shape,
+                        qkv_shapes,
+                        child_kind,
+                    )
+                    yield (
+                        "qkv",
+                        self._build_qkv_child_dist_meta(
+                            parent_dist_meta=split_parent_dist_meta,
+                            child_kind=child_kind,
+                            split_shapes=qkv_shapes,
+                            child_local_shape=child_local_shape,
+                            child_global_shape=child_global_shape,
+                        ),
+                    )
+                return
+
+        if not bool(self.optimizer.defaults.get("split_linear", False)):
+            return
+        split_rows = resolve_linear_split_rows(optimizer_state=state, dist_meta=dist_meta)
+        if split_rows is None:
+            return
+        for child_kind in iter_linear_child_kinds():
+            if not linear_child_has_local_overlap(
+                split_rows,
+                split_parent_dist_meta,
+                child_kind,
+            ):
+                continue
+            child_local_shape = linear_child_local_shape(
+                parent_local_shape,
+                split_rows,
+                dist_meta=split_parent_dist_meta,
+                child_kind=child_kind,
+            )
+            child_global_shape = linear_child_global_shape(
+                parent_global_shape,
+                split_rows,
+                child_kind,
+            )
+            yield (
+                "linear",
+                self._build_linear_child_dist_meta(
+                    parent_dist_meta=split_parent_dist_meta,
+                    child_kind=child_kind,
+                    split_rows=split_rows,
+                    child_local_shape=child_local_shape,
+                    child_global_shape=child_global_shape,
+                ),
+            )
+
+    def _ensure_split_checkpoint_state(self, param, state, optim_group, dist_meta) -> None:
+        """Initialize lazy split-child Dion state for checkpoint load templates."""
+        if optim_group.get("algorithm", "dion") != "dion":
+            return
+        if not bool(self.optimizer.defaults.get("split_qkv", False)) and not bool(
+            self.optimizer.defaults.get("split_linear", False)
+        ):
+            return
+
+        for split_kind, child_dist_meta in self._iter_split_child_dist_metas(
+            param=param,
+            state=state,
+            dist_meta=dist_meta,
+        ):
+            if split_kind == "qkvg":
+                self._ensure_qkvg_child_state_(
+                    parent_param=param,
+                    parent_state=state,
+                    optim_group=optim_group,
+                    child_dist_meta=child_dist_meta,
+                )
+            elif split_kind == "qkv":
+                self._ensure_qkv_child_state_(
+                    parent_param=param,
+                    parent_state=state,
+                    optim_group=optim_group,
+                    child_dist_meta=child_dist_meta,
+                )
+            elif split_kind == "linear":
+                self._ensure_linear_child_state_(
+                    parent_param=param,
+                    parent_state=state,
+                    optim_group=optim_group,
+                    child_dist_meta=child_dist_meta,
+                )
+            else:
+                raise RuntimeError(f"[DION_INVALID_SPLIT_KIND] {split_kind!r}")
+
+    def _scalar_checkpoint_optimizer(self, optim_group) -> str:
+        default_scalar = self.optimizer.defaults.get("scalar_optimizer", "adamw")
+        group_algorithm = optim_group.get("algorithm", None)
+        if group_algorithm is None or group_algorithm == "dion":
+            scalar_optimizer = optim_group.get("scalar_optimizer", default_scalar)
+        else:
+            scalar_optimizer = group_algorithm
+        if scalar_optimizer == "adam":
+            return "adamw"
+        if scalar_optimizer not in {"adamw", "lion"}:
+            raise RuntimeError(f"[DION_INVALID_SCALAR_CHECKPOINT_OPT] {scalar_optimizer!r}")
+        return str(scalar_optimizer)
+
+    def _ensure_scalar_checkpoint_state(self, param, state, optim_group) -> None:
+        """Match scalar checkpoint tensor keys to the active scalar optimizer."""
+        if "first_moment" in state and "exp_avg" in state:
+            raise RuntimeError(
+                "[DION_SCALAR_STATE_LAYOUT_CONFLICT] found both first_moment and exp_avg"
+            )
+        if "first_moment" not in state:
+            if "exp_avg" in state:
+                state["first_moment"] = state.pop("exp_avg")
+            elif "momentum" in state:
+                state["first_moment"] = state.pop("momentum")
+            else:
+                momentum_dtype = self.optimizer._mixed_precision_config.momentum_dtype
+                if momentum_dtype is None:
+                    momentum_dtype = param.dtype
+                state["first_moment"] = torch.zeros_like(param, dtype=momentum_dtype)
+
+        if self._scalar_checkpoint_optimizer(optim_group) != "adamw":
+            return
+        if "second_moment" in state and "exp_avg_sq" in state:
+            raise RuntimeError(
+                "[DION_SCALAR_STATE_LAYOUT_CONFLICT] found both second_moment and exp_avg_sq"
+            )
+        if "second_moment" not in state:
+            if "exp_avg_sq" in state:
+                state["second_moment"] = state.pop("exp_avg_sq")
+            elif "variance" in state:
+                state["second_moment"] = state.pop("variance")
+            else:
+                variance_dtype = self.optimizer._mixed_precision_config.variance_dtype
+                if variance_dtype is None:
+                    variance_dtype = param.dtype
+                state["second_moment"] = torch.zeros_like(param, dtype=variance_dtype)
+
     def _log_grad_issue(
         self,
         kind: str,
@@ -3986,7 +3960,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
 
         Handles FS-sharded parameters correctly when loading from checkpoint.
         """
-        from .cpu_offloading import HybridDeviceOptimizer
+        from ...cpu_offloading import HybridDeviceOptimizer
         use_precision_aware_optimizer = bool(
             getattr(self.config, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False)
         )
@@ -4073,7 +4047,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
 
     def _refresh_param_groups(self):
         """Update optimizer param groups after rebuilding."""
-        from .cpu_offloading import HybridDeviceOptimizer
+        from ...cpu_offloading import HybridDeviceOptimizer
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
@@ -4166,7 +4140,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
         and store only Dion-specific per-param state as an extra payload keyed by
         `param_uid`.
         """
-        from ..dist_checkpointing.mapping import ShardedObject
+        from ....dist_checkpointing.mapping import ShardedObject, ShardedTensor
 
         if model_sharded_state_dict is None:
             model_sharded_state_dict = {}
@@ -4185,6 +4159,8 @@ class DionDistributedOptimizer(DistributedOptimizer):
                 "[Dion] invalid FS checkpoint state coordinates: "
                 f"fs_size={fs_size} fs_rank={fs_rank}"
             )
+        if is_loading:
+            self._ensure_dion_checkpoint_state()
 
         state_replica_group = getattr(self, "state_replica_group", None)
         state_replica_size = (
@@ -4193,6 +4169,19 @@ class DionDistributedOptimizer(DistributedOptimizer):
         state_replica_rank = (
             0 if state_replica_group is None else self._group_rank(state_replica_group)
         )
+        state_owner_dp_rank = dp_rank
+        if state_replica_group is not None:
+            dp_ranks = self._get_group_ranks_for_checkpoint(self.data_parallel_group)
+            state_replica_ranks = self._get_group_ranks_for_checkpoint(state_replica_group)
+            if not state_replica_ranks:
+                raise RuntimeError("[Dion] empty state-replica group for checkpoint")
+            state_owner_global_rank = int(state_replica_ranks[0])
+            if state_owner_global_rank not in dp_ranks:
+                raise RuntimeError(
+                    "[Dion] checkpoint state replica owner is outside data-parallel group: "
+                    f"owner={state_owner_global_rank} dp_ranks={dp_ranks}"
+                )
+            state_owner_dp_rank = int(dp_ranks.index(state_owner_global_rank))
 
         checkpoint_metadata = build_dion_checkpoint_metadata(
             dp_size=dp_size,
@@ -4202,6 +4191,7 @@ class DionDistributedOptimizer(DistributedOptimizer):
             state_replica_size=state_replica_size,
             requested_type=requested_type,
             topology_signature=self._dion_checkpoint_topology_signature(),
+            backend_state_spec=self._require_matrix_backend().state_spec(),
         )
         common_state = self.state_dict()
         return build_distributed_checkpoint_state(
@@ -4216,7 +4206,63 @@ class DionDistributedOptimizer(DistributedOptimizer):
             state_replica_id=(state_replica_rank,),
             checkpoint_metadata=checkpoint_metadata,
             sharded_object_cls=ShardedObject,
+            sharded_tensor_cls=ShardedTensor,
+            state_rank_key=str(state_owner_dp_rank),
         )
+
+    @staticmethod
+    def _param_group_match_key(param_group):
+        keys = []
+        for key in param_group_identifier_keys:
+            if key in param_group:
+                keys.append(param_group[key])
+            elif f"pre_{key}" in param_group:
+                keys.append(param_group[f"pre_{key}"])
+            else:
+                raise ValueError(
+                    f"Key {key} (or pre_{key}) not found in param_group {param_group}."
+                )
+        return tuple(keys)
+
+    def _load_dion_common_state_dict(self, state_dict) -> None:
+        """Load non-tensor optimizer state without Adam-style param-state allocation."""
+        if "optimizer" not in state_dict:
+            raise RuntimeError("[Dion] distributed checkpoint missing optimizer common state")
+
+        saved_groups = {
+            self._param_group_match_key(param_group): param_group
+            for param_group in state_dict["optimizer"]["param_groups"]
+        }
+        inner_state_dict = self.optimizer.state_dict()
+        param_groups = []
+        for inner_param_group in inner_state_dict["param_groups"]:
+            group_key = self._param_group_match_key(inner_param_group)
+            if group_key not in saved_groups:
+                raise RuntimeError(
+                    "[Dion] checkpoint optimizer param-group metadata mismatch: "
+                    f"group_key={group_key}"
+                )
+            param_groups.append(
+                {**saved_groups[group_key], "params": inner_param_group["params"]}
+            )
+
+        self.optimizer.load_state_dict(
+            {
+                "state": inner_state_dict.get("state", {}),
+                "param_groups": param_groups,
+            }
+        )
+
+        if "grad_scaler" in state_dict:
+            if self.grad_scaler:
+                self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
+            else:
+                logger.info(
+                    "[Dion] checkpoint has grad scaler state but optimizer has no grad scaler; "
+                    "skipping grad scaler restore"
+                )
+        elif self.config.fp16:
+            logger.info("[Dion] checkpoint has no grad scaler state; skipping grad scaler restore")
 
     def load_state_dict(self, state_dict):
         """Load optimizer checkpoint state with standard common-state outer protocol."""
@@ -4245,13 +4291,10 @@ class DionDistributedOptimizer(DistributedOptimizer):
             rp_size=int(self._rp_size) if self._rp_size is not None else 1,
             state_replica_size=int(state_replica_size),
             topology_signature=self._dion_checkpoint_topology_signature(),
+            backend_state_spec=self._require_matrix_backend().state_spec(),
         )
-        ensure_state_initialized_for_load(
-            param_groups=self.optimizer.param_groups,
-            optimizer_state=self.optimizer.state,
-            init_state=getattr(self.optimizer, "_init_state", None),
-        )
-        super().load_state_dict(common_state_dict)
+        self._load_dion_common_state_dict(common_state_dict)
+        self._ensure_dion_checkpoint_state()
 
         restore_summary = restore_distributed_checkpoint_state(
             param_state_payload=param_state_payload,

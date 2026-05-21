@@ -7,15 +7,15 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 import torch
 import torch.distributed as dist
 
-from ..dion.state import require_2d_local_shape
-from ..dion.state import (
+from ..state import require_2d_local_shape
+from ..state import (
     is_fs_without_tp,
     should_reduce_p_over_fs,
     should_reduce_r_over_tp,
     is_p_tp_sharded,
 )
-from ..dion.utils import get_local_shape, has_multiple_local_experts
-from ..dion.types import (
+from ..utils import get_local_shape, has_multiple_local_experts, local_expert_tensor_view
+from ..types import (
     DionAxisCollective,
     DionBatch,
     DionBatchEntry,
@@ -360,43 +360,6 @@ def pad_batch(
     return batch
 
 
-def _local_expert_tensor_view(
-    tensor: torch.Tensor,
-    *,
-    axis: int,
-    num_local_experts: int,
-    local_expert_index: int,
-    local_shape: Tuple[int, int],
-) -> torch.Tensor:
-    if axis not in (0, 1):
-        raise RuntimeError(f"[DION_INVALID_EXPERT_AXIS] axis={axis}")
-    if num_local_experts <= 1:
-        return tensor
-    if local_expert_index < 0 or local_expert_index >= num_local_experts:
-        raise RuntimeError(
-            "[DION_INVALID_EXPERT_LOCAL_INDEX] "
-            f"axis={axis} num_local_experts={num_local_experts} local_expert_index={local_expert_index}"
-        )
-
-    expected_axis_size = int(local_shape[axis]) * int(num_local_experts)
-    current_axis = int(tensor.size(axis))
-    if current_axis == int(local_shape[axis]):
-        return tensor
-    if current_axis != expected_axis_size:
-        raise RuntimeError(
-            "[DION_EXPERT_TENSOR_SHAPE_MISMATCH] "
-            f"axis={axis} tensor_shape={tuple(int(dim) for dim in tensor.shape)} "
-            f"local_shape={local_shape} num_local_experts={num_local_experts}"
-        )
-
-    local_extent = int(local_shape[axis])
-    start = int(local_expert_index) * local_extent
-    end = start + local_extent
-    if axis == 0:
-        return tensor[start:end, :]
-    return tensor[:, start:end]
-
-
 def _local_expert_q_view(
     q_tensor: torch.Tensor,
     *,
@@ -422,12 +385,13 @@ def _local_expert_q_view(
             f"q_shape={tuple(int(dim) for dim in q_tensor.shape)} local_shape={local_shape} "
             f"expert_axis={expert_axis} q_base_axis={q_base_axis}"
         )
-    return _local_expert_tensor_view(
+    return local_expert_tensor_view(
         q_tensor,
         axis=0,
         num_local_experts=num_local_experts,
         local_expert_index=local_expert_index,
         local_shape=(expected_q_rows, int(q_tensor.size(1))),
+        context=f"q:param_uid={getattr(dist_meta, 'param_uid', None)}",
     )
 
 
@@ -440,26 +404,33 @@ def _local_expert_views(*, param, grad, optimizer_state, config, dist_meta):
     expert_axis = int(getattr(dist_meta, "expert_axis", -1))
     num_local_experts = int(getattr(dist_meta, "num_local_experts", 1))
     local_expert_index = int(getattr(dist_meta, "local_expert_index", -1))
-    param_view = _local_expert_tensor_view(
+    context = (
+        f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+        f"param_name={getattr(dist_meta, 'param_name', '')}"
+    )
+    param_view = local_expert_tensor_view(
         param,
         axis=expert_axis,
         num_local_experts=num_local_experts,
         local_expert_index=local_expert_index,
         local_shape=local_shape,
+        context=f"param:{context}",
     )
-    grad_view = _local_expert_tensor_view(
+    grad_view = local_expert_tensor_view(
         grad.view(*physical_shape),
         axis=expert_axis,
         num_local_experts=num_local_experts,
         local_expert_index=local_expert_index,
         local_shape=local_shape,
+        context=f"grad:{context}",
     )
-    momentum_view = _local_expert_tensor_view(
+    momentum_view = local_expert_tensor_view(
         optimizer_state["momentum"].view(*physical_shape),
         axis=expert_axis,
         num_local_experts=num_local_experts,
         local_expert_index=local_expert_index,
         local_shape=local_shape,
+        context=f"momentum:{context}",
     )
     q_view = _local_expert_q_view(
         optimizer_state["Q"],

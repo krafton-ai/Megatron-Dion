@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from megatron.core.optimizer.dion import linear as linear_helpers
-from megatron.core.optimizer.dion import qkv as qkv_helpers
+from megatron.core.optimizer.matrix.splits import linear as linear_helpers
+from megatron.core.optimizer.matrix.splits import qkv as qkv_helpers
 
 
 def _fail_cat(*args, **kwargs):

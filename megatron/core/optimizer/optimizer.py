@@ -48,8 +48,8 @@ from ..dist_checkpointing.optimizer import (
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
-from .dion.qkv import copy_qkv_split_metadata
-from .dion.qkvg import copy_qkvg_split_metadata
+from .matrix.splits.qkv import copy_qkv_split_metadata
+from .matrix.splits.qkvg import copy_qkvg_split_metadata
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig

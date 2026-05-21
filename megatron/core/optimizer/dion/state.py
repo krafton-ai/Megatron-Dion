@@ -16,9 +16,9 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch import Tensor
 
-from .linear import get_linear_split_rows_from_dist_meta
-from .qkv import get_qkv_split_shapes_from_dist_meta
-from .qkvg import get_qkvg_split_shapes_from_dist_meta
+from ..matrix.splits.linear import get_linear_split_rows_from_dist_meta
+from ..matrix.splits.qkv import get_qkv_split_shapes_from_dist_meta
+from ..matrix.splits.qkvg import get_qkvg_split_shapes_from_dist_meta
 from .types import (
     DionMixedPrecisionConfig,
     DionParamConfig,

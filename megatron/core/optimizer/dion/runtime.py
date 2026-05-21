@@ -304,15 +304,15 @@ def iter_dist_tasks(optimizer) -> Generator[AsyncTask, None, None]:
             f"step={optimizer._step_count} rank={optimizer._global_rank}"
         )
 
-    dion_batches, elementwise_params = route_step_params()
+    dion_batches, scalar_params = route_step_params()
     optimizer._dion_update_count += sum(int(batch.real_batch_size) for batch in dion_batches)
-    optimizer._elementwise_update_count += len(elementwise_params)
+    optimizer._scalar_update_count += len(scalar_params)
 
     for dion_batch in dion_batches:
         yield AsyncTask(run_dion_batch_async(optimizer, dion_batch))
 
-    if elementwise_params:
-        yield AsyncTask(optimizer._apply_elementwise_batches(elementwise_params))
+    if scalar_params:
+        yield AsyncTask(optimizer._apply_scalar_batches(scalar_params))
 
 
 def run_dion_batch_async(

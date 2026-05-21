@@ -39,7 +39,7 @@ except ImportError:
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
 try:
-    from megatron.core.optimizer.megatron_dion import MegatronDion
+    from megatron.core.optimizer.dion import MegatronDion
 except ImportError:
     MegatronDion = None
 
@@ -58,8 +58,8 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_b
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
-from .dion.qkv import copy_qkv_split_metadata
-from .dion.qkvg import copy_qkvg_split_metadata
+from .matrix.splits.qkv import copy_qkv_split_metadata
+from .matrix.splits.qkvg import copy_qkvg_split_metadata
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig

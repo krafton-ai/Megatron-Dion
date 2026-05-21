@@ -3,10 +3,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.optimizer import dion_distrib_optimizer as dion_do
+from megatron.core.optimizer.dion.distributed import optimizer as dion_do
 from megatron.core.optimizer.dion.kernels import scaled_lr_for_shape
 from megatron.core.optimizer.dion.ortho import orthogonalize
-from megatron.core.optimizer.distrib_dion import bootstrap as dion_bootstrap
+from megatron.core.optimizer.dion.distributed import bootstrap as dion_bootstrap
 
 
 def test_enable_distributed_dion_builds_metadata_for_single_rank(monkeypatch):
@@ -45,8 +45,6 @@ def test_enable_distributed_dion_builds_metadata_for_single_rank(monkeypatch):
         route_step_params=route_step_params,
         group_size=lambda group: 1,
         group_rank=lambda group: 0,
-        use_low_rank_sync=True,
-        use_fs_collectives=True,
         validate_enabled_rp_topology=dion_bootstrap.validate_enabled_rp_topology,
         log_error=lambda *args, **kwargs: None,
     )
@@ -56,7 +54,7 @@ def test_enable_distributed_dion_builds_metadata_for_single_rank(monkeypatch):
 
 
 def test_shard_param_uid_recovers_from_canonical_shard_metadata():
-    wrapper = dion_do.DionDistributedOptimizer.__new__(dion_do.DionDistributedOptimizer)
+    wrapper = dion_do.DistributedDionOptimizer.__new__(dion_do.DistributedDionOptimizer)
 
     model_param = torch.nn.Parameter(torch.empty(4, 4))
     canonical_shard = model_param.detach().view(-1)[:8]

@@ -7,19 +7,19 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.optimizer.dion.types import DionDistMeta, DionParamConfig
-from megatron.core.optimizer.dion_distrib_optimizer import (
+from megatron.core.optimizer.dion.distributed.optimizer import (
     _CHILD_GROUP_CACHE,
-    DionDistributedOptimizer,
+    DistributedDionOptimizer,
 )
-from megatron.core.optimizer.distrib_dion.batches import (
+from megatron.core.optimizer.dion.distributed.batches import (
     build_batch_collectives,
     resolve_batch_group,
 )
-from megatron.core.optimizer.distrib_dion.integration import (
+from megatron.core.optimizer.dion.distributed.integration import (
     _get_dion_replica_group,
     _resolve_fs_group,
 )
-from megatron.core.optimizer.distrib_dion.parameter import (
+from megatron.core.optimizer.dion.distributed.parameter import (
     is_dion_param,
     resolve_grad_rank_to_fs_rank,
 )
@@ -69,7 +69,7 @@ def _destroy_model_parallel():
 
 
 def _new_optimizer():
-    return object.__new__(DionDistributedOptimizer)
+    return object.__new__(DistributedDionOptimizer)
 
 
 def _all_gather_object(obj):

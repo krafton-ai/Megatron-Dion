@@ -6,22 +6,27 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Callable, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
-from ...distributed.param_and_grad_buffer import _HandleGroup
-from ...fp8_utils import is_float8tensor
-from ...transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
-from .sharding import (
-    DionShardLayout,
+from ....distributed.param_and_grad_buffer import _HandleGroup
+from ....fp8_utils import is_float8tensor
+from ....transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
+from ...matrix.sharding import (
     compute_fs_flat_segments,
     compute_fs_shard_range,
+    fs_shard_view_2d,
     get_fs_split_dim,
     get_tp_split_dim,
     is_tp_enabled,
-    fs_shard_view_2d,
+)
+from ...matrix.types import (
+    MatrixBucketLayout,
+    MatrixShardEntry,
+    MatrixShardLayout,
+    MatrixStandardGatherRoute,
 )
 
 
@@ -29,6 +34,7 @@ def mark_dion_candidates(module: torch.nn.Module) -> None:
     """Mark all local parameters as potential Dion candidates."""
     for param in module.parameters():
         param.dion_candidate = True
+        param.matrix_optimizer_candidate = True
 
 
 def is_dion_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool:
@@ -36,7 +42,7 @@ def is_dion_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool
     resolved_name = param_name or getattr(param, "_param_name", None)
     if getattr(param, "use_dion", None) is False:
         return False
-    if not getattr(param, "dion_candidate", False):
+    if not getattr(param, "matrix_optimizer_candidate", getattr(param, "dion_candidate", False)):
         return False
     if param.ndim != 2:
         return False
@@ -108,80 +114,6 @@ def has_explicit_expert_index(param_name: Optional[str]) -> bool:
         return get_expert_index_from_key(param_name) is not None
     except AssertionError:
         return False
-
-
-@dataclass(frozen=True)
-class DionShardEntry:
-    """Bucket-local Dion shard layout for one parameter."""
-
-    param: torch.nn.Parameter
-    shard_layout: DionShardLayout
-    size_per_rank: int
-    shard_capacity: int
-    shard_offset: int
-    canonical_bucket_start: int
-    canonical_bucket_end: int
-    canonical_rank_flat_segments: Tuple[Tuple[Tuple[int, int], ...], ...]
-    grad_rank_flat_segments: Tuple[Tuple[Tuple[int, int], ...], ...]
-    rank_split_ranges: Tuple[Tuple[int, int], ...]
-
-    @property
-    def local_shape(self) -> Tuple[int, int]:
-        return self.shard_layout.local_shape
-
-    @property
-    def global_shape(self) -> Tuple[int, int]:
-        return self.shard_layout.global_shape
-
-    @property
-    def fs_shard_dim(self) -> int:
-        return int(self.shard_layout.fs_shard_dim)
-
-    @property
-    def start_idx(self) -> int:
-        return int(self.shard_layout.start_idx)
-
-    @property
-    def end_idx(self) -> int:
-        return int(self.shard_layout.end_idx)
-
-    @property
-    def local_numel(self) -> int:
-        return int(self.shard_layout.local_numel)
-
-
-@dataclass(frozen=True)
-class DionBucketLayout:
-    """Bucket-local Dion transport layout under stock DO control."""
-
-    entries: Tuple[DionShardEntry, ...]
-    shard_size: int
-    gathered_numel: int
-    grad_gathered_numel: int
-    param_ids: FrozenSet[int]
-
-    @property
-    def has_params(self) -> bool:
-        return bool(self.entries)
-
-    @property
-    def entry_count(self) -> int:
-        return len(self.entries)
-
-    @property
-    def max_shard_capacity(self) -> int:
-        return max((int(entry.shard_capacity) for entry in self.entries), default=0)
-
-
-@dataclass(frozen=True)
-class StandardParamGatherRoute:
-    """Bucket all-gather layout for standard params inside a mixed bucket."""
-
-    group_size: int
-    group_rank: int
-    standard_shard_size: int
-    standard_numel: int
-    rank_segments: Tuple[Tuple[Tuple[int, int, int], ...], ...]
 
 
 @dataclass
@@ -386,7 +318,7 @@ def build_dion_shard_entries(
     fs_rank: int,
     grad_shard_group_size: int,
     grad_rank_to_fs_rank: Tuple[int, ...],
-) -> tuple[DionBucketLayout | None, dict, int]:
+) -> tuple[MatrixBucketLayout | None, dict, int]:
     """Build bucket-local Dion shard layouts without mutating parent `param_map`."""
     if grad_shard_group_size <= 0:
         raise RuntimeError(
@@ -408,7 +340,7 @@ def build_dion_shard_entries(
                 "[Dion] Dion grad rank maps outside FS range "
                 f"grad_rank={grad_rank} fs_rank={int(grad_fs_rank)} fs_size={fs_size}"
             )
-    entries: List[DionShardEntry] = []
+    entries: List[MatrixShardEntry] = []
     dion_shard_layout_by_param = {}
     shard_offset = 0
 
@@ -473,7 +405,7 @@ def build_dion_shard_entries(
             grad_fs_rank = int(grad_rank_to_fs_rank[grad_rank])
             grad_rank_flat_segments.append(canonical_rank_flat_segments[grad_fs_rank])
 
-        shard_layout = DionShardLayout(
+        shard_layout = MatrixShardLayout(
             local_shape=tuple(int(dim) for dim in local_shape),
             global_shape=tuple(int(dim) for dim in global_shape),
             fs_shard_dim=fs_shard_dim,
@@ -483,7 +415,7 @@ def build_dion_shard_entries(
         )
         dion_shard_layout_by_param[param] = shard_layout
         entries.append(
-            DionShardEntry(
+            MatrixShardEntry(
                 param=param,
                 shard_layout=shard_layout,
                 size_per_rank=int(size_per_rank),
@@ -506,7 +438,7 @@ def build_dion_shard_entries(
 
     bucket_layout = None
     if entries:
-        bucket_layout = DionBucketLayout(
+        bucket_layout = MatrixBucketLayout(
             entries=tuple(entries),
             shard_size=int(shard_offset),
             gathered_numel=int(shard_offset) * int(fs_size),
@@ -539,7 +471,7 @@ def param_rank_range(full_start: int, full_end: int, shard_size: int, rank: int)
     return local_abs_start - int(full_start), local_abs_end - int(full_start)
 
 
-def collect_dion_bucket_params(dion_layout: DionBucketLayout | None) -> list[torch.nn.Parameter]:
+def collect_dion_bucket_params(dion_layout: MatrixBucketLayout | None) -> list[torch.nn.Parameter]:
     """Return unique bucket-local Dion params in canonical entry order."""
     if dion_layout is None or not dion_layout.has_params:
         return []
@@ -553,7 +485,7 @@ def collect_dion_bucket_params(dion_layout: DionBucketLayout | None) -> list[tor
     return params
 
 
-def serialize_bucket_gather_layout(dion_layout: DionBucketLayout) -> tuple[int, ...]:
+def serialize_bucket_gather_layout(dion_layout: MatrixBucketLayout) -> tuple[int, ...]:
     """Serialize bucket-global Dion gather invariants for cross-rank validation."""
     payload: list[int] = [
         int(dion_layout.entry_count),
@@ -583,7 +515,7 @@ def serialize_bucket_gather_layout(dion_layout: DionBucketLayout) -> tuple[int, 
 def validate_bucket_gather_layout(
     *,
     bucket,
-    dion_layout: DionBucketLayout,
+    dion_layout: MatrixBucketLayout,
     shard_group,
 ) -> None:
     """Validate that all shard ranks agree on one Dion bucket gather layout."""
@@ -635,7 +567,7 @@ def write_dion_shard_(
 
 def restore_dion_shards_from_bucket_(
     *,
-    dion_layout: DionBucketLayout | None,
+    dion_layout: MatrixBucketLayout | None,
     get_full_view_2d: Callable[[object], torch.Tensor],
     update_data_shard: Callable[[torch.nn.Parameter, torch.Tensor], None],
     param_name: Callable[[torch.nn.Parameter], str],
@@ -813,7 +745,7 @@ def build_bucket_param_map(
     """Rebuild the parent DO param_map in canonical bucket-param order."""
     del bucket_param_to_index, param_to_name
     from collections import OrderedDict
-    from ..distrib_optimizer import DistributedOptimizer, Range
+    from ...distrib_optimizer import DistributedOptimizer, Range
 
     parent_param_map = parent_result["param_map"]
     dp_world_size = dp_group.size()
@@ -858,7 +790,7 @@ def build_bucket_param_map(
 def mark_dion_bucket_params(cls, param_map, param_to_name, fs_size):
     """Classify bucket params and build static Dion metadata once."""
     del cls
-    from .. import parallel_state
+    from .... import parallel_state
 
     fs_size = int(fs_size)
     if fs_size <= 0:
@@ -874,13 +806,15 @@ def mark_dion_bucket_params(cls, param_map, param_to_name, fs_size):
         if param_name:
             param._param_name = param_name
 
-        fallback_to_elementwise = (
+        fallback_to_scalar = (
             is_combined_grouped_mlp_param(param, param_name)
             or is_unindexed_multi_local_expert_param(param, param_name)
         )
         param.is_dion_param = is_dion_param(param, param_name)
-        if not param.is_dion_param and fallback_to_elementwise:
+        param.is_matrix_param = bool(param.is_dion_param)
+        if not param.is_dion_param and fallback_to_scalar:
             param.dion_candidate = False
+            param.matrix_optimizer_candidate = False
 
         is_expert = is_moe_expert_param(param, param_name)
         raw_tp_split_dim = get_tp_split_dim(param)
@@ -899,7 +833,9 @@ def mark_dion_bucket_params(cls, param_map, param_to_name, fs_size):
         split_size = m_local if fs_shard_dim == 0 else n_local
         if fs_size > 1 and split_size < fs_size:
             param.is_dion_param = False
+            param.is_matrix_param = False
             param.dion_candidate = False
+            param.matrix_optimizer_candidate = False
             continue
 
         dion_param_count += 1
@@ -1056,7 +992,7 @@ def attach_dion_bucket_layout_(
     gbuf_idx: int,
     buffer,
     bucket,
-    dion_layout: DionBucketLayout,
+    dion_layout: MatrixBucketLayout,
 ) -> None:
     """Validate that stored Dion entries already target the current runtime bucket."""
     if not hasattr(bucket, "param_to_index") or bucket.param_to_index is None:
@@ -1086,7 +1022,7 @@ def init_dion_bucket(
     gbuf_idx: int,
     buffer,
     bucket,
-    dion_layout: DionBucketLayout,
+    dion_layout: MatrixBucketLayout,
     fs_group,
 ) -> None:
     """Configure one bucket that contains at least one Dion param."""
@@ -1133,7 +1069,7 @@ def init_standard_bucket(optimizer, *, gbuf_idx: int, buffer, bucket, fs_group) 
     bucket._dion_full_param_ready = True
 
 
-def bucket_dion_param_view(optimizer, bucket, entry: DionShardEntry) -> torch.Tensor:
+def bucket_dion_param_view(optimizer, bucket, entry: MatrixShardEntry) -> torch.Tensor:
     """Return the canonical full-param view for one Dion entry."""
     full_view_2d = bucket_full_param_view_2d(bucket, entry.param, entry)
     if full_view_2d is None:
@@ -1148,7 +1084,7 @@ def bucket_dion_param_view(optimizer, bucket, entry: DionShardEntry) -> torch.Te
 def fill_dion_shard_buffer(
     optimizer,
     *,
-    entry: DionShardEntry,
+    entry: MatrixShardEntry,
     full_view_2d: torch.Tensor,
     shard_buffer: torch.Tensor,
 ) -> None:
@@ -1186,7 +1122,9 @@ def fill_dion_shard_buffer(
         shard_buffer[local_numel:].zero_()
 
 
-def prepare_dion_param_gather(optimizer, bucket) -> Tuple[torch.Tensor, List[Tuple[DionShardEntry, torch.Tensor]]]:
+def prepare_dion_param_gather(
+    optimizer, bucket
+) -> Tuple[torch.Tensor, List[Tuple[MatrixShardEntry, torch.Tensor]]]:
     """Build one bucket-local Dion shard buffer in canonical entry order."""
     dion_layout = getattr(bucket, "dion_layout", None)
     if dion_layout is None or not dion_layout.has_params:
@@ -1310,7 +1248,7 @@ def _get_standard_param_gather_route(
     group_size: int,
     group_rank: int,
     standard_shard_size: int,
-) -> StandardParamGatherRoute:
+) -> MatrixStandardGatherRoute:
     cached = getattr(bucket, "_standard_param_gather_route", None)
     if (
         cached is not None
@@ -1325,7 +1263,7 @@ def _get_standard_param_gather_route(
         group_size=int(group_size),
         shard_size=int(standard_shard_size),
     )
-    route = StandardParamGatherRoute(
+    route = MatrixStandardGatherRoute(
         group_size=int(group_size),
         group_rank=int(group_rank),
         standard_shard_size=int(standard_shard_size),
@@ -1368,7 +1306,9 @@ def _standard_param_gather_route(optimizer, bucket):
     return route, dp_group, dp_size
 
 
-def fill_standard_param_gather(bucket, target: torch.Tensor, route: StandardParamGatherRoute) -> None:
+def fill_standard_param_gather(
+    bucket, target: torch.Tensor, route: MatrixStandardGatherRoute
+) -> None:
     target.zero_()
     for source_start, source_end, target_start in route.rank_segments[int(route.group_rank)]:
         source_start = int(source_start)
@@ -1578,8 +1518,8 @@ def prepare_mixed_param_gather(
     optimizer,
     bucket,
     *,
-    dion_layout: DionBucketLayout,
-    standard_route: StandardParamGatherRoute,
+    dion_layout: MatrixBucketLayout,
+    standard_route: MatrixStandardGatherRoute,
 ):
     group_size = int(standard_route.group_size)
     dion_size = int(dion_layout.shard_size)
@@ -1624,7 +1564,7 @@ def _all_gather_mixed_payload_(
     async_op: bool,
     input_payload: torch.Tensor,
     prepared_entries,
-    standard_route: StandardParamGatherRoute,
+    standard_route: MatrixStandardGatherRoute,
     dp_group,
     group_size: int,
     dion_size: int,

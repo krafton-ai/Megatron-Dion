@@ -68,7 +68,8 @@ def _cholesky_upper_factor(X: Tensor) -> Tensor:
     )[0].to(dtype=torch.float32)
 
 
-@_dion_compile()
+# Keep this wrapper eager: MCore passes a per-step sketch callback, which makes
+# torch.compile recompile; only fixed-shape helper kernels are eligible for it.
 def orthogonalize(
     P: Tensor,
     rcqr_oversample: float = 1.25,
@@ -98,27 +99,11 @@ def orthogonalize(
             oversample=rcqr_oversample,
             make_sketch=make_sketch,
         ).to(dtype=torch.float32)
-        R = torch.linalg.qr(
-            S @ P_local,
-            mode="r",
-        )[1].to(dtype=torch.float32)
-        P_local = torch.linalg.solve_triangular(
-            R,
-            P_local,
-            upper=True,
-            left=False,
-        ).to(dtype=torch.float32)
+        R = _qr_r_factor(S @ P_local)
+        P_local = _solve_triangular_right(R, P_local)
 
-        R = torch.linalg.cholesky_ex(
-            (P_local.mT @ P_local).to(dtype=torch.float32),
-            upper=True,
-        )[0].to(dtype=torch.float32)
-        P_local = torch.linalg.solve_triangular(
-            R,
-            P_local,
-            upper=True,
-            left=False,
-        ).to(dtype=torch.float32)
+        R = _cholesky_upper_factor((P_local.mT @ P_local).to(dtype=torch.float32))
+        P_local = _solve_triangular_right(R, P_local)
 
     return P_local.to(original_dtype).contiguous()
 

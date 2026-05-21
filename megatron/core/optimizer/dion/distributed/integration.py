@@ -8,7 +8,7 @@ from megatron.core import parallel_state
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 
-from ..optimizer_config import DionOptimizerConfig, OptimizerConfig
+from ...optimizer_config import DionOptimizerConfig, OptimizerConfig
 
 
 def _validate_replica_group(
@@ -156,7 +156,7 @@ def get_dion_param_override(
     param_override: Optional[ParamGroupOverride],
     param_name: Optional[str] = None,
 ) -> Optional[ParamGroupOverride]:
-    """Return Dion-specific elementwise-surface LR overrides."""
+    """Return Dion-specific scalar-surface LR overrides."""
     if not isinstance(config, DionOptimizerConfig):
         return None
 
@@ -411,9 +411,9 @@ def build_dion_optimizer(
         epsilon=config.dion_normalize_eps,
         rcqr_oversample=config.dion_oversample,
         betas=(config.dion_beta1, config.dion_beta2),
-        elementwise_eps=config.dion_scalar_eps,
-        elementwise_optimizer=config.dion_scalar_optimizer,
-        elementwise_lr_scale=config.dion_scalar_lr_scale,
+        scalar_eps=config.dion_scalar_eps,
+        scalar_optimizer=config.dion_scalar_optimizer,
+        scalar_lr_scale=config.dion_scalar_lr_scale,
         scale_mode=config.dion_scale_mode,
         extra_scale_factor=config.dion_extra_scale_factor,
         split_qkv=config.dion_split_qkv,
@@ -442,7 +442,7 @@ def build_dion_distributed_optimizer(
     pg_collection: Optional[ProcessGroupCollection],
     is_expert_parallel: bool,
 ):
-    from megatron.core.optimizer.dion_distrib_optimizer import DionDistributedOptimizer
+    from megatron.core.optimizer.dion.distributed.optimizer import DistributedDionOptimizer
 
     requested_fs_size = getattr(config, 'fully_shard_model_parallel_size', None) or 1
     requested_rp_size = getattr(config, 'replicate_model_parallel_size', None) or 1
@@ -458,14 +458,14 @@ def build_dion_distributed_optimizer(
         fs_size = len(fs_world_ranks)
         if not is_expert_parallel and fs_size != requested_fs_size:
             raise RuntimeError(
-                "Dion FS topology mismatch while constructing DionDistributedOptimizer. "
+                "Dion FS topology mismatch while constructing DistributedDionOptimizer. "
                 f"requested_fs={requested_fs_size} actual_fs_group_size={fs_size} "
                 f"(fs_group_ranks={fs_world_ranks})."
             )
     else:
         fs_size = requested_fs_size
 
-    return DionDistributedOptimizer(
+    return DistributedDionOptimizer(
         *optimizer_args,
         model_chunks=model_chunks,
         per_model_buffers=per_model_buffers,

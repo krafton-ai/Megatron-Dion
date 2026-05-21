@@ -1,43 +1,26 @@
-"""TP/FS sharding helpers for distributed Dion."""
+"""TP/FS sharding helpers for matrix-aware distributed optimizers."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
-from ..dion.state import is_p_fs_sharded, is_p_tp_sharded
+from .types import MatrixShardLayout
 
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class DionShardLayout:
-    """Minimal Dion shard layout for one model parameter."""
-
-    local_shape: Tuple[int, int]
-    global_shape: Tuple[int, int]
-    fs_shard_dim: int
-    start_idx: int
-    end_idx: int
-    per_expert_global_shape: Optional[Tuple[int, int]] = None
-
-    @property
-    def local_numel(self) -> int:
-        return int(self.local_shape[0]) * int(self.local_shape[1])
-
-
 def get_tp_split_dim(param: torch.Tensor) -> int:
-    """Return TP split dim in Dion naming convention."""
+    """Return the tensor-parallel split dim used by MCore parameters."""
     return getattr(param, "partition_dim", -1)
 
 
 def is_tp_enabled(param: torch.Tensor) -> bool:
-    """Return True iff this parameter participates in Tensor Parallelism."""
+    """Return True iff this parameter participates in tensor parallelism."""
     return bool(getattr(param, "tensor_model_parallel", False))
 
 
@@ -135,7 +118,7 @@ def resolve_tp_group(
     if tp_group is None:
         if expect_group and meta_tp_world_size > 1:
             raise RuntimeError(
-                "[DION_MISSING_TP_GROUP_META] "
+                "[MATRIX_MISSING_TP_GROUP_META] "
                 f"rank={dist.get_rank()} param={param_name} param_uid={param_uid} "
                 f"meta_tp_world_size={meta_tp_world_size} meta_tp_rank={meta_tp_rank}"
             )
@@ -145,7 +128,7 @@ def resolve_tp_group(
     actual_tp_rank = dist.get_rank(tp_group)
     if actual_tp_world_size != meta_tp_world_size or actual_tp_rank != meta_tp_rank:
         raise RuntimeError(
-            "[DION_INCONSISTENT_TP_GROUP_META] "
+            "[MATRIX_INCONSISTENT_TP_GROUP_META] "
             f"rank={dist.get_rank()} param={param_name} param_uid={param_uid} "
             f"meta_tp_world_size={meta_tp_world_size} actual_tp_world_size={actual_tp_world_size} "
             f"meta_tp_rank={meta_tp_rank} actual_tp_rank={actual_tp_rank}"
@@ -171,7 +154,7 @@ def resolve_fs_group_from_meta(
     if fs_group is None:
         if expect_group and meta_fs_world_size > 1:
             raise RuntimeError(
-                "[DION_MISSING_FS_GROUP_META] "
+                "[MATRIX_MISSING_FS_GROUP_META] "
                 f"rank={dist.get_rank()} param={param_name} param_uid={param_uid} "
                 f"meta_fs_world_size={meta_fs_world_size} meta_fs_rank={meta_fs_rank}"
             )
@@ -181,7 +164,7 @@ def resolve_fs_group_from_meta(
     actual_fs_rank = dist.get_rank(fs_group)
     if actual_fs_world_size != meta_fs_world_size or actual_fs_rank != meta_fs_rank:
         raise RuntimeError(
-            "[DION_INCONSISTENT_FS_GROUP_META] "
+            "[MATRIX_INCONSISTENT_FS_GROUP_META] "
             f"rank={dist.get_rank()} param={param_name} param_uid={param_uid} "
             f"meta_fs_world_size={meta_fs_world_size} actual_fs_world_size={actual_fs_world_size} "
             f"meta_fs_rank={meta_fs_rank} actual_fs_rank={actual_fs_rank}"
@@ -198,18 +181,20 @@ def resolve_ortho_group(
     use_fs_collectives: bool,
     resolve_tp_group: Callable,
     resolve_fs_group_from_meta: Callable,
+    is_tp_sharded: Callable,
+    is_fs_sharded: Callable,
 ):
     """Return the authoritative orthogonalization group from adapter metadata."""
     tp_active = bool(getattr(config, "use_tp_shard", False))
 
-    if is_p_tp_sharded(config, tp_active=tp_active):
+    if is_tp_sharded(config, tp_active=tp_active):
         return resolve_tp_group(dist_meta, expect_group=True)
-    if use_fs_collectives and is_p_fs_sharded(config):
+    if use_fs_collectives and is_fs_sharded(config):
         return resolve_fs_group_from_meta(dist_meta, expect_group=True)
     return None
 
 
-def create_fs_shard(optimizer, model_param, shard_layout: DionShardLayout):
+def create_fs_shard(optimizer, model_param, shard_layout: MatrixShardLayout):
     """Create the local FS shard view from `model_param`."""
     start_idx = int(shard_layout.start_idx)
     end_idx = int(shard_layout.end_idx)
@@ -231,9 +216,10 @@ def attach_fs_shard_(optimizer, model_param, shard):
             int(shard_layout.end_idx),
         )
         if shard.shape != expected_view.shape or shard.data_ptr() != expected_view.data_ptr():
-            param_name = getattr(model_param, '_param_name', f'id_{id(model_param)}')
+            param_name = getattr(model_param, "_param_name", f"id_{id(model_param)}")
             logger.error(
-                "[DION_FS_ALIAS_MISMATCH] param=%s shard_shape=%s expected_shape=%s shard_ptr=%s expected_ptr=%s",
+                "[MATRIX_FS_ALIAS_MISMATCH] param=%s shard_shape=%s expected_shape=%s "
+                "shard_ptr=%s expected_ptr=%s",
                 param_name,
                 tuple(shard.shape),
                 tuple(expected_view.shape),
@@ -243,26 +229,26 @@ def attach_fs_shard_(optimizer, model_param, shard):
     model_param._fs_shard = shard
 
 
-def register_dion_shard(
+def register_matrix_shard(
     optimizer,
     model_param: torch.nn.Parameter,
     data_shard: torch.Tensor,
     opt_shard: torch.Tensor,
-    shard_layout: DionShardLayout,
+    shard_layout: MatrixShardLayout,
 ) -> None:
-    """Register all shard info for a Dion parameter in one call."""
+    """Register all shard info for a matrix parameter in one call."""
     optimizer._shards_by_param[model_param] = (data_shard, opt_shard)
     optimizer._shard_layouts_by_param[model_param] = shard_layout
 
 
 def get_data_shard(optimizer, model_param: torch.nn.Parameter) -> Optional[torch.Tensor]:
-    """Get data shard (FP16) for a model parameter."""
+    """Get data shard for a model parameter."""
     info = optimizer._shards_by_param.get(model_param)
     return info[0] if info else None
 
 
 def get_opt_shard(optimizer, model_param: torch.nn.Parameter) -> Optional[torch.Tensor]:
-    """Get optimizer shard (FP32) for a model parameter."""
+    """Get optimizer shard for a model parameter."""
     info = optimizer._shards_by_param.get(model_param)
     return info[1] if info else None
 
@@ -287,6 +273,6 @@ def update_opt_shard(
         optimizer._shards_by_param[model_param] = (data_shard, new_opt_shard)
 
 
-def param_shard_layout(optimizer, model_param: torch.nn.Parameter) -> Optional[DionShardLayout]:
-    """Return typed Dion shard layout for one model param, if any."""
+def param_shard_layout(optimizer, model_param: torch.nn.Parameter) -> Optional[MatrixShardLayout]:
+    """Return typed shard layout for one model param, if any."""
     return optimizer._shard_layouts_by_param.get(model_param)

@@ -67,6 +67,54 @@ def has_multiple_local_experts(dist_meta: Optional[DionDistMeta]) -> bool:
     )
 
 
+def local_expert_tensor_view(
+    tensor: torch.Tensor,
+    *,
+    axis: int,
+    num_local_experts: int,
+    local_expert_index: int,
+    local_shape: Tuple[int, int],
+    context: str = "",
+) -> torch.Tensor:
+    """Return the single-expert view from a tensor that may pack local experts."""
+    detail = f" context={context}" if context else ""
+    if axis not in (0, 1):
+        raise RuntimeError(f"[DION_INVALID_EXPERT_AXIS]{detail} axis={axis}")
+    if int(num_local_experts) <= 1:
+        return tensor
+    if int(local_expert_index) < 0 or int(local_expert_index) >= int(num_local_experts):
+        raise RuntimeError(
+            "[DION_INVALID_EXPERT_LOCAL_INDEX] "
+            f"{detail} axis={axis} num_local_experts={num_local_experts} "
+            f"local_expert_index={local_expert_index}"
+        )
+
+    local_extent = int(local_shape[axis])
+    expected_axis_size = local_extent * int(num_local_experts)
+    current_axis_size = int(tensor.size(axis))
+    other_axis = 1 - axis
+    if int(tensor.size(other_axis)) != int(local_shape[other_axis]):
+        raise RuntimeError(
+            "[DION_EXPERT_SPLIT_TENSOR_SHAPE_MISMATCH] "
+            f"{detail} axis={axis} tensor_shape={tuple(int(dim) for dim in tensor.shape)} "
+            f"local_shape={local_shape} num_local_experts={num_local_experts}"
+        )
+    if current_axis_size == local_extent:
+        return tensor
+    if current_axis_size != expected_axis_size:
+        raise RuntimeError(
+            "[DION_EXPERT_SPLIT_TENSOR_SHAPE_MISMATCH] "
+            f"{detail} axis={axis} tensor_shape={tuple(int(dim) for dim in tensor.shape)} "
+            f"local_shape={local_shape} num_local_experts={num_local_experts}"
+        )
+
+    start = int(local_expert_index) * local_extent
+    end = start + local_extent
+    if axis == 0:
+        return tensor[start:end, :]
+    return tensor[:, start:end]
+
+
 def str_to_dtype(dtype_val) -> Optional[torch.dtype]:
     """Convert string dtype to torch.dtype if needed.
 

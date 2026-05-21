@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from ..dion.state import build_param_config, is_p_fs_sharded, is_p_tp_sharded
+from ..state import build_param_config, is_p_fs_sharded, is_p_tp_sharded
 
 
 def _tensor_row_shard_sizes(fs_row_shard_sizes, tp_row_shard_sizes, *, error_prefix: str, detail: str):

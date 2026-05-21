@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from megatron.core.optimizer.distrib_dion import grad_norm as dion_grad_norm
+from megatron.core.optimizer.dion.distributed import grad_norm as dion_grad_norm
 
 
 def test_grad_sum_sq_fp64_casts_in_bounded_chunks(monkeypatch):

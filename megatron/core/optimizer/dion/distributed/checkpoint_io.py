@@ -6,19 +6,20 @@ math or collective patterns, only code organization.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
 
-from ...fp8_utils import dequantize_fp8_tensor, is_float8tensor
-from ..dion.linear import iter_linear_child_kinds, linear_state_key
-from ..dion.qkv import iter_qkv_child_kinds, qkv_state_key
-from ..dion.qkvg import iter_qkvg_child_kinds, qkvg_state_key
-from ..dion.utils import str_to_dtype
-from .sharding import (
-    DionShardLayout,
+from ....fp8_utils import dequantize_fp8_tensor, is_float8tensor
+from ...matrix.splits.linear import iter_linear_child_kinds, linear_state_key
+from ...matrix.splits.qkv import iter_qkv_child_kinds, qkv_state_key
+from ...matrix.splits.qkvg import iter_qkvg_child_kinds, qkvg_state_key
+from ..utils import str_to_dtype
+from ...matrix.sharding import (
+    MatrixShardLayout,
     compute_fs_shard_range,
     fs_shard_view_2d,
     set_fs_shard_view_2d,
@@ -26,9 +27,15 @@ from .sharding import (
 
 logger = logging.getLogger(__name__)
 
-DION_PARAM_STATE_FORMAT = "dion_dp_rank_state_v3"
-_LEGACY_DION_PARAM_STATE_FORMATS = {"dion_fs_rank_state_v1", "dion_dp_rank_state_v2"}
+DION_PARAM_STATE_FORMAT = "dion_dp_rank_state_v4"
+MATRIX_SUBSTRATE_FORMAT_VERSION = 1
+_LEGACY_DION_PARAM_STATE_FORMATS = {
+    "dion_fs_rank_state_v1",
+    "dion_dp_rank_state_v2",
+    "dion_dp_rank_state_v3",
+}
 _SUPPORTED_DION_PARAM_STATE_FORMATS = {"dp_reshardable", "dion_fs_rank_state"}
+_DION_TENSOR_PAYLOAD_FORMAT = "rank_local_tensor_shards_v1"
 
 
 def _param_name(param: torch.Tensor) -> str:
@@ -48,7 +55,7 @@ def resolve_dion_checkpoint_sharding_type(sharding_type, metadata) -> str:
     """Return the checkpoint state format requested for Dion optimizer state."""
     if sharding_type is not None:
         logger.warning(
-            "DionDistributedOptimizer.sharded_state_dict parameter `sharding_type` "
+            "DistributedDionOptimizer.sharded_state_dict parameter `sharding_type` "
             "is deprecated; use metadata['distrib_optim_sharding_type'] instead."
         )
         requested_type = sharding_type
@@ -80,7 +87,11 @@ def _normalize_topology_signature(signature: dict) -> dict:
         )
     normalized = {}
     for key, ranks in signature.items():
-        normalized[str(key)] = tuple(int(rank) for rank in ranks)
+        key = str(key)
+        ranks = tuple(int(rank) for rank in ranks)
+        if key in {"fs", "tp", "rp", "state_replica"} and len(ranks) <= 1:
+            ranks = ()
+        normalized[key] = ranks
     return normalized
 
 
@@ -93,6 +104,7 @@ def build_dion_checkpoint_metadata(
     state_replica_size: int,
     requested_type: str,
     topology_signature: Optional[dict] = None,
+    backend_state_spec=None,
 ) -> dict:
     """Build small checkpoint metadata for Dion optimizer-state compatibility checks."""
     metadata = {
@@ -106,6 +118,13 @@ def build_dion_checkpoint_metadata(
     }
     if topology_signature is not None:
         metadata["topology_signature"] = topology_signature
+    if backend_state_spec is not None:
+        metadata["matrix_optimizer"] = {
+            "backend": str(backend_state_spec.backend),
+            "substrate_version": MATRIX_SUBSTRATE_FORMAT_VERSION,
+            "backend_state_version": int(backend_state_spec.version),
+            "state_keys": tuple(str(key) for key in backend_state_spec.state_keys),
+        }
     return metadata
 
 
@@ -118,6 +137,7 @@ def validate_dion_checkpoint_metadata(
     rp_size: int = 1,
     state_replica_size: int = 1,
     topology_signature: Optional[dict] = None,
+    backend_state_spec=None,
 ) -> None:
     """Fail before restore when the saved Dion tensor layout cannot be resharded."""
     if checkpoint_metadata is None:
@@ -210,6 +230,33 @@ def validate_dion_checkpoint_metadata(
                 f"saved={saved_topology_signature} current={topology_signature}"
             )
 
+    saved_matrix = checkpoint_metadata.get("matrix_optimizer", None)
+    if saved_matrix is None or backend_state_spec is None:
+        return
+    if not isinstance(saved_matrix, dict):
+        raise RuntimeError(
+            "[Dion] invalid matrix optimizer checkpoint metadata: "
+            f"type={type(saved_matrix).__name__}"
+        )
+    saved_backend = saved_matrix.get("backend", None)
+    if saved_backend != backend_state_spec.backend:
+        raise RuntimeError(
+            "[Dion] unsupported matrix optimizer backend checkpoint restore: "
+            f"saved={saved_backend!r} current={backend_state_spec.backend!r}"
+        )
+    saved_substrate_version = int(saved_matrix.get("substrate_version", -1))
+    if saved_substrate_version > MATRIX_SUBSTRATE_FORMAT_VERSION:
+        raise RuntimeError(
+            "[Dion] unsupported matrix optimizer substrate checkpoint version: "
+            f"saved={saved_substrate_version} current={MATRIX_SUBSTRATE_FORMAT_VERSION}"
+        )
+    saved_backend_state_version = int(saved_matrix.get("backend_state_version", -1))
+    if saved_backend_state_version > int(backend_state_spec.version):
+        raise RuntimeError(
+            "[Dion] unsupported Dion backend checkpoint state version: "
+            f"saved={saved_backend_state_version} current={backend_state_spec.version}"
+        )
+
 
 def _is_q_state_key(key: str) -> bool:
     if key == "Q":
@@ -268,6 +315,198 @@ def build_persistent_param_state(param_groups, optimizer_state, get_param_key) -
     return key_to_state
 
 
+def _stable_param_key_id(value) -> str:
+    """Return a deterministic checkpoint id for a param key."""
+    return hashlib.sha1(repr(value).encode("utf-8")).hexdigest()
+
+
+def _wrap_rank_local_tensor(
+    *,
+    tensor: torch.Tensor,
+    key: str,
+    replica_id,
+    sharded_tensor_cls,
+):
+    """Represent one same-topology rank-local tensor as an independent shard."""
+    data = tensor.detach()
+    shape = tuple(int(dim) for dim in data.shape)
+    return sharded_tensor_cls(
+        key=key,
+        data=data,
+        dtype=data.dtype,
+        local_shape=shape,
+        global_shape=shape,
+        global_offset=tuple(0 for _ in shape),
+        axis_fragmentations=tuple(1 for _ in shape),
+        replica_id=replica_id,
+    )
+
+
+def build_tensor_param_state(
+    *,
+    param_groups,
+    optimizer_state,
+    get_param_key,
+    base_key: str,
+    rank_key: str,
+    state_replica_id,
+    sharded_object_cls,
+    sharded_tensor_cls,
+) -> dict:
+    """Build Dion persistent state using tensors, not one large object payload."""
+    metadata_payload = {
+        "format": _DION_TENSOR_PAYLOAD_FORMAT,
+        "params": {},
+    }
+    tensor_payload = {}
+
+    for param_group in param_groups:
+        for param in param_group["params"]:
+            state = optimizer_state.get(param)
+            if not state:
+                continue
+            param_key = get_param_key(param)
+            if param_key is None:
+                continue
+
+            param_id = _stable_param_key_id(param_key)
+            values = {}
+            tensor_keys = []
+            tensors = {"param": param.detach()}
+            for key, value in state.items():
+                if key.startswith("_"):
+                    continue
+                if isinstance(value, torch.Tensor):
+                    tensors[key] = value
+                else:
+                    values[key] = value
+
+            for key, value in tensors.items():
+                tensor_key = f"{base_key}.dion_param_state.{rank_key}.{param_id}.{key}"
+                tensor_payload.setdefault(param_id, {})[key] = _wrap_rank_local_tensor(
+                    tensor=value,
+                    key=tensor_key,
+                    replica_id=state_replica_id,
+                    sharded_tensor_cls=sharded_tensor_cls,
+                )
+                tensor_keys.append(key)
+
+            metadata_payload["params"][param_key] = {
+                "id": param_id,
+                "values": values,
+                "tensor_keys": tuple(tensor_keys),
+            }
+
+    return {
+        "metadata": sharded_object_cls(
+            f"{base_key}.dion_param_state.{rank_key}.metadata",
+            metadata_payload,
+            (1,),
+            (0,),
+            replica_id=state_replica_id,
+        ),
+        "tensors": tensor_payload,
+    }
+
+
+def _unwrap_checkpoint_leaf(value):
+    """Return raw payload from loaded or still-wrapped checkpoint leaves."""
+    if hasattr(value, "data") and value.__class__.__name__ in {"ShardedObject", "ShardedTensor"}:
+        return value.data
+    return value
+
+
+def _is_tensor_param_state_payload(value) -> bool:
+    return isinstance(value, dict) and "metadata" in value and "tensors" in value
+
+
+def _select_tensor_param_state_payload(param_state_payload: dict):
+    """Return the tensor payload, accepting one extra rank-key nesting level."""
+    if _is_tensor_param_state_payload(param_state_payload):
+        return param_state_payload
+
+    candidates = [
+        value
+        for value in param_state_payload.values()
+        if _is_tensor_param_state_payload(value)
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _sample_keys(mapping, limit: int = 5) -> tuple[str, ...]:
+    if not isinstance(mapping, dict):
+        return (f"<{type(mapping).__name__}>",)
+    keys = []
+    for key in mapping.keys():
+        text = repr(key)
+        if len(text) > 160:
+            text = text[:157] + "..."
+        keys.append(text)
+        if len(keys) >= int(limit):
+            break
+    return tuple(keys)
+
+
+def _materialize_param_state_payload(param_state_payload) -> dict:
+    """Return the legacy param-keyed state dict from either checkpoint layout."""
+    if not isinstance(param_state_payload, dict):
+        raise RuntimeError("[Dion] distributed checkpoint missing Dion param state payload")
+    tensor_payload = _select_tensor_param_state_payload(param_state_payload)
+    if tensor_payload is None:
+        return param_state_payload
+
+    metadata = _unwrap_checkpoint_leaf(tensor_payload["metadata"])
+    if not isinstance(metadata, dict):
+        raise RuntimeError(
+            "[Dion] invalid sharded Dion param-state metadata: "
+            f"type={type(metadata).__name__}"
+        )
+    if metadata.get("format") != _DION_TENSOR_PAYLOAD_FORMAT:
+        raise RuntimeError(
+            "[Dion] unsupported sharded Dion param-state payload format: "
+            f"{metadata.get('format')!r}"
+        )
+
+    tensors_by_param = tensor_payload.get("tensors", {})
+    key_to_state = {}
+    for ordinal, (param_key, entry) in enumerate(metadata.get("params", {}).items()):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"[Dion] invalid param-state metadata entry for {param_key}")
+        param_id = entry.get("id", None)
+        values = dict(entry.get("values", {}))
+        tensor_keys = tuple(entry.get("tensor_keys", ()))
+        tensor_state = tensors_by_param.get(param_id, {})
+        if not isinstance(tensor_state, dict):
+            raise RuntimeError(f"[Dion] invalid tensor payload entry for {param_key}")
+        for key in tensor_keys:
+            if key not in tensor_state:
+                raise RuntimeError(
+                    "[Dion] sharded checkpoint missing tensor state "
+                    f"{key!r} for {param_key}"
+                )
+            values[key] = _unwrap_checkpoint_leaf(tensor_state[key])
+        key_to_state[param_key] = values
+        if param_id is not None:
+            key_to_state[("__dion_param_id__", str(param_id))] = values
+        key_to_state[("__dion_param_ordinal__", int(ordinal))] = values
+    return key_to_state
+
+
+def _find_saved_param_state(key_to_state: dict, param_key, ordinal: int):
+    saved_state = key_to_state.get(param_key, None)
+    if saved_state is not None:
+        return saved_state
+    saved_state = key_to_state.get(
+        ("__dion_param_id__", _stable_param_key_id(param_key)),
+        None,
+    )
+    if saved_state is not None:
+        return saved_state
+    return key_to_state.get(("__dion_param_ordinal__", int(ordinal)), None)
+
+
 def restore_persistent_param_state_(
     *,
     param_groups,
@@ -293,6 +532,7 @@ def restore_persistent_param_state_(
         "no_payload_entry": 0,
     }
 
+    restore_ordinal = 0
     for param_group in param_groups:
         for param in param_group["params"]:
             param_key = get_param_key(param)
@@ -300,11 +540,12 @@ def restore_persistent_param_state_(
             if param_key is None:
                 summary["unnamed"] += 1
                 continue
-            if param_key not in key_to_state:
+            saved_state = _find_saved_param_state(key_to_state, param_key, restore_ordinal)
+            restore_ordinal += 1
+            if saved_state is None:
                 summary["no_payload_entry"] += 1
                 continue
 
-            saved_state = key_to_state[param_key]
             new_state = {k: v for k, v in current_state.items() if k.startswith("_")}
             new_state["_needs_state_replica_q_sync"] = False
             if "_q_full_buffer" in new_state:
@@ -389,6 +630,8 @@ def build_distributed_checkpoint_state(
     state_replica_id,
     checkpoint_metadata: dict,
     sharded_object_cls,
+    sharded_tensor_cls=None,
+    state_rank_key: Optional[str] = None,
 ) -> dict:
     """Build distributed checkpoint state with standard common-state outer layout."""
     state_dict = {
@@ -409,18 +652,34 @@ def build_distributed_checkpoint_state(
         replica_id=common_replica_id,
     )
 
-    param_state_payload = build_persistent_param_state(
-        param_groups,
-        optimizer_state,
-        get_param_key,
-    )
-    state_dict["dion_param_state"] = sharded_object_cls(
-        f"{base_key}.dion_param_state",
-        param_state_payload,
-        tuple(int(dim) for dim in state_global_shape),
-        tuple(int(offset) for offset in state_global_offset),
-        replica_id=state_replica_id,
-    )
+    if sharded_tensor_cls is None:
+        param_state_payload = build_persistent_param_state(
+            param_groups,
+            optimizer_state,
+            get_param_key,
+        )
+        state_dict["dion_param_state"] = sharded_object_cls(
+            f"{base_key}.dion_param_state",
+            param_state_payload,
+            tuple(int(dim) for dim in state_global_shape),
+            tuple(int(offset) for offset in state_global_offset),
+            replica_id=state_replica_id,
+        )
+    else:
+        state_dict["dion_param_state"] = build_tensor_param_state(
+            param_groups=param_groups,
+            optimizer_state=optimizer_state,
+            get_param_key=get_param_key,
+            base_key=base_key,
+            rank_key=(
+                state_rank_key
+                if state_rank_key is not None
+                else ".".join(str(int(offset)) for offset in state_global_offset)
+            ),
+            state_replica_id=state_replica_id,
+            sharded_object_cls=sharded_object_cls,
+            sharded_tensor_cls=sharded_tensor_cls,
+        )
     return state_dict
 
 
@@ -447,26 +706,6 @@ def split_distributed_checkpoint_state(
     return checkpoint_metadata, param_state_payload, common_state_dict
 
 
-def ensure_state_initialized_for_load(
-    *,
-    param_groups,
-    optimizer_state,
-    init_state,
-) -> None:
-    """Initialize Dion optimizer state tensors before loading persistent payload."""
-    if init_state is None:
-        return
-
-    for param_group in param_groups:
-        for param in param_group["params"]:
-            state = optimizer_state.get(param)
-            if state is None:
-                optimizer_state[param] = {}
-                state = optimizer_state[param]
-            if len(state) == 0:
-                init_state(param, state, param_group)
-
-
 def restore_distributed_checkpoint_state(
     *,
     param_state_payload,
@@ -478,15 +717,34 @@ def restore_distributed_checkpoint_state(
     """Restore Dion-specific distributed checkpoint payload and validate completeness."""
     if not isinstance(param_state_payload, dict) or len(param_state_payload) == 0:
         raise RuntimeError("[Dion] distributed checkpoint missing Dion param state payload")
+    key_to_state = _materialize_param_state_payload(param_state_payload)
+    if not key_to_state:
+        raise RuntimeError("[Dion] distributed checkpoint has no Dion param state entries")
 
     restore_summary = restore_persistent_param_state_(
         param_groups=param_groups,
         optimizer_state=optimizer_state,
         get_param_key=get_param_key,
-        key_to_state=param_state_payload,
+        key_to_state=key_to_state,
         mixed_precision_config=mixed_precision_config,
     )
     if restore_summary["unnamed"] > 0 or restore_summary["no_payload_entry"] > 0:
+        current_key_samples = []
+        for param_group in param_groups:
+            for param in param_group["params"]:
+                current_key_samples.append(repr(get_param_key(param))[:160])
+                if len(current_key_samples) >= 5:
+                    break
+            if len(current_key_samples) >= 5:
+                break
+        logger.error(
+            "[Dion] checkpoint restore unresolved entries: "
+            "payload_type=%s payload_keys=%s materialized_keys=%s current_keys=%s",
+            type(param_state_payload).__name__,
+            _sample_keys(param_state_payload),
+            _sample_keys(key_to_state),
+            tuple(current_key_samples),
+        )
         raise RuntimeError(
             "[Dion] distributed checkpoint restore left unresolved param state entries "
             f"(restored={restore_summary['restored']} "
@@ -607,7 +865,7 @@ def copy_param_to_main_shard_(
     *,
     source_param: torch.Tensor,
     shard_main_param: torch.nn.Parameter,
-    dion_shard_layout: Optional[DionShardLayout],
+    dion_shard_layout: Optional[MatrixShardLayout],
     param_range,
 ) -> None:
     """Copy a source model/state-dict param into the local optimizer shard."""
@@ -658,7 +916,7 @@ def copy_group_to_main_shards_(
     shard_main_groups,
     get_source_param: Callable[[torch.nn.Parameter], torch.Tensor],
     get_param_range: Callable[[torch.nn.Parameter], object],
-    get_dion_shard_layout: Callable[[torch.nn.Parameter], Optional[DionShardLayout]],
+    get_dion_shard_layout: Callable[[torch.nn.Parameter], Optional[MatrixShardLayout]],
     dion_params_only: bool = False,
 ) -> None:
     """Copy one or more model param groups into their local optimizer shards."""
@@ -758,7 +1016,7 @@ def write_shard_to_param_(
     opt_shard: torch.Tensor,
     data_shard: torch.Tensor,
     param_range_map,
-    dion_shard_layout: Optional[DionShardLayout],
+    dion_shard_layout: Optional[MatrixShardLayout],
     get_bucket_param_data: Callable[[torch.nn.Parameter], torch.Tensor] | None,
     empty_range_warning_count: int,
 ) -> int:
@@ -913,7 +1171,7 @@ def write_group_shards_to_model_(
     shard16_groups,
     get_data_shard: Callable[[torch.nn.Parameter], torch.Tensor],
     get_param_range_map: Callable[[torch.nn.Parameter], dict],
-    get_dion_shard_layout: Callable[[torch.nn.Parameter], Optional[DionShardLayout]],
+    get_dion_shard_layout: Callable[[torch.nn.Parameter], Optional[MatrixShardLayout]],
     get_bucket_param_data: Callable[[torch.nn.Parameter], torch.Tensor] | None,
     empty_range_warning_count: int,
 ) -> tuple[int, int]:
@@ -965,7 +1223,7 @@ def copy_main_params_to_model_shards(
     shard_fp32_groups,
     get_data_shard: Callable[[torch.nn.Parameter], torch.Tensor],
     get_param_range_map: Callable[[torch.nn.Parameter], dict],
-    get_dion_shard_layout: Callable[[torch.nn.Parameter], Optional[DionShardLayout]],
+    get_dion_shard_layout: Callable[[torch.nn.Parameter], Optional[MatrixShardLayout]],
     get_bucket_param_data: Callable[[torch.nn.Parameter], torch.Tensor] | None,
     mark_buckets_full_param_ready: Callable[[bool], None],
     check_main_shards: Callable,
@@ -1058,7 +1316,7 @@ def restore_full_model_param_(
     *,
     model_param: torch.nn.Parameter,
     param_range,
-    dion_shard_layout: Optional[DionShardLayout],
+    dion_shard_layout: Optional[MatrixShardLayout],
     fs_group: dist.ProcessGroup,
     fs_size: int,
 ) -> bool:

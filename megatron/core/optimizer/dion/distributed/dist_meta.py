@@ -6,20 +6,20 @@ from typing import Callable
 
 import torch.distributed as dist
 
-from ... import parallel_state
-from ..dion.linear import get_linear_split_rows, is_linear_fc1_param
-from ..dion.qkv import get_qkv_split_shapes, is_qkv_param, validate_qkv_split_shapes_for_rows
-from ..dion.qkvg import (
+from .... import parallel_state
+from ...matrix.splits.linear import get_linear_split_rows, is_linear_fc1_param
+from ...matrix.splits.qkv import get_qkv_split_shapes, is_qkv_param, validate_qkv_split_shapes_for_rows
+from ...matrix.splits.qkvg import (
     get_qkvg_split_shapes,
     is_qkvg_param,
     validate_qkvg_split_shapes_for_rows,
 )
-from ..dion.state import build_param_config
-from ..dion.types import DionDistMeta
-from ..dion.utils import get_local_shape
+from ..state import build_param_config
+from ..types import DionDistMeta
+from ..utils import get_local_shape
 from .parameter import is_moe_expert_param
-from .sharding import get_tp_split_dim, is_tp_enabled
-from ...transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
+from ...matrix.sharding import get_tp_split_dim, is_tp_enabled
+from ....transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
 
 
 def get_expert_layout(*, model_param, shard_param, param_name: str, dion_shard_layout):

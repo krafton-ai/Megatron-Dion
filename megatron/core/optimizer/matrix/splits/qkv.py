@@ -1,4 +1,4 @@
-"""QKV virtual-split helpers for Dion/Muon-style fused QKV weights."""
+"""QKV virtual-split helpers for matrix-style fused QKV weights."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def _normalize_qkv_split_shapes(split_shapes, *, context: str) -> Tuple[int, int
     split_shapes = tuple(int(dim) for dim in split_shapes)
     if len(split_shapes) != 3 or any(dim <= 0 for dim in split_shapes):
         raise RuntimeError(
-            "[DION_INVALID_QKV_SPLIT_SHAPES] "
+            "[MATRIX_INVALID_QKV_SPLIT_SHAPES] "
             f"context={context} "
             f"split_shapes={split_shapes}"
         )
@@ -35,7 +35,7 @@ def get_qkv_split_shapes(param: torch.Tensor) -> Tuple[int, int, int]:
         split_shapes = getattr(model_param, "qkv_split_shapes", None)
     if split_shapes is None:
         raise RuntimeError(
-            "[DION_QKV_SPLIT_SHAPES_MISSING] "
+            "[MATRIX_QKV_SPLIT_SHAPES_MISSING] "
             f"param={getattr(param, '_param_name', '') or id(param)}"
         )
     return _normalize_qkv_split_shapes(
@@ -66,7 +66,7 @@ def get_qkv_split_shapes_from_state(optimizer_state: Optional[dict]) -> Optional
         return None
     split_shapes = optimizer_state.get("qkv_split_shapes", None)
     if split_shapes is None:
-        raise RuntimeError("[DION_QKV_SPLIT_STATE_MISSING_SHAPES]")
+        raise RuntimeError("[MATRIX_QKV_SPLIT_STATE_MISSING_SHAPES]")
     return _normalize_qkv_split_shapes(split_shapes, context="optimizer_state")
 
 
@@ -105,23 +105,23 @@ def copy_qkv_split_metadata(destination_tensor: torch.Tensor, source_tensor: tor
 def qkv_child_name(parent_name: str, child_kind: str) -> str:
     """Return the optimizer-only child name for one fused QKV child."""
     if child_kind not in QKV_CHILD_KINDS:
-        raise RuntimeError(f"[DION_INVALID_QKV_CHILD_KIND] child_kind={child_kind!r}")
+        raise RuntimeError(f"[MATRIX_INVALID_QKV_CHILD_KIND] child_kind={child_kind!r}")
     return f"{parent_name}::{child_kind}"
 
 
 def qkv_state_key(prefix: str, child_kind: str) -> str:
     """Return a stable parent-state key for one QKV child field."""
     if child_kind not in QKV_CHILD_KINDS:
-        raise RuntimeError(f"[DION_INVALID_QKV_CHILD_KIND] child_kind={child_kind!r}")
+        raise RuntimeError(f"[MATRIX_INVALID_QKV_CHILD_KIND] child_kind={child_kind!r}")
     return f"qkv_{child_kind}_{prefix}"
 
 
 def qkv_child_param_uid(parent_uid, child_kind: str):
     """Return a stable optimizer-only child identity derived from the parent uid."""
     if child_kind not in QKV_CHILD_KINDS:
-        raise RuntimeError(f"[DION_INVALID_QKV_CHILD_KIND] child_kind={child_kind!r}")
+        raise RuntimeError(f"[MATRIX_INVALID_QKV_CHILD_KIND] child_kind={child_kind!r}")
     if parent_uid is None:
-        raise RuntimeError("[DION_QKV_CHILD_UID_REQUIRES_PARENT_UID]")
+        raise RuntimeError("[MATRIX_QKV_CHILD_UID_REQUIRES_PARENT_UID]")
     if isinstance(parent_uid, tuple):
         return (*parent_uid, ("qkv_child", child_kind))
     return (parent_uid, ("qkv_child", child_kind))
@@ -134,19 +134,19 @@ def _qkv_child_index(child_kind: str) -> int:
         return 1
     if child_kind == "v":
         return 2
-    raise RuntimeError(f"[DION_INVALID_QKV_CHILD_KIND] child_kind={child_kind!r}")
+    raise RuntimeError(f"[MATRIX_INVALID_QKV_CHILD_KIND] child_kind={child_kind!r}")
 
 
 def _validate_qkv_layout_rows(*, rows: int, split_shapes: Tuple[int, int, int], context: str) -> int:
     total_per_group = int(sum(split_shapes))
     if rows <= 0:
-        raise RuntimeError(f"[DION_INVALID_QKV_ROW_COUNT] context={context} rows={rows}")
+        raise RuntimeError(f"[MATRIX_INVALID_QKV_ROW_COUNT] context={context} rows={rows}")
     if rows % total_per_group != 0:
         raise RuntimeError(
-            "[DION_QKV_LOCAL_LAYOUT_MISMATCH] "
+            "[MATRIX_QKV_LOCAL_LAYOUT_MISMATCH] "
             f"context={context} rows={rows} total_per_group={total_per_group} "
             f"split_shapes={split_shapes} "
-            "dion_split_qkv requires an integral global grouped-QKV row layout."
+            "matrix_split_qkv requires an integral global grouped-QKV row layout."
         )
     return rows // total_per_group
 
@@ -163,10 +163,10 @@ def validate_qkv_split_shapes_for_rows(
 
 def _split_range(size: int, world_size: int, rank: int) -> Tuple[int, int]:
     if world_size <= 0:
-        raise RuntimeError(f"[DION_INVALID_QKV_WORLD_SIZE] world_size={world_size}")
+        raise RuntimeError(f"[MATRIX_INVALID_QKV_WORLD_SIZE] world_size={world_size}")
     if rank < 0 or rank >= world_size:
         raise RuntimeError(
-            f"[DION_INVALID_QKV_RANK] rank={rank} world_size={world_size}"
+            f"[MATRIX_INVALID_QKV_RANK] rank={rank} world_size={world_size}"
         )
     size_per_rank = int(size) // int(world_size)
     remainder = int(size) % int(world_size)
@@ -183,7 +183,7 @@ def _global_row_count(dist_meta, *, context: str) -> int:
     parent_global_shape = getattr(dist_meta, "global_shape", None)
     if parent_global_shape is None or len(parent_global_shape) != 2:
         raise RuntimeError(
-            "[DION_QKV_MISSING_GLOBAL_SHAPE] "
+            "[MATRIX_QKV_MISSING_GLOBAL_SHAPE] "
             f"context={context} "
             f"param_uid={getattr(dist_meta, 'param_uid', None)} "
             f"param_name={getattr(dist_meta, 'param_name', '')}"
@@ -210,14 +210,14 @@ def _parent_row_range(
         parent_row_end = int(getattr(dist_meta, "fs_end_idx", -1))
         if parent_row_start < 0 or parent_row_end < parent_row_start:
             raise RuntimeError(
-                "[DION_QKV_MISSING_FS_RANGE] "
+                "[MATRIX_QKV_MISSING_FS_RANGE] "
                 f"context={context} "
                 f"param_uid={getattr(dist_meta, 'param_uid', None)} "
                 f"param_name={getattr(dist_meta, 'param_name', '')}"
             )
         if parent_row_end - parent_row_start != int(local_rows):
             raise RuntimeError(
-                "[DION_QKV_LOCAL_ROW_RANGE_MISMATCH] "
+                "[MATRIX_QKV_LOCAL_ROW_RANGE_MISMATCH] "
                 f"context={context} local_rows={local_rows} "
                 f"parent_row_range=({parent_row_start}, {parent_row_end})"
             )
@@ -235,7 +235,7 @@ def _parent_row_range(
         )
         if parent_row_end - parent_row_start != int(local_rows):
             raise RuntimeError(
-                "[DION_QKV_LOCAL_ROW_RANGE_MISMATCH] "
+                "[MATRIX_QKV_LOCAL_ROW_RANGE_MISMATCH] "
                 f"context={context} local_rows={local_rows} "
                 f"parent_row_range=({parent_row_start}, {parent_row_end})"
             )
@@ -277,7 +277,7 @@ def _child_segments(
         source_end = overlap_end - int(parent_row_start)
         if segments and segments[-1][3] != child_start:
             raise RuntimeError(
-                "[DION_QKV_CHILD_NONCONTIGUOUS_LOCAL_RANGE] "
+                "[MATRIX_QKV_CHILD_NONCONTIGUOUS_LOCAL_RANGE] "
                 f"child_kind={child_kind} parent_row_range=({parent_row_start}, {parent_row_end}) "
                 f"previous_child_end={segments[-1][3]} next_child_start={child_start}"
             )
@@ -359,7 +359,7 @@ def qkv_child_local_shape(
     )
     if child_rows <= 0:
         raise RuntimeError(
-            "[DION_QKV_EMPTY_CHILD_LOCAL_SHAPE] "
+            "[MATRIX_QKV_EMPTY_CHILD_LOCAL_SHAPE] "
             f"child_kind={child_kind} parent_local_shape={parent_local_shape}"
         )
     return (child_rows, local_cols)
@@ -378,7 +378,7 @@ def qkv_child_has_local_overlap(
     total_per_group = int(sum(int(dim) for dim in split_shapes))
     if total_per_group <= 0 or parent_global_rows % total_per_group != 0:
         raise RuntimeError(
-            "[DION_QKV_GLOBAL_LAYOUT_MISMATCH] "
+            "[MATRIX_QKV_GLOBAL_LAYOUT_MISMATCH] "
             f"child_kind={child_kind} parent_global_rows={parent_global_rows} "
             f"split_shapes={split_shapes}"
         )
@@ -445,7 +445,7 @@ def extract_qkv_child(
     """Read one Q/K/V child from a fused QKV tensor into a contiguous 2D tensor."""
     if tensor.ndim != 2:
         raise RuntimeError(
-            "[DION_QKV_READ_REQUIRES_2D] "
+            "[MATRIX_QKV_READ_REQUIRES_2D] "
             f"child_kind={child_kind} shape={tuple(int(dim) for dim in tensor.shape)}"
         )
     rows, cols = int(tensor.size(0)), int(tensor.size(1))
@@ -462,7 +462,7 @@ def extract_qkv_child(
     )
     if not segments:
         raise RuntimeError(
-            "[DION_QKV_EMPTY_CHILD_LOCAL_SHAPE] "
+            "[MATRIX_QKV_EMPTY_CHILD_LOCAL_SHAPE] "
             f"child_kind={child_kind} tensor_shape={tuple(int(dim) for dim in tensor.shape)}"
         )
     if len(segments) == 1:
@@ -491,7 +491,7 @@ def scatter_qkv_child_(
     """Write one Q/K/V child back into the fused parent tensor."""
     if dest.ndim != 2 or child.ndim != 2:
         raise RuntimeError(
-            "[DION_QKV_SCATTER_REQUIRES_2D] "
+            "[MATRIX_QKV_SCATTER_REQUIRES_2D] "
             f"child_kind={child_kind} dest_shape={tuple(int(dim) for dim in dest.shape)} "
             f"child_shape={tuple(int(dim) for dim in child.shape)}"
         )
@@ -513,7 +513,7 @@ def scatter_qkv_child_(
     expected_child_shape = (expected_child_rows, cols)
     if tuple(int(dim) for dim in child.shape) != expected_child_shape:
         raise RuntimeError(
-            "[DION_QKV_SCATTER_CHILD_SHAPE_MISMATCH] "
+            "[MATRIX_QKV_SCATTER_CHILD_SHAPE_MISMATCH] "
             f"child_kind={child_kind} expected_child_shape={expected_child_shape} "
             f"child_shape={tuple(int(dim) for dim in child.shape)}"
         )

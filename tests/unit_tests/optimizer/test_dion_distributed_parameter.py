@@ -2,7 +2,9 @@ from types import SimpleNamespace
 
 import torch
 
-from megatron.core.optimizer.distrib_dion import parameter as dion_parameter
+from megatron.core.optimizer.dion.distributed import parameter as dion_parameter
+from megatron.core.optimizer.matrix.sharding import MatrixShardLayout
+from megatron.core.optimizer.matrix.types import MatrixBucketLayout, MatrixShardEntry
 
 
 def test_mixed_param_gather_cache_keeps_async_tensors_until_wait(monkeypatch):
@@ -18,9 +20,9 @@ def test_mixed_param_gather_cache_keeps_async_tensors_until_wait(monkeypatch):
     group = FakeGroup()
     dion_param = torch.nn.Parameter(torch.empty(2, 1))
     standard_param = torch.nn.Parameter(torch.empty(6))
-    dion_entry = dion_parameter.DionShardEntry(
+    dion_entry = MatrixShardEntry(
         param=dion_param,
-        shard_layout=dion_parameter.DionShardLayout(
+        shard_layout=MatrixShardLayout(
             local_shape=(2, 1),
             global_shape=(2, 1),
             fs_shard_dim=0,
@@ -44,7 +46,7 @@ def test_mixed_param_gather_cache_keeps_async_tensors_until_wait(monkeypatch):
         param_to_index={dion_param: (0, 2), standard_param: (2, 8)},
         dion_param_ids={id(dion_param)},
         has_standard_params=True,
-        dion_layout=dion_parameter.DionBucketLayout(
+        dion_layout=MatrixBucketLayout(
             entries=(dion_entry,),
             shard_size=2,
             gathered_numel=4,

@@ -75,7 +75,10 @@ Megatron-LM/
 │   │   ├── tensor_parallel/     # Tensor parallelism
 │   │   ├── pipeline_parallel/   # Pipeline parallelism
 │   │   ├── distributed/         # Distributed training (FSDP, DDP)
-│   │   ├── optimizer/           # Optimizers
+│   │   ├── optimizer/           # Optimizers and distributed optimizer wrappers
+│   │   │   ├── dion/            # Dion optimizer state, kernels, runtime, distributed internals
+│   │   │   │   └── distributed/ # Dion-owned MCore distributed optimizer helpers
+│   │   │   └── matrix/          # Matrix optimizer substrate and split helpers
 │   │   ├── datasets/            # Dataset loaders
 │   │   ├── inference/           # Inference engines
 │   │   └── export/              # Model export (e.g. TensorRT-LLM)

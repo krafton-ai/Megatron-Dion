@@ -1,14 +1,16 @@
 import pytest
 import torch
 
-from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.optimizer.dion.types import DionMixedPrecisionConfig
-from megatron.core.optimizer.distrib_dion import checkpoint_io
-from megatron.core.optimizer.distrib_dion.checkpoint_io import (
+from megatron.core.optimizer.dion.distributed import checkpoint_io
+from megatron.core.optimizer.dion.distributed.checkpoint_io import (
+    _stable_param_key_id,
     build_dion_checkpoint_metadata,
     build_distributed_checkpoint_state,
     resolve_dion_checkpoint_sharding_type,
     restore_persistent_param_state_,
+    restore_distributed_checkpoint_state,
     validate_dion_checkpoint_metadata,
 )
 
@@ -69,6 +71,191 @@ def test_dion_param_state_uses_dp_rank_object_metadata():
     assert metadata.data["param_state_format"] == checkpoint_io.DION_PARAM_STATE_FORMAT
     assert metadata.data["dp_size"] == 8
     assert metadata.data["topology_signature"] == TOPOLOGY
+
+
+def test_dion_param_state_can_use_rank_local_sharded_tensors():
+    param = torch.nn.Parameter(torch.full((2, 3), 3.0))
+    param._dion_param_uid = "layer.weight"
+    optimizer_state = {
+        param: {
+            "momentum": torch.ones(2, 3),
+            "Q": torch.ones(3, 1),
+            "r": 1,
+            "_q_gather_buffer": torch.empty(3, 1),
+        }
+    }
+
+    state_dict = build_distributed_checkpoint_state(
+        common_state={"optimizer": {"param_groups": []}},
+        param_groups=[{"params": [param]}],
+        optimizer_state=optimizer_state,
+        get_param_key=lambda tensor: tensor._dion_param_uid,
+        base_key="optimizer.distributed.dp_group_idx_0",
+        common_replica_id=(0, 0, 3),
+        state_global_shape=(8,),
+        state_global_offset=(3,),
+        state_replica_id=(0,),
+        checkpoint_metadata=build_dion_checkpoint_metadata(
+            dp_size=8,
+            fs_size=4,
+            tp_size=2,
+            rp_size=2,
+            state_replica_size=2,
+            requested_type="dp_reshardable",
+            topology_signature=TOPOLOGY,
+        ),
+        sharded_object_cls=ShardedObject,
+        sharded_tensor_cls=ShardedTensor,
+    )
+
+    dion_state = state_dict["dion_param_state"]
+    assert dion_state["metadata"].global_shape == (1,)
+    assert dion_state["metadata"].global_offset == (0,)
+    metadata = dion_state["metadata"].data
+    param_entry = metadata["params"]["layer.weight"]
+    tensor_payload = dion_state["tensors"][param_entry["id"]]
+    assert set(tensor_payload) == {"param", "momentum", "Q"}
+    assert all(isinstance(value, ShardedTensor) for value in tensor_payload.values())
+    assert "_q_gather_buffer" not in param_entry["values"]
+
+    restored_param = torch.nn.Parameter(torch.empty(2, 3))
+    restored_param._dion_param_uid = "layer.weight"
+    restored_state = {
+        restored_param: {
+            "momentum": torch.zeros(2, 3),
+            "Q": torch.zeros(3, 1),
+        }
+    }
+    summary = restore_distributed_checkpoint_state(
+        param_state_payload=dion_state,
+        param_groups=[{"params": [restored_param]}],
+        optimizer_state=restored_state,
+        get_param_key=lambda tensor: tensor._dion_param_uid,
+        mixed_precision_config=DionMixedPrecisionConfig(),
+    )
+
+    assert summary == {"restored": 1, "unnamed": 0, "no_payload_entry": 0}
+    assert torch.equal(restored_param.detach(), torch.full((2, 3), 3.0))
+    assert torch.equal(restored_state[restored_param]["momentum"], torch.ones(2, 3))
+    assert torch.equal(restored_state[restored_param]["Q"], torch.ones(3, 1))
+    assert restored_state[restored_param]["r"] == 1
+
+
+def test_dion_param_state_restore_can_match_stable_id():
+    param_key = ("layer.weight", (2, 3), True)
+    param_id = _stable_param_key_id(param_key)
+    saved_param = torch.nn.Parameter(torch.full((2, 3), 5.0))
+    restored_param = torch.nn.Parameter(torch.empty(2, 3))
+
+    payload = {
+        "metadata": {
+            "format": checkpoint_io._DION_TENSOR_PAYLOAD_FORMAT,
+            "params": {
+                str(param_key): {
+                    "id": param_id,
+                    "values": {"r": 1},
+                    "tensor_keys": ("param", "momentum"),
+                }
+            },
+        },
+        "tensors": {
+            param_id: {
+                "param": saved_param.detach(),
+                "momentum": torch.ones(2, 3),
+            }
+        },
+    }
+    optimizer_state = {restored_param: {"momentum": torch.zeros(2, 3)}}
+
+    summary = restore_distributed_checkpoint_state(
+        param_state_payload=payload,
+        param_groups=[{"params": [restored_param]}],
+        optimizer_state=optimizer_state,
+        get_param_key=lambda tensor: param_key,
+        mixed_precision_config=DionMixedPrecisionConfig(),
+    )
+
+    assert summary == {"restored": 1, "unnamed": 0, "no_payload_entry": 0}
+    assert torch.equal(restored_param.detach(), torch.full((2, 3), 5.0))
+    assert torch.equal(optimizer_state[restored_param]["momentum"], torch.ones(2, 3))
+
+
+def test_dion_param_state_restore_accepts_rank_nested_tensor_payload():
+    param_key = ("layer.weight", (2, 3), True)
+    param_id = _stable_param_key_id(param_key)
+    saved_param = torch.nn.Parameter(torch.full((2, 3), 6.0))
+    restored_param = torch.nn.Parameter(torch.empty(2, 3))
+
+    payload = {
+        "0": {
+            "metadata": {
+                "format": checkpoint_io._DION_TENSOR_PAYLOAD_FORMAT,
+                "params": {
+                    param_key: {
+                        "id": param_id,
+                        "values": {"r": 1},
+                        "tensor_keys": ("param", "momentum"),
+                    }
+                },
+            },
+            "tensors": {
+                param_id: {
+                    "param": saved_param.detach(),
+                    "momentum": torch.ones(2, 3),
+                }
+            },
+        }
+    }
+    optimizer_state = {restored_param: {"momentum": torch.zeros(2, 3)}}
+
+    summary = restore_distributed_checkpoint_state(
+        param_state_payload=payload,
+        param_groups=[{"params": [restored_param]}],
+        optimizer_state=optimizer_state,
+        get_param_key=lambda tensor: param_key,
+        mixed_precision_config=DionMixedPrecisionConfig(),
+    )
+
+    assert summary == {"restored": 1, "unnamed": 0, "no_payload_entry": 0}
+    assert torch.equal(restored_param.detach(), torch.full((2, 3), 6.0))
+    assert torch.equal(optimizer_state[restored_param]["momentum"], torch.ones(2, 3))
+
+
+def test_dion_param_state_restore_can_match_checkpoint_order():
+    saved_param = torch.nn.Parameter(torch.full((2, 3), 9.0))
+    restored_param = torch.nn.Parameter(torch.empty(2, 3))
+
+    payload = {
+        "metadata": {
+            "format": checkpoint_io._DION_TENSOR_PAYLOAD_FORMAT,
+            "params": {
+                ("saved.name", (2, 3), True): {
+                    "id": "saved-id",
+                    "values": {"r": 1},
+                    "tensor_keys": ("param", "momentum"),
+                }
+            },
+        },
+        "tensors": {
+            "saved-id": {
+                "param": saved_param.detach(),
+                "momentum": torch.ones(2, 3),
+            }
+        },
+    }
+    optimizer_state = {restored_param: {"momentum": torch.zeros(2, 3)}}
+
+    summary = restore_distributed_checkpoint_state(
+        param_state_payload=payload,
+        param_groups=[{"params": [restored_param]}],
+        optimizer_state=optimizer_state,
+        get_param_key=lambda tensor: ("current.name", (2, 3), True),
+        mixed_precision_config=DionMixedPrecisionConfig(),
+    )
+
+    assert summary == {"restored": 1, "unnamed": 0, "no_payload_entry": 0}
+    assert torch.equal(restored_param.detach(), torch.full((2, 3), 9.0))
+    assert torch.equal(optimizer_state[restored_param]["momentum"], torch.ones(2, 3))
 
 
 def test_restore_casts_to_current_state_dtype_and_marks_normal_q_for_sync():

@@ -46,12 +46,12 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
-from .distrib_dion.integration import (
+from .dion.distributed.integration import (
     build_dion_distributed_optimizer,
     build_dion_optimizer,
     get_dion_param_override,
 )
-from .distrib_dion.parameter import mark_dion_candidates
+from .dion.distributed.parameter import mark_dion_candidates
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import (

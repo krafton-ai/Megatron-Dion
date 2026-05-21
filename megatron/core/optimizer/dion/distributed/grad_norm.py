@@ -7,14 +7,14 @@ from typing import List, Tuple
 import torch
 import torch.distributed as dist
 
-from ..dion.runtime import replicate_reduce_op
-from ... import tensor_parallel
-from ..dion.dense_grad_cache import (
+from ..runtime import replicate_reduce_op
+from .... import tensor_parallel
+from ..dense_grad_cache import (
     dense_cache_entries as _dense_cache_entries,
     dense_cache_state as _dense_cache_state,
     mark_dense_grad_reduced as _mark_dense_grad_reduced,
 )
-from ...utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
+from ....utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
 
 _GRAD_NORM_FP64_CHUNK_BYTES = 128 * 1024 * 1024
@@ -279,7 +279,7 @@ def contributes_dion_grad(optimizer) -> bool:
 
 
 def _grad_norm_routes(optimizer):
-    from ...transformer.module import param_is_not_shared
+    from ....transformer.module import param_is_not_shared
 
     main_grad_view_by_param_id = {}
     params = []

@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from megatron.core.optimizer import _get_param_groups
-from megatron.core.optimizer.dion.linear import (
+from megatron.core.optimizer.matrix.splits.linear import (
     get_linear_split_rows,
     linear_child_has_local_overlap,
     linear_child_local_shape,
@@ -13,7 +13,7 @@ from megatron.core.optimizer.dion.linear import (
     read_linear_child,
     write_linear_child_,
 )
-from megatron.core.optimizer.dion.qkv import (
+from megatron.core.optimizer.matrix.splits.qkv import (
     extract_qkv_child,
     qkv_child_has_local_overlap,
     qkv_child_local_shape,
@@ -21,7 +21,7 @@ from megatron.core.optimizer.dion.qkv import (
     qkv_state_key,
     scatter_qkv_child_,
 )
-from megatron.core.optimizer.dion.qkvg import (
+from megatron.core.optimizer.matrix.splits.qkvg import (
     extract_qkvg_child,
     qkvg_child_has_local_overlap,
     qkvg_child_local_shape,
@@ -30,26 +30,26 @@ from megatron.core.optimizer.dion.qkvg import (
     scatter_qkvg_child_,
 )
 from megatron.core.optimizer.dion.types import DionBatchGroup, DionDistMeta, DionQInit, DionQLayout
-from megatron.core.optimizer.dion_distrib_optimizer import (
+from megatron.core.optimizer.dion.distributed.optimizer import (
     _CHILD_GROUP_CACHE,
-    DionDistributedOptimizer,
+    DistributedDionOptimizer,
     _ensure_child_group,
 )
-from megatron.core.optimizer.distrib_dion.batches import (
+from megatron.core.optimizer.dion.distributed.batches import (
     _batch_group_key,
     _batch_key_for_sync,
     _sync_group_batch_metadata,
     build_batch_key,
 )
-from megatron.core.optimizer.distrib_dion import integration as dion_integration
-from megatron.core.optimizer.distrib_dion.parameter import (
+from megatron.core.optimizer.dion.distributed import integration as dion_integration
+from megatron.core.optimizer.dion.distributed.parameter import (
     is_combined_grouped_mlp_param,
     is_dion_param,
     mark_dion_bucket_params,
     resolve_grad_rank_to_fs_rank,
 )
-from megatron.core.optimizer.distrib_dion.dist_meta import build_param_dist_meta, select_tp_group
-from megatron.core.optimizer.distrib_dion.sharding import DionShardLayout
+from megatron.core.optimizer.dion.distributed.dist_meta import build_param_dist_meta, select_tp_group
+from megatron.core.optimizer.matrix.sharding import MatrixShardLayout
 
 
 class FakeGroup:
@@ -58,7 +58,7 @@ class FakeGroup:
 
 
 def make_optimizer_stub():
-    optimizer = object.__new__(DionDistributedOptimizer)
+    optimizer = object.__new__(DistributedDionOptimizer)
     optimizer.optimizer = SimpleNamespace(
         use_low_rank_sync=True,
         _mixed_precision_config=None,
@@ -242,19 +242,19 @@ def test_dense_tp_group_must_exclude_context_parallel_peers(monkeypatch):
     cp_group = FakeGroup((0, 1))
 
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.dist_meta.parallel_state.get_tensor_model_parallel_group",
+        "megatron.core.optimizer.dion.distributed.dist_meta.parallel_state.get_tensor_model_parallel_group",
         lambda check_initialized=False: dense_tp_group,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.dist_meta.parallel_state.get_context_parallel_group",
+        "megatron.core.optimizer.dion.distributed.dist_meta.parallel_state.get_context_parallel_group",
         lambda check_initialized=False: cp_group,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.dist_meta.dist.get_process_group_ranks",
+        "megatron.core.optimizer.dion.distributed.dist_meta.dist.get_process_group_ranks",
         lambda group: group.ranks,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.dist_meta.dist.get_rank",
+        "megatron.core.optimizer.dion.distributed.dist_meta.dist.get_rank",
         lambda: 0,
     )
 
@@ -271,15 +271,15 @@ def test_allreduce_false_tp_param_uses_expert_tp_group(monkeypatch):
     expert_tp_group = FakeGroup((0, 2))
 
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.dist_meta.parallel_state.get_tensor_model_parallel_group",
+        "megatron.core.optimizer.dion.distributed.dist_meta.parallel_state.get_tensor_model_parallel_group",
         lambda check_initialized=False: dense_tp_group,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.dist_meta.parallel_state.get_expert_tensor_parallel_group",
+        "megatron.core.optimizer.dion.distributed.dist_meta.parallel_state.get_expert_tensor_parallel_group",
         lambda check_initialized=False: expert_tp_group,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.distrib_dion.dist_meta.parallel_state.get_context_parallel_group",
+        "megatron.core.optimizer.dion.distributed.dist_meta.parallel_state.get_context_parallel_group",
         lambda check_initialized=False: None,
     )
 
@@ -1173,15 +1173,15 @@ def test_expand_split_qkv_expert_initializes_child_q_from_child_meta(monkeypatch
         return torch.full(tuple(int(dim) for dim in q_layout.q_local_shape), 5.0)
 
     monkeypatch.setattr(
-        "megatron.core.optimizer.dion_distrib_optimizer.build_q_init",
+        "megatron.core.optimizer.dion.distributed.optimizer.build_q_init",
         fake_build_q_init,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.dion_distrib_optimizer.init_q_state",
+        "megatron.core.optimizer.dion.distributed.optimizer.init_q_state",
         fake_init_q_state,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.dion_distrib_optimizer.resolve_base_training_seed",
+        "megatron.core.optimizer.dion.distributed.optimizer.resolve_base_training_seed",
         lambda: 1234,
     )
 
@@ -1295,7 +1295,7 @@ def test_build_param_dist_meta_normalizes_expert_linear_split_rows():
     model_param.linear_split_rows = (6, 6)
     model_param.num_local_experts = 2
     param_name = "decoder.layers.0.mlp.experts.local_experts.1.linear_fc1.weight"
-    shard_layout = DionShardLayout(
+    shard_layout = MatrixShardLayout(
         local_shape=(12, 4),
         global_shape=(12, 4),
         fs_shard_dim=-1,
@@ -1455,15 +1455,15 @@ def test_expand_split_linear_expert_initializes_child_q_from_child_meta(monkeypa
         return torch.full(tuple(int(dim) for dim in q_layout.q_local_shape), 7.0)
 
     monkeypatch.setattr(
-        "megatron.core.optimizer.dion_distrib_optimizer.build_q_init",
+        "megatron.core.optimizer.dion.distributed.optimizer.build_q_init",
         fake_build_q_init,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.dion_distrib_optimizer.init_q_state",
+        "megatron.core.optimizer.dion.distributed.optimizer.init_q_state",
         fake_init_q_state,
     )
     monkeypatch.setattr(
-        "megatron.core.optimizer.dion_distrib_optimizer.resolve_base_training_seed",
+        "megatron.core.optimizer.dion.distributed.optimizer.resolve_base_training_seed",
         lambda: 1234,
     )
 
@@ -1508,7 +1508,7 @@ def test_linear_child_tp_layout_records_noncanonical_row_sizes(monkeypatch):
         fake_create_group,
     )
 
-    optimizer = object.__new__(DionDistributedOptimizer)
+    optimizer = object.__new__(DistributedDionOptimizer)
     parent_rank1_meta = SimpleNamespace(
         tp_shard_dim=0,
         tp_world_size=4,
@@ -1778,7 +1778,7 @@ def test_linear_child_tp_layout_uses_partition_stride(monkeypatch):
         "torch.distributed.get_process_group_ranks",
         lambda process_group: process_group.ranks,
     )
-    optimizer = object.__new__(DionDistributedOptimizer)
+    optimizer = object.__new__(DistributedDionOptimizer)
     parent_meta = SimpleNamespace(
         tp_shard_dim=0,
         tp_world_size=2,

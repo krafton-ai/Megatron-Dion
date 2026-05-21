@@ -1,4 +1,4 @@
-from megatron.core.optimizer.distrib_dion import row_child
+from megatron.core.optimizer.dion.distributed import row_child
 
 
 def test_row_child_layout_reuses_parent_group(monkeypatch):
