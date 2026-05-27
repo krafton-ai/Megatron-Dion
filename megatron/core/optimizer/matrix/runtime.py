@@ -2,7 +2,15 @@
 
 from typing import Callable
 
+import torch.distributed as dist
+
 from .types import MatrixStepParam, ScalarStepParam
+
+
+def replicate_reduce_op(optimizer):
+    """Return the replica-reduction op matching MCore's grad scaling mode."""
+    average_in_collective = bool(optimizer.defaults.get("rp_average_in_collective", True))
+    return dist.ReduceOp.AVG if average_in_collective else dist.ReduceOp.SUM
 
 
 def route_step_params(

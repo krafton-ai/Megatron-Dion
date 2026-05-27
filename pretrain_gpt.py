@@ -313,6 +313,8 @@ def core_gpt_dataset_config_from_args(args):
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
     blend, blend_per_split = get_blend_and_blend_per_split(args)
+    if args.mock_data:
+        blend, blend_per_split = None, None
 
     sequences_per_dataset = None
     if args.per_dataset_sequences_path is not None:
@@ -425,8 +427,11 @@ if __name__ == "__main__":
     # Register startup timestamps for timing report in pretrain()
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
-    # Temporary for transition to core datasets
-    train_valid_test_datasets_provider.is_distributed = True
+    # Temporary for transition to core datasets. TP>1 uses the regular TP
+    # broadcast path unless explicitly requested otherwise.
+    train_valid_test_datasets_provider.is_distributed = os.environ.get(
+        "MEGATRON_GPT_DATASET_IS_DISTRIBUTED", "1"
+    ).lower() not in ("0", "false", "no")
 
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)

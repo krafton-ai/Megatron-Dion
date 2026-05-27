@@ -272,11 +272,29 @@ class OptimizerConfig:
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
 
+    muon_coefficient_type: str = "quintic"
+    """Newton-Schulz coefficient set for Muon."""
+
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
     muon_tp_mode: str = "blockwise"
     """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
+
+    muon_fs_mode: str = "blockwise"
+    """How distributed-optimizer FS shards participate in Muon NS calculation."""
+
+    muon_ns_backend: str = "standard"
+    """Newton-Schulz backend for Muon. Valid values are "standard" and "gram"."""
+
+    muon_gram_ns_restart_iters: Tuple[int, ...] = (2,)
+    """Restart iterations for the Gram Newton-Schulz backend."""
+
+    muon_gram_ns_kernel_policy: str = "torch"
+    """Kernel policy for Gram Newton-Schulz. Valid values include "torch", "auto", and "dao"."""
+
+    muon_split_linear: bool = True
+    """Whether to split fused gate/up linear_fc1 parameters for Muon optimizer."""
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
@@ -445,6 +463,20 @@ class AdamOptimizerConfig(OptimizerConfig):
 
     adam_eps: float = 1e-08
     """Term added to the denominator to improve numerical stability in Adam optimizer."""
+
+
+@dataclass
+class MuonOptimizerConfig(AdamOptimizerConfig):
+    """Muon optimizer configuration object with AdamW scalar fallback fields."""
+
+    optimizer: str = 'muon'
+    """Optimizer name."""
+
+    fully_shard_model_parallel_size: int = 1
+    """Matrix optimizer fully-sharded model-parallel size."""
+
+    replicate_model_parallel_size: int = 1
+    """Matrix optimizer replicate-parallel size."""
 
 
 @dataclass

@@ -5,11 +5,11 @@ import torch
 
 from megatron.core.optimizer.dion.backend import DionBackend
 from megatron.core.optimizer.dion.distributed.optimizer import DistributedDionOptimizer
-from megatron.core.optimizer.dion.distributed.grad_norm import grad_norm_inputs
-from megatron.core.optimizer.dion.distributed.checkpoint_io import (
+from megatron.core.optimizer.matrix.grad_norm import grad_norm_inputs
+from megatron.core.optimizer.matrix.checkpoint_io import (
     MATRIX_SUBSTRATE_FORMAT_VERSION,
-    build_dion_checkpoint_metadata,
-    validate_dion_checkpoint_metadata,
+    build_matrix_checkpoint_metadata as build_dion_checkpoint_metadata,
+    validate_matrix_checkpoint_metadata as validate_dion_checkpoint_metadata,
 )
 from megatron.core.optimizer.dion.types import (
     DionDistMeta,

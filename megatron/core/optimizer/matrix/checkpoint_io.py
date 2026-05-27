@@ -1,4 +1,4 @@
-"""Checkpoint and export helpers for Dion distributed optimizer.
+"""Checkpoint and export helpers for Matrix distributed optimizer.
 
 These helpers are intended to be behavior-preserving refactors: no changes to
 math or collective patterns, only code organization.
@@ -13,12 +13,12 @@ from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 
-from ....fp8_utils import dequantize_fp8_tensor, is_float8tensor
-from ...matrix.splits.linear import iter_linear_child_kinds, linear_state_key
-from ...matrix.splits.qkv import iter_qkv_child_kinds, qkv_state_key
-from ...matrix.splits.qkvg import iter_qkvg_child_kinds, qkvg_state_key
-from ..utils import str_to_dtype
-from ...matrix.sharding import (
+from ...fp8_utils import dequantize_fp8_tensor, is_float8tensor
+from .splits.linear import iter_linear_child_kinds, linear_state_key
+from .splits.qkv import iter_qkv_child_kinds, qkv_state_key
+from .splits.qkvg import iter_qkvg_child_kinds, qkvg_state_key
+from .utils import str_to_dtype
+from .sharding import (
     MatrixShardLayout,
     compute_fs_shard_range,
     fs_shard_view_2d,
@@ -27,15 +27,15 @@ from ...matrix.sharding import (
 
 logger = logging.getLogger(__name__)
 
-DION_PARAM_STATE_FORMAT = "dion_dp_rank_state_v4"
+MATRIX_PARAM_STATE_FORMAT = "matrix_dp_rank_state_v4"
 MATRIX_SUBSTRATE_FORMAT_VERSION = 1
-_LEGACY_DION_PARAM_STATE_FORMATS = {
-    "dion_fs_rank_state_v1",
-    "dion_dp_rank_state_v2",
-    "dion_dp_rank_state_v3",
+_LEGACY_MATRIX_PARAM_STATE_FORMATS = {
+    "matrix_fs_rank_state_v1",
+    "matrix_dp_rank_state_v2",
+    "matrix_dp_rank_state_v3",
 }
-_SUPPORTED_DION_PARAM_STATE_FORMATS = {"dp_reshardable", "dion_fs_rank_state"}
-_DION_TENSOR_PAYLOAD_FORMAT = "rank_local_tensor_shards_v1"
+_SUPPORTED_MATRIX_PARAM_STATE_FORMATS = {"dp_reshardable", "matrix_fs_rank_state"}
+_MATRIX_TENSOR_PAYLOAD_FORMAT = "rank_local_tensor_shards_v1"
 
 
 def _param_name(param: torch.Tensor) -> str:
@@ -51,11 +51,11 @@ def _param_name(param: torch.Tensor) -> str:
     return f"id_{id(param)}"
 
 
-def resolve_dion_checkpoint_sharding_type(sharding_type, metadata) -> str:
-    """Return the checkpoint state format requested for Dion optimizer state."""
+def resolve_matrix_checkpoint_sharding_type(sharding_type, metadata) -> str:
+    """Return the checkpoint state format requested for Matrix optimizer state."""
     if sharding_type is not None:
         logger.warning(
-            "DistributedDionOptimizer.sharded_state_dict parameter `sharding_type` "
+            "DistributedMatrixOptimizer.sharded_state_dict parameter `sharding_type` "
             "is deprecated; use metadata['distrib_optim_sharding_type'] instead."
         )
         requested_type = sharding_type
@@ -64,16 +64,16 @@ def resolve_dion_checkpoint_sharding_type(sharding_type, metadata) -> str:
 
     if requested_type in {"fully_reshardable", "fully_sharded_model_space", "fsdp_dtensor"}:
         raise NotImplementedError(
-            "[Dion] optimizer checkpoint format "
-            f"{requested_type!r} requires tensor-level Dion momentum/Q resharding, "
-            "which is not implemented. Use the Dion FS-rank checkpoint state with "
+            "[Matrix] optimizer checkpoint format "
+            f"{requested_type!r} requires tensor-level Matrix momentum/Q resharding, "
+            "which is not implemented. Use the Matrix FS-rank checkpoint state with "
             "unchanged FS and TP sizes."
         )
-    if requested_type not in _SUPPORTED_DION_PARAM_STATE_FORMATS:
+    if requested_type not in _SUPPORTED_MATRIX_PARAM_STATE_FORMATS:
         raise NotImplementedError(
-            "[Dion] unsupported optimizer checkpoint format "
+            "[Matrix] unsupported optimizer checkpoint format "
             f"{requested_type!r}; supported formats are "
-            f"{sorted(_SUPPORTED_DION_PARAM_STATE_FORMATS)}"
+            f"{sorted(_SUPPORTED_MATRIX_PARAM_STATE_FORMATS)}"
         )
     return str(requested_type)
 
@@ -82,7 +82,7 @@ def _normalize_topology_signature(signature: dict) -> dict:
     """Normalize checkpoint topology signatures for exact equality checks."""
     if not isinstance(signature, dict):
         raise RuntimeError(
-            "[Dion] invalid Dion optimizer topology signature: "
+            "[Matrix] invalid Matrix optimizer topology signature: "
             f"type={type(signature).__name__}"
         )
     normalized = {}
@@ -95,7 +95,7 @@ def _normalize_topology_signature(signature: dict) -> dict:
     return normalized
 
 
-def build_dion_checkpoint_metadata(
+def build_matrix_checkpoint_metadata(
     *,
     dp_size: int,
     fs_size: int,
@@ -106,9 +106,9 @@ def build_dion_checkpoint_metadata(
     topology_signature: Optional[dict] = None,
     backend_state_spec=None,
 ) -> dict:
-    """Build small checkpoint metadata for Dion optimizer-state compatibility checks."""
+    """Build small checkpoint metadata for Matrix optimizer-state compatibility checks."""
     metadata = {
-        "param_state_format": DION_PARAM_STATE_FORMAT,
+        "param_state_format": MATRIX_PARAM_STATE_FORMAT,
         "requested_type": str(requested_type),
         "dp_size": int(dp_size),
         "fs_size": int(fs_size),
@@ -128,7 +128,7 @@ def build_dion_checkpoint_metadata(
     return metadata
 
 
-def validate_dion_checkpoint_metadata(
+def validate_matrix_checkpoint_metadata(
     checkpoint_metadata,
     *,
     dp_size: int = 1,
@@ -139,7 +139,7 @@ def validate_dion_checkpoint_metadata(
     topology_signature: Optional[dict] = None,
     backend_state_spec=None,
 ) -> None:
-    """Fail before restore when the saved Dion tensor layout cannot be resharded."""
+    """Fail before restore when the saved Matrix tensor layout cannot be resharded."""
     if checkpoint_metadata is None:
         if (
             int(fs_size) == 1
@@ -149,24 +149,24 @@ def validate_dion_checkpoint_metadata(
         ):
             return
         raise RuntimeError(
-            "[Dion] checkpoint is missing Dion optimizer metadata. "
-            "Older Dion distributed checkpoints did not save all FS-local state; "
+            "[Matrix] checkpoint is missing Matrix optimizer metadata. "
+            "Older Matrix distributed checkpoints did not save all FS-local state; "
             f"refusing restore for current fs_size={int(fs_size)} "
             f"tp_size={int(tp_size)} rp_size={int(rp_size)} "
             f"state_replica_size={int(state_replica_size)}."
         )
     if not isinstance(checkpoint_metadata, dict):
         raise RuntimeError(
-            "[Dion] invalid Dion optimizer checkpoint metadata: "
+            "[Matrix] invalid Matrix optimizer checkpoint metadata: "
             f"type={type(checkpoint_metadata).__name__}"
         )
 
     saved_format = checkpoint_metadata.get("param_state_format", None)
-    supported_formats = {DION_PARAM_STATE_FORMAT, *_LEGACY_DION_PARAM_STATE_FORMATS}
+    supported_formats = {MATRIX_PARAM_STATE_FORMAT, *_LEGACY_MATRIX_PARAM_STATE_FORMATS}
     if saved_format not in supported_formats:
         raise RuntimeError(
-            "[Dion] unsupported Dion optimizer checkpoint state format: "
-            f"saved={saved_format!r} current={DION_PARAM_STATE_FORMAT!r}"
+            "[Matrix] unsupported Matrix optimizer checkpoint state format: "
+            f"saved={saved_format!r} current={MATRIX_PARAM_STATE_FORMAT!r}"
         )
 
     saved_dp_size = int(checkpoint_metadata.get("dp_size", -1))
@@ -175,58 +175,58 @@ def validate_dion_checkpoint_metadata(
     saved_rp_size = int(
         checkpoint_metadata.get(
             "rp_size",
-            -1 if saved_format == DION_PARAM_STATE_FORMAT else 1,
+            -1 if saved_format == MATRIX_PARAM_STATE_FORMAT else 1,
         )
     )
     saved_state_replica_size = int(
         checkpoint_metadata.get(
             "state_replica_size",
-            -1 if saved_format == DION_PARAM_STATE_FORMAT else 1,
+            -1 if saved_format == MATRIX_PARAM_STATE_FORMAT else 1,
         )
     )
-    if saved_format == DION_PARAM_STATE_FORMAT and saved_dp_size != int(dp_size):
+    if saved_format == MATRIX_PARAM_STATE_FORMAT and saved_dp_size != int(dp_size):
         raise RuntimeError(
-            "[Dion] unsupported Dion checkpoint DP topology change: "
+            "[Matrix] unsupported Matrix checkpoint DP topology change: "
             f"saved_dp_size={saved_dp_size} current_dp_size={int(dp_size)}. "
-            "Dion optimizer-state resharding across DP ranks is not implemented."
+            "Matrix optimizer-state resharding across DP ranks is not implemented."
         )
     if saved_fs_size != int(fs_size):
         raise RuntimeError(
-            "[Dion] unsupported Dion checkpoint FS topology change: "
+            "[Matrix] unsupported Matrix checkpoint FS topology change: "
             f"saved_fs_size={saved_fs_size} current_fs_size={int(fs_size)}. "
-            "Dion momentum/Q resharding across FS is not implemented."
+            "Matrix momentum/Q resharding across FS is not implemented."
         )
     if saved_tp_size != int(tp_size):
         raise RuntimeError(
-            "[Dion] unsupported Dion checkpoint TP topology change: "
+            "[Matrix] unsupported Matrix checkpoint TP topology change: "
             f"saved_tp_size={saved_tp_size} current_tp_size={int(tp_size)}. "
-            "Dion Q resharding across TP is not implemented."
+            "Matrix Q resharding across TP is not implemented."
         )
     if saved_rp_size != int(rp_size):
         raise RuntimeError(
-            "[Dion] unsupported Dion checkpoint RP topology change: "
+            "[Matrix] unsupported Matrix checkpoint RP topology change: "
             f"saved_rp_size={saved_rp_size} current_rp_size={int(rp_size)}. "
-            "Dion replica-state remapping across RP is not implemented."
+            "Matrix replica-state remapping across RP is not implemented."
         )
     if saved_state_replica_size != int(state_replica_size):
         raise RuntimeError(
-            "[Dion] unsupported Dion checkpoint state-replica topology change: "
+            "[Matrix] unsupported Matrix checkpoint state-replica topology change: "
             f"saved_state_replica_size={saved_state_replica_size} "
             f"current_state_replica_size={int(state_replica_size)}. "
-            "Dion state-replica remapping is not implemented."
+            "Matrix state-replica remapping is not implemented."
         )
-    if saved_format == DION_PARAM_STATE_FORMAT:
+    if saved_format == MATRIX_PARAM_STATE_FORMAT:
         saved_topology_signature = checkpoint_metadata.get("topology_signature", None)
         if saved_topology_signature is None or topology_signature is None:
             raise RuntimeError(
-                "[Dion] checkpoint is missing Dion optimizer topology signature. "
+                "[Matrix] checkpoint is missing Matrix optimizer topology signature. "
                 "Refusing same-size restore because group membership/order cannot be proven."
             )
         if _normalize_topology_signature(saved_topology_signature) != _normalize_topology_signature(
             topology_signature
         ):
             raise RuntimeError(
-                "[Dion] unsupported Dion checkpoint topology identity change: "
+                "[Matrix] unsupported Matrix checkpoint topology identity change: "
                 f"saved={saved_topology_signature} current={topology_signature}"
             )
 
@@ -235,25 +235,25 @@ def validate_dion_checkpoint_metadata(
         return
     if not isinstance(saved_matrix, dict):
         raise RuntimeError(
-            "[Dion] invalid matrix optimizer checkpoint metadata: "
+            "[Matrix] invalid matrix optimizer checkpoint metadata: "
             f"type={type(saved_matrix).__name__}"
         )
     saved_backend = saved_matrix.get("backend", None)
     if saved_backend != backend_state_spec.backend:
         raise RuntimeError(
-            "[Dion] unsupported matrix optimizer backend checkpoint restore: "
+            "[Matrix] unsupported matrix optimizer backend checkpoint restore: "
             f"saved={saved_backend!r} current={backend_state_spec.backend!r}"
         )
     saved_substrate_version = int(saved_matrix.get("substrate_version", -1))
     if saved_substrate_version > MATRIX_SUBSTRATE_FORMAT_VERSION:
         raise RuntimeError(
-            "[Dion] unsupported matrix optimizer substrate checkpoint version: "
+            "[Matrix] unsupported matrix optimizer substrate checkpoint version: "
             f"saved={saved_substrate_version} current={MATRIX_SUBSTRATE_FORMAT_VERSION}"
         )
     saved_backend_state_version = int(saved_matrix.get("backend_state_version", -1))
     if saved_backend_state_version > int(backend_state_spec.version):
         raise RuntimeError(
-            "[Dion] unsupported Dion backend checkpoint state version: "
+            "[Matrix] unsupported Matrix backend checkpoint state version: "
             f"saved={saved_backend_state_version} current={backend_state_spec.version}"
         )
 
@@ -292,7 +292,7 @@ def _target_tensor_dtype(
 
 
 def build_persistent_param_state(param_groups, optimizer_state, get_param_key) -> dict:
-    """Build persistent Dion optimizer state keyed by `param_uid`.
+    """Build persistent Matrix optimizer state keyed by `param_uid`.
 
     This is intentionally narrower than the raw optimizer state:
     per-call gather buffers and transient sync flags are excluded.
@@ -353,9 +353,9 @@ def build_tensor_param_state(
     sharded_object_cls,
     sharded_tensor_cls,
 ) -> dict:
-    """Build Dion persistent state using tensors, not one large object payload."""
+    """Build Matrix persistent state using tensors, not one large object payload."""
     metadata_payload = {
-        "format": _DION_TENSOR_PAYLOAD_FORMAT,
+        "format": _MATRIX_TENSOR_PAYLOAD_FORMAT,
         "params": {},
     }
     tensor_payload = {}
@@ -382,7 +382,7 @@ def build_tensor_param_state(
                     values[key] = value
 
             for key, value in tensors.items():
-                tensor_key = f"{base_key}.dion_param_state.{rank_key}.{param_id}.{key}"
+                tensor_key = f"{base_key}.matrix_param_state.{rank_key}.{param_id}.{key}"
                 tensor_payload.setdefault(param_id, {})[key] = _wrap_rank_local_tensor(
                     tensor=value,
                     key=tensor_key,
@@ -399,7 +399,7 @@ def build_tensor_param_state(
 
     return {
         "metadata": sharded_object_cls(
-            f"{base_key}.dion_param_state.{rank_key}.metadata",
+            f"{base_key}.matrix_param_state.{rank_key}.metadata",
             metadata_payload,
             (1,),
             (0,),
@@ -452,7 +452,7 @@ def _sample_keys(mapping, limit: int = 5) -> tuple[str, ...]:
 def _materialize_param_state_payload(param_state_payload) -> dict:
     """Return the legacy param-keyed state dict from either checkpoint layout."""
     if not isinstance(param_state_payload, dict):
-        raise RuntimeError("[Dion] distributed checkpoint missing Dion param state payload")
+        raise RuntimeError("[Matrix] distributed checkpoint missing Matrix param state payload")
     tensor_payload = _select_tensor_param_state_payload(param_state_payload)
     if tensor_payload is None:
         return param_state_payload
@@ -460,12 +460,12 @@ def _materialize_param_state_payload(param_state_payload) -> dict:
     metadata = _unwrap_checkpoint_leaf(tensor_payload["metadata"])
     if not isinstance(metadata, dict):
         raise RuntimeError(
-            "[Dion] invalid sharded Dion param-state metadata: "
+            "[Matrix] invalid sharded Matrix param-state metadata: "
             f"type={type(metadata).__name__}"
         )
-    if metadata.get("format") != _DION_TENSOR_PAYLOAD_FORMAT:
+    if metadata.get("format") != _MATRIX_TENSOR_PAYLOAD_FORMAT:
         raise RuntimeError(
-            "[Dion] unsupported sharded Dion param-state payload format: "
+            "[Matrix] unsupported sharded Matrix param-state payload format: "
             f"{metadata.get('format')!r}"
         )
 
@@ -473,24 +473,24 @@ def _materialize_param_state_payload(param_state_payload) -> dict:
     key_to_state = {}
     for ordinal, (param_key, entry) in enumerate(metadata.get("params", {}).items()):
         if not isinstance(entry, dict):
-            raise RuntimeError(f"[Dion] invalid param-state metadata entry for {param_key}")
+            raise RuntimeError(f"[Matrix] invalid param-state metadata entry for {param_key}")
         param_id = entry.get("id", None)
         values = dict(entry.get("values", {}))
         tensor_keys = tuple(entry.get("tensor_keys", ()))
         tensor_state = tensors_by_param.get(param_id, {})
         if not isinstance(tensor_state, dict):
-            raise RuntimeError(f"[Dion] invalid tensor payload entry for {param_key}")
+            raise RuntimeError(f"[Matrix] invalid tensor payload entry for {param_key}")
         for key in tensor_keys:
             if key not in tensor_state:
                 raise RuntimeError(
-                    "[Dion] sharded checkpoint missing tensor state "
+                    "[Matrix] sharded checkpoint missing tensor state "
                     f"{key!r} for {param_key}"
                 )
             values[key] = _unwrap_checkpoint_leaf(tensor_state[key])
         key_to_state[param_key] = values
         if param_id is not None:
-            key_to_state[("__dion_param_id__", str(param_id))] = values
-        key_to_state[("__dion_param_ordinal__", int(ordinal))] = values
+            key_to_state[("__matrix_param_id__", str(param_id))] = values
+        key_to_state[("__matrix_param_ordinal__", int(ordinal))] = values
     return key_to_state
 
 
@@ -499,12 +499,12 @@ def _find_saved_param_state(key_to_state: dict, param_key, ordinal: int):
     if saved_state is not None:
         return saved_state
     saved_state = key_to_state.get(
-        ("__dion_param_id__", _stable_param_key_id(param_key)),
+        ("__matrix_param_id__", _stable_param_key_id(param_key)),
         None,
     )
     if saved_state is not None:
         return saved_state
-    return key_to_state.get(("__dion_param_ordinal__", int(ordinal)), None)
+    return key_to_state.get(("__matrix_param_ordinal__", int(ordinal)), None)
 
 
 def restore_persistent_param_state_(
@@ -515,7 +515,7 @@ def restore_persistent_param_state_(
     key_to_state: dict,
     mixed_precision_config=None,
 ) -> dict[str, int]:
-    """Restore persistent Dion optimizer state keyed by `param_uid`.
+    """Restore persistent Matrix optimizer state keyed by `param_uid`.
 
     Returns:
         Summary counts with distinct buckets:
@@ -560,7 +560,7 @@ def restore_persistent_param_state_(
                     if key == "param":
                         if tuple(param.shape) != tuple(value.shape):
                             raise RuntimeError(
-                                f"[Dion] checkpoint tensor shape mismatch for {param_key}.param: "
+                                f"[Matrix] checkpoint tensor shape mismatch for {param_key}.param: "
                                 f"saved={tuple(value.shape)} current={tuple(param.shape)}"
                             )
                         param.data.copy_(value.to(device=param.device, dtype=param.dtype))
@@ -569,7 +569,7 @@ def restore_persistent_param_state_(
                     current_value = current_state.get(key)
                     if isinstance(current_value, torch.Tensor) and current_value.shape != value.shape:
                         raise RuntimeError(
-                            f"[Dion] checkpoint tensor shape mismatch for {param_key}.{key}: "
+                            f"[Matrix] checkpoint tensor shape mismatch for {param_key}.{key}: "
                             f"saved={tuple(value.shape)} current={tuple(current_value.shape)}"
                         )
                     target_dtype = _target_tensor_dtype(
@@ -591,7 +591,7 @@ def restore_persistent_param_state_(
                 new_state["_needs_state_replica_q_sync"] = True
             if not restored_param:
                 raise RuntimeError(
-                    "[Dion] distributed checkpoint is missing optimizer master param "
+                    "[Matrix] distributed checkpoint is missing optimizer master param "
                     f"for {param_key}"
                 )
 
@@ -644,8 +644,8 @@ def build_distributed_checkpoint_state(
         )
         for key, value in common_state.items()
     }
-    state_dict["dion_checkpoint_metadata"] = sharded_object_cls(
-        f"{base_key}.dion_checkpoint_metadata",
+    state_dict["matrix_checkpoint_metadata"] = sharded_object_cls(
+        f"{base_key}.matrix_checkpoint_metadata",
         checkpoint_metadata,
         (1,),
         (0,),
@@ -658,15 +658,15 @@ def build_distributed_checkpoint_state(
             optimizer_state,
             get_param_key,
         )
-        state_dict["dion_param_state"] = sharded_object_cls(
-            f"{base_key}.dion_param_state",
+        state_dict["matrix_param_state"] = sharded_object_cls(
+            f"{base_key}.matrix_param_state",
             param_state_payload,
             tuple(int(dim) for dim in state_global_shape),
             tuple(int(offset) for offset in state_global_offset),
             replica_id=state_replica_id,
         )
     else:
-        state_dict["dion_param_state"] = build_tensor_param_state(
+        state_dict["matrix_param_state"] = build_tensor_param_state(
             param_groups=param_groups,
             optimizer_state=optimizer_state,
             get_param_key=get_param_key,
@@ -686,10 +686,10 @@ def build_distributed_checkpoint_state(
 def split_distributed_checkpoint_state(
     state_dict: dict,
 ) -> tuple[Optional[dict], Optional[dict], dict]:
-    """Split Dion payload from the standard common-state outer protocol."""
-    checkpoint_metadata = state_dict.get("dion_checkpoint_metadata", None)
-    param_state_payload = state_dict.get("dion_param_state", None)
-    if param_state_payload is None and state_dict.get("param_state_sharding_type") == "dion_non_reshardable":
+    """Split Matrix payload from the standard common-state outer protocol."""
+    checkpoint_metadata = state_dict.get("matrix_checkpoint_metadata", None)
+    param_state_payload = state_dict.get("matrix_param_state", None)
+    if param_state_payload is None and state_dict.get("param_state_sharding_type") == "matrix_non_reshardable":
         param_state_payload = state_dict.get("param_state", None)
 
     common_state_dict = {
@@ -697,8 +697,8 @@ def split_distributed_checkpoint_state(
         for key, value in state_dict.items()
         if key
         not in (
-            "dion_checkpoint_metadata",
-            "dion_param_state",
+            "matrix_checkpoint_metadata",
+            "matrix_param_state",
             "param_state",
             "param_state_sharding_type",
         )
@@ -714,12 +714,12 @@ def restore_distributed_checkpoint_state(
     get_param_key,
     mixed_precision_config=None,
 ) -> dict[str, int]:
-    """Restore Dion-specific distributed checkpoint payload and validate completeness."""
+    """Restore Matrix-specific distributed checkpoint payload and validate completeness."""
     if not isinstance(param_state_payload, dict) or len(param_state_payload) == 0:
-        raise RuntimeError("[Dion] distributed checkpoint missing Dion param state payload")
+        raise RuntimeError("[Matrix] distributed checkpoint missing Matrix param state payload")
     key_to_state = _materialize_param_state_payload(param_state_payload)
     if not key_to_state:
-        raise RuntimeError("[Dion] distributed checkpoint has no Dion param state entries")
+        raise RuntimeError("[Matrix] distributed checkpoint has no Matrix param state entries")
 
     restore_summary = restore_persistent_param_state_(
         param_groups=param_groups,
@@ -738,7 +738,7 @@ def restore_distributed_checkpoint_state(
             if len(current_key_samples) >= 5:
                 break
         logger.error(
-            "[Dion] checkpoint restore unresolved entries: "
+            "[Matrix] checkpoint restore unresolved entries: "
             "payload_type=%s payload_keys=%s materialized_keys=%s current_keys=%s",
             type(param_state_payload).__name__,
             _sample_keys(param_state_payload),
@@ -746,7 +746,7 @@ def restore_distributed_checkpoint_state(
             tuple(current_key_samples),
         )
         raise RuntimeError(
-            "[Dion] distributed checkpoint restore left unresolved param state entries "
+            "[Matrix] distributed checkpoint restore left unresolved param state entries "
             f"(restored={restore_summary['restored']} "
             f"no_payload_entry={restore_summary['no_payload_entry']} "
             f"unnamed={restore_summary['unnamed']})"
@@ -764,7 +764,7 @@ def all_gather_flat_shards_(
 ) -> None:
     """All-gather uneven 1D shards back into `param_flat` in-place.
 
-    This matches the existing Dion code path:
+    This matches the existing Matrix code path:
     - pad each rank's shard to max_shard_size
     - `dist.all_gather` padded shards
     - `dist.all_gather` each rank's true (start,end) range
@@ -773,7 +773,7 @@ def all_gather_flat_shards_(
     local_shard_size = flat_end - flat_start
     if flat_start < 0 or local_shard_size < 0:
         raise RuntimeError(
-            f"[Dion] invalid flat shard range for checkpoint gather: "
+            f"[Matrix] invalid flat shard range for checkpoint gather: "
             f"start={flat_start} end={flat_end}"
         )
 
@@ -814,13 +814,13 @@ def all_gather_fs_shards_2d_(
 ) -> None:
     """All-gather FS-sharded 2D shards back into `param_2d` in-place.
 
-    This matches the existing Dion code path: pad to max shard size along the FS
+    This matches the existing Matrix code path: pad to max shard size along the FS
     axis, all_gather, then write each rank's actual shard view back in place.
     """
     local_shard_size = end_idx - start_idx
     if start_idx < 0 or local_shard_size < 0:
         raise RuntimeError(
-            f"[Dion] invalid FS shard range for checkpoint gather: "
+            f"[Matrix] invalid FS shard range for checkpoint gather: "
             f"start={start_idx} end={end_idx}"
         )
 
@@ -865,7 +865,7 @@ def copy_param_to_main_shard_(
     *,
     source_param: torch.Tensor,
     shard_main_param: torch.nn.Parameter,
-    dion_shard_layout: Optional[MatrixShardLayout],
+    matrix_shard_layout: Optional[MatrixShardLayout],
     param_range,
 ) -> None:
     """Copy a source model/state-dict param into the local optimizer shard."""
@@ -874,10 +874,10 @@ def copy_param_to_main_shard_(
     else:
         source_param_fp32 = source_param
 
-    if dion_shard_layout is not None:
-        start_idx = int(dion_shard_layout.start_idx)
-        end_idx = int(dion_shard_layout.end_idx)
-        fs_shard_dim = int(dion_shard_layout.fs_shard_dim)
+    if matrix_shard_layout is not None:
+        start_idx = int(matrix_shard_layout.start_idx)
+        end_idx = int(matrix_shard_layout.end_idx)
+        fs_shard_dim = int(matrix_shard_layout.fs_shard_dim)
 
         if source_param_fp32.ndim == 2:
             source_2d = source_param_fp32
@@ -892,7 +892,7 @@ def copy_param_to_main_shard_(
             f"shard_main_param={shard_main_param.numel()}, "
             f"fs_shard_dim={fs_shard_dim}, start_idx={start_idx}, end_idx={end_idx}, "
             f"source_shape={source_param_fp32.shape}, "
-            f"global_shape={tuple(dion_shard_layout.global_shape)}"
+            f"global_shape={tuple(matrix_shard_layout.global_shape)}"
         )
         shard_main_param.data.copy_(shard_model_param.reshape(shard_main_param.shape))
         return
@@ -916,22 +916,22 @@ def copy_group_to_main_shards_(
     shard_main_groups,
     get_source_param: Callable[[torch.nn.Parameter], torch.Tensor],
     get_param_range: Callable[[torch.nn.Parameter], object],
-    get_dion_shard_layout: Callable[[torch.nn.Parameter], Optional[MatrixShardLayout]],
-    dion_params_only: bool = False,
+    get_matrix_shard_layout: Callable[[torch.nn.Parameter], Optional[MatrixShardLayout]],
+    matrix_params_only: bool = False,
 ) -> None:
     """Copy one or more model param groups into their local optimizer shards."""
     for model_group, shard_main_group in zip(model_groups, shard_main_groups):
         for model_param, shard_main_param in zip(model_group, shard_main_group):
             if shard_main_param is None:
                 continue
-            dion_shard_layout = get_dion_shard_layout(model_param)
-            if dion_params_only and dion_shard_layout is None:
+            matrix_shard_layout = get_matrix_shard_layout(model_param)
+            if matrix_params_only and matrix_shard_layout is None:
                 continue
 
             copy_param_to_main_shard_(
                 source_param=get_source_param(model_param),
                 shard_main_param=shard_main_param,
-                dion_shard_layout=dion_shard_layout,
+                matrix_shard_layout=matrix_shard_layout,
                 param_range=get_param_range(model_param),
             )
 
@@ -949,13 +949,13 @@ def copy_model_params_to_main_shards(
     model_fp32_groups,
     shard_fp32_groups,
     get_model_param_range_map: Callable,
-    get_dion_shard_layout: Callable,
+    get_matrix_shard_layout: Callable,
 ) -> None:
     """Copy model params onto optimizer main shards using the canonical adapter mapping."""
     if is_hybrid_device_optimizer:
         if hybrid_optimizer_update is None:
             raise RuntimeError(
-                "[Dion] HybridDeviceOptimizer path requires update_fp32_param_by_new_param callback"
+                "[Matrix] HybridDeviceOptimizer path requires update_fp32_param_by_new_param callback"
             )
         hybrid_optimizer_update()
         return
@@ -981,16 +981,16 @@ def copy_model_params_to_main_shards(
             shard_main_groups=main_shard_groups,
             get_source_param=get_source_param,
             get_param_range=get_param_range,
-            get_dion_shard_layout=get_dion_shard_layout,
-            dion_params_only=True,
+            get_matrix_shard_layout=get_matrix_shard_layout,
+            matrix_params_only=True,
         )
         copy_group_to_main_shards_(
             model_groups=model_fp32_groups,
             shard_main_groups=shard_fp32_groups,
             get_source_param=get_source_param,
             get_param_range=get_param_range,
-            get_dion_shard_layout=get_dion_shard_layout,
-            dion_params_only=True,
+            get_matrix_shard_layout=get_matrix_shard_layout,
+            matrix_params_only=True,
         )
         return
 
@@ -999,14 +999,14 @@ def copy_model_params_to_main_shards(
         shard_main_groups=main_shard_groups,
         get_source_param=get_source_param,
         get_param_range=get_param_range,
-        get_dion_shard_layout=get_dion_shard_layout,
+        get_matrix_shard_layout=get_matrix_shard_layout,
     )
     copy_group_to_main_shards_(
         model_groups=model_fp32_groups,
         shard_main_groups=shard_fp32_groups,
         get_source_param=get_source_param,
         get_param_range=get_param_range,
-        get_dion_shard_layout=get_dion_shard_layout,
+        get_matrix_shard_layout=get_matrix_shard_layout,
     )
 
 
@@ -1016,7 +1016,7 @@ def write_shard_to_param_(
     opt_shard: torch.Tensor,
     data_shard: torch.Tensor,
     param_range_map,
-    dion_shard_layout: Optional[MatrixShardLayout],
+    matrix_shard_layout: Optional[MatrixShardLayout],
     get_bucket_param_data: Callable[[torch.nn.Parameter], torch.Tensor] | None,
     empty_range_warning_count: int,
 ) -> int:
@@ -1024,17 +1024,17 @@ def write_shard_to_param_(
     data_shard.data.copy_(opt_shard)
     model_param._fs_shard = data_shard
 
-    if dion_shard_layout is not None:
-        fs_shard_dim = int(dion_shard_layout.fs_shard_dim)
-        start_idx = int(dion_shard_layout.start_idx)
-        end_idx = int(dion_shard_layout.end_idx)
+    if matrix_shard_layout is not None:
+        fs_shard_dim = int(matrix_shard_layout.fs_shard_dim)
+        start_idx = int(matrix_shard_layout.start_idx)
+        end_idx = int(matrix_shard_layout.end_idx)
 
         if start_idx == 0 and end_idx == 0 and empty_range_warning_count < 5:
             param_name = getattr(model_param, "_param_name", f"shape={model_param.shape}")
             logger.error(
-                "[ZERO RANGE] start_idx=0, end_idx=0 for param %s! No data will be copied to model_param.data! dion_shard_layout=%s",
+                "[ZERO RANGE] start_idx=0, end_idx=0 for param %s! No data will be copied to model_param.data! matrix_shard_layout=%s",
                 param_name,
-                dion_shard_layout,
+                matrix_shard_layout,
             )
             empty_range_warning_count += 1
 
@@ -1048,7 +1048,7 @@ def write_shard_to_param_(
         if data_shard.numel() != expected_rows * expected_cols:
             param_name = getattr(model_param, "_param_name", f"id_{id(model_param)}")
             raise RuntimeError(
-                f"[Dion] FS shard shape mismatch: param={param_name}, "
+                f"[Matrix] FS shard shape mismatch: param={param_name}, "
                 f"data_shard.numel()={data_shard.numel()}, "
                 f"expected={expected_rows}x{expected_cols}={expected_rows * expected_cols}, "
                 f"fs_shard_dim={fs_shard_dim}, range=[{start_idx}:{end_idx}]"
@@ -1060,7 +1060,7 @@ def write_shard_to_param_(
             return empty_range_warning_count
         param_name = getattr(model_param, "_param_name", f"id_{id(model_param)}")
         logger.error(
-            "[DION_FS_ALIAS_MISMATCH] param=%s data_shard_ptr=%s target_ptr=%s fs_shard_dim=%s range=[%s:%s]",
+            "[MATRIX_FS_ALIAS_MISMATCH] param=%s data_shard_ptr=%s target_ptr=%s fs_shard_dim=%s range=[%s:%s]",
             param_name,
             src_view.data_ptr(),
             target_view.data_ptr(),
@@ -1069,7 +1069,7 @@ def write_shard_to_param_(
             end_idx,
         )
         raise RuntimeError(
-            f"[Dion] FS shard alias mismatch for {param_name}: "
+            f"[Matrix] FS shard alias mismatch for {param_name}: "
             f"data_shard no longer aliases canonical model_param.data view "
             f"(fs_shard_dim={fs_shard_dim}, range=[{start_idx}:{end_idx}])"
         )
@@ -1077,7 +1077,7 @@ def write_shard_to_param_(
     if param_range_map is None or "gbuf_world_in_bucket" not in param_range_map:
         param_name = _param_name(model_param)
         raise RuntimeError(
-            "[Dion] standard write-back requires canonical gbuf_world_in_bucket "
+            "[Matrix] standard write-back requires canonical gbuf_world_in_bucket "
             f"for {param_name}"
         )
 
@@ -1085,14 +1085,14 @@ def write_shard_to_param_(
     if get_bucket_param_data is None:
         param_name = _param_name(model_param)
         raise RuntimeError(
-            "[Dion] standard write-back requires canonical bucket.param_data "
+            "[Matrix] standard write-back requires canonical bucket.param_data "
             f"for {param_name}"
         )
     bucket_param_data = get_bucket_param_data(model_param)
     if bucket_param_data is None:
         param_name = _param_name(model_param)
         raise RuntimeError(
-            "[Dion] standard write-back missing bucket.param_data "
+            "[Matrix] standard write-back missing bucket.param_data "
             f"for {param_name}"
         )
     target_flat = bucket_param_data.view(-1)[world_range.start : world_range.end]
@@ -1100,7 +1100,7 @@ def write_shard_to_param_(
         param_name = _param_name(model_param)
         param_local_range = param_range_map.get("param", None)
         raise RuntimeError(
-            "[Dion] standard write-back size mismatch "
+            "[Matrix] standard write-back size mismatch "
             f"param={param_name} world_range_size={target_flat.numel()} "
             f"opt_shard_numel={opt_shard.numel()} "
             f"current_world_range=[{world_range.start}:{world_range.end}] "
@@ -1126,28 +1126,28 @@ def write_standard_shards_to_model_(
     param_count = 0
     for model_group, shard_param_group in zip(model_groups, shard_groups):
         for model_param, shard_param in zip(model_group, shard_param_group):
-            if shard_param is None or getattr(model_param, "is_dion_param", False):
+            if shard_param is None or getattr(model_param, "is_matrix_param", False):
                 continue
             if is_float8tensor(model_param):
                 continue
             if get_bucket_param_data is None:
                 param_name = _param_name(model_param)
                 raise RuntimeError(
-                    "[Dion] standard write-back requires canonical bucket.param_data "
+                    "[Matrix] standard write-back requires canonical bucket.param_data "
                     f"for {param_name}"
                 )
             bucket_param_data = get_bucket_param_data(model_param)
             if bucket_param_data is None:
                 param_name = _param_name(model_param)
                 raise RuntimeError(
-                    "[Dion] standard write-back missing bucket.param_data "
+                    "[Matrix] standard write-back missing bucket.param_data "
                     f"for {param_name}"
                 )
             param_range_map = get_param_range_map(model_param)
             if param_range_map is None or "gbuf_world_in_bucket" not in param_range_map:
                 param_name = _param_name(model_param)
                 raise RuntimeError(
-                    "[Dion] standard write-back requires canonical gbuf_world_in_bucket "
+                    "[Matrix] standard write-back requires canonical gbuf_world_in_bucket "
                     f"for {param_name}"
                 )
             world_range = param_range_map["gbuf_world_in_bucket"]
@@ -1155,7 +1155,7 @@ def write_standard_shards_to_model_(
             if target_flat.numel() != shard_param.nelement():
                 param_name = _param_name(model_param)
                 raise RuntimeError(
-                    "[Dion] standard write-back size mismatch "
+                    "[Matrix] standard write-back size mismatch "
                     f"param={param_name} world_range_size={target_flat.numel()} "
                     f"opt_shard_numel={shard_param.nelement()}"
                 )
@@ -1171,11 +1171,11 @@ def write_group_shards_to_model_(
     shard16_groups,
     get_data_shard: Callable[[torch.nn.Parameter], torch.Tensor],
     get_param_range_map: Callable[[torch.nn.Parameter], dict],
-    get_dion_shard_layout: Callable[[torch.nn.Parameter], Optional[MatrixShardLayout]],
+    get_matrix_shard_layout: Callable[[torch.nn.Parameter], Optional[MatrixShardLayout]],
     get_bucket_param_data: Callable[[torch.nn.Parameter], torch.Tensor] | None,
     empty_range_warning_count: int,
 ) -> tuple[int, int]:
-    """Apply updated Dion optimizer shards to grouped model params."""
+    """Apply updated Matrix optimizer shards to grouped model params."""
     param_count = 0
 
     for model_group, shard_param_group, shard16_param_group in zip(
@@ -1188,8 +1188,8 @@ def write_group_shards_to_model_(
         ):
             if shard_param is None:
                 continue
-            dion_shard_layout = get_dion_shard_layout(model_param)
-            if dion_shard_layout is None:
+            matrix_shard_layout = get_matrix_shard_layout(model_param)
+            if matrix_shard_layout is None:
                 continue
 
             data_shard = get_data_shard(model_param)
@@ -1201,7 +1201,7 @@ def write_group_shards_to_model_(
                 opt_shard=shard_param,
                 data_shard=data_shard,
                 param_range_map=get_param_range_map(model_param),
-                dion_shard_layout=dion_shard_layout,
+                matrix_shard_layout=matrix_shard_layout,
                 get_bucket_param_data=get_bucket_param_data,
                 empty_range_warning_count=empty_range_warning_count,
             )
@@ -1223,7 +1223,7 @@ def copy_main_params_to_model_shards(
     shard_fp32_groups,
     get_data_shard: Callable[[torch.nn.Parameter], torch.Tensor],
     get_param_range_map: Callable[[torch.nn.Parameter], dict],
-    get_dion_shard_layout: Callable[[torch.nn.Parameter], Optional[MatrixShardLayout]],
+    get_matrix_shard_layout: Callable[[torch.nn.Parameter], Optional[MatrixShardLayout]],
     get_bucket_param_data: Callable[[torch.nn.Parameter], torch.Tensor] | None,
     mark_buckets_full_param_ready: Callable[[bool], None],
     check_main_shards: Callable,
@@ -1237,7 +1237,7 @@ def copy_main_params_to_model_shards(
     if use_megatron_fsdp:
         if copy_fsdp_main_to_model_weights is None:
             raise RuntimeError(
-                "[Dion] FSDP param restore requires copy_main_weights_to_model_weights callback"
+                "[Matrix] FSDP param restore requires copy_main_weights_to_model_weights callback"
             )
         copy_fsdp_main_to_model_weights()
         return empty_range_warning_count
@@ -1245,7 +1245,7 @@ def copy_main_params_to_model_shards(
     if use_precision_aware_optimizer:
         mark_buckets_full_param_ready(False)
         check_main_shards(main_shard_groups)
-        restore_model_params_to_canonical_bucket_storage(dion_only=True)
+        restore_model_params_to_canonical_bucket_storage(matrix_only=True)
 
         _, empty_range_warning_count = write_group_shards_to_model_(
             model_groups=model_float16_groups,
@@ -1253,7 +1253,7 @@ def copy_main_params_to_model_shards(
             shard16_groups=shard_float16_groups,
             get_data_shard=get_data_shard,
             get_param_range_map=get_param_range_map,
-            get_dion_shard_layout=get_dion_shard_layout,
+            get_matrix_shard_layout=get_matrix_shard_layout,
             get_bucket_param_data=get_bucket_param_data,
             empty_range_warning_count=empty_range_warning_count,
         )
@@ -1263,7 +1263,7 @@ def copy_main_params_to_model_shards(
             shard16_groups=shard_fp32_groups,
             get_data_shard=get_data_shard,
             get_param_range_map=get_param_range_map,
-            get_dion_shard_layout=get_dion_shard_layout,
+            get_matrix_shard_layout=get_matrix_shard_layout,
             get_bucket_param_data=get_bucket_param_data,
             empty_range_warning_count=empty_range_warning_count,
         )
@@ -1284,7 +1284,7 @@ def copy_main_params_to_model_shards(
         shard16_groups=shard_float16_groups,
         get_data_shard=get_data_shard,
         get_param_range_map=get_param_range_map,
-        get_dion_shard_layout=get_dion_shard_layout,
+        get_matrix_shard_layout=get_matrix_shard_layout,
         get_bucket_param_data=get_bucket_param_data,
         empty_range_warning_count=empty_range_warning_count,
     )
@@ -1296,7 +1296,7 @@ def copy_main_params_to_model_shards(
         get_bucket_param_data=get_bucket_param_data,
     )
 
-    restore_model_params_to_canonical_bucket_storage(dion_only=True)
+    restore_model_params_to_canonical_bucket_storage(matrix_only=True)
 
     _, empty_range_warning_count = write_group_shards_to_model_(
         model_groups=model_fp32_groups,
@@ -1304,7 +1304,7 @@ def copy_main_params_to_model_shards(
         shard16_groups=shard_fp32_groups,
         get_data_shard=get_data_shard,
         get_param_range_map=get_param_range_map,
-        get_dion_shard_layout=get_dion_shard_layout,
+        get_matrix_shard_layout=get_matrix_shard_layout,
         get_bucket_param_data=get_bucket_param_data,
         empty_range_warning_count=empty_range_warning_count,
     )
@@ -1316,12 +1316,12 @@ def restore_full_model_param_(
     *,
     model_param: torch.nn.Parameter,
     param_range,
-    dion_shard_layout: Optional[MatrixShardLayout],
+    matrix_shard_layout: Optional[MatrixShardLayout],
     fs_group: dist.ProcessGroup,
     fs_size: int,
 ) -> bool:
     """Restore `model_param.data` to its full view by all-gathering local shards."""
-    if dion_shard_layout is None:
+    if matrix_shard_layout is None:
         if param_range is None:
             return False
         flat_start = param_range.start
@@ -1336,9 +1336,9 @@ def restore_full_model_param_(
         )
         return True
 
-    fs_shard_dim = int(dion_shard_layout.fs_shard_dim)
-    start_idx = int(dion_shard_layout.start_idx)
-    end_idx = int(dion_shard_layout.end_idx)
+    fs_shard_dim = int(matrix_shard_layout.fs_shard_dim)
+    start_idx = int(matrix_shard_layout.start_idx)
+    end_idx = int(matrix_shard_layout.end_idx)
 
     all_gather_fs_shards_2d_(
         model_param.data,

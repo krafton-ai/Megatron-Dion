@@ -42,6 +42,10 @@ try:
     from megatron.core.optimizer.dion import MegatronDion
 except ImportError:
     MegatronDion = None
+try:
+    from megatron.core.optimizer.muon.algorithm import MegatronMuon
+except ImportError:
+    MegatronMuon = None
 
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -528,9 +532,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         allowed_optimizers = (Adam, torch.optim.AdamW, HybridDeviceOptimizer)
         if MegatronDion is not None:
             allowed_optimizers = allowed_optimizers + (MegatronDion,)
+        if MegatronMuon is not None:
+            allowed_optimizers = allowed_optimizers + (MegatronMuon,)
 
         assert isinstance(optimizer, allowed_optimizers) or optimizer is None, (
-            "Only Adam, HybridDeviceOptimizer, and MegatronDion currently supported, "
+            "Only Adam, HybridDeviceOptimizer, MegatronDion, and MegatronMuon currently supported, "
             "due to checkpointing requirements."
         )
 

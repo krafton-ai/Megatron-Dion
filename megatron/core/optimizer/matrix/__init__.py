@@ -1,3 +1,13 @@
 """Matrix-aware distributed optimizer substrate."""
 
-__all__: list[str] = []
+from .backend import MatrixBackend, MatrixStateSpec
+from .distrib_optimizer import DistributedMatrixOptimizer
+from .types import MatrixDistMeta, MatrixStepParam
+
+__all__ = [
+    "DistributedMatrixOptimizer",
+    "MatrixBackend",
+    "MatrixDistMeta",
+    "MatrixStateSpec",
+    "MatrixStepParam",
+]

@@ -37,8 +37,8 @@ def _get_main_grad_attr(param: torch.nn.Parameter):
     return "grad"
 
 
-def _get_dion_local_grad(model_chunk: torch.nn.Module, param: torch.nn.Parameter):
-    getter = getattr(model_chunk, "get_dion_local_grad", None)
+def _get_matrix_local_grad(model_chunk: torch.nn.Module, param: torch.nn.Parameter):
+    getter = getattr(model_chunk, "get_matrix_local_grad", None)
     if getter is None:
         return None
     return getter(param)
@@ -127,7 +127,7 @@ def _allreduce_conditional_embedding_grads(
 
     if pp_group.size() > 1 and getattr(config, "has_cond_embedder", False):
         grads_dict = {}
-        dion_grads_dict = {}
+        matrix_grads_dict = {}
         for model_chunk in model:
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
                 if param.requires_grad and getattr(param, 'pipeline_parallel', False):
@@ -140,24 +140,24 @@ def _allreduce_conditional_embedding_grads(
                         grads_dict[name].append(grad)
                     else:
                         grads_dict[name] = [grad]
-                    dion_grad = _get_dion_local_grad(model_chunk, param)
-                    if dion_grad is not None:
-                        if name in dion_grads_dict:
-                            dion_grads_dict[name][0].add_(dion_grad)
-                            dion_grads_dict[name].append(dion_grad)
+                    matrix_grad = _get_matrix_local_grad(model_chunk, param)
+                    if matrix_grad is not None:
+                        if name in matrix_grads_dict:
+                            matrix_grads_dict[name][0].add_(matrix_grad)
+                            matrix_grads_dict[name].append(matrix_grad)
                         else:
-                            dion_grads_dict[name] = [dion_grad]
-        if grads_dict or dion_grads_dict:
+                            matrix_grads_dict[name] = [matrix_grad]
+        if grads_dict or matrix_grads_dict:
             # All-reduce the gradient on the first VPP rank.
             grads = [param_grad[0] for _, param_grad in grads_dict.items()]
-            grads.extend(param_grad[0] for _, param_grad in dion_grads_dict.items())
+            grads.extend(param_grad[0] for _, param_grad in matrix_grads_dict.items())
             _all_reduce_tensors(grads, pp_group)
 
             # Update the gradients on other VPP ranks.
             for grads in grads_dict.values():
                 for grad in grads[1:]:
                     grad.copy_(grads[0])
-            for grads in dion_grads_dict.values():
+            for grads in matrix_grads_dict.values():
                 for grad in grads[1:]:
                     grad.copy_(grads[0])
 
@@ -289,8 +289,8 @@ def _allreduce_embedding_grad(
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
-        dion_grad = _get_dion_local_grad(ddp_model_module, weight)
-        _all_reduce_tensors([grad, dion_grad], embd_group)
+        matrix_grad = _get_matrix_local_grad(ddp_model_module, weight)
+        _all_reduce_tensors([grad, matrix_grad], embd_group)
         setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 

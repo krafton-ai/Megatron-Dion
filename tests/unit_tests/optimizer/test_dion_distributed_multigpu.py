@@ -19,10 +19,8 @@ from megatron.core.optimizer.dion.distributed.integration import (
     _get_dion_replica_group,
     _resolve_fs_group,
 )
-from megatron.core.optimizer.dion.distributed.parameter import (
-    is_dion_param,
-    resolve_grad_rank_to_fs_rank,
-)
+from megatron.core.optimizer.dion.params import is_dion_param
+from megatron.core.optimizer.matrix.parameter import resolve_grad_rank_to_fs_rank
 
 
 def _require_multigpu(min_world_size=4):

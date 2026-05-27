@@ -65,23 +65,23 @@ class _HandleGroup:
         self._handles = []
 
 
-def _dion_profile_param_sync_enabled() -> bool:
-    return os.getenv("DION_PROFILE_PARAM_SYNC", "0") == "1"
+def _matrix_profile_param_sync_enabled() -> bool:
+    return os.getenv("MATRIX_PROFILE_PARAM_SYNC", "0") == "1"
 
 
-def _dion_profile_param_sync_rank_selected() -> bool:
+def _matrix_profile_param_sync_rank_selected() -> bool:
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return True
-    ranks = os.getenv("DION_PROFILE_PARAM_SYNC_RANKS", "0").strip()
+    ranks = os.getenv("MATRIX_PROFILE_PARAM_SYNC_RANKS", "0").strip()
     if not ranks:
         return True
     rank = torch.distributed.get_rank()
     return rank in {int(token) for token in ranks.split(",") if token.strip()}
 
 
-def _dion_bucket_summary(bucket) -> str:
-    dion_layout = getattr(bucket, "dion_layout", None)
-    entries = tuple(getattr(dion_layout, "entries", ()) or ())
+def _matrix_bucket_summary(bucket) -> str:
+    matrix_layout = getattr(bucket, "matrix_layout", None)
+    entries = tuple(getattr(matrix_layout, "entries", ()) or ())
     qkvg = sum(1 for entry in entries if getattr(getattr(entry, "dist_meta", None), "qkvg_split_shapes", None) is not None)
     qkv = sum(1 for entry in entries if getattr(getattr(entry, "dist_meta", None), "qkv_split_shapes", None) is not None)
     names = []
@@ -91,18 +91,18 @@ def _dion_bucket_summary(bucket) -> str:
     return (
         f"id={getattr(bucket, 'bucket_id', -1)} "
         f"numel={int(getattr(getattr(bucket, 'param_data', None), 'numel', lambda: 0)())} "
-        f"dion={int(bool(getattr(bucket, 'has_dion_params', False)))} "
+        f"matrix={int(bool(getattr(bucket, 'has_matrix_params', False)))} "
         f"standard={int(bool(getattr(bucket, 'has_standard_params', False)))} "
         f"entries={len(entries)} qkvg={qkvg} qkv={qkv} "
         f"names={names}"
     )
 
 
-def _dion_profile_param_sync_log(message: str) -> None:
-    if not _dion_profile_param_sync_enabled() or not _dion_profile_param_sync_rank_selected():
+def _matrix_profile_param_sync_log(message: str) -> None:
+    if not _matrix_profile_param_sync_enabled() or not _matrix_profile_param_sync_rank_selected():
         return
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    print(f"[DION_PARAM_SYNC] rank={rank} {message}", flush=True)
+    print(f"[MATRIX_PARAM_SYNC] rank={rank} {message}", flush=True)
 
 
 def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
@@ -161,29 +161,32 @@ class _ParamAndGradBucket:
             self.param_to_index[param] = (offset, offset + param.numel())
             offset += param.numel()
 
-        # Dion transport metadata.
-        self.dion_shard_group = None
-        self.dion_layout = None
+        # Matrix-optimizer transport metadata.
+        self.matrix_shard_group = None
+        self.matrix_layout = None
+        self.matrix_optimizer = None
 
     # Helper Properties
 
     @property
-    def dion_param_ids(self):
-        """Set of Dion param IDs from the bucket layout."""
-        if self.dion_layout is None:
+    def matrix_param_ids(self):
+        """Set of matrix-optimizer param IDs from the bucket layout."""
+        layout = self.matrix_layout
+        if layout is None:
             return frozenset()
-        return self.dion_layout.param_ids
+        return layout.param_ids
 
     @property
-    def has_dion_params(self) -> bool:
-        """Whether bucket carries any Dion params."""
-        return self.dion_layout is not None and self.dion_layout.has_params
+    def has_matrix_params(self) -> bool:
+        """Whether bucket carries matrix-optimizer params."""
+        layout = self.matrix_layout
+        return layout is not None and layout.has_params
 
     @property
     def has_standard_params(self) -> bool:
         """Whether bucket has standard params."""
-        dion_param_ids = self.dion_param_ids
-        return any(id(param) not in dion_param_ids for param in self.params)
+        matrix_param_ids = self.matrix_param_ids
+        return any(id(param) not in matrix_param_ids for param in self.params)
 
 
 class _ParamAndGradBucketGroup:
@@ -279,22 +282,22 @@ class _ParamAndGradBucketGroup:
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
-    def _mark_dion_param_sync_ready(self, ready: bool):
-        """Update forward-readiness state for Dion param-gather buckets."""
+    def _mark_matrix_param_sync_ready(self, ready: bool):
+        """Update forward-readiness state for matrix param-gather buckets."""
         for bucket in self.buckets:
-            if hasattr(bucket, "_dion_full_param_ready"):
-                bucket._dion_full_param_ready = ready
+            if hasattr(bucket, "_matrix_full_param_ready"):
+                bucket._matrix_full_param_ready = ready
 
-    def _check_dion_param_sync_ready(self):
+    def _check_matrix_param_sync_ready(self):
         """Verify bucket.param_data remains the forward-visible canonical storage."""
         for bucket in self.buckets:
-            if not getattr(bucket, "_tracks_dion_param_views", False):
+            if not getattr(bucket, "_tracks_matrix_param_views", False):
                 continue
-            optimizer = getattr(bucket, "dion_optimizer", None)
+            optimizer = getattr(bucket, "matrix_optimizer", None)
             if optimizer is None:
                 continue
             optimizer._check_bucket_param_views(bucket, context="finish_param_sync")
-            bucket._dion_full_param_ready = True
+            bucket._matrix_full_param_ready = True
 
     def _get_standard_local_grad_view(self, idx: int, bucket: _ParamAndGradBucket) -> torch.Tensor:
         """Return the canonical standard local optimizer shard for one bucket."""
@@ -310,22 +313,22 @@ class _ParamAndGradBucketGroup:
         """Collect bucket-wise param-gather launches for one dispatch.
 
         Pure standard buckets follow the stock DO path from the standard local
-        contiguous bucket shard. Buckets that contain Dion params must instead
-        launch the Dion bucket-wise gather helper, because a Dion local FS shard
-        is not generally the same layout as the stock flat bucket shard source.
+        contiguous bucket shard. Buckets that contain matrix params launch the
+        matrix bucket-wise gather helper because a matrix FS shard is not
+        generally the same layout as the stock flat bucket shard source.
         """
         standard_bucket_indices = []
-        dion_handles = []
+        matrix_handles = []
 
         for idx, bucket in enumerate(self.buckets):
-            has_dion = bucket.has_dion_params
+            has_matrix = bucket.has_matrix_params
             has_standard = bucket.has_standard_params
 
-            if has_dion:
-                optimizer = getattr(bucket, "dion_optimizer", None)
+            if has_matrix:
+                optimizer = getattr(bucket, "matrix_optimizer", None)
                 if optimizer is None or not hasattr(optimizer, "_all_gather_bucket_params_"):
                     raise RuntimeError(
-                        "[Dion] missing bucket-wise Dion param-gather helper "
+                        "[MatrixOptimizer] missing bucket-wise param-gather helper "
                         f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                     )
                 handle = optimizer._all_gather_bucket_params_(
@@ -333,31 +336,33 @@ class _ParamAndGradBucketGroup:
                     async_op=async_op,
                 )
                 if handle is not None:
-                    dion_handles.append(handle)
+                    matrix_handles.append(handle)
                 continue
 
             if has_standard:
                 standard_bucket_indices.append(idx)
 
-        return standard_bucket_indices, dion_handles
+        return standard_bucket_indices, matrix_handles
 
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
         """
         for bucket in self.buckets:
-            optimizer = getattr(bucket, "dion_optimizer", None)
-            dion_layout = getattr(bucket, "dion_layout", None)
+            optimizer = getattr(bucket, "matrix_optimizer", None)
+            matrix_layout = getattr(bucket, "matrix_layout", None)
             if (
                 optimizer is not None
-                and dion_layout is not None
-                and dion_layout.has_params
+                and matrix_layout is not None
+                and matrix_layout.has_params
             ):
-                if hasattr(optimizer, "_clear_dion_local_grads"):
-                    optimizer._clear_dion_local_grads(
-                        [entry.param for entry in dion_layout.entries]
+                if hasattr(optimizer, "_clear_matrix_local_grads"):
+                    optimizer._clear_matrix_local_grads(
+                        [entry.param for entry in matrix_layout.entries]
                     )
-                if hasattr(optimizer, "_clear_grad_transport"):
+                if hasattr(optimizer, "_clear_matrix_grad_transport"):
+                    optimizer._clear_matrix_grad_transport(bucket)
+                elif hasattr(optimizer, "_clear_grad_transport"):
                     optimizer._clear_grad_transport(bucket)
         if self.is_first_batch and len(self.per_param_grad_ready_counts) > 0:
             assert len(self.per_param_grad_ready_counts) == len(self.params)
@@ -423,15 +428,15 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
-                self._check_dion_param_sync_ready()
+                self._check_matrix_param_sync_ready()
                 return
         else:
             assert self.param_gather_handle is None
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
-        self._mark_dion_param_sync_ready(False)
-        profile_start = time.perf_counter() if _dion_profile_param_sync_enabled() else None
-        pure_standard_indices, dion_handles = self._collect_param_gather_launches(
+        self._mark_matrix_param_sync_ready(False)
+        profile_start = time.perf_counter() if _matrix_profile_param_sync_enabled() else None
+        pure_standard_indices, matrix_handles = self._collect_param_gather_launches(
             async_op=async_op,
         )
         standard_handle = None
@@ -457,19 +462,19 @@ class _ParamAndGradBucketGroup:
             standard_handle = cm if async_op else None
 
         if async_op:
-            self.param_gather_handle = _HandleGroup([standard_handle, *dion_handles])
+            self.param_gather_handle = _HandleGroup([standard_handle, *matrix_handles])
         else:
             self.param_gather_handle = None
-            self._check_dion_param_sync_ready()
+            self._check_matrix_param_sync_ready()
         self.param_gather_dispatched = True
         if profile_start is not None:
             elapsed = time.perf_counter() - profile_start
-            bucket_desc = "; ".join(_dion_bucket_summary(bucket) for bucket in self.buckets[:4])
+            bucket_desc = "; ".join(_matrix_bucket_summary(bucket) for bucket in self.buckets[:4])
             if len(self.buckets) > 4:
                 bucket_desc += f"; ... total_buckets={len(self.buckets)}"
-            _dion_profile_param_sync_log(
+            _matrix_profile_param_sync_log(
                 f"start async={int(async_op)} force={int(force_sync)} "
-                f"standard_buckets={len(pure_standard_indices)} dion_handles={len(dion_handles)} "
+                f"standard_buckets={len(pure_standard_indices)} matrix_handles={len(matrix_handles)} "
                 f"elapsed={elapsed:.6f}s buckets=[{bucket_desc}]"
             )
 
@@ -497,18 +502,18 @@ class _ParamAndGradBucketGroup:
             self.start_param_sync()
 
         if self.param_gather_handle is not None:
-            profile_start = time.perf_counter() if _dion_profile_param_sync_enabled() else None
+            profile_start = time.perf_counter() if _matrix_profile_param_sync_enabled() else None
             self.param_gather_handle.wait()
             if profile_start is not None:
                 elapsed = time.perf_counter() - profile_start
-                bucket_desc = "; ".join(_dion_bucket_summary(bucket) for bucket in self.buckets[:4])
+                bucket_desc = "; ".join(_matrix_bucket_summary(bucket) for bucket in self.buckets[:4])
                 if len(self.buckets) > 4:
                     bucket_desc += f"; ... total_buckets={len(self.buckets)}"
-                _dion_profile_param_sync_log(
+                _matrix_profile_param_sync_log(
                     f"finish wait={elapsed:.6f}s buckets=[{bucket_desc}]"
                 )
             self.param_gather_handle = None
-            self._check_dion_param_sync_ready()
+            self._check_matrix_param_sync_ready()
 
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
                 if self.next_param_gather_bucket_group.param_gather_dispatched:
@@ -609,21 +614,24 @@ class _ParamAndGradBucketGroup:
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
-                    optimizer = getattr(bucket, "dion_optimizer", None)
-                    has_dion = bucket.has_dion_params
+                    optimizer = getattr(bucket, "matrix_optimizer", None)
+                    has_matrix = bucket.has_matrix_params
                     has_standard = bucket.has_standard_params
                     local_data_view = (
                         self._get_standard_local_grad_view(idx, bucket)
-                        if (not has_dion or has_standard)
+                        if (not has_matrix or has_standard)
                         else None
                     )
-                    if bucket.has_dion_params:
-                        if optimizer is None or not hasattr(optimizer, "_start_dion_grad_sync"):
+                    if bucket.has_matrix_params:
+                        start_matrix_grad_sync = getattr(
+                            optimizer, "_start_matrix_grad_sync", None
+                        ) if optimizer is not None else None
+                        if optimizer is None or start_matrix_grad_sync is None:
                             raise RuntimeError(
-                                "[Dion] missing adapter grad launch hook "
+                                "[MatrixOptimizer] missing adapter grad launch hook "
                                 f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                             )
-                        grad_reduce_handle = optimizer._start_dion_grad_sync(
+                        grad_reduce_handle = start_matrix_grad_sync(
                             bucket=bucket,
                             local_data_view=local_data_view,
                             communication_group=communication_group,
@@ -644,8 +652,8 @@ class _ParamAndGradBucketGroup:
                         logger.info(
                             f"Performing reduction using all_reduce because {force_all_reduce=}"
                         )
-                    if bucket.has_dion_params:
-                        bucket._dion_use_full_grad_after_sync = True
+                    if bucket.has_matrix_params:
+                        bucket._matrix_use_full_grad_after_sync = True
                     torch.distributed.all_reduce(
                         bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                     )
@@ -663,9 +671,9 @@ class _ParamAndGradBucketGroup:
                 ) as cm,
             ):
                 for idx, bucket in enumerate(self.buckets):
-                    has_dion = bucket.has_dion_params
+                    has_matrix = bucket.has_matrix_params
                     has_standard = bucket.has_standard_params
-                    if not has_dion:
+                    if not has_matrix:
                         local_data_view = self._get_standard_local_grad_view(idx, bucket)
                         has_standard_local_grad = (
                             local_data_view is not None and local_data_view.numel() > 0
@@ -678,12 +686,12 @@ class _ParamAndGradBucketGroup:
                                 async_op=async_op,
                             )
                     elif has_standard:
-                        optimizer = getattr(bucket, "dion_optimizer", None)
+                        optimizer = getattr(bucket, "matrix_optimizer", None)
                         if not hasattr(
                             optimizer, "_get_standard_inter_instance_grad_buffer"
                         ):
                             raise RuntimeError(
-                                "[Dion] missing adapter inter-instance standard grad hook "
+                                "[MatrixOptimizer] missing adapter inter-instance standard grad hook "
                                 f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                             )
                         standard_data_view = (
@@ -709,11 +717,11 @@ class _ParamAndGradBucketGroup:
             self.grad_reduce_handle = None
         self.grad_sync_launched = True
 
-    def _finish_dion_grad_transports(self) -> None:
-        """Hand stock local bucket shards off to the Dion adapter grad transport hook.
+    def _finish_matrix_grad_transports(self) -> None:
+        """Hand stock local bucket shards off to the matrix adapter grad hook.
 
         Stock DO owns the bucket-wise RS/AR lifecycle and leaves each rank with
-        its standard local bucket shard. Dion-specific interpretation of that
+        its standard local bucket shard. Matrix-optimizer interpretation of that
         shard belongs to the optimizer adapter, not the stock bucket runtime.
         """
         communication_group = (
@@ -723,13 +731,13 @@ class _ParamAndGradBucketGroup:
         )
 
         for idx, bucket in enumerate(self.buckets):
-            dion_layout = getattr(bucket, "dion_layout", None)
-            if dion_layout is None or not dion_layout.has_params:
+            matrix_layout = getattr(bucket, "matrix_layout", None)
+            if matrix_layout is None or not matrix_layout.has_params:
                 continue
-            optimizer = getattr(bucket, "dion_optimizer", None)
+            optimizer = getattr(bucket, "matrix_optimizer", None)
             if optimizer is None or not hasattr(optimizer, "_apply_bucket_grads"):
                 raise RuntimeError(
-                    "[Dion] missing adapter grad transport hook "
+                    "[MatrixOptimizer] missing adapter grad transport hook "
                     f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                 )
 
@@ -758,7 +766,7 @@ class _ParamAndGradBucketGroup:
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
-            self._finish_dion_grad_transports()
+            self._finish_matrix_grad_transports()
             return
         if self.is_first_batch:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
@@ -767,7 +775,7 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             if self.communication_stream is not None:
                 torch.cuda.default_stream().wait_stream(self.communication_stream)
-            self._finish_dion_grad_transports()
+            self._finish_matrix_grad_transports()
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -776,7 +784,7 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
-        self._finish_dion_grad_transports()
+        self._finish_matrix_grad_transports()
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
@@ -866,7 +874,7 @@ class _ParamAndGradBuffer:
         self.data_parallel_world_size = self.data_parallel_group.size()
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
-        self.param_to_name = param_to_name  # Store for Dion optimizer's _build_model_gbuf_range
+        self.param_to_name = param_to_name  # Store for matrix optimizer bucket-range builders.
         for param in self.params:
             if not getattr(param, "_param_name", ""):
                 param._param_name = self.param_to_name.get(param, "")
@@ -1137,14 +1145,17 @@ class _ParamAndGradBuffer:
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
         for idx, bucket in enumerate(self.buckets):
-            if not bucket.has_dion_params:
+            if not bucket.has_matrix_params:
                 bucket.grad_data *= scaling_factor
                 continue
 
-            optimizer = getattr(bucket, "dion_optimizer", None)
-            if optimizer is None or not hasattr(optimizer, "_scale_dion_bucket_grads"):
+            optimizer = getattr(bucket, "matrix_optimizer", None)
+            scale_matrix_bucket_grads = getattr(
+                optimizer, "_scale_matrix_bucket_grads", None
+            ) if optimizer is not None else None
+            if optimizer is None or scale_matrix_bucket_grads is None:
                 raise RuntimeError(
-                    "[Dion] missing adapter grad scaling hook "
+                    "[MatrixOptimizer] missing adapter grad scaling hook "
                     f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                 )
             local_data_view = (
@@ -1157,7 +1168,7 @@ class _ParamAndGradBuffer:
                 if self.ddp_config.use_distributed_optimizer
                 else getattr(self, "data_parallel_group", None)
             )
-            optimizer._scale_dion_bucket_grads(
+            scale_matrix_bucket_grads(
                 bucket=bucket,
                 local_data_view=local_data_view,
                 communication_group=communication_group,

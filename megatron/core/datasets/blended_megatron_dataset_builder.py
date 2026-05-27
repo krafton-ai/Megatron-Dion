@@ -189,6 +189,14 @@ class BlendedMegatronDatasetBuilder(object):
             blended_datasets = [None] * len(Split)
             for i in range(len(Split)):
                 if split[i] is not None:
+                    synchronize_top_level = (
+                        False
+                        if (
+                            isinstance(self.config, GPTDatasetConfig)
+                            and self.config.fast_cache_load
+                        )
+                        else True
+                    )
                     weights_i = weights
                     if weights_i is not None and self.sizes[i] is not None:
                         # Blend according to client-specified weights and client-specified size
@@ -211,6 +219,13 @@ class BlendedMegatronDatasetBuilder(object):
                         raise ValueError(
                             "Using client-specified weights requires client-specified size"
                         )
+                    if torch.distributed.is_initialized() and not self.is_built_on_rank():
+                        blended_datasets[i] = self.build_generic_dataset(
+                            BlendedDataset,
+                            self.is_built_on_rank,
+                            synchronize_top_level,
+                        )
+                        continue
                     datasets_i = megatron_datasets[i]
                     nonzero_datasets_and_weights = [
                         (dataset, weight)
@@ -226,14 +241,7 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
-                        (
-                            False
-                            if (
-                                isinstance(self.config, GPTDatasetConfig)
-                                and self.config.fast_cache_load
-                            )
-                            else True
-                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
+                        synchronize_top_level,
                         datasets_i,
                         weights_i,
                         size_i,
@@ -321,17 +329,25 @@ class BlendedMegatronDatasetBuilder(object):
                             size = None
                     else:
                         raise RuntimeError
+                    synchronize_top_level = (
+                        False
+                        if (
+                            isinstance(self.config, GPTDatasetConfig)
+                            and self.config.fast_cache_load
+                        )
+                        else True
+                    )
+                    if torch.distributed.is_initialized() and not self.is_built_on_rank():
+                        blended_datasets[i] = self.build_generic_dataset(
+                            BlendedDataset,
+                            self.is_built_on_rank,
+                            synchronize_top_level,
+                        )
+                        continue
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
-                        (
-                            False
-                            if (
-                                isinstance(self.config, GPTDatasetConfig)
-                                and self.config.fast_cache_load
-                            )
-                            else True
-                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
+                        synchronize_top_level,
                         megatron_datasets,
                         weights,
                         size,

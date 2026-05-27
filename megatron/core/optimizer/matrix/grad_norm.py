@@ -1,4 +1,4 @@
-"""Dion grad norm helpers."""
+"""Matrix grad norm helpers."""
 
 from __future__ import annotations
 
@@ -7,14 +7,14 @@ from typing import List, Tuple
 import torch
 import torch.distributed as dist
 
-from ..runtime import replicate_reduce_op
-from .... import tensor_parallel
-from ..dense_grad_cache import (
+from .runtime import replicate_reduce_op
+from ... import tensor_parallel
+from .dense_grad_cache import (
     dense_cache_entries as _dense_cache_entries,
     dense_cache_state as _dense_cache_state,
     mark_dense_grad_reduced as _mark_dense_grad_reduced,
 )
-from ....utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
+from ...utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
 
 _GRAD_NORM_FP64_CHUNK_BYTES = 128 * 1024 * 1024
@@ -45,10 +45,7 @@ def _can_reuse_dense_rp_grad(optimizer, shard_param) -> bool:
         return False
     if getattr(dist_meta, "linear_split_rows", None) is not None:
         return False
-    config = getattr(dist_meta, "param_config", None)
-    if config is None:
-        return False
-    return not bool(getattr(config, "use_low_rank_sync", False))
+    return getattr(dist_meta, "param_config", None) is not None
 
 
 def _grad_sum_sq_fp64(tensor: torch.Tensor) -> torch.Tensor:
@@ -82,25 +79,25 @@ def _grad_stats_device(*collections) -> torch.device:
     return torch.device("cpu")
 
 
-def dion_replica_grads(
+def matrix_replica_grads(
     optimizer,
-    dion_params: List[Tuple[torch.nn.Parameter, torch.nn.Parameter]],
-    count_dion_grad: bool,
+    matrix_params: List[Tuple[torch.nn.Parameter, torch.nn.Parameter]],
+    count_matrix_grad: bool,
 ) -> List[torch.Tensor]:
-    if not dion_params:
+    if not matrix_params:
         return []
 
-    dion_params = sorted(
-        dion_params,
+    matrix_params = sorted(
+        matrix_params,
         key=lambda pair: repr(optimizer._shard_param_uid(pair[1])),
     )
     local_grads = [
         optimizer._get_local_grad(model_param, shard_param)
-        for model_param, shard_param in dion_params
+        for model_param, shard_param in matrix_params
     ]
     replica_group = optimizer._get_replicate_group() if dist.is_initialized() else None
     if replica_group is None or optimizer._group_size(replica_group) <= 1:
-        return local_grads if count_dion_grad else []
+        return local_grads if count_matrix_grad else []
 
     groups_by_dtype_device = {}
     for index, grad in enumerate(local_grads):
@@ -123,7 +120,7 @@ def dion_replica_grads(
 
         dist.all_reduce(flat_grad, op=replicate_reduce_op(optimizer.optimizer), group=replica_group)
 
-        if not count_dion_grad:
+        if not count_matrix_grad:
             continue
         cursor = 0
         for index in indices:
@@ -132,7 +129,7 @@ def dion_replica_grads(
             replica_grads[index] = flat_grad[cursor:next_cursor].view_as(grad)
             cursor = next_cursor
 
-    if not count_dion_grad:
+    if not count_matrix_grad:
         return []
     return [
         replica_grads[index]
@@ -141,30 +138,30 @@ def dion_replica_grads(
     ]
 
 
-def _dion_grad_norm_sq(
+def _matrix_grad_norm_sq(
     optimizer,
-    dion_params: List[Tuple[torch.nn.Parameter, torch.nn.Parameter]],
-    count_dion_grad: bool,
+    matrix_params: List[Tuple[torch.nn.Parameter, torch.nn.Parameter]],
+    count_matrix_grad: bool,
 ) -> torch.Tensor | None:
-    """Return exact Dion grad-norm contribution without materializing reduced views."""
-    if not dion_params:
+    """Return exact Matrix grad-norm contribution without materializing reduced views."""
+    if not matrix_params:
         return None
 
-    dion_params = sorted(
-        dion_params,
+    matrix_params = sorted(
+        matrix_params,
         key=lambda pair: repr(optimizer._shard_param_uid(pair[1])),
     )
     local_grads = [
         optimizer._get_local_grad(model_param, shard_param)
-        for model_param, shard_param in dion_params
+        for model_param, shard_param in matrix_params
     ]
     dense_reuse = [
         _can_reuse_dense_rp_grad(optimizer, shard_param)
-        for _, shard_param in dion_params
+        for _, shard_param in matrix_params
     ]
     replica_group = optimizer._get_replicate_group() if dist.is_initialized() else None
     if replica_group is None or optimizer._group_size(replica_group) <= 1:
-        if not count_dion_grad:
+        if not count_matrix_grad:
             return None
         total_sq = torch.zeros(1, dtype=torch.float64, device=local_grads[0].device)
         for grad in local_grads:
@@ -193,7 +190,7 @@ def _dion_grad_norm_sq(
                     before_step=before_step,
                 )
                 if state == "match":
-                    if count_dion_grad:
+                    if count_matrix_grad:
                         total_sq = total_sq_by_device.get(local_grads[index].device)
                         if total_sq is None:
                             total_sq = torch.zeros(
@@ -204,8 +201,8 @@ def _dion_grad_norm_sq(
                     continue
                 if state == "mismatch":
                     raise RuntimeError(
-                        "[DION_DENSE_RP_GRAD_CACHE_MISMATCH] "
-                        f"param_uid={optimizer._shard_param_uid(dion_params[index][1])}"
+                        "[MATRIX_DENSE_RP_GRAD_CACHE_MISMATCH] "
+                        f"param_uid={optimizer._shard_param_uid(matrix_params[index][1])}"
                     )
             reduce_indices.append(index)
 
@@ -225,7 +222,7 @@ def _dion_grad_norm_sq(
             cursor = next_cursor
 
         dist.all_reduce(flat_grad, op=reduce_op, group=replica_group)
-        if count_dion_grad:
+        if count_matrix_grad:
             total_sq = total_sq_by_device.get(device)
             if total_sq is None:
                 total_sq = torch.zeros(1, dtype=torch.float64, device=device)
@@ -246,7 +243,7 @@ def _dion_grad_norm_sq(
                 )
             cursor = next_cursor
 
-    if not count_dion_grad or not total_sq_by_device:
+    if not count_matrix_grad or not total_sq_by_device:
         return None
 
     first_total = None
@@ -258,7 +255,7 @@ def _dion_grad_norm_sq(
     return first_total
 
 
-def contributes_dion_grad(optimizer) -> bool:
+def contributes_matrix_grad(optimizer) -> bool:
     if not dist.is_initialized():
         return True
     replica_group = optimizer._get_replicate_group()
@@ -279,11 +276,11 @@ def contributes_dion_grad(optimizer) -> bool:
 
 
 def _grad_norm_routes(optimizer):
-    from ....transformer.module import param_is_not_shared
+    from ...transformer.module import param_is_not_shared
 
     main_grad_view_by_param_id = {}
     params = []
-    dion_params = []
+    matrix_params = []
     seen_param_ids = set()
     for model_group, shard_group in zip(
         optimizer.model_float16_groups + optimizer.model_fp32_groups,
@@ -291,7 +288,7 @@ def _grad_norm_routes(optimizer):
     ):
         if len(model_group) != len(shard_group):
             raise RuntimeError(
-                "[Dion] grad norm route requires equal model/shard group lengths "
+                "[Matrix] grad norm route requires equal model/shard group lengths "
                 f"model_len={len(model_group)} shard_len={len(shard_group)}"
             )
         for model_param, shard_param in zip(model_group, shard_group):
@@ -302,7 +299,7 @@ def _grad_norm_routes(optimizer):
                 continue
             seen_param_ids.add(shard_param_id)
             params.append(shard_param)
-            if getattr(model_param, "is_dion_param", False):
+            if getattr(model_param, "is_matrix_param", False):
                 continue
             model_grad = getattr(model_param, "main_grad", None)
             if model_grad is None:
@@ -314,14 +311,14 @@ def _grad_norm_routes(optimizer):
                 int(param_range.start) : int(param_range.end)
             ]
     grads_for_norm = []
-    count_dion_grad = contributes_dion_grad(optimizer)
+    count_matrix_grad = contributes_matrix_grad(optimizer)
 
     def _stats_grad(param):
         main_grad_view = main_grad_view_by_param_id.get(id(param), None)
         if main_grad_view is not None:
             return main_grad_view
         model_param = getattr(param, "_model_param", None)
-        if model_param is not None and getattr(model_param, "is_dion_param", False):
+        if model_param is not None and getattr(model_param, "is_matrix_param", False):
             return None
         if getattr(param, "__fsdp_param__", False):
             return param.grad._local_tensor if param.grad is not None else None
@@ -333,27 +330,27 @@ def _grad_norm_routes(optimizer):
         grad = _stats_grad(param)
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
-            param, optimizer._resolve_dion_tp_group()
+            param, optimizer._resolve_matrix_tp_group()
         )
         model_param = getattr(param, "_model_param", None)
-        if model_param is not None and getattr(model_param, "is_dion_param", False):
+        if model_param is not None and getattr(model_param, "is_matrix_param", False):
             if is_not_shared and is_not_tp_duplicate:
-                dion_params.append((model_param, param))
+                matrix_params.append((model_param, param))
             continue
 
         if grad is not None and is_not_shared and is_not_tp_duplicate:
             grads_for_norm.append(grad)
 
-    return grads_for_norm, dion_params, count_dion_grad
+    return grads_for_norm, matrix_params, count_matrix_grad
 
 
 def grad_norm_inputs(optimizer) -> List[torch.Tensor]:
-    grads_for_norm, dion_params, count_dion_grad = _grad_norm_routes(optimizer)
+    grads_for_norm, matrix_params, count_matrix_grad = _grad_norm_routes(optimizer)
     grads_for_norm.extend(
-        dion_replica_grads(
+        matrix_replica_grads(
             optimizer,
-            dion_params=dion_params,
-            count_dion_grad=count_dion_grad,
+            matrix_params=matrix_params,
+            count_matrix_grad=count_matrix_grad,
         )
     )
     return grads_for_norm
@@ -361,11 +358,11 @@ def grad_norm_inputs(optimizer) -> List[torch.Tensor]:
 
 @torch.no_grad()
 def compute_grad_norm(optimizer):
-    grads_for_norm, dion_params, count_dion_grad = _grad_norm_routes(optimizer)
+    grads_for_norm, matrix_params, count_matrix_grad = _grad_norm_routes(optimizer)
     total_sq = torch.zeros(
         1,
         dtype=torch.float64,
-        device=_grad_stats_device(grads_for_norm, dion_params),
+        device=_grad_stats_device(grads_for_norm, matrix_params),
     )
     data_parallel_group = None
     for grad in grads_for_norm:
@@ -373,13 +370,13 @@ def compute_grad_norm(optimizer):
         local_grad = to_local_if_dtensor(grad).detach()
         total_sq += _grad_sum_sq_fp64(local_grad)
 
-    dion_sq = _dion_grad_norm_sq(
+    matrix_sq = _matrix_grad_norm_sq(
         optimizer,
-        dion_params=dion_params,
-        count_dion_grad=count_dion_grad,
+        matrix_params=matrix_params,
+        count_matrix_grad=count_matrix_grad,
     )
-    if dion_sq is not None:
-        total_sq += dion_sq.to(device=total_sq.device)
+    if matrix_sq is not None:
+        total_sq += matrix_sq.to(device=total_sq.device)
 
     if data_parallel_group is not None:
         torch.distributed.all_reduce(

@@ -445,9 +445,9 @@ class DistributedDataParallel(_BaseDataParallel):
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
-                trace_main_grad_add = os.getenv("DION_DEBUG_TRACE_DDP_MAIN_GRAD_ADD", "0") == "1"
+                trace_main_grad_add = os.getenv("MATRIX_DEBUG_TRACE_DDP_MAIN_GRAD_ADD", "0") == "1"
                 param_name = getattr(param, "_param_name", "") or ""
-                target_name = os.getenv("DION_DEBUG_TRACE_DDP_MAIN_GRAD_ADD_PARAM", "").strip()
+                target_name = os.getenv("MATRIX_DEBUG_TRACE_DDP_MAIN_GRAD_ADD_PARAM", "").strip()
                 trace_this_param = trace_main_grad_add and _ddp_debug_name_matches(param_name, target_name)
                 hook_call_idx = None
                 rank = pp_rank = tp_rank = dp_rank = None
@@ -455,8 +455,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 main_before_norm = main_before_sum = 0.0
                 grad_added_before = bool(getattr(param, "grad_added_to_main_grad", False))
                 if trace_this_param:
-                    hook_call_idx = int(getattr(param, "_dion_ddp_main_grad_add_call_idx", 0))
-                    param._dion_ddp_main_grad_add_call_idx = hook_call_idx + 1
+                    hook_call_idx = int(getattr(param, "_matrix_ddp_main_grad_add_call_idx", 0))
+                    param._matrix_ddp_main_grad_add_call_idx = hook_call_idx + 1
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     pp_rank = (
                         parallel_state.get_pipeline_model_parallel_rank()
@@ -492,7 +492,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         main_after_norm = float(param.main_grad.detach().float().norm().item())
                         main_after_sum = float(param.main_grad.detach().float().sum().item())
                     logger.warning(
-                        "[DION_DDP_MAIN_GRAD_ADD] rank=%s pp_rank=%s tp_rank=%s dp_rank=%s "
+                        "[MATRIX_DDP_MAIN_GRAD_ADD] rank=%s pp_rank=%s tp_rank=%s dp_rank=%s "
                         "call=%s param=%s grad_added_before=%s zero_out_wgrad=%s will_add=%s "
                         "grad_norm=%.9e grad_sum=%.9e main_before_norm=%.9e main_before_sum=%.9e "
                         "main_after_norm=%.9e main_after_sum=%.9e",
@@ -608,26 +608,26 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
 
-    def get_dion_local_grad(self, param: torch.nn.Parameter) -> Optional[torch.Tensor]:
-        """Return the Dion local grad shard for `param` when the param uses Dion."""
-        if not getattr(param, "is_dion_param", False):
+    def get_matrix_local_grad(self, param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+        """Return the local matrix grad shard for `param` when it uses a matrix optimizer."""
+        if not getattr(param, "is_matrix_param", False):
             return None
         bucket_group = self.param_to_bucket_group.get(param)
         if bucket_group is None:
             return None
         bucket = bucket_group.param_to_bucket.get(param)
-        if bucket is None or not bucket.has_dion_params or id(param) not in bucket.dion_param_ids:
+        if bucket is None or not bucket.has_matrix_params or id(param) not in bucket.matrix_param_ids:
             return None
-        optimizer = getattr(bucket, "dion_optimizer", None)
-        if optimizer is None or not hasattr(optimizer, "_dion_local_grad_by_param"):
+        optimizer = getattr(bucket, "matrix_optimizer", None)
+        if optimizer is None or not hasattr(optimizer, "_matrix_local_grad_by_param"):
             raise RuntimeError(
-                "[Dion] missing optimizer local grad storage for PP-shared param "
+                "[MatrixOptimizer] missing optimizer local grad storage for PP-shared param "
                 f"name={getattr(param, '_param_name', f'id_{id(param)}')}"
             )
-        local_grad = optimizer._dion_local_grad_by_param.get(param)
+        local_grad = optimizer._matrix_local_grad_by_param.get(param)
         if local_grad is None:
             raise RuntimeError(
-                "[Dion] missing local grad for PP-shared Dion param "
+                "[MatrixOptimizer] missing local grad for PP-shared matrix param "
                 f"name={getattr(param, '_param_name', f'id_{id(param)}')}"
             )
         return local_grad

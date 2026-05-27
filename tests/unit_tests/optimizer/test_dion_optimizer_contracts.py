@@ -16,9 +16,9 @@ from megatron.core.optimizer.dion.types import (
     DionParamConfig,
 )
 from megatron.core.optimizer.matrix.types import ScalarStepParam
-from megatron.core.optimizer.dion.distributed import checkpoint_io
-from megatron.core.optimizer.dion.distributed import grad_norm as dion_grad_norm
-from megatron.core.optimizer.dion.distributed import gradients as dion_gradients
+from megatron.core.optimizer.matrix import checkpoint_io
+from megatron.core.optimizer.matrix import grad_norm as dion_grad_norm
+from megatron.core.optimizer.matrix import gradients as dion_gradients
 from megatron.core.optimizer.dion.distributed.integration import get_dion_param_override
 from megatron.core.optimizer.optimizer_config import DionOptimizerConfig
 from megatron.core.distributed.param_and_grad_buffer import (

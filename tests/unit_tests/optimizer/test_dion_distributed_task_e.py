@@ -42,10 +42,9 @@ from megatron.core.optimizer.dion.distributed.batches import (
     build_batch_key,
 )
 from megatron.core.optimizer.dion.distributed import integration as dion_integration
-from megatron.core.optimizer.dion.distributed.parameter import (
+from megatron.core.optimizer.dion.params import is_dion_param, mark_dion_bucket_params
+from megatron.core.optimizer.matrix.parameter import (
     is_combined_grouped_mlp_param,
-    is_dion_param,
-    mark_dion_bucket_params,
     resolve_grad_rank_to_fs_rank,
 )
 from megatron.core.optimizer.dion.distributed.dist_meta import build_param_dist_meta, select_tp_group

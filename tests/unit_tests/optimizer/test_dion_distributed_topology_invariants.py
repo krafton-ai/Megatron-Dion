@@ -19,7 +19,7 @@ from megatron.core.optimizer.dion.types import (
     DionDistMeta,
 )
 from megatron.core.optimizer.dion.distributed.batches import build_batch_collectives, build_batch_key
-from megatron.core.optimizer.dion.distributed.parameter import build_dion_shard_entries
+from megatron.core.optimizer.matrix.parameter import build_matrix_shard_entries as build_dion_shard_entries
 
 
 def test_resolve_q_state_layout_keeps_reference_rank_with_uneven_tp():

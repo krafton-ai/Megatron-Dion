@@ -663,6 +663,15 @@ def validate_args(args, defaults={}):
         args.dion_q_dtype = map_dtype(args.dion_q_dtype)
     if hasattr(args, "dion_variance_dtype") and args.dion_variance_dtype is not None:
         args.dion_variance_dtype = map_dtype(args.dion_variance_dtype)
+    if hasattr(args, "muon_gram_ns_restart_iters"):
+        restart_iters = args.muon_gram_ns_restart_iters
+        if isinstance(restart_iters, str):
+            restart_iters = restart_iters.strip()
+            args.muon_gram_ns_restart_iters = (
+                tuple(int(item.strip()) for item in restart_iters.split(",") if item.strip())
+                if restart_iters
+                else tuple()
+            )
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
@@ -1202,14 +1211,29 @@ def validate_args(args, defaults={}):
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
 
-    # Muon optimizer check
-    if 'muon' in args.optimizer:
+    # Muon optimizer check.
+    if args.optimizer in ('muon', 'dist_muon'):
 
-        # TODO: remove these checks once we support them
-        assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce for now."
-        assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather for now."
-
-        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
+        if args.optimizer == 'dist_muon':
+            assert not args.overlap_grad_reduce, (
+                "dist_muon uses the legacy layer-wise Muon path and does not support "
+                "overlap grad reduce."
+            )
+            assert not args.overlap_param_gather, (
+                "dist_muon uses the legacy layer-wise Muon path and does not support "
+                "overlap param gather."
+            )
+            assert not args.use_distributed_optimizer, (
+                "dist_muon uses the legacy layer-wise Muon path and does not support "
+                "distributed optimizer."
+            )
+        if args.optimizer == 'muon' and args.use_distributed_optimizer:
+            if not args.no_save_optim or not args.no_load_optim:
+                assert args.ckpt_format == "torch_dist", (
+                    "Muon distributed optimizer supports optimizer checkpointing only with "
+                    "--ckpt-format torch_dist. Use --no-save-optim/--no-load-optim for "
+                    "model-only checkpoints."
+                )
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
@@ -1884,11 +1908,28 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
+    group.add_argument('--muon-coefficient-type', type=str, default='quintic',
+                       choices=['simple', 'quintic', 'polar_express', 'aol'],
+                       help='Newton-Schulz coefficient set for Muon optimizer')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
-                       choices=['blockwise', 'duplicated', 'distributed'],
+                       choices=['blockwise', 'duplicated', 'duplicated_debug', 'distributed'],
                        help='How to perform NS calculation for tensor model parallel weights')
+    group.add_argument('--muon-fs-mode', type=str, default='blockwise',
+                       choices=['blockwise', 'distributed', 'duplicated_debug'],
+                       help='How distributed optimizer FS shards participate in Muon NS calculation')
+    group.add_argument('--muon-ns-backend', type=str, default='standard',
+                       choices=['standard', 'gram'],
+                       help='Newton-Schulz backend for Muon optimizer')
+    group.add_argument('--muon-gram-ns-restart-iters', type=str, default='2',
+                       help='Comma-separated restart iterations for Gram Newton-Schulz')
+    group.add_argument('--muon-gram-ns-kernel-policy', type=str, default='torch',
+                       choices=['torch', 'auto', 'dao', 'quack', 'compile', 'disabled'],
+                       help='Kernel policy for Gram Newton-Schulz')
+    group.add_argument('--muon-split-linear', action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='Treat fused linear_fc1 weights as optimizer-only children for Muon')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
 
@@ -2144,9 +2185,9 @@ def _add_training_args(parser):
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
                        help='Dtype for Dion scalar second-moment state.')
     group.add_argument('--fully-shard-model-parallel-size', type=int, default=1,
-                       help='Dion fully-sharded optimizer axis size.')
+                       help='Matrix optimizer fully-sharded axis size.')
     group.add_argument('--replicate-model-parallel-size', type=int, default=1,
-                       help='Dion replicate optimizer axis size.')
+                       help='Matrix optimizer replicate axis size.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,

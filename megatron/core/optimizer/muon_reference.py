@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Megatron muon optimizer wrapper to handle tensor-parallel."""
+"""Reference Megatron Muon wrapper based on emerging-optimizers."""
 
 import logging
 from typing import Any, Callable, Dict, List, Literal, Optional
@@ -78,14 +78,24 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             size = [grad.size(-2), grad.size(-1)]
             if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
-            orth_grad = newton_schulz_tp(
-                grad,
+            ns_mode = "duplicated" if mode == "blockwise" else mode
+            ns_kwargs = dict(
                 steps=num_ns_steps,
                 coefficient_type=coefficient_type,
                 tp_group=tp_group,
                 partition_dim=partition_dim,
-                mode="duplicated" if mode == "blockwise" else mode,
             )
+            try:
+                orth_grad = newton_schulz_tp(grad, mode=ns_mode, **ns_kwargs)
+            except TypeError as exc:
+                if "mode" not in str(exc):
+                    raise
+                try:
+                    orth_grad = newton_schulz_tp(grad, tp_mode=ns_mode, **ns_kwargs)
+                except TypeError as exc_tp:
+                    if "tp_mode" not in str(exc_tp):
+                        raise
+                    orth_grad = newton_schulz_tp(grad, **ns_kwargs)
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
             return orth_grad * scale_factor * extra_scale_factor
 
@@ -96,16 +106,30 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.qkv_split_shapes = qkv_split_shapes
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
-        super().__init__(
-            params,
-            lr,
-            momentum_beta,
-            use_nesterov=use_nesterov,
+        init_kwargs = dict(
             weight_decay=weight_decay,
             weight_decay_method=weight_decay_method,
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
+        try:
+            super().__init__(
+                params,
+                lr,
+                momentum_beta,
+                nesterov=use_nesterov,
+                **init_kwargs,
+            )
+        except TypeError as exc:
+            if "nesterov" not in str(exc):
+                raise
+            super().__init__(
+                params,
+                lr,
+                momentum_beta,
+                use_nesterov=use_nesterov,
+                **init_kwargs,
+            )
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.

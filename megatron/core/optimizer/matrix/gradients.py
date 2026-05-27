@@ -1,4 +1,4 @@
-"""Dion gradient-path helpers for the distributed optimizer."""
+"""Matrix gradient-path helpers for the distributed optimizer."""
 
 from __future__ import annotations
 
@@ -8,14 +8,14 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 
-from ...matrix.sharding import compute_fs_shard_range, fs_shard_view_2d
+from .sharding import compute_fs_shard_range, fs_shard_view_2d
 
 
 @dataclass
-class DionGradTransport:
-    """Bucket-local Dion grad transport kept through reduce-scatter completion."""
+class MatrixGradTransport:
+    """Bucket-local Matrix grad transport kept through reduce-scatter completion."""
 
-    dion_grad_shard: torch.Tensor
+    matrix_grad_shard: torch.Tensor
     bucket_payload: torch.Tensor | None = None
     standard_grad: torch.Tensor | None = None
     standard_segments: tuple[tuple[int, int, int], ...] = ()
@@ -26,13 +26,13 @@ class DionGradTransport:
 
 
 @dataclass(frozen=True)
-class DionGradRoute:
-    """Bucket reduce-scatter layout for Dion and mixed standard grads."""
+class MatrixGradRoute:
+    """Bucket reduce-scatter layout for Matrix and mixed standard grads."""
 
     group_size: int
     group_rank: int
     standard_shard_size: int
-    dion_numel: int
+    matrix_numel: int
     standard_numel: int
     payload_numel: int
     standard_rank_segments: tuple[tuple[tuple[int, int, int, int], ...], ...]
@@ -64,20 +64,20 @@ def _get_bucket_grad_buffer(
 
 
 def _build_full_bucket_grad(*, bucket) -> torch.Tensor:
-    """Build this rank's Dion local grad shard from a synchronized full bucket grad."""
-    dion_layout = getattr(bucket, "dion_layout", None)
-    if dion_layout is None or not dion_layout.has_params:
+    """Build this rank's Matrix local grad shard from a synchronized full bucket grad."""
+    matrix_layout = getattr(bucket, "matrix_layout", None)
+    if matrix_layout is None or not matrix_layout.has_params:
         raise RuntimeError(
-            f"[Dion] missing Dion layout for full-bucket grad bucket={getattr(bucket, 'bucket_id', -1)}"
+            f"[Matrix] missing Matrix layout for full-bucket grad bucket={getattr(bucket, 'bucket_id', -1)}"
         )
 
-    dion_grad_shard = torch.zeros(
-        int(dion_layout.shard_size),
+    matrix_grad_shard = torch.zeros(
+        int(matrix_layout.shard_size),
         dtype=bucket.grad_data.dtype,
         device=bucket.grad_data.device,
     )
 
-    for entry in dion_layout.entries:
+    for entry in matrix_layout.entries:
         full_view_2d = bucket.grad_data[
             int(entry.canonical_bucket_start) : int(entry.canonical_bucket_end)
         ].view(tuple(entry.param.shape))
@@ -90,22 +90,22 @@ def _build_full_bucket_grad(*, bucket) -> torch.Tensor:
         local_numel = int(local_source.numel())
         if local_numel > int(entry.shard_capacity):
             raise RuntimeError(
-                "[Dion] invalid full-bucket Dion grad size "
+                "[Matrix] invalid full-bucket Matrix grad size "
                 f"bucket={getattr(bucket, 'bucket_id', -1)} "
                 f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')} "
                 f"local_numel={local_numel} shard_capacity={int(entry.shard_capacity)}"
         )
         shard_start = int(entry.shard_offset)
         if local_numel > 0:
-            dion_grad_shard[shard_start : shard_start + local_numel].copy_(
+            matrix_grad_shard[shard_start : shard_start + local_numel].copy_(
                 local_source.reshape(-1)
             )
         padding_start = shard_start + local_numel
         padding_end = shard_start + int(entry.shard_capacity)
         if padding_end > padding_start:
-            dion_grad_shard[padding_start:padding_end].zero_()
+            matrix_grad_shard[padding_start:padding_end].zero_()
 
-    return dion_grad_shard
+    return matrix_grad_shard
 
 
 def _build_standard_rank_segments(
@@ -118,7 +118,7 @@ def _build_standard_rank_segments(
     int,
 ]:
     """Return compact per-rank source ranges for standard params in a mixed bucket."""
-    dion_param_ids = bucket.dion_param_ids
+    matrix_param_ids = bucket.matrix_param_ids
     rank_segments = []
     max_rank_numel = 0
     for group_rank in range(int(group_size)):
@@ -127,7 +127,7 @@ def _build_standard_rank_segments(
         cursor = 0
         segments = []
         for param in bucket.params_list:
-            if id(param) in dion_param_ids:
+            if id(param) in matrix_param_ids:
                 continue
             param_start, param_end = bucket.param_to_index[param]
             source_start = max(int(param_start), rank_start)
@@ -155,23 +155,23 @@ def _get_grad_route(
     bucket,
     local_data_view: torch.Tensor | None,
     communication_group,
-) -> DionGradRoute:
-    dion_layout = getattr(bucket, "dion_layout", None)
-    if dion_layout is None or not dion_layout.has_params:
+) -> MatrixGradRoute:
+    matrix_layout = getattr(bucket, "matrix_layout", None)
+    if matrix_layout is None or not matrix_layout.has_params:
         raise RuntimeError(
-            f"[Dion] missing Dion layout for bucket grad sync bucket={getattr(bucket, 'bucket_id', -1)}"
+            f"[Matrix] missing Matrix layout for bucket grad sync bucket={getattr(bucket, 'bucket_id', -1)}"
         )
 
     group_size = 1 if communication_group is None else int(dist.get_world_size(communication_group))
     group_rank = 0 if communication_group is None else int(dist.get_rank(communication_group))
     if group_size <= 0:
         raise RuntimeError(
-            "[Dion] invalid Dion grad sync group size "
+            "[Matrix] invalid Matrix grad sync group size "
             f"bucket={getattr(bucket, 'bucket_id', -1)} group_size={group_size}"
         )
     if group_rank < 0 or group_rank >= group_size:
         raise RuntimeError(
-            "[Dion] invalid Dion grad sync rank "
+            "[Matrix] invalid Matrix grad sync rank "
             f"bucket={getattr(bucket, 'bucket_id', -1)} rank={group_rank} size={group_size}"
         )
 
@@ -181,13 +181,13 @@ def _get_grad_route(
         expected_bucket_numel = standard_shard_size * group_size
         if expected_bucket_numel != int(bucket.grad_data.numel()):
             raise RuntimeError(
-                "[Dion] mixed bucket standard shard size mismatch "
+                "[Matrix] mixed bucket standard shard size mismatch "
                 f"bucket={getattr(bucket, 'bucket_id', -1)} "
                 f"bucket_numel={int(bucket.grad_data.numel())} "
                 f"shard_size={standard_shard_size} group_size={group_size}"
             )
 
-    cached = getattr(bucket, "_dion_grad_route", None)
+    cached = getattr(bucket, "_matrix_grad_route", None)
     if (
         cached is not None
         and int(cached.group_size) == group_size
@@ -201,7 +201,7 @@ def _get_grad_route(
     if bucket.has_standard_params:
         if local_data_view is None or local_data_view.numel() == 0:
             raise RuntimeError(
-                "[Dion] mixed bucket grad sync requires a standard local grad view "
+                "[Matrix] mixed bucket grad sync requires a standard local grad view "
                 f"bucket={getattr(bucket, 'bucket_id', -1)}"
             )
         standard_rank_segments, standard_numel = _build_standard_rank_segments(
@@ -215,32 +215,32 @@ def _get_grad_route(
         length = int(source_end) - int(source_start)
         if length <= 0:
             raise RuntimeError(
-                "[Dion] invalid standard grad route segment "
+                "[Matrix] invalid standard grad route segment "
                 f"bucket={getattr(bucket, 'bucket_id', -1)} target_start={target_start}"
             )
         standard_local_segments.append(
             (int(target_start), int(target_start) + int(length), int(local_start))
         )
 
-    dion_numel = int(dion_layout.shard_size)
-    payload_numel = dion_numel + int(standard_numel)
+    matrix_numel = int(matrix_layout.shard_size)
+    payload_numel = matrix_numel + int(standard_numel)
     if payload_numel <= 0:
         raise RuntimeError(
-            "[Dion] empty bucket grad route "
+            "[Matrix] empty bucket grad route "
             f"bucket={getattr(bucket, 'bucket_id', -1)}"
         )
 
-    route = DionGradRoute(
+    route = MatrixGradRoute(
         group_size=group_size,
         group_rank=group_rank,
         standard_shard_size=standard_shard_size,
-        dion_numel=dion_numel,
+        matrix_numel=matrix_numel,
         standard_numel=int(standard_numel),
         payload_numel=payload_numel,
         standard_rank_segments=standard_rank_segments,
         standard_local_segments=tuple(standard_local_segments),
     )
-    bucket._dion_grad_route = route
+    bucket._matrix_grad_route = route
     return route
 
 
@@ -252,7 +252,7 @@ def _entry_grad_split_range(entry, group_rank: int) -> tuple[int, int]:
     if int(entry.fs_shard_dim) == 0:
         if len(rank_segments) != 1:
             raise RuntimeError(
-                "[Dion] row-sharded Dion grad range must be contiguous "
+                "[Matrix] row-sharded Matrix grad range must be contiguous "
                 f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')} "
                 f"group_rank={int(group_rank)} ranges={len(rank_segments)}"
             )
@@ -262,7 +262,7 @@ def _entry_grad_split_range(entry, group_rank: int) -> tuple[int, int]:
         end_offset = int(source_end) - int(entry.canonical_bucket_start)
         if start_offset % n != 0 or end_offset % n != 0:
             raise RuntimeError(
-                "[Dion] row-sharded Dion grad range is not row aligned "
+                "[Matrix] row-sharded Matrix grad range is not row aligned "
                 f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')} "
                 f"group_rank={int(group_rank)}"
             )
@@ -277,14 +277,14 @@ def _entry_grad_split_range(entry, group_rank: int) -> tuple[int, int]:
 def _build_grad_reduce_input(
     *,
     bucket,
-    route: DionGradRoute,
+    route: MatrixGradRoute,
     reduce_input: torch.Tensor,
 ) -> torch.Tensor:
-    """Build Dion reduce-scatter input from the MCore bucket grad buffer."""
-    dion_layout = getattr(bucket, "dion_layout", None)
-    if dion_layout is None or not dion_layout.has_params:
+    """Build Matrix reduce-scatter input from the MCore bucket grad buffer."""
+    matrix_layout = getattr(bucket, "matrix_layout", None)
+    if matrix_layout is None or not matrix_layout.has_params:
         raise RuntimeError(
-            f"[Dion] missing Dion layout for bucket grad sync bucket={getattr(bucket, 'bucket_id', -1)}"
+            f"[Matrix] missing Matrix layout for bucket grad sync bucket={getattr(bucket, 'bucket_id', -1)}"
         )
 
     expected_numel = int(route.group_size) * int(route.payload_numel)
@@ -295,17 +295,17 @@ def _build_grad_reduce_input(
         or reduce_input.device != bucket.grad_data.device
     ):
         raise RuntimeError(
-            "[Dion] invalid Dion grad reduce input buffer "
+            "[Matrix] invalid Matrix grad reduce input buffer "
             f"bucket={getattr(bucket, 'bucket_id', -1)} "
             f"shape={tuple(reduce_input.shape)} expected_numel={expected_numel}"
         )
 
     for group_rank in range(int(route.group_size)):
         group_rank_start = int(group_rank) * int(route.payload_numel)
-        for entry in dion_layout.entries:
+        for entry in matrix_layout.entries:
             if len(entry.grad_rank_flat_segments) != int(route.group_size):
                 raise RuntimeError(
-                    "[Dion] grad sync rank mapping size mismatch "
+                    "[Matrix] grad sync rank mapping size mismatch "
                     f"bucket={getattr(bucket, 'bucket_id', -1)} "
                     f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')} "
                     f"group_size={int(route.group_size)} "
@@ -325,7 +325,7 @@ def _build_grad_reduce_input(
             source_numel = int(source_2d.numel())
             if source_numel > int(entry.shard_capacity):
                 raise RuntimeError(
-                    "[Dion] Dion grad source exceeds shard capacity "
+                    "[Matrix] Matrix grad source exceeds shard capacity "
                     f"bucket={getattr(bucket, 'bucket_id', -1)} "
                     f"param={getattr(entry.param, '_param_name', f'id_{id(entry.param)}')} "
                     f"source_numel={source_numel} "
@@ -340,7 +340,7 @@ def _build_grad_reduce_input(
                 reduce_input[padding_start:target_end].zero_()
 
         if route.standard_numel > 0:
-            standard_start = group_rank_start + int(route.dion_numel)
+            standard_start = group_rank_start + int(route.matrix_numel)
             standard_end = standard_start + int(route.standard_numel)
             reduce_input[standard_start:standard_end].zero_()
             for source_start, source_end, target_start, _ in route.standard_rank_segments[
@@ -352,7 +352,7 @@ def _build_grad_reduce_input(
                 target_end = target_start + source_end - source_start
                 if target_end > standard_end:
                     raise RuntimeError(
-                        "[Dion] standard grad route exceeds payload "
+                        "[Matrix] standard grad route exceeds payload "
                         f"bucket={getattr(bucket, 'bucket_id', -1)} "
                         f"target_end={target_end} payload_end={standard_end}"
                     )
@@ -363,42 +363,42 @@ def _build_grad_reduce_input(
     return reduce_input
 
 
-def _install_dion_local_grads_(
+def _install_matrix_local_grads_(
     *,
     bucket,
     set_local_grad: Callable[[torch.nn.Parameter, torch.Tensor], None],
-    grad_transport: DionGradTransport | None,
+    grad_transport: MatrixGradTransport | None,
 ) -> None:
-    """Set Dion local grads from the reduced bucket tensor without full-bucket reconstruction."""
-    dion_layout = getattr(bucket, "dion_layout", None)
-    if dion_layout is None or not dion_layout.has_params:
+    """Set Matrix local grads from the reduced bucket tensor without full-bucket reconstruction."""
+    matrix_layout = getattr(bucket, "matrix_layout", None)
+    if matrix_layout is None or not matrix_layout.has_params:
         return
 
     if grad_transport is None:
         raise RuntimeError(
-            "[Dion] missing Dion bucket grad transport "
+            "[Matrix] missing Matrix bucket grad transport "
             f"for bucket={getattr(bucket, 'bucket_id', -1)}"
         )
-    dion_grad_shard = grad_transport.dion_grad_shard
-    expected_shard_size = int(dion_layout.shard_size)
-    if dion_grad_shard.ndim != 1 or dion_grad_shard.numel() != expected_shard_size:
+    matrix_grad_shard = grad_transport.matrix_grad_shard
+    expected_shard_size = int(matrix_layout.shard_size)
+    if matrix_grad_shard.ndim != 1 or matrix_grad_shard.numel() != expected_shard_size:
         raise RuntimeError(
-            "[Dion] invalid Dion bucket grad transport output "
+            "[Matrix] invalid Matrix bucket grad transport output "
             f"bucket={getattr(bucket, 'bucket_id', -1)} "
-            f"shape={tuple(dion_grad_shard.shape)} expected_numel={expected_shard_size}"
+            f"shape={tuple(matrix_grad_shard.shape)} expected_numel={expected_shard_size}"
         )
-    for entry in dion_layout.entries:
+    for entry in matrix_layout.entries:
         local_numel = int(entry.local_numel)
         shard_capacity = int(entry.shard_capacity)
         if local_numel > shard_capacity:
             raise RuntimeError(
-                "[Dion] invalid Dion grad shard metadata "
+                "[Matrix] invalid Matrix grad shard metadata "
                 f"bucket={getattr(bucket, 'bucket_id', -1)} "
                 f"param={getattr(entry.param, '_param_name', id(entry.param))} "
                 f"local_numel={local_numel} shard_capacity={shard_capacity}"
             )
         shard_start = int(entry.shard_offset)
-        local_shard = dion_grad_shard[shard_start : shard_start + local_numel].view(
+        local_shard = matrix_grad_shard[shard_start : shard_start + local_numel].view(
             entry.local_shape
         )
         set_local_grad(entry.param, local_shard)
@@ -408,7 +408,7 @@ def _install_standard_local_grads_(
     *,
     bucket,
     local_data_view: torch.Tensor | None,
-    grad_transport: DionGradTransport,
+    grad_transport: MatrixGradTransport,
 ) -> None:
     """Restore mixed-bucket standard reduced grads into the standard MCore view."""
     standard_grad = grad_transport.standard_grad
@@ -416,7 +416,7 @@ def _install_standard_local_grads_(
         return
     if local_data_view is None or local_data_view.numel() == 0:
         raise RuntimeError(
-            "[Dion] mixed bucket standard grad transport missing standard local view "
+            "[Matrix] mixed bucket standard grad transport missing standard local view "
             f"bucket={getattr(bucket, 'bucket_id', -1)}"
         )
     for source_start, source_end, local_start in grad_transport.standard_segments:
@@ -425,14 +425,14 @@ def _install_standard_local_grads_(
         local_start = int(local_start)
         if source_end <= source_start:
             raise RuntimeError(
-                "[Dion] invalid mixed bucket standard grad segment "
+                "[Matrix] invalid mixed bucket standard grad segment "
                 f"bucket={getattr(bucket, 'bucket_id', -1)} "
                 f"source_start={source_start} source_end={source_end}"
             )
         local_end = local_start + source_end - source_start
         if local_end > int(local_data_view.numel()):
             raise RuntimeError(
-                "[Dion] mixed bucket standard grad segment exceeds standard local view "
+                "[Matrix] mixed bucket standard grad segment exceeds standard local view "
                 f"bucket={getattr(bucket, 'bucket_id', -1)} "
                 f"local_end={local_end} view_numel={int(local_data_view.numel())}"
             )
@@ -448,42 +448,42 @@ def validate_local_shard_grad(
     shard_view: torch.Tensor | None,
     log_grad_issue: Callable,
 ) -> torch.Tensor:
-    """Validate one adapter-stored Dion local grad shard before optimizer use."""
+    """Validate one adapter-stored Matrix local grad shard before optimizer use."""
     if shard_view is None:
-        log_grad_issue("DION_LOCAL_GRAD_NONE", model_param, shard_param)
+        log_grad_issue("MATRIX_LOCAL_GRAD_NONE", model_param, shard_param)
         raise RuntimeError(
-            "[Dion] Dion grad set requires stored local grad shard "
+            "[Matrix] Matrix grad set requires stored local grad shard "
             f"param_shape={tuple(model_param.shape)} shard_shape={tuple(shard_param.shape)}"
         )
 
     if shard_view.ndim != shard_param.ndim:
         raise RuntimeError(
-            "[Dion] Dion canonical shard grad ndim mismatch "
+            "[Matrix] Matrix canonical shard grad ndim mismatch "
             f"shard_view_ndim={int(shard_view.ndim)} shard_param_ndim={int(shard_param.ndim)}"
         )
 
     if shard_view.nelement() != shard_param.nelement():
         log_grad_issue(
-            "DION_MAIN_GRAD_NUMEL_MISMATCH",
+            "MATRIX_MAIN_GRAD_NUMEL_MISMATCH",
             model_param,
             shard_param,
             shard_view_numel=int(shard_view.nelement()),
             shard_param_numel=int(shard_param.nelement()),
         )
         raise RuntimeError(
-            "[Dion] Dion canonical shard grad numel mismatch "
+            "[Matrix] Matrix canonical shard grad numel mismatch "
             f"shard_view_numel={int(shard_view.nelement())} shard_param_numel={int(shard_param.nelement())}"
         )
     if tuple(shard_view.shape) != tuple(shard_param.shape):
         log_grad_issue(
-            "DION_MAIN_GRAD_SHAPE_MISMATCH",
+            "MATRIX_MAIN_GRAD_SHAPE_MISMATCH",
             model_param,
             shard_param,
             shard_view_shape=tuple(shard_view.shape),
             shard_param_shape=tuple(shard_param.shape),
         )
         raise RuntimeError(
-            "[Dion] Dion canonical shard grad shape mismatch "
+            "[Matrix] Matrix canonical shard grad shape mismatch "
             f"shard_view_shape={tuple(shard_view.shape)} shard_param_shape={tuple(shard_param.shape)}"
         )
     return shard_view
@@ -501,7 +501,7 @@ def optimizer_shard_grad_view(
     if model_grad is None:
         log_grad_issue("STANDARD_MODEL_MAIN_GRAD_NONE", model_param, shard_main_param)
         raise RuntimeError(
-            "[Dion] optimizer shard grad requires canonical model_param.main_grad "
+            "[Matrix] optimizer shard grad requires canonical model_param.main_grad "
             f"param_shape={tuple(model_param.shape)} shard_shape={tuple(shard_main_param.shape)}"
         )
 
@@ -518,7 +518,7 @@ def optimizer_shard_grad_view(
             end=int(end),
         )
         raise RuntimeError(
-            "[Dion] optimizer shard grad view exceeded canonical main_grad "
+            "[Matrix] optimizer shard grad view exceeded canonical main_grad "
             f"grad_numel={int(flat_grad.numel())} start={int(start)} end={int(end)}"
         )
     shard_view = flat_grad[start:end]
@@ -533,13 +533,13 @@ def optimizer_shard_grad_view(
             end=int(end),
         )
         raise RuntimeError(
-            "[Dion] optimizer shard grad size mismatch "
+            "[Matrix] optimizer shard grad size mismatch "
             f"expected={int(shard_main_param.nelement())} got={int(shard_view.numel())}"
         )
     return shard_view.view(shard_main_param.shape)
 
 
-def install_dion_shard_grad_(
+def install_matrix_shard_grad_(
     *,
     model_param: torch.nn.Parameter,
     shard_param: torch.nn.Parameter,
@@ -547,7 +547,7 @@ def install_dion_shard_grad_(
     log_grad_issue: Callable,
     use_precision_aware_optimizer: bool,
 ) -> None:
-    """Set one Dion optimizer shard grad onto an optimizer shard param."""
+    """Set one Matrix optimizer shard grad onto an optimizer shard param."""
     optimizer_shard_grad = validate_local_shard_grad(
         model_param=model_param,
         shard_param=shard_param,
@@ -555,7 +555,6 @@ def install_dion_shard_grad_(
         log_grad_issue=log_grad_issue,
     )
 
-    shard_param.is_dion_param = True
     shard_param.is_matrix_param = True
     shard_param.main_grad = None
     if use_precision_aware_optimizer:
@@ -580,7 +579,7 @@ def install_standard_shard_grad_(
     model_grad = getattr(model_param, "main_grad", None)
     if model_grad is None:
         raise RuntimeError(
-            "[Dion] standard optimizer grad set requires canonical model_param.main_grad "
+            "[Matrix] standard optimizer grad set requires canonical model_param.main_grad "
             f"param={getattr(model_param, '_param_name', f'id_{id(model_param)}')} "
             f"shard_shape={tuple(shard_param.shape)}"
         )
@@ -596,14 +595,12 @@ def install_standard_shard_grad_(
         shard_param.main_grad = None
         shard_param.decoupled_grad = shard_grad
         shard_param.grad = None
-        shard_param.is_dion_param = False
         shard_param.is_matrix_param = False
         return
 
     shard_param.main_grad = None
     shard_param.decoupled_grad = None
     shard_param.grad = shard_grad.float()
-    shard_param.is_dion_param = False
     shard_param.is_matrix_param = False
 
 
@@ -619,11 +616,11 @@ def install_standard_optimizer_grads_(
     for model_group, shard_param_group in zip(model_groups, shard_groups):
         if len(model_group) != len(shard_param_group):
             raise RuntimeError(
-                "[Dion] standard grad copy requires equal model/shard group lengths "
+                "[Matrix] standard grad copy requires equal model/shard group lengths "
                 f"model_len={len(model_group)} shard_len={len(shard_param_group)}"
             )
         for model_param, shard_param in zip(model_group, shard_param_group):
-            if shard_param is None or getattr(model_param, "is_dion_param", False):
+            if shard_param is None or getattr(model_param, "is_matrix_param", False):
                 continue
             install_standard_shard_grad_(
                 model_param=model_param,
@@ -634,7 +631,7 @@ def install_standard_optimizer_grads_(
             )
 
 
-def install_dion_optimizer_grads_(
+def install_matrix_optimizer_grads_(
     *,
     model_groups,
     shard_groups,
@@ -642,17 +639,17 @@ def install_dion_optimizer_grads_(
     log_grad_issue: Callable,
     use_precision_aware_optimizer: bool,
 ) -> None:
-    """Set Dion local shard grads onto optimizer shard params for one or more param groups."""
+    """Set Matrix local shard grads onto optimizer shard params for one or more param groups."""
     for model_group, shard_param_group in zip(model_groups, shard_groups):
         if len(model_group) != len(shard_param_group):
             raise RuntimeError(
-                "[Dion] Dion grad copy requires equal model/shard group lengths "
+                "[Matrix] Matrix grad copy requires equal model/shard group lengths "
                 f"model_len={len(model_group)} shard_len={len(shard_param_group)}"
             )
         for model_param, shard_param in zip(model_group, shard_param_group):
-            if not getattr(model_param, "is_dion_param", False):
+            if not getattr(model_param, "is_matrix_param", False):
                 continue
-            install_dion_shard_grad_(
+            install_matrix_shard_grad_(
                 model_param=model_param,
                 shard_param=shard_param,
                 get_local_grad=get_local_grad,
@@ -661,23 +658,23 @@ def install_dion_optimizer_grads_(
             )
 
 
-def clear_dion_local_grads(optimizer, params: list[torch.nn.Parameter] | None = None) -> None:
-    """Clear the active adapter-stored Dion local grad surface."""
+def clear_matrix_local_grads(optimizer, params: list[torch.nn.Parameter] | None = None) -> None:
+    """Clear the active adapter-stored Matrix local grad surface."""
     if params is None:
-        optimizer._dion_local_grad_by_param.clear()
+        optimizer._matrix_local_grad_by_param.clear()
         return
     for param in params:
-        optimizer._dion_local_grad_by_param.pop(param, None)
+        optimizer._matrix_local_grad_by_param.pop(param, None)
 
 
-def scale_dion_local_grads(
+def scale_matrix_local_grads(
     optimizer,
     params: list[torch.nn.Parameter] | None,
     scaling_factor: float,
 ) -> None:
-    """Scale adapter-stored Dion grads by the same factor as MCore grad buffers."""
+    """Scale adapter-stored Matrix grads by the same factor as MCore grad buffers."""
     if params is None:
-        local_grads = tuple(optimizer._dion_local_grad_by_param.values())
+        local_grads = tuple(optimizer._matrix_local_grad_by_param.values())
     else:
         seen_param_ids = set()
         local_grads = []
@@ -685,10 +682,10 @@ def scale_dion_local_grads(
             if id(param) in seen_param_ids:
                 continue
             seen_param_ids.add(id(param))
-            local_grad = optimizer._dion_local_grad_by_param.get(param)
+            local_grad = optimizer._matrix_local_grad_by_param.get(param)
             if local_grad is None:
                 raise RuntimeError(
-                    "[Dion] cannot scale missing Dion local grad "
+                    "[Matrix] cannot scale missing Matrix local grad "
                     f"param={optimizer._param_name(param) or f'id_{id(param)}'}"
                 )
             local_grads.append(local_grad)
@@ -700,7 +697,7 @@ def scale_dion_local_grads(
         torch._foreach_mul_(local_grad_group, scaling_factor)
 
 
-def scale_dion_bucket_grads(
+def scale_matrix_bucket_grads(
     optimizer,
     *,
     bucket,
@@ -709,12 +706,12 @@ def scale_dion_bucket_grads(
     scaling_factor: float,
     use_distributed_optimizer: bool,
 ) -> None:
-    """Scale only the active standard and Dion grad surfaces for one Dion bucket."""
+    """Scale only the active standard and Matrix grad surfaces for one Matrix bucket."""
     if bucket.has_standard_params:
         if use_distributed_optimizer:
             if local_data_view is None or local_data_view.numel() == 0:
                 raise RuntimeError(
-                    "[Dion] mixed bucket grad scaling requires a standard local grad view "
+                    "[Matrix] mixed bucket grad scaling requires a standard local grad view "
                     f"bucket={getattr(bucket, 'bucket_id', -1)}"
                 )
             route = _get_grad_route(
@@ -727,16 +724,16 @@ def scale_dion_bucket_grads(
                 local_end = local_start + int(source_end) - int(source_start)
                 local_data_view[local_start:local_end].mul_(scaling_factor)
         else:
-            dion_param_ids = bucket.dion_param_ids
+            matrix_param_ids = bucket.matrix_param_ids
             for param in bucket.params_list:
-                if id(param) in dion_param_ids:
+                if id(param) in matrix_param_ids:
                     continue
                 start, end = bucket.param_to_index[param]
                 bucket.grad_data[int(start) : int(end)].mul_(scaling_factor)
 
-    scale_dion_local_grads(
+    scale_matrix_local_grads(
         optimizer,
-        [entry.param for entry in bucket.dion_layout.entries],
+        [entry.param for entry in bucket.matrix_layout.entries],
         scaling_factor,
     )
 
@@ -817,17 +814,17 @@ def gather_fs_grad(
 
 
 def set_local_grad(optimizer, model_param: torch.nn.Parameter, local_grad: torch.Tensor) -> None:
-    """Store one Dion-local grad shard in stable adapter storage."""
+    """Store one Matrix-local grad shard in stable adapter storage."""
     shard_layout = optimizer._param_shard_layout(model_param)
     if shard_layout is None:
         raise RuntimeError(
-            "[Dion] cannot store Dion local grad without shard layout "
+            "[Matrix] cannot store Matrix local grad without shard layout "
             f"param={optimizer._param_name(model_param) or f'id_{id(model_param)}'}"
         )
     expected_shape = tuple(int(dim) for dim in shard_layout.local_shape)
     if tuple(local_grad.shape) != expected_shape:
         raise RuntimeError(
-            "[Dion] stored Dion local grad shape mismatch "
+            "[Matrix] stored Matrix local grad shape mismatch "
             f"param={optimizer._param_name(model_param) or f'id_{id(model_param)}'} "
             f"stored_shape={tuple(local_grad.shape)} expected_shape={expected_shape}"
         )
@@ -845,7 +842,7 @@ def set_local_grad(optimizer, model_param: torch.nn.Parameter, local_grad: torch
     )
     stored_shape = tuple(local_grad.shape)
     stored_device = local_grad.device
-    stored_local_grad = optimizer._dion_local_grad_by_param.get(model_param)
+    stored_local_grad = optimizer._matrix_local_grad_by_param.get(model_param)
     if (
         stored_local_grad is None
         or tuple(stored_local_grad.shape) != stored_shape
@@ -857,7 +854,7 @@ def set_local_grad(optimizer, model_param: torch.nn.Parameter, local_grad: torch
             dtype=stored_dtype,
             device=stored_device,
         )
-        optimizer._dion_local_grad_by_param[model_param] = stored_local_grad
+        optimizer._matrix_local_grad_by_param[model_param] = stored_local_grad
     stored_local_grad.copy_(local_grad)
 
 
@@ -866,11 +863,11 @@ def get_local_grad(
     model_param: torch.nn.Parameter,
     shard_param: torch.nn.Parameter,
 ) -> torch.Tensor:
-    """Return the canonical Dion local grad shard for one optimizer param."""
-    local_grad = optimizer._dion_local_grad_by_param.get(model_param)
+    """Return the canonical Matrix local grad shard for one optimizer param."""
+    local_grad = optimizer._matrix_local_grad_by_param.get(model_param)
     if local_grad is None:
         raise RuntimeError(
-            "[Dion] missing stored Dion local grad shard "
+            "[Matrix] missing stored Matrix local grad shard "
             f"param={optimizer._param_name(model_param) or f'id_{id(model_param)}'} "
             f"shard_shape={tuple(shard_param.shape)}"
         )
@@ -882,7 +879,7 @@ def get_main_grad_local(
     model_param: torch.nn.Parameter,
     shard_param: torch.nn.Parameter,
 ) -> torch.Tensor | None:
-    """Return the canonical Dion local grad view directly from model_param.main_grad."""
+    """Return the canonical Matrix local grad view directly from model_param.main_grad."""
     model_grad = getattr(model_param, "main_grad", None)
     if model_grad is None:
         return None
@@ -890,7 +887,7 @@ def get_main_grad_local(
     shard_layout = optimizer._param_shard_layout(model_param)
     if shard_layout is None:
         raise RuntimeError(
-            "[Dion] missing shard layout while reading main_grad "
+            "[Matrix] missing shard layout while reading main_grad "
             f"param={optimizer._param_name(model_param) or f'id_{id(model_param)}'}"
         )
 
@@ -902,7 +899,7 @@ def get_main_grad_local(
     )
     if tuple(local_grad.shape) != tuple(shard_param.shape):
         raise RuntimeError(
-            "[Dion] main_grad local shape mismatch "
+            "[Matrix] main_grad local shape mismatch "
             f"param={optimizer._param_name(model_param) or f'id_{id(model_param)}'} "
             f"main_grad_shape={tuple(model_grad.shape)} "
             f"local_shape={tuple(local_grad.shape)} shard_shape={tuple(shard_param.shape)}"
@@ -917,37 +914,37 @@ def apply_bucket_grads(
     local_data_view: torch.Tensor | None,
     communication_group,
 ) -> None:
-    """Set Dion local grads from the completed Dion bucket grad transport."""
+    """Set Matrix local grads from the completed Matrix bucket grad transport."""
     del communication_group
-    dion_layout = getattr(bucket, "dion_layout", None)
-    if dion_layout is None or not dion_layout.has_params:
+    matrix_layout = getattr(bucket, "matrix_layout", None)
+    if matrix_layout is None or not matrix_layout.has_params:
         return
     grad_transport = pop_grad_transport(bucket)
-    if grad_transport is None and bool(getattr(bucket, "_dion_use_full_grad_after_sync", False)):
-        grad_transport = DionGradTransport(dion_grad_shard=_build_full_bucket_grad(bucket=bucket))
-    bucket._dion_use_full_grad_after_sync = False
+    if grad_transport is None and bool(getattr(bucket, "_matrix_use_full_grad_after_sync", False)):
+        grad_transport = MatrixGradTransport(matrix_grad_shard=_build_full_bucket_grad(bucket=bucket))
+    bucket._matrix_use_full_grad_after_sync = False
     if grad_transport is not None:
         _install_standard_local_grads_(
             bucket=bucket,
             local_data_view=local_data_view,
             grad_transport=grad_transport,
         )
-    _install_dion_local_grads_(
+    _install_matrix_local_grads_(
         bucket=bucket,
         set_local_grad=optimizer._set_local_grad,
         grad_transport=grad_transport,
     )
 
 
-def stash_grad_transport(optimizer, bucket, grad_transport: DionGradTransport) -> None:
-    """Keep one Dion grad transport alive until local grads are set."""
+def stash_grad_transport(optimizer, bucket, grad_transport: MatrixGradTransport) -> None:
+    """Keep one Matrix grad transport alive until local grads are set."""
     del optimizer
-    bucket._dion_grad_transport = grad_transport
+    bucket._matrix_grad_transport = grad_transport
 
 
-def wait_grad_transport(bucket) -> DionGradTransport | None:
-    """Ensure one bucket's Dion RS payload is ready before any consumer reads it."""
-    grad_transport = getattr(bucket, "_dion_grad_transport", None)
+def wait_grad_transport(bucket) -> MatrixGradTransport | None:
+    """Ensure one bucket's Matrix RS payload is ready before any consumer reads it."""
+    grad_transport = getattr(bucket, "_matrix_grad_transport", None)
     if grad_transport is None:
         return None
     grad_reduce_handle = getattr(grad_transport, "grad_reduce_handle", None)
@@ -966,29 +963,29 @@ def wait_grad_transport(bucket) -> DionGradTransport | None:
     return grad_transport
 
 
-def pop_grad_transport(bucket) -> DionGradTransport | None:
-    """Return and clear one bucket's pending Dion grad transport."""
+def pop_grad_transport(bucket) -> MatrixGradTransport | None:
+    """Return and clear one bucket's pending Matrix grad transport."""
     grad_transport = wait_grad_transport(bucket)
-    bucket._dion_grad_transport = None
+    bucket._matrix_grad_transport = None
     return grad_transport
 
 
 def get_standard_inter_instance_grad_buffer(bucket) -> torch.Tensor | None:
     """Return mixed-bucket standard grads that need inter-instance reduction."""
-    grad_transport = getattr(bucket, "_dion_grad_transport", None)
+    grad_transport = getattr(bucket, "_matrix_grad_transport", None)
     if grad_transport is None:
         return None
     return grad_transport.standard_grad
 
 
 def clear_grad_transport(bucket) -> None:
-    """Drop any stale Dion grad transport cached on a bucket."""
+    """Drop any stale Matrix grad transport cached on a bucket."""
     wait_grad_transport(bucket)
-    bucket._dion_grad_transport = None
-    bucket._dion_use_full_grad_after_sync = False
+    bucket._matrix_grad_transport = None
+    bucket._matrix_use_full_grad_after_sync = False
 
 
-def start_dion_grad_sync(
+def start_matrix_grad_sync(
     optimizer,
     *,
     bucket,
@@ -998,7 +995,7 @@ def start_dion_grad_sync(
     async_op: bool,
     reduce_scatter,
 ):
-    """Launch stock and Dion bucket grad transport from the MCore bucket grad buffer."""
+    """Launch stock and Matrix bucket grad transport from the MCore bucket grad buffer."""
     clear_grad_transport(bucket)
     route = _get_grad_route(
         bucket=bucket,
@@ -1007,26 +1004,26 @@ def start_dion_grad_sync(
     )
     bucket_payload = _get_bucket_grad_buffer(
         bucket,
-        cache_attr="_dion_grad_bucket_payload_cache",
+        cache_attr="_matrix_grad_bucket_payload_cache",
         shape=(int(route.payload_numel),),
         dtype=bucket.grad_data.dtype,
         device=bucket.grad_data.device,
     )
-    dion_grad_shard = bucket_payload[: int(route.dion_numel)]
+    matrix_grad_shard = bucket_payload[: int(route.matrix_numel)]
     standard_grad = None
     if route.standard_numel > 0:
         standard_grad = bucket_payload[
-            int(route.dion_numel) : int(route.payload_numel)
+            int(route.matrix_numel) : int(route.payload_numel)
         ]
     reduce_input = _get_bucket_grad_buffer(
         bucket,
-        cache_attr="_dion_grad_reduce_input_cache",
+        cache_attr="_matrix_grad_reduce_input_cache",
         shape=(int(route.group_size) * int(route.payload_numel),),
         dtype=bucket.grad_data.dtype,
         device=bucket.grad_data.device,
     )
     _build_grad_reduce_input(bucket=bucket, route=route, reduce_input=reduce_input)
-    dion_handle = reduce_scatter(
+    matrix_handle = reduce_scatter(
         bucket_payload,
         reduce_input,
         op=reduce_op,
@@ -1036,16 +1033,16 @@ def start_dion_grad_sync(
     stash_grad_transport(
         optimizer,
         bucket,
-        DionGradTransport(
-            dion_grad_shard=dion_grad_shard,
+        MatrixGradTransport(
+            matrix_grad_shard=matrix_grad_shard,
             bucket_payload=bucket_payload,
             standard_grad=standard_grad,
             standard_segments=route.standard_local_segments,
             reduce_input=reduce_input,
-            grad_reduce_handle=dion_handle,
+            grad_reduce_handle=matrix_handle,
         ),
     )
-    return dion_handle
+    return matrix_handle
 
 
 def build_grad_route(
@@ -1116,7 +1113,7 @@ def set_optimizer_shard_grads(
             log_grad_issue=log_grad_issue,
             use_precision_aware_optimizer=use_precision_aware_optimizer,
         )
-        install_dion_optimizer_grads_(
+        install_matrix_optimizer_grads_(
             model_groups=model_groups,
             shard_groups=shard_groups,
             get_local_grad=get_local_grad,

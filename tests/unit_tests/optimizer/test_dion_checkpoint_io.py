@@ -3,15 +3,15 @@ import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.optimizer.dion.types import DionMixedPrecisionConfig
-from megatron.core.optimizer.dion.distributed import checkpoint_io
-from megatron.core.optimizer.dion.distributed.checkpoint_io import (
+from megatron.core.optimizer.matrix import checkpoint_io
+from megatron.core.optimizer.matrix.checkpoint_io import (
     _stable_param_key_id,
-    build_dion_checkpoint_metadata,
+    build_matrix_checkpoint_metadata as build_dion_checkpoint_metadata,
     build_distributed_checkpoint_state,
-    resolve_dion_checkpoint_sharding_type,
+    resolve_matrix_checkpoint_sharding_type as resolve_dion_checkpoint_sharding_type,
     restore_persistent_param_state_,
     restore_distributed_checkpoint_state,
-    validate_dion_checkpoint_metadata,
+    validate_matrix_checkpoint_metadata as validate_dion_checkpoint_metadata,
 )
 
 TOPOLOGY = {

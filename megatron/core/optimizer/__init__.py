@@ -51,9 +51,16 @@ from .dion.distributed.integration import (
     build_dion_optimizer,
     get_dion_param_override,
 )
-from .dion.distributed.parameter import mark_dion_candidates
+from .dion.params import mark_dion_candidates
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
+from .muon import (
+    build_muon_distributed_optimizer,
+    build_muon_optimizer,
+    get_muon_param_override,
+    init_muon_state,
+    mark_muon_candidates,
+)
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -64,6 +71,7 @@ from .optimizer import (
 from .optimizer_config import (
     AdamOptimizerConfig,
     DionOptimizerConfig,
+    MuonOptimizerConfig,
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
@@ -229,6 +237,15 @@ def _get_param_groups(
                 else:
                     param_override = combine_param_group_overrides(
                         [param_override, dion_param_override]
+                    )
+
+            muon_param_override = get_muon_param_override(config, param, param_override, name)
+            if muon_param_override is not None:
+                if param_override is None:
+                    param_override = muon_param_override
+                else:
+                    param_override = combine_param_group_overrides(
+                        [param_override, muon_param_override]
                     )
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
@@ -491,6 +508,18 @@ def _get_megatron_optimizer_based_on_param_groups(
                 is_expert_parallel=is_expert_parallel,
             )
             init_state = None
+        elif config.optimizer == 'muon':
+            optimizer = build_muon_optimizer(
+                config=config,
+                param_groups=param_groups,
+                data_parallel_group=data_parallel_group,
+                pure_data_parallel_group=pure_data_parallel_group,
+                dense_fs_group=intra_dist_opt_dp_group,
+                muon_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
+                pg_collection=pg_collection,
+                is_expert_parallel=is_expert_parallel,
+            )
+            init_state = init_muon_state
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:
@@ -539,6 +568,22 @@ def _get_megatron_optimizer_based_on_param_groups(
                     pure_data_parallel_group=pure_data_parallel_group,
                     dense_fs_group=intra_dist_opt_dp_group,
                     dion_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                    pg_collection=pg_collection,
+                    is_expert_parallel=is_expert_parallel,
+                )
+            elif config.optimizer == 'muon':
+                optimizer = build_muon_distributed_optimizer(
+                    optimizer_args=optimizer_args,
+                    config=config,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    pure_data_parallel_group=pure_data_parallel_group,
+                    dense_fs_group=intra_dist_opt_dp_group,
+                    muon_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
                     data_parallel_group_gloo=data_parallel_group_gloo,
                     data_parallel_group_idx=data_parallel_group_idx,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
@@ -639,6 +684,9 @@ def get_megatron_optimizer(
     if getattr(config, 'optimizer', None) == 'dion':
         for model_chunk in model_chunks:
             mark_dion_candidates(model_chunk)
+    elif getattr(config, 'optimizer', None) == 'muon':
+        for model_chunk in model_chunks:
+            mark_muon_candidates(model_chunk)
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:

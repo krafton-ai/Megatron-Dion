@@ -131,6 +131,7 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     AdamOptimizerConfig,
     DionOptimizerConfig,
+    MuonOptimizerConfig,
     OptimizerConfig,
     ParamKey,
     SGDOptimizerConfig,
@@ -1456,7 +1457,7 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
     config = None
-    if args.optimizer == 'adam' or 'muon' in args.optimizer:
+    if args.optimizer == 'adam' or args.optimizer == 'dist_muon':
         # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
         # So for now we keep using adam config that's back compat with old way
         kwargs = {}
@@ -1464,6 +1465,12 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
             if hasattr(args, f.name):
                 kwargs[f.name] = getattr(args, f.name)
         config = AdamOptimizerConfig(**kwargs)
+    elif args.optimizer == 'muon':
+        kwargs = {}
+        for f in dataclasses.fields(MuonOptimizerConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        config = MuonOptimizerConfig(**kwargs)
     elif args.optimizer == 'sgd':
         kwargs = {}
         for f in dataclasses.fields(SGDOptimizerConfig):
@@ -1524,7 +1531,7 @@ def setup_model_and_optimizer(
                 model,
                 config_overrides=config_overrides,
                 use_gloo_process_groups=args.enable_gloo_process_groups,
-                layer_wise_distributed_optimizer='dist' in config.optimizer,
+                layer_wise_distributed_optimizer=config.optimizer == 'dist_muon',
             )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 

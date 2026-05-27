@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
-from megatron.core.optimizer.dion.distributed import parameter as dion_parameter
+from megatron.core.optimizer.matrix import parameter as dion_parameter
 from megatron.core.optimizer.matrix.sharding import MatrixShardLayout
 from megatron.core.optimizer.matrix.types import MatrixBucketLayout, MatrixShardEntry
 

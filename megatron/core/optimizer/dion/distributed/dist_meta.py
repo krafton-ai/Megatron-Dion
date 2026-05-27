@@ -17,7 +17,7 @@ from ...matrix.splits.qkvg import (
 from ..state import build_param_config
 from ..types import DionDistMeta
 from ..utils import get_local_shape
-from .parameter import is_moe_expert_param
+from ...matrix.parameter import is_moe_expert_param
 from ...matrix.sharding import get_tp_split_dim, is_tp_enabled
 from ....transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
 
