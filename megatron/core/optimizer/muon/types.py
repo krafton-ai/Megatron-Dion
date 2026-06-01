@@ -49,6 +49,10 @@ class MuonParamConfig:
     split_linear: bool = False
 
     def __post_init__(self) -> None:
+        if self.fs_mode == "duplicated_debug":
+            self.fs_mode = "duplicated"
+        if self.tp_mode == "duplicated_debug":
+            self.tp_mode = "duplicated"
         if self.ns_backend not in ("standard", "gram"):
             raise ValueError(f"Invalid Muon ns_backend: {self.ns_backend!r}")
         if self.coefficient_type not in ("simple", "quintic", "polar_express", "aol", "custom"):
@@ -57,9 +61,9 @@ class MuonParamConfig:
             raise ValueError(f"num_ns_steps must be at least 1, got {self.num_ns_steps}")
         if self.scale_mode not in ("spectral", "unit_rms_norm", "shape_scaling"):
             raise ValueError(f"Invalid Muon scale_mode: {self.scale_mode!r}")
-        if self.fs_mode not in ("blockwise", "distributed", "duplicated_debug"):
+        if self.fs_mode not in ("blockwise", "duplicated", "distributed"):
             raise ValueError(f"Invalid Muon fs_mode: {self.fs_mode!r}")
-        if self.tp_mode not in ("blockwise", "distributed", "duplicated", "duplicated_debug"):
+        if self.tp_mode not in ("blockwise", "duplicated", "distributed"):
             raise ValueError(f"Invalid Muon tp_mode: {self.tp_mode!r}")
         if self.gram_kernel_policy not in (
             "torch",

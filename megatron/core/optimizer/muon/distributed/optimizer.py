@@ -15,6 +15,7 @@ import torch.distributed as dist
 from .... import parallel_state, tensor_parallel
 from ....fp8_utils import is_float8tensor
 from ...matrix.distrib_optimizer import DistributedMatrixOptimizer
+from ...matrix.gradients import get_inter_instance_grad_buffers
 from ...matrix.types import MatrixBucketLayout
 from ...matrix.sharding import (
     create_fs_shard,
@@ -28,7 +29,9 @@ from ...matrix.sharding import (
     update_opt_shard,
 )
 from ...matrix.splits.linear import (
+    get_linear_split_rows,
     iter_linear_child_kinds,
+    is_linear_fc1_param,
     linear_child_global_shape,
     linear_child_has_local_overlap,
     linear_child_local_shape,
@@ -79,6 +82,7 @@ from ..kernels import (
     get_muon_scale_factor,
     orthogonalize_muon,
     orthogonalize_muon_update,
+    orthogonalize_muon_update_2d,
 )
 from ..state import build_param_config, is_muon_matrix_param
 from ..types import MuonBatch, MuonDistMeta, MuonParamConfig, MuonStepParam
@@ -334,8 +338,6 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         self._muon_profile_ns_groups = os.getenv("MEGATRON_MUON_PROFILE_NS_GROUPS", "0") == "1"
         self._muon_profile_apply_ms = 0.0
         self._muon_profile_apply_batches = 0
-        self._muon_profile_fs_a2a_ms = 0.0
-        self._muon_profile_fs_a2a_calls = 0
 
         per_model_buffers = kwargs.get("per_model_buffers", None)
         muon_fs_size = 1 if self._muon_fs_group is None else _group_size(self._muon_fs_group)
@@ -581,6 +583,9 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         tensor_parallel.copy_tensor_model_parallel_attributes(shard_param, model_param)
         copy_qkv_split_metadata(shard_param, model_param)
         copy_qkvg_split_metadata(shard_param, model_param)
+        if is_linear_fc1_param(model_param):
+            shard_param.is_linear_fc1 = True
+            shard_param.linear_split_rows = get_linear_split_rows(model_param)
         if hasattr(model_param, "shared"):
             shard_param.shared = model_param.shared
 
@@ -780,6 +785,11 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     global_shape = self._global_shape(model_param, tp_shard_dim)
                     is_transposed = bool(global_shape[0] > global_shape[1])
                     param_uid = (name or f"id_{id(model_param)}", tuple(global_shape))
+                    linear_split_rows = (
+                        get_linear_split_rows(model_param)
+                        if is_linear_fc1_param(model_param)
+                        else None
+                    )
                 else:
                     global_shape = None
                     is_transposed = False
@@ -787,6 +797,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                         name or f"id_{id(model_param)}",
                         tuple(int(dim) for dim in local_shape),
                     )
+                    linear_split_rows = None
                 dist_meta = MuonDistMeta(
                     shape=tuple(int(dim) for dim in local_shape),
                     global_shape=global_shape,
@@ -806,6 +817,8 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     tp_world_size=int(self.tp_size) if tp_shard_dim in (0, 1) else 1,
                     tp_rank=int(self.tp_rank) if tp_shard_dim in (0, 1) else 0,
                     local_shape=tuple(int(dim) for dim in local_shape) if use_matrix else None,
+                    linear_split_rows=linear_split_rows,
+                    linear_partition_stride=int(getattr(model_param, "partition_stride", 1)),
                 )
                 dist_meta.param_config = self._build_param_config(shard_param, dist_meta, optim_group)
                 shard_param._matrix_param_uid = dist_meta.param_uid
@@ -839,8 +852,6 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             split_qkvg=bool(getattr(self.config, "muon_split_qkv", True)),
             split_linear=bool(getattr(self.config, "muon_split_linear", True)),
         )
-        if cfg.tp_mode == "duplicated":
-            cfg.tp_mode = "duplicated_debug"
         return cfg
 
     def _refresh_muon_step_metadata(self, *, param, optimizer_state, optim_group, dist_meta):
@@ -1066,8 +1077,6 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 )
             ),
         )
-        if config.tp_mode == "duplicated":
-            config.tp_mode = "duplicated_debug"
         return config
 
     @staticmethod
@@ -1123,10 +1132,20 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 return self._expand_linear(param2d, grad2d, optimizer_state, optim_group, dist_meta, parent_shape, parent_global_shape, rows)
         return None
 
+    @staticmethod
+    def _include_empty_split_child(meta) -> bool:
+        cfg = getattr(meta, "param_config", None)
+        fs_mode = getattr(cfg, "fs_mode", "blockwise")
+        tp_mode = getattr(cfg, "tp_mode", "blockwise")
+        return fs_mode in ("duplicated", "distributed") or tp_mode in (
+            "duplicated",
+            "distributed",
+        )
+
     def _expand_qkv(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, shapes):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = getattr(meta.param_config, "fs_mode", "blockwise") == "distributed"
+        include_empty = self._include_empty_split_child(meta)
         for kind in iter_qkv_child_kinds():
             has_overlap = qkv_child_has_local_overlap(shapes, meta, kind)
             if not has_overlap and not include_empty:
@@ -1188,7 +1207,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
     def _expand_qkvg(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, shapes):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = getattr(meta.param_config, "fs_mode", "blockwise") == "distributed"
+        include_empty = self._include_empty_split_child(meta)
         for kind in iter_qkvg_child_kinds():
             has_overlap = qkvg_child_has_local_overlap(shapes, meta, kind)
             if not has_overlap and not include_empty:
@@ -1250,7 +1269,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
     def _expand_linear(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, rows):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = getattr(meta.param_config, "fs_mode", "blockwise") == "distributed"
+        include_empty = self._include_empty_split_child(meta)
         for kind in iter_linear_child_kinds():
             has_overlap = linear_child_has_local_overlap(rows, meta, kind)
             if not has_overlap and not include_empty:
@@ -1312,6 +1331,13 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
     def _sync_muon_state(self, matrix_params) -> None:
         del matrix_params
 
+    @staticmethod
+    def _get_inter_instance_grad_buffers(bucket):
+        return get_inter_instance_grad_buffers(bucket)
+
+    def _matrix_grads_are_replicate_synced(self) -> bool:
+        return True
+
     def _build_muon_batches(self, matrix_params):
         return build_muon_batches(
             matrix_params,
@@ -1344,9 +1370,31 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         if wd:
             param.mul_(1.0 - lr * wd)
 
-    def _orthogonalize(self, update, entry, meta=None):
+    @staticmethod
+    def _axis_logical_shape(update, meta, shard_dim: int, mode: str):
+        if mode != "distributed":
+            return None
+        shard_dim = int(shard_dim)
+        if shard_dim not in (0, 1):
+            return None
+        global_shape = tuple(int(dim) for dim in getattr(meta, "global_shape", update.shape[-2:]))
+        shape = [int(update.size(-2)), int(update.size(-1))]
+        shape[shard_dim] = int(global_shape[shard_dim])
+        return tuple(shape)
+
+    def _orthogonalize_axis(
+        self,
+        update,
+        entry,
+        meta=None,
+        *,
+        shard_group=None,
+        shard_dim: int = -1,
+        shard_mode: str = "blockwise",
+    ):
         meta = entry.dist_meta if meta is None else meta
         cfg = entry.config
+        logical_shape = self._axis_logical_shape(update, meta, shard_dim, shard_mode)
         matrix_count = int(update.size(0)) if update.ndim > 2 else 1
         elapsed_ms = None
         if bool(getattr(self, "_muon_profile_ns", False)) and update.is_cuda:
@@ -1361,9 +1409,10 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             scale_mode=cfg.scale_mode,
             extra_scale_factor=cfg.extra_scale_factor,
             global_shape=tuple(int(dim) for dim in getattr(meta, "global_shape", entry.global_shape)),
-            tp_group=getattr(meta, "tp_group", None),
-            partition_dim=getattr(meta, "tp_shard_dim", -1),
-            tp_mode=cfg.tp_mode,
+            logical_shape=logical_shape,
+            tp_group=shard_group,
+            partition_dim=shard_dim,
+            tp_mode=shard_mode,
             gram_restart_iterations=cfg.gram_restart_iterations,
             gram_dtype=cfg.gram_dtype,
             gram_kernel_policy=cfg.gram_kernel_policy,
@@ -1387,19 +1436,72 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         )
         return result
 
-    @staticmethod
-    def _same_orthogonalize_config(entry, other_entry, meta, other_meta) -> bool:
+    def _orthogonalize_2d(self, update, entry, meta=None):
+        meta = entry.dist_meta if meta is None else meta
         cfg = entry.config
-        other_cfg = other_entry.config
-        if cfg != other_cfg:
-            return False
-        if getattr(meta, "tp_group", None) is not getattr(other_meta, "tp_group", None):
-            return False
-        return int(getattr(meta, "tp_shard_dim", -1)) == int(
-            getattr(other_meta, "tp_shard_dim", -1)
+        matrix_count = int(update.size(0)) if update.ndim > 2 else 1
+        elapsed_ms = None
+        if bool(getattr(self, "_muon_profile_ns", False)) and update.is_cuda:
+            torch.cuda.synchronize(update.device)
+            start = time.perf_counter()
+        result = orthogonalize_muon_update_2d(
+            update,
+            ns_backend=cfg.ns_backend,
+            coefficient_type=cfg.coefficient_type,
+            num_ns_steps=cfg.num_ns_steps,
+            eps=cfg.ns_epsilon,
+            scale_mode=cfg.scale_mode,
+            extra_scale_factor=cfg.extra_scale_factor,
+            global_shape=tuple(int(dim) for dim in getattr(meta, "global_shape", entry.global_shape)),
+            logical_shape=tuple(int(dim) for dim in getattr(meta, "global_shape", entry.global_shape)),
+            fs_group=getattr(meta, "fs_group", None),
+            fs_partition_dim=int(getattr(meta, "fs_shard_dim", -1)),
+            tp_group=getattr(meta, "tp_group", None),
+            tp_partition_dim=int(getattr(meta, "tp_shard_dim", -1)),
+            gram_restart_iterations=cfg.gram_restart_iterations,
+            gram_dtype=cfg.gram_dtype,
+            gram_kernel_policy=cfg.gram_kernel_policy,
+            fp32_matmul_prec=getattr(
+                getattr(self, "config", None),
+                "muon_fp32_matmul_prec",
+                "medium",
+            ),
+        )
+        if bool(getattr(self, "_muon_profile_ns", False)) and update.is_cuda:
+            torch.cuda.synchronize(update.device)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            self._muon_profile_ns_ms += elapsed_ms
+            self._muon_profile_ns_calls += matrix_count
+            self._muon_profile_ns_launches += 1
+        self._maybe_log_ns_group(
+            update=update,
+            entries=(entry,),
+            metas=(meta,),
+            elapsed_ms=elapsed_ms,
+        )
+        return result
+
+    def _orthogonalize(self, update, entry, meta=None):
+        meta = entry.dist_meta if meta is None else meta
+        return self._orthogonalize_axis(
+            update,
+            entry,
+            meta,
+            shard_group=getattr(meta, "tp_group", None),
+            shard_dim=getattr(meta, "tp_shard_dim", -1),
+            shard_mode=entry.config.tp_mode,
         )
 
-    def _orthogonalize_batch_key(self, update, entry, meta):
+    def _orthogonalize_batch_key(
+        self,
+        update,
+        entry,
+        meta,
+        *,
+        shard_group=None,
+        shard_dim: int = -1,
+        shard_mode: str = "blockwise",
+    ):
         cfg = entry.config
         return (
             tuple(update.shape),
@@ -1412,9 +1514,10 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             tuple(int(step) for step in cfg.gram_restart_iterations),
             str(cfg.gram_kernel_policy),
             str(cfg.gram_dtype),
-            cfg.tp_mode,
-            id(getattr(meta, "tp_group", None)),
-            int(getattr(meta, "tp_shard_dim", -1)),
+            shard_mode,
+            self._axis_logical_shape(update, meta, shard_dim, shard_mode),
+            id(shard_group),
+            int(shard_dim),
         )
 
     @staticmethod
@@ -1424,10 +1527,20 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         scale = get_muon_scale_factor(int(global_shape[0]), int(global_shape[1]), mode=cfg.scale_mode)
         return update * float(scale) * float(cfg.extra_scale_factor)
 
-    def _orthogonalize_stacked_unscaled(self, stacked_update, entries, metas):
+    def _orthogonalize_stacked_unscaled(
+        self,
+        stacked_update,
+        entries,
+        metas,
+        *,
+        shard_group=None,
+        shard_dim: int = -1,
+        shard_mode: str = "blockwise",
+    ):
         entry = entries[0]
         meta = metas[0]
         cfg = entry.config
+        logical_shape = self._axis_logical_shape(stacked_update, meta, shard_dim, shard_mode)
         matrix_count = int(stacked_update.size(0)) if stacked_update.ndim > 2 else 1
         elapsed_ms = None
         if bool(getattr(self, "_muon_profile_ns", False)) and stacked_update.is_cuda:
@@ -1438,9 +1551,10 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             ns_backend=cfg.ns_backend,
             steps=cfg.num_ns_steps,
             coefficient_type=cfg.coefficient_type,
-            tp_group=getattr(meta, "tp_group", None),
-            partition_dim=getattr(meta, "tp_shard_dim", -1),
-            tp_mode=cfg.tp_mode,
+            tp_group=shard_group,
+            partition_dim=shard_dim,
+            tp_mode=shard_mode,
+            logical_shape=logical_shape,
             gram_restart_steps=cfg.gram_restart_iterations,
             gram_dtype=cfg.gram_dtype,
             gram_kernel_policy=cfg.gram_kernel_policy,
@@ -1465,7 +1579,16 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         )
         return result
 
-    def _orthogonalize_batch(self, updates, entries, metas=None):
+    def _orthogonalize_axis_batch(
+        self,
+        updates,
+        entries,
+        metas=None,
+        *,
+        shard_group_getter,
+        shard_dim_getter,
+        shard_mode_getter,
+    ):
         if not updates:
             return []
         if metas is None:
@@ -1473,19 +1596,63 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         results = [None] * len(updates)
         groups = {}
         for index, (update, entry, meta) in enumerate(zip(updates, entries, metas)):
-            groups.setdefault(self._orthogonalize_batch_key(update, entry, meta), []).append(index)
+            shard_group = shard_group_getter(entry, meta)
+            shard_dim = shard_dim_getter(entry, meta)
+            shard_mode = shard_mode_getter(entry, meta)
+            key = self._orthogonalize_batch_key(
+                update,
+                entry,
+                meta,
+                shard_group=shard_group,
+                shard_dim=shard_dim,
+                shard_mode=shard_mode,
+            )
+            groups.setdefault(key, []).append(index)
 
         for indices in groups.values():
+            first_entry = entries[indices[0]]
+            first_cfg = first_entry.config
+            dao_gram = (
+                first_cfg.ns_backend == "gram"
+                and str(first_cfg.gram_kernel_policy).lower() in ("dao", "quack", "compile")
+            )
             if len(indices) == 1:
                 index = indices[0]
-                results[index] = self._orthogonalize(updates[index], entries[index], metas[index])
+                entry = first_entry
+                meta = metas[index]
+                results[index] = self._orthogonalize_axis(
+                    updates[index],
+                    entry,
+                    meta,
+                    shard_group=shard_group_getter(entry, meta),
+                    shard_dim=shard_dim_getter(entry, meta),
+                    shard_mode=shard_mode_getter(entry, meta),
+                )
+                continue
+
+            if dao_gram:
+                for index in indices:
+                    entry = entries[index]
+                    meta = metas[index]
+                    results[index] = self._orthogonalize_axis(
+                        updates[index],
+                        entry,
+                        meta,
+                        shard_group=shard_group_getter(entry, meta),
+                        shard_dim=shard_dim_getter(entry, meta),
+                        shard_mode=shard_mode_getter(entry, meta),
+                    )
                 continue
 
             batch_update = torch.stack([updates[index].contiguous() for index in indices], dim=0)
+            first_meta = metas[indices[0]]
             batch_result = self._orthogonalize_stacked_unscaled(
                 batch_update,
                 tuple(entries[index] for index in indices),
                 tuple(metas[index] for index in indices),
+                shard_group=shard_group_getter(first_entry, first_meta),
+                shard_dim=shard_dim_getter(first_entry, first_meta),
+                shard_mode=shard_mode_getter(first_entry, first_meta),
             )
             for batch_index, result_index in enumerate(indices):
                 results[result_index] = self._scale_update(
@@ -1494,6 +1661,16 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     metas[result_index],
                 )
         return results
+
+    def _orthogonalize_batch(self, updates, entries, metas=None):
+        return self._orthogonalize_axis_batch(
+            updates,
+            entries,
+            metas,
+            shard_group_getter=lambda entry, meta: getattr(meta, "tp_group", None),
+            shard_dim_getter=lambda entry, meta: getattr(meta, "tp_shard_dim", -1),
+            shard_mode_getter=lambda entry, meta: entry.config.tp_mode,
+        )
 
     def _maybe_log_ns_group(self, *, update, entries, metas, elapsed_ms):
         if not bool(getattr(self, "_muon_profile_ns_groups", False)):
@@ -1530,8 +1707,6 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             self._muon_profile_ns_launches = 0
             self._muon_profile_apply_ms = 0.0
             self._muon_profile_apply_batches = 0
-            self._muon_profile_fs_a2a_ms = 0.0
-            self._muon_profile_fs_a2a_calls = 0
             return
 
         local_ms = float(self._muon_profile_ns_ms)
@@ -1539,18 +1714,13 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         local_launches = int(self._muon_profile_ns_launches)
         local_apply_ms = float(self._muon_profile_apply_ms)
         local_apply_batches = int(self._muon_profile_apply_batches)
-        local_fs_a2a_ms = float(self._muon_profile_fs_a2a_ms)
-        local_fs_a2a_calls = int(self._muon_profile_fs_a2a_calls)
         max_ms = local_ms
         avg_ms = local_ms
         max_apply_ms = local_apply_ms
         avg_apply_ms = local_apply_ms
-        max_fs_a2a_ms = local_fs_a2a_ms
-        avg_fs_a2a_ms = local_fs_a2a_ms
         max_calls = local_calls
         max_launches = local_launches
         max_apply_batches = local_apply_batches
-        max_fs_a2a_calls = local_fs_a2a_calls
         total_gram_stats = dict(gram_stats)
         rank = 0
         if dist.is_available() and dist.is_initialized():
@@ -1563,8 +1733,6 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     float(local_launches),
                     local_apply_ms,
                     float(local_apply_batches),
-                    local_fs_a2a_ms,
-                    float(local_fs_a2a_calls),
                     float(gram_stats.get("dao_groups", 0)),
                     float(gram_stats.get("torch_groups", 0)),
                     float(gram_stats.get("dao_matrices", 0)),
@@ -1589,20 +1757,17 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             avg_apply_ms = float(sum_stats[3].item()) / float(dist.get_world_size())
             max_apply_ms = float(max_stats[3].item())
             max_apply_batches = int(max_stats[4].item())
-            avg_fs_a2a_ms = float(sum_stats[5].item()) / float(dist.get_world_size())
-            max_fs_a2a_ms = float(max_stats[5].item())
-            max_fs_a2a_calls = int(max_stats[6].item())
             total_gram_stats = {
-                "dao_groups": int(sum_stats[7].item()),
-                "torch_groups": int(sum_stats[8].item()),
-                "dao_matrices": int(sum_stats[9].item()),
-                "torch_matrices": int(sum_stats[10].item()),
-                "fallback_policy_torch_groups": int(sum_stats[11].item()),
-                "fallback_device_groups": int(sum_stats[12].item()),
-                "fallback_dtype_groups": int(sum_stats[13].item()),
-                "fallback_tile_groups": int(sum_stats[14].item()),
-                "gram_all_reduce_calls": int(sum_stats[15].item()),
-                "gram_all_reduce_numel": int(sum_stats[16].item()),
+                "dao_groups": int(sum_stats[5].item()),
+                "torch_groups": int(sum_stats[6].item()),
+                "dao_matrices": int(sum_stats[7].item()),
+                "torch_matrices": int(sum_stats[8].item()),
+                "fallback_policy_torch_groups": int(sum_stats[9].item()),
+                "fallback_device_groups": int(sum_stats[10].item()),
+                "fallback_dtype_groups": int(sum_stats[11].item()),
+                "fallback_tile_groups": int(sum_stats[12].item()),
+                "gram_all_reduce_calls": int(sum_stats[13].item()),
+                "gram_all_reduce_numel": int(sum_stats[14].item()),
             }
 
         if rank == 0:
@@ -1617,8 +1782,6 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 f"local_launches={local_launches} max_launches={max_launches} "
                 f"apply_avg_ms={avg_apply_ms:.3f} apply_max_ms={max_apply_ms:.3f} "
                 f"apply_batches_max={max_apply_batches} "
-                f"fs_a2a_avg_ms={avg_fs_a2a_ms:.3f} fs_a2a_max_ms={max_fs_a2a_ms:.3f} "
-                f"fs_a2a_calls_max={max_fs_a2a_calls} "
                 f"dao_groups={total_gram_stats.get('dao_groups', 0)} "
                 f"torch_groups={total_gram_stats.get('torch_groups', 0)} "
                 f"dao_matrices={total_gram_stats.get('dao_matrices', 0)} "
@@ -1633,8 +1796,6 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         self._muon_profile_ns_launches = 0
         self._muon_profile_apply_ms = 0.0
         self._muon_profile_apply_batches = 0
-        self._muon_profile_fs_a2a_ms = 0.0
-        self._muon_profile_fs_a2a_calls = 0
 
     def _prepare_entry(self, entry):
         param = entry.param if entry.param.ndim == 2 else entry.param.view(entry.param_shape)
@@ -1763,6 +1924,56 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         s, e = ranges[rank]
         return full[s:e, :].contiguous() if int(entry.dist_meta.fs_shard_dim) == 0 else full[:, s:e].contiguous()
 
+    @staticmethod
+    def _gather_axis(tensor, *, group, dim: int, return_sizes: bool = False):
+        world_size = _group_size(group)
+        if group is None or int(world_size) <= 1:
+            return (tensor, (int(tensor.size(int(dim))),)) if return_sizes else tensor
+        dim = int(dim)
+        local_size = torch.tensor([int(tensor.size(dim))], device=tensor.device, dtype=torch.int64)
+        gathered_sizes = [torch.empty_like(local_size) for _ in range(int(world_size))]
+        dist.all_gather(gathered_sizes, local_size, group=group)
+        sizes = [int(size.item()) for size in gathered_sizes]
+        max_size = max(sizes)
+        if max_size == int(local_size.item()):
+            send = tensor.contiguous()
+        else:
+            padded_shape = list(tensor.shape)
+            padded_shape[dim] = max_size
+            send = tensor.new_zeros(tuple(padded_shape))
+            index = [slice(None)] * tensor.ndim
+            index[dim] = slice(0, int(local_size.item()))
+            send[tuple(index)].copy_(tensor.contiguous())
+        gathered = [torch.empty_like(send) for _ in range(int(world_size))]
+        dist.all_gather(gathered, send, group=group)
+        shards = []
+        for shard, size in zip(gathered, sizes):
+            index = [slice(None)] * tensor.ndim
+            index[dim] = slice(0, int(size))
+            shards.append(shard[tuple(index)])
+        gathered = torch.cat(shards, dim=int(dim))
+        return (gathered, tuple(sizes)) if return_sizes else gathered
+
+    @staticmethod
+    def _slice_axis(tensor, *, group, dim: int, partition_sizes=None):
+        world_size = _group_size(group)
+        if group is None or int(world_size) <= 1:
+            return tensor
+        rank = _group_rank(group)
+        if partition_sizes is None:
+            start, end = _split_range(int(tensor.size(int(dim))), int(world_size), int(rank))
+        else:
+            if len(partition_sizes) != int(world_size):
+                raise RuntimeError(
+                    "[MUON_INVALID_AXIS_PARTITION_SIZES] "
+                    f"num_sizes={len(partition_sizes)} world_size={int(world_size)}"
+                )
+            start = sum(int(size) for size in partition_sizes[: int(rank)])
+            end = start + int(partition_sizes[int(rank)])
+        index = [slice(None)] * tensor.ndim
+        index[int(dim)] = slice(start, end)
+        return tensor[tuple(index)].contiguous()
+
     def _unpack(self, flat, entry, rank):
         _, ranges, other = self._fs_capacity(entry)
         s, e = ranges[rank]
@@ -1795,38 +2006,8 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         if getattr(first_meta, "fs_group", None) is None or int(first_meta.fs_world_size) <= 1:
             self._apply_local_batch(entries)
             return
-
-        params = []
-        full_updates = []
-        full_metas = []
         for entry in entries:
-            meta = entry.dist_meta
-            param, update = self._prepare_entry(entry)
-            params.append(param)
-            cap, _, _ = self._fs_capacity(entry)
-            send = update.new_zeros((cap,))
-            send[: update.numel()].copy_(update.contiguous().view(-1))
-            gathered = [torch.empty_like(send) for _ in range(int(meta.fs_world_size))]
-            dist.all_gather(gathered, send, group=meta.fs_group)
-            full = update.new_empty(self._fs_full_shape(entry))
-            for rank, flat in enumerate(gathered):
-                self._put_shard(full, self._unpack(flat, entry, rank), entry, rank)
-            full_updates.append(full)
-            full_metas.append(
-                replace(
-                    meta,
-                    shape=tuple(full.shape),
-                    local_shape=tuple(full.shape),
-                    fs_group=None,
-                    fs_world_size=1,
-                    fs_rank=0,
-                )
-            )
-
-        orthogonalized = self._orthogonalize_batch(full_updates, entries, full_metas)
-        for entry, param, update in zip(entries, params, orthogonalized):
-            local = self._get_shard(update, entry, int(entry.dist_meta.fs_rank))
-            self._commit(entry, param, local)
+            self._apply_fs_duplicated_entry(entry)
 
     def _distributed_fs_group_info(self, entries):
         active = [
@@ -1860,206 +2041,87 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 raise RuntimeError("[MUON_FS_DISTRIBUTED_MIXED_SHARD_DIMS]")
         return group, world_size, rank
 
-    @staticmethod
-    def _owner_schedule(entry_count: int, world_size: int) -> list[list[int]]:
-        owners = [[] for _ in range(int(world_size))]
-        for index in range(int(entry_count)):
-            owners[index % int(world_size)].append(index)
-        return owners
-
-    @staticmethod
-    def _pack_flat(dest, offset: int, tensor, capacity: int) -> int:
-        flat = tensor.contiguous().view(-1)
-        if int(flat.numel()) > int(capacity):
-            raise RuntimeError(
-                f"[MUON_FS_DISTRIBUTED_PACK_OVERFLOW] numel={int(flat.numel())} "
-                f"capacity={int(capacity)}"
-            )
-        dest.narrow(0, int(offset), int(flat.numel())).copy_(flat)
-        return int(offset) + int(capacity)
-
-    def _pack_updates_for_owners(self, updates, entries, owners, capacities, split_sizes):
-        send = updates[0].new_zeros((sum(int(size) for size in split_sizes),))
-        offset = 0
-        for owner, owner_indices in enumerate(owners):
-            owner_start = offset
-            for index in owner_indices:
-                offset = self._pack_flat(send, offset, updates[index], capacities[index])
-            expected = owner_start + int(split_sizes[owner])
-            if offset != expected:
-                raise RuntimeError("[MUON_FS_DISTRIBUTED_PACK_SIZE_MISMATCH]")
-        return send
-
-    def _extract_owner_full_updates(self, recv, entries, owners, capacities, owner_rank, world_size):
-        owner_indices = owners[owner_rank]
-        owner_size = sum(int(capacities[index]) for index in owner_indices)
-        full_updates = {}
-        prefix = {}
-        cursor = 0
-        for index in owner_indices:
-            prefix[index] = cursor
-            cursor += int(capacities[index])
-
-        owner_entries = []
-        owner_full_updates = []
-        owner_full_metas = []
-        for index in owner_indices:
-            entry = entries[index]
-            full = recv.new_empty(self._fs_full_shape(entry))
-            for source_rank in range(int(world_size)):
-                offset = source_rank * owner_size + prefix[index]
-                shard = self._unpack(
-                    recv.narrow(0, int(offset), int(capacities[index])),
-                    entry,
-                    source_rank,
-                )
-                self._put_shard(full, shard, entry, source_rank)
-            owner_entries.append(entry)
-            owner_full_updates.append(full)
-            owner_full_metas.append(
-                replace(
-                    entry.dist_meta,
-                    shape=tuple(full.shape),
-                    local_shape=tuple(full.shape),
-                    fs_group=None,
-                    fs_world_size=1,
-                    fs_rank=0,
-                )
-            )
-        for index, update in zip(
-            owner_indices,
-            self._orthogonalize_batch(owner_full_updates, owner_entries, owner_full_metas),
-        ):
-            full_updates[index] = update
-        return full_updates
-
-    def _pack_owner_results(self, full_updates, entries, owners, capacities, owner_rank, world_size):
-        owner_indices = owners[owner_rank]
-        owner_size = sum(int(capacities[index]) for index in owner_indices)
-        if not owner_indices:
-            return None
-        send = next(iter(full_updates.values())).new_zeros((owner_size * int(world_size),))
-        for target_rank in range(int(world_size)):
-            offset = target_rank * owner_size
-            for index in owner_indices:
-                shard = self._get_shard(full_updates[index], entries[index], target_rank)
-                offset = self._pack_flat(send, offset, shard, capacities[index])
-        return send
-
-    def _unpack_local_results(self, recv, entries, owners, capacities, split_sizes, local_rank):
-        local_updates = {}
-        offset = 0
-        for owner, owner_indices in enumerate(owners):
-            owner_start = offset
-            for index in owner_indices:
-                local_updates[index] = self._unpack(
-                    recv.narrow(0, int(offset), int(capacities[index])),
-                    entries[index],
-                    local_rank,
-                )
-                offset += int(capacities[index])
-            expected = owner_start + int(split_sizes[owner])
-            if offset != expected:
-                raise RuntimeError("[MUON_FS_DISTRIBUTED_UNPACK_SIZE_MISMATCH]")
-        return local_updates
-
-    def _all_to_all_single(self, output, input_, *, output_split_sizes, input_split_sizes, group):
-        if bool(getattr(self, "_muon_profile_ns", False)) and output.is_cuda:
-            torch.cuda.synchronize(output.device)
-            start = time.perf_counter()
-            dist.all_to_all_single(
-                output,
-                input_,
-                output_split_sizes=output_split_sizes,
-                input_split_sizes=input_split_sizes,
-                group=group,
-            )
-            torch.cuda.synchronize(output.device)
-            self._muon_profile_fs_a2a_ms += (time.perf_counter() - start) * 1000.0
-            self._muon_profile_fs_a2a_calls += 1
-            return
-        dist.all_to_all_single(
-            output,
-            input_,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
-            group=group,
-        )
-
     def _apply_fs_distributed_batch(self, batch: MuonBatch):
         entries = tuple(batch.entries)
-        group, world_size, rank = self._distributed_fs_group_info(entries)
+        group, world_size, _ = self._distributed_fs_group_info(entries)
         if group is None or int(world_size) <= 1:
             for entry in entries:
                 self._apply_local_entry(entry)
             return
-        if not hasattr(dist, "all_to_all_single"):
-            raise RuntimeError("[MUON_FS_DISTRIBUTED_REQUIRES_ALL_TO_ALL_SINGLE]")
 
         prepared = [self._prepare_entry(entry) for entry in entries]
         params = [param for param, _ in prepared]
         updates = [update for _, update in prepared]
-        dtype = updates[0].dtype
-        device = updates[0].device
-        if any(update.dtype != dtype or update.device != device for update in updates):
-            raise RuntimeError("[MUON_FS_DISTRIBUTED_MIXED_DTYPES_OR_DEVICES]")
 
-        owners = self._owner_schedule(len(entries), int(world_size))
-        capacities = [int(self._fs_capacity(entry)[0]) for entry in entries]
-        split_sizes = [
-            sum(int(capacities[index]) for index in owner_indices)
-            for owner_indices in owners
+        tp_duplicated = [entry.config.tp_mode == "duplicated" for entry in entries]
+        tp_distributed = [
+            entry.config.tp_mode == "distributed"
+            and getattr(entry.dist_meta, "tp_group", None) is not None
+            and int(getattr(entry.dist_meta, "tp_world_size", 1)) > 1
+            and int(getattr(entry.dist_meta, "tp_shard_dim", -1)) in (0, 1)
+            for entry in entries
         ]
+        fs_updates = []
+        fs_metas = []
+        tp_partition_sizes = []
+        for update, entry, duplicate_tp in zip(updates, entries, tp_duplicated):
+            meta = entry.dist_meta
+            if duplicate_tp and getattr(meta, "tp_group", None) is not None:
+                full_tp_update, partition_sizes = self._gather_axis(
+                    update,
+                    group=meta.tp_group,
+                    dim=int(meta.tp_shard_dim),
+                    return_sizes=True,
+                )
+                fs_updates.append(full_tp_update)
+                fs_metas.append(
+                    replace(
+                        meta,
+                        shape=tuple(int(dim) for dim in full_tp_update.shape),
+                        local_shape=tuple(int(dim) for dim in full_tp_update.shape),
+                        tp_group=None,
+                        tp_world_size=1,
+                        tp_rank=0,
+                    )
+                )
+                tp_partition_sizes.append(partition_sizes)
+            else:
+                fs_updates.append(update)
+                fs_metas.append(meta)
+                tp_partition_sizes.append(None)
 
-        send = self._pack_updates_for_owners(updates, entries, owners, capacities, split_sizes)
-        owner_size = int(split_sizes[rank])
-        recv = updates[0].new_empty((owner_size * int(world_size),))
-        self._all_to_all_single(
-            recv,
-            send,
-            output_split_sizes=[owner_size] * int(world_size),
-            input_split_sizes=[int(size) for size in split_sizes],
-            group=group,
-        )
-
-        full_updates = self._extract_owner_full_updates(
-            recv,
-            entries,
-            owners,
-            capacities,
-            int(rank),
-            int(world_size),
-        )
-        reverse_send = self._pack_owner_results(
-            full_updates,
-            entries,
-            owners,
-            capacities,
-            int(rank),
-            int(world_size),
-        )
-        if reverse_send is None:
-            reverse_send = updates[0].new_empty((0,))
-
-        reverse_recv = updates[0].new_empty((sum(int(size) for size in split_sizes),))
-        self._all_to_all_single(
-            reverse_recv,
-            reverse_send,
-            output_split_sizes=[int(size) for size in split_sizes],
-            input_split_sizes=[owner_size] * int(world_size),
-            group=group,
-        )
-
-        local_updates = self._unpack_local_results(
-            reverse_recv,
-            entries,
-            owners,
-            capacities,
-            split_sizes,
-            int(rank),
-        )
-        for index, entry in enumerate(entries):
-            self._commit(entry, params[index], local_updates[index])
+        orthogonalized = [
+            (
+                self._orthogonalize_2d(update, entry, meta)
+                if distribute_tp
+                else self._orthogonalize_axis(
+                    update,
+                    entry,
+                    meta,
+                    shard_group=getattr(meta, "fs_group", None),
+                    shard_dim=getattr(meta, "fs_shard_dim", -1),
+                    shard_mode="distributed",
+                )
+            )
+            for update, entry, meta, distribute_tp in zip(
+                fs_updates,
+                entries,
+                fs_metas,
+                tp_distributed,
+            )
+        ]
+        for entry, param, update, duplicate_tp, partition_sizes in zip(
+            entries, params, orthogonalized, tp_duplicated, tp_partition_sizes
+        ):
+            meta = entry.dist_meta
+            if duplicate_tp and getattr(meta, "tp_group", None) is not None:
+                update = self._slice_axis(
+                    update,
+                    group=meta.tp_group,
+                    dim=int(meta.tp_shard_dim),
+                    partition_sizes=partition_sizes,
+                )
+            self._commit(entry, param, update)
 
     def _apply_muon_batches(self, batches: Sequence[MuonBatch]):
         profile = bool(getattr(self, "_muon_profile_ns", False)) and torch.cuda.is_available()
@@ -2075,7 +2137,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 mode = batch.entries[0].config.fs_mode
                 if mode == "blockwise":
                     self._apply_local_batch(batch.entries)
-                elif mode == "duplicated_debug":
+                elif mode == "duplicated":
                     self._apply_fs_duplicated_batch(batch.entries)
                 elif mode == "distributed":
                     self._apply_fs_distributed_batch(batch)

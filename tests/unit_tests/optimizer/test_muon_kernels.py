@@ -1,7 +1,10 @@
 import math
+import tempfile
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 import megatron.core.optimizer.muon.kernels as muon_kernels
 from megatron.core.optimizer.muon.backend import MuonBackend
@@ -9,7 +12,11 @@ from megatron.core.optimizer.muon.kernels import (
     apply_muon_momentum,
     get_muon_scale_factor,
     gram_newton_schulz,
+    gram_newton_schulz_1d,
+    gram_newton_schulz_2d,
     newton_schulz,
+    newton_schulz_1d,
+    newton_schulz_2d,
     orthogonalize_muon_update,
     standard_newton_schulz,
 )
@@ -155,6 +162,415 @@ def test_right_gram_backend_matches_standard_backend(shape, device):
     torch.testing.assert_close(gram, standard, rtol=3e-4, atol=3e-4)
 
 
+def _distributed_1d_worker(rank, world_size, init_file, backend_name, mode, partition_dim):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        full = torch.arange(1, 17, dtype=torch.float32).view(4, 4) / 17.0
+        local = torch.chunk(full, world_size, dim=partition_dim)[rank].contiguous()
+        common = {
+            "steps": 2,
+            "coefficient_type": "simple",
+            "tp_group": dist.group.WORLD,
+            "partition_dim": partition_dim,
+            "mode": mode,
+            "logical_shape": tuple(full.shape),
+            "fp32_matmul_prec": "highest",
+        }
+        if backend_name == "standard":
+            actual = newton_schulz_1d(local, **common)
+            expected_full = newton_schulz(
+                full,
+                steps=2,
+                coefficient_type="simple",
+                fp32_matmul_prec="highest",
+            )
+        else:
+            actual = gram_newton_schulz_1d(
+                local,
+                **common,
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+            )
+            expected_full = gram_newton_schulz(
+                full,
+                steps=2,
+                coefficient_type="simple",
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+                fp32_matmul_prec="highest",
+            )
+        expected = torch.chunk(expected_full, world_size, dim=partition_dim)[rank].contiguous()
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    finally:
+        dist.destroy_process_group()
+
+
+def _slice_range(x, ranges, rank, dim):
+    start, end = ranges[rank]
+    index = [slice(None)] * x.ndim
+    index[int(dim)] = slice(start, end)
+    return x[tuple(index)].contiguous()
+
+
+def _distributed_1d_uneven_worker(rank, world_size, init_file, backend_name, mode, partition_dim):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        full = torch.arange(1, 36, dtype=torch.float32).view(5, 7) / 35.0
+        ranges = ((0, 0), (0, 2), (2, 5)) if partition_dim == 0 else ((0, 0), (0, 3), (3, 7))
+        local = _slice_range(full, ranges, rank, partition_dim)
+        common = {
+            "steps": 2,
+            "coefficient_type": "simple",
+            "tp_group": dist.group.WORLD,
+            "partition_dim": partition_dim,
+            "mode": mode,
+            "logical_shape": tuple(full.shape),
+            "fp32_matmul_prec": "highest",
+        }
+        if backend_name == "standard":
+            actual = newton_schulz_1d(local, **common)
+            expected_full = newton_schulz(
+                full,
+                steps=2,
+                coefficient_type="simple",
+                fp32_matmul_prec="highest",
+            )
+        else:
+            actual = gram_newton_schulz_1d(
+                local,
+                **common,
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+            )
+            expected_full = gram_newton_schulz(
+                full,
+                steps=2,
+                coefficient_type="simple",
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+                fp32_matmul_prec="highest",
+            )
+        expected = _slice_range(expected_full, ranges, rank, partition_dim)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    finally:
+        dist.destroy_process_group()
+
+
+def _distributed_blockwise_worker(rank, world_size, init_file, backend_name, partition_dim):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(20260527)
+        full = torch.randn(6, 6, dtype=torch.float32)
+        local = torch.chunk(full, world_size, dim=partition_dim)[rank].contiguous()
+        common = {
+            "steps": 2,
+            "coefficient_type": "simple",
+            "tp_group": dist.group.WORLD,
+            "partition_dim": partition_dim,
+            "mode": "blockwise",
+            "logical_shape": tuple(full.shape),
+            "fp32_matmul_prec": "highest",
+        }
+        if backend_name == "standard":
+            actual = newton_schulz_1d(local, **common)
+            expected_local = newton_schulz(
+                local,
+                steps=2,
+                coefficient_type="simple",
+                fp32_matmul_prec="highest",
+            )
+            full_reference = newton_schulz(
+                full,
+                steps=2,
+                coefficient_type="simple",
+                fp32_matmul_prec="highest",
+            )
+        else:
+            actual = gram_newton_schulz_1d(
+                local,
+                **common,
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+            )
+            expected_local = gram_newton_schulz(
+                local,
+                steps=2,
+                coefficient_type="simple",
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+                fp32_matmul_prec="highest",
+            )
+            full_reference = gram_newton_schulz(
+                full,
+                steps=2,
+                coefficient_type="simple",
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+                fp32_matmul_prec="highest",
+            )
+        expected_full_slice = torch.chunk(full_reference, world_size, dim=partition_dim)[
+            rank
+        ].contiguous()
+        torch.testing.assert_close(actual, expected_local, rtol=1e-5, atol=1e-5)
+        assert not torch.allclose(actual, expected_full_slice, rtol=1e-5, atol=1e-5)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+@pytest.mark.parametrize("backend_name", ("standard", "gram"))
+@pytest.mark.parametrize("mode", ("duplicated", "distributed"))
+@pytest.mark.parametrize("partition_dim", (0, 1))
+def test_1d_sharded_newton_schulz_matches_full_reference(
+    backend_name,
+    mode,
+    partition_dim,
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mp.spawn(
+            _distributed_1d_worker,
+            args=(2, f"{tmpdir}/pg-init", backend_name, mode, partition_dim),
+            nprocs=2,
+            join=True,
+        )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+@pytest.mark.parametrize("backend_name", ("standard", "gram"))
+@pytest.mark.parametrize("mode", ("duplicated", "distributed"))
+@pytest.mark.parametrize("partition_dim", (0, 1))
+def test_1d_sharded_newton_schulz_handles_uneven_and_empty_shards(
+    backend_name,
+    mode,
+    partition_dim,
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mp.spawn(
+            _distributed_1d_uneven_worker,
+            args=(3, f"{tmpdir}/pg-init", backend_name, mode, partition_dim),
+            nprocs=3,
+            join=True,
+        )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+@pytest.mark.parametrize("backend_name", ("standard", "gram"))
+@pytest.mark.parametrize("partition_dim", (0, 1))
+def test_1d_blockwise_newton_schulz_is_shard_local_and_approximate(
+    backend_name,
+    partition_dim,
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mp.spawn(
+            _distributed_blockwise_worker,
+            args=(2, f"{tmpdir}/pg-init", backend_name, partition_dim),
+            nprocs=2,
+            join=True,
+        )
+
+
+def _distributed_2d_worker(rank, world_size, init_file, backend_name, fs_dim, tp_dim):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        row_world = 2
+        col_world = 2
+        row_rank = rank // col_world
+        col_rank = rank % col_world
+        row_groups = []
+        col_groups = []
+        for col in range(col_world):
+            row_groups.append(dist.new_group([row * col_world + col for row in range(row_world)]))
+        for row in range(row_world):
+            col_groups.append(dist.new_group([row * col_world + col for col in range(col_world)]))
+        row_group = row_groups[col_rank]
+        col_group = col_groups[row_rank]
+
+        full = torch.arange(1, 65, dtype=torch.float32).view(8, 8) / 65.0
+        first_rank = row_rank if fs_dim == 0 else col_rank
+        second_rank = col_rank if tp_dim == 1 else row_rank
+        local = torch.chunk(full, 2, dim=fs_dim)[first_rank].contiguous()
+        local = torch.chunk(local, 2, dim=tp_dim)[second_rank].contiguous()
+
+        common = {
+            "steps": 2,
+            "coefficient_type": "simple",
+            "fs_group": row_group if fs_dim == 0 else col_group,
+            "fs_partition_dim": fs_dim,
+            "tp_group": col_group if tp_dim == 1 else row_group,
+            "tp_partition_dim": tp_dim,
+            "logical_shape": tuple(full.shape),
+            "fp32_matmul_prec": "highest",
+        }
+        if backend_name == "standard":
+            actual = newton_schulz_2d(local, **common)
+            expected_full = newton_schulz(
+                full,
+                steps=2,
+                coefficient_type="simple",
+                fp32_matmul_prec="highest",
+            )
+        else:
+            actual = gram_newton_schulz_2d(
+                local,
+                **common,
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+            )
+            expected_full = gram_newton_schulz(
+                full,
+                steps=2,
+                coefficient_type="simple",
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+                fp32_matmul_prec="highest",
+            )
+        expected = torch.chunk(expected_full, 2, dim=fs_dim)[first_rank].contiguous()
+        expected = torch.chunk(expected, 2, dim=tp_dim)[second_rank].contiguous()
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    finally:
+        dist.destroy_process_group()
+
+
+def _distributed_2d_uneven_worker(rank, world_size, init_file, backend_name, fs_dim, tp_dim):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        row_world = 2
+        col_world = 2
+        row_rank = rank // col_world
+        col_rank = rank % col_world
+        row_groups = []
+        col_groups = []
+        for col in range(col_world):
+            row_groups.append(dist.new_group([row * col_world + col for row in range(row_world)]))
+        for row in range(row_world):
+            col_groups.append(dist.new_group([row * col_world + col for col in range(col_world)]))
+        row_group = row_groups[col_rank]
+        col_group = col_groups[row_rank]
+
+        if fs_dim == 0:
+            full = torch.arange(1, 36, dtype=torch.float32).view(5, 7) / 35.0
+            fs_ranges = ((0, 0), (0, 5))
+            tp_ranges = ((0, 3), (3, 7))
+            local = _slice_range(full, fs_ranges, row_rank, 0)
+            local = _slice_range(local, tp_ranges, col_rank, 1)
+            fs_group = row_group
+            tp_group = col_group
+            fs_rank = row_rank
+            tp_rank = col_rank
+        else:
+            full = torch.arange(1, 36, dtype=torch.float32).view(7, 5) / 35.0
+            fs_ranges = ((0, 0), (0, 5))
+            tp_ranges = ((0, 3), (3, 7))
+            local = _slice_range(full, tp_ranges, row_rank, 0)
+            local = _slice_range(local, fs_ranges, col_rank, 1)
+            fs_group = col_group
+            tp_group = row_group
+            fs_rank = col_rank
+            tp_rank = row_rank
+
+        common = {
+            "steps": 2,
+            "coefficient_type": "simple",
+            "fs_group": fs_group,
+            "fs_partition_dim": fs_dim,
+            "tp_group": tp_group,
+            "tp_partition_dim": tp_dim,
+            "logical_shape": tuple(full.shape),
+            "fp32_matmul_prec": "highest",
+        }
+        if backend_name == "standard":
+            actual = newton_schulz_2d(local, **common)
+            expected_full = newton_schulz(
+                full,
+                steps=2,
+                coefficient_type="simple",
+                fp32_matmul_prec="highest",
+            )
+        else:
+            actual = gram_newton_schulz_2d(
+                local,
+                **common,
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+            )
+            expected_full = gram_newton_schulz(
+                full,
+                steps=2,
+                coefficient_type="simple",
+                gram_dtype=torch.float32,
+                gram_kernel_policy="torch",
+                fp32_matmul_prec="highest",
+            )
+        if fs_dim == 0:
+            expected = _slice_range(expected_full, fs_ranges, fs_rank, 0)
+            expected = _slice_range(expected, tp_ranges, tp_rank, 1)
+        else:
+            expected = _slice_range(expected_full, tp_ranges, tp_rank, 0)
+            expected = _slice_range(expected, fs_ranges, fs_rank, 1)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+@pytest.mark.parametrize("backend_name", ("standard", "gram"))
+@pytest.mark.parametrize("fs_dim,tp_dim", ((0, 1), (1, 0)))
+def test_2d_sharded_newton_schulz_matches_full_reference(
+    backend_name,
+    fs_dim,
+    tp_dim,
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mp.spawn(
+            _distributed_2d_worker,
+            args=(4, f"{tmpdir}/pg-init", backend_name, fs_dim, tp_dim),
+            nprocs=4,
+            join=True,
+        )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+@pytest.mark.parametrize("backend_name", ("standard", "gram"))
+@pytest.mark.parametrize("fs_dim,tp_dim", ((0, 1), (1, 0)))
+def test_2d_sharded_newton_schulz_handles_uneven_and_empty_split_ranges(
+    backend_name,
+    fs_dim,
+    tp_dim,
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mp.spawn(
+            _distributed_2d_uneven_worker,
+            args=(4, f"{tmpdir}/pg-init", backend_name, fs_dim, tp_dim),
+            nprocs=4,
+            join=True,
+        )
+
+
 def test_gram_kernel_policy_dispatches_to_dao_backend(monkeypatch):
     calls = []
 
@@ -182,6 +598,7 @@ def test_gram_kernel_policy_dispatches_to_dao_backend(monkeypatch):
             return torch.addmm(C, a, b, beta=beta)
 
     monkeypatch.setattr(muon_kernels, "_dao_gram_eligible", lambda x: True)
+    monkeypatch.setattr(muon_kernels, "_dao_gram_fallback_reason", lambda x: None)
     monkeypatch.setattr(muon_kernels, "_DAO_GRAM_BACKEND", FakeDaoBackend())
     monkeypatch.setattr(muon_kernels, "_DAO_GRAM_IMPORT_ERROR", None)
 
@@ -208,6 +625,7 @@ def test_gram_kernel_policy_dispatches_to_dao_backend(monkeypatch):
 
 def test_gram_kernel_policy_auto_falls_back_when_dao_unavailable(monkeypatch):
     monkeypatch.setattr(muon_kernels, "_dao_gram_eligible", lambda x: True)
+    monkeypatch.setattr(muon_kernels, "_dao_gram_fallback_reason", lambda x: None)
     monkeypatch.setattr(muon_kernels, "_DAO_GRAM_BACKEND", None)
     monkeypatch.setattr(muon_kernels, "_DAO_GRAM_IMPORT_ERROR", ImportError("missing quack"))
 

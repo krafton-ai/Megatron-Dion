@@ -48,6 +48,11 @@ def _can_reuse_dense_rp_grad(optimizer, shard_param) -> bool:
     return getattr(dist_meta, "param_config", None) is not None
 
 
+def _matrix_grads_are_replicate_synced(optimizer) -> bool:
+    checker = getattr(optimizer, "_matrix_grads_are_replicate_synced", None)
+    return bool(checker()) if checker is not None else False
+
+
 def _grad_sum_sq_fp64(tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.detach()
     total_sq = torch.zeros(1, dtype=torch.float64, device=tensor.device)
@@ -97,6 +102,8 @@ def matrix_replica_grads(
     ]
     replica_group = optimizer._get_replicate_group() if dist.is_initialized() else None
     if replica_group is None or optimizer._group_size(replica_group) <= 1:
+        return local_grads if count_matrix_grad else []
+    if _matrix_grads_are_replicate_synced(optimizer):
         return local_grads if count_matrix_grad else []
 
     groups_by_dtype_device = {}
@@ -161,6 +168,13 @@ def _matrix_grad_norm_sq(
     ]
     replica_group = optimizer._get_replicate_group() if dist.is_initialized() else None
     if replica_group is None or optimizer._group_size(replica_group) <= 1:
+        if not count_matrix_grad:
+            return None
+        total_sq = torch.zeros(1, dtype=torch.float64, device=local_grads[0].device)
+        for grad in local_grads:
+            total_sq += _grad_sum_sq_fp64(grad)
+        return total_sq
+    if _matrix_grads_are_replicate_synced(optimizer):
         if not count_matrix_grad:
             return None
         total_sq = torch.zeros(1, dtype=torch.float64, device=local_grads[0].device)

@@ -86,6 +86,7 @@ class MegatronMuon(torch.optim.AdamW):
         num_ns_steps: int = 5,
         ns_backend: str = "standard",
         gram_restart_steps: tuple[int, ...] = (2,),
+        gram_dtype: Optional[torch.dtype | str] = None,
         gram_kernel_policy: str = "torch",
         scale_mode: str = "spectral",
         extra_scale_factor: float = 1.0,
@@ -95,11 +96,13 @@ class MegatronMuon(torch.optim.AdamW):
     ) -> None:
         if int(num_ns_steps) < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
-        if fs_mode not in ("blockwise", "distributed", "duplicated_debug"):
+        if fs_mode == "duplicated_debug":
+            fs_mode = "duplicated"
+        if tp_mode == "duplicated_debug":
+            tp_mode = "duplicated"
+        if fs_mode not in ("blockwise", "duplicated", "distributed"):
             raise ValueError(f"invalid Muon fs_mode: {fs_mode}")
-        if tp_mode == "duplicated":
-            tp_mode = "duplicated_debug"
-        if tp_mode not in ("blockwise", "distributed", "duplicated_debug"):
+        if tp_mode not in ("blockwise", "duplicated", "distributed"):
             raise ValueError(f"invalid Muon tp_mode: {tp_mode}")
         if ns_backend not in ("standard", "gram"):
             raise ValueError(f"invalid Muon ns_backend: {ns_backend}")
@@ -118,6 +121,7 @@ class MegatronMuon(torch.optim.AdamW):
             num_ns_steps=int(num_ns_steps),
             ns_backend=ns_backend,
             gram_restart_steps=tuple(int(step) for step in gram_restart_steps),
+            gram_dtype=gram_dtype,
             gram_kernel_policy=gram_kernel_policy,
             scale_mode=scale_mode,
             extra_scale_factor=extra_scale_factor,
@@ -192,6 +196,11 @@ class MegatronMuon(torch.optim.AdamW):
         partition_dim = getattr(parent_param, "partition_dim", None)
         if partition_dim == -1:
             partition_dim = None
+        logical_shape = logical_shape_for_tp(
+            update,
+            partition_dim=partition_dim,
+            tp_group=tp_group,
+        )
 
         orth_update = orthogonalize_muon(
             update,
@@ -201,9 +210,11 @@ class MegatronMuon(torch.optim.AdamW):
             tp_group=tp_group,
             partition_dim=partition_dim,
             tp_mode=group.get("tp_mode", self.defaults["tp_mode"]),
+            logical_shape=logical_shape,
             gram_restart_steps=group.get(
                 "gram_restart_steps", self.defaults["gram_restart_steps"]
             ),
+            gram_dtype=group.get("gram_dtype", self.defaults["gram_dtype"]),
             gram_kernel_policy=group.get(
                 "gram_kernel_policy", self.defaults["gram_kernel_policy"]
             ),
@@ -211,11 +222,7 @@ class MegatronMuon(torch.optim.AdamW):
                 "fp32_matmul_prec", self.defaults["fp32_matmul_prec"]
             ),
         )
-        m, n = logical_shape_for_tp(
-            update,
-            partition_dim=partition_dim,
-            tp_group=tp_group,
-        )
+        m, n = logical_shape
         scale = muon_scale_factor(m, n, group.get("scale_mode", self.defaults["scale_mode"]))
         return orth_update * (scale * float(group.get("extra_scale_factor", 1.0)))
 
@@ -226,6 +233,7 @@ class MegatronMuon(torch.optim.AdamW):
         partition_dim = getattr(param, "partition_dim", None)
         if partition_dim == -1:
             partition_dim = None
+        logical_shape = logical_shape_for_tp(update, partition_dim=partition_dim, tp_group=tp_group)
         orth_update = orthogonalize_muon(
             update,
             ns_backend=group.get("ns_backend", self.defaults["ns_backend"]),
@@ -234,9 +242,11 @@ class MegatronMuon(torch.optim.AdamW):
             tp_group=tp_group,
             partition_dim=partition_dim,
             tp_mode=group.get("tp_mode", self.defaults["tp_mode"]),
+            logical_shape=logical_shape,
             gram_restart_steps=group.get(
                 "gram_restart_steps", self.defaults["gram_restart_steps"]
             ),
+            gram_dtype=group.get("gram_dtype", self.defaults["gram_dtype"]),
             gram_kernel_policy=group.get(
                 "gram_kernel_policy", self.defaults["gram_kernel_policy"]
             ),
@@ -244,7 +254,7 @@ class MegatronMuon(torch.optim.AdamW):
                 "fp32_matmul_prec", self.defaults["fp32_matmul_prec"]
             ),
         )
-        m, n = logical_shape_for_tp(update, partition_dim=partition_dim, tp_group=tp_group)
+        m, n = logical_shape
         scale = muon_scale_factor(m, n, group.get("scale_mode", self.defaults["scale_mode"]))
         return orth_update * (scale * float(group.get("extra_scale_factor", 1.0)))
 
@@ -329,6 +339,7 @@ def build_muon_optimizer(
                 getattr(config, "muon_gram_ns_restart_iters", (2,)),
             )
         ),
+        gram_dtype=getattr(config, "muon_gram_ns_dtype", None),
         gram_kernel_policy=getattr(config, "muon_gram_ns_kernel_policy", "torch"),
         scale_mode=config.muon_scale_mode,
         extra_scale_factor=config.muon_extra_scale_factor,

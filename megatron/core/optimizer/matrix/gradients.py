@@ -978,6 +978,26 @@ def get_standard_inter_instance_grad_buffer(bucket) -> torch.Tensor | None:
     return grad_transport.standard_grad
 
 
+def get_inter_instance_grad_buffers(bucket) -> tuple[torch.Tensor, ...]:
+    """Return Matrix-owned grad buffers that need inter-instance reduction."""
+    if bool(getattr(bucket, "_matrix_use_full_grad_after_sync", False)):
+        grad_data = getattr(bucket, "grad_data", None)
+        return (grad_data,) if grad_data is not None and grad_data.numel() > 0 else ()
+
+    grad_transport = getattr(bucket, "_matrix_grad_transport", None)
+    if grad_transport is None:
+        return ()
+
+    buffers = []
+    matrix_grad_shard = getattr(grad_transport, "matrix_grad_shard", None)
+    if matrix_grad_shard is not None and matrix_grad_shard.numel() > 0:
+        buffers.append(matrix_grad_shard)
+    standard_grad = getattr(grad_transport, "standard_grad", None)
+    if standard_grad is not None and standard_grad.numel() > 0:
+        buffers.append(standard_grad)
+    return tuple(buffers)
+
+
 def clear_grad_transport(bucket) -> None:
     """Drop any stale Matrix grad transport cached on a bucket."""
     wait_grad_transport(bucket)

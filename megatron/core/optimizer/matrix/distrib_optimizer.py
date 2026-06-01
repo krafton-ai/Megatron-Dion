@@ -541,6 +541,14 @@ class DistributedMatrixOptimizer(DistributedOptimizer):
     def _get_standard_inter_instance_grad_buffer(bucket):
         return get_standard_inter_instance_grad_buffer(bucket)
 
+    @staticmethod
+    def _get_inter_instance_grad_buffers(bucket):
+        standard_grad = get_standard_inter_instance_grad_buffer(bucket)
+        return (standard_grad,) if standard_grad is not None and standard_grad.numel() > 0 else ()
+
+    def _matrix_grads_are_replicate_synced(self) -> bool:
+        return False
+
     def _set_local_grad(self, model_param, local_grad) -> None:
         self._matrix_local_grad_by_param[model_param] = local_grad
 

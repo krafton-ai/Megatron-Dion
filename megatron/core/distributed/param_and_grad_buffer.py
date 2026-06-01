@@ -685,21 +685,23 @@ class _ParamAndGradBucketGroup:
                                 group=self.inter_distributed_optimizer_instance_group,
                                 async_op=async_op,
                             )
-                    elif has_standard:
+                    elif has_matrix:
                         optimizer = getattr(bucket, "matrix_optimizer", None)
-                        if not hasattr(
-                            optimizer, "_get_standard_inter_instance_grad_buffer"
-                        ):
+                        get_inter_instance_grad_buffers = (
+                            getattr(optimizer, "_get_inter_instance_grad_buffers", None)
+                            if optimizer is not None
+                            else None
+                        )
+                        if get_inter_instance_grad_buffers is None:
                             raise RuntimeError(
-                                "[MatrixOptimizer] missing adapter inter-instance standard grad hook "
+                                "[MatrixOptimizer] missing adapter inter-instance grad hook "
                                 f"for bucket={getattr(bucket, 'bucket_id', -1)}"
                             )
-                        standard_data_view = (
-                            optimizer._get_standard_inter_instance_grad_buffer(bucket)
-                        )
-                        if standard_data_view is not None and standard_data_view.numel() > 0:
+                        for grad_buffer in get_inter_instance_grad_buffers(bucket):
+                            if grad_buffer is None or grad_buffer.numel() == 0:
+                                continue
                             torch.distributed.all_reduce(
-                                standard_data_view,
+                                grad_buffer,
                                 op=reduce_op,
                                 group=self.inter_distributed_optimizer_instance_group,
                                 async_op=async_op,

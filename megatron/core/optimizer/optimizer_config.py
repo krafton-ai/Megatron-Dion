@@ -293,6 +293,9 @@ class OptimizerConfig:
     muon_gram_ns_kernel_policy: str = "torch"
     """Kernel policy for Gram Newton-Schulz. Valid values include "torch", "auto", and "dao"."""
 
+    muon_gram_ns_dtype: Optional[str] = None
+    """Optional compute dtype override for Gram Newton-Schulz."""
+
     muon_split_linear: bool = True
     """Whether to split fused gate/up linear_fc1 parameters for Muon optimizer."""
 

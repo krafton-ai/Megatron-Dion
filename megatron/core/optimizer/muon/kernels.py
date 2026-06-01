@@ -186,6 +186,29 @@ def _dist_world_size(group) -> int:
     return int(dist.get_world_size(group))
 
 
+def _split_range(size: int, world_size: int, rank: int) -> tuple[int, int]:
+    base = int(size) // int(world_size)
+    rem = int(size) % int(world_size)
+    start = int(rank) * base + min(int(rank), rem)
+    return start, start + base + (1 if int(rank) < rem else 0)
+
+
+def _normalize_shard_mode(mode: Optional[str]) -> str:
+    mode = "blockwise" if mode is None else str(mode)
+    if mode == "duplicated_debug":
+        mode = "duplicated"
+    if mode not in ("blockwise", "duplicated", "distributed"):
+        raise RuntimeError(f"[MUON_INVALID_SHARD_MODE] mode={mode!r}")
+    return mode
+
+
+def _normalize_gram_restart_steps(restart_steps: tuple[int, ...], num_steps: int) -> set[int]:
+    restarts = {int(step) for step in restart_steps}
+    if any(step < 0 for step in restarts):
+        raise RuntimeError(f"[MUON_INVALID_GRAM_RESTART_STEPS] steps={tuple(restarts)}")
+    return {step for step in restarts if step < int(num_steps)}
+
+
 def _make_dao_gram_backend():
     global _DAO_GRAM_BACKEND, _DAO_GRAM_IMPORT_ERROR
     if _DAO_GRAM_BACKEND is not None:
@@ -224,8 +247,12 @@ def _load_dao_gemm_ops():
         alpha=alpha,
         beta=beta,
     )
-    _DAO_MM = backend.mm
-    _DAO_MM_ADD = lambda a, b, *, C, beta=1.0: backend.mm_add(a, b, C=C, beta=beta)
+    # Keep Dao/Quack on the symmetric Gram kernels, where the custom kernel is
+    # useful. Generic GEMM goes through Quack autotuning per shape; full MCore
+    # runs hit many Muon matrix shapes in one optimizer step and can retain
+    # enough autotune workspace to OOM before the next forward.
+    _DAO_MM = _TORCH_GRAM_BACKEND.mm
+    _DAO_MM_ADD = _TORCH_GRAM_BACKEND.mm_add
     return _DAO_SYM_MM, _DAO_SYM_BADDMM, _DAO_MM, _DAO_MM_ADD
 
 
@@ -244,6 +271,19 @@ def _normalize_gram_kernel_policy(policy: Optional[str]) -> str:
 
 def _dao_gram_eligible(x: Tensor) -> bool:
     return _dao_gram_fallback_reason(x) is None
+
+
+def _default_gram_dtype(x: Tensor, *, policy: str) -> Optional[torch.dtype]:
+    if not x.is_cuda or x.dtype == torch.float64:
+        return None
+    policy = _normalize_gram_kernel_policy(policy)
+    if policy not in ("dao", "compile"):
+        return None
+    if min(int(x.size(-2)), int(x.size(-1))) <= _DAO_GRAM_TILE_SIZE:
+        return None
+    if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
 
 
 def _select_gram_backend(x: Tensor, *, policy: Optional[str]):
@@ -430,8 +470,8 @@ def _compiled_gram_newton_schulz(
     backend_name: str = "dao",
 ) -> Tensor:
     dtype = _str_to_dtype(gram_dtype)
-    if dtype is None and x.is_cuda:
-        dtype = torch.float16
+    if dtype is None:
+        dtype = _default_gram_dtype(x, policy=backend_name)
     coeffs = tuple(
         _coefficients(
             steps,
@@ -502,6 +542,12 @@ def _normalize_ns_input(x: Tensor, *, eps: float = 1e-7, group=None) -> tuple[Te
     dtype = torch.float64 if x_work.dtype == torch.float64 else torch.float32
     x_work = x_work.to(dtype=dtype)
     return _normalize_frobenius(x_work, eps=eps, group=group), transposed
+
+
+def _logical_transpose(x: Tensor, logical_shape: Optional[tuple[int, int]]) -> bool:
+    if logical_shape is None:
+        return bool(x.size(-2) > x.size(-1))
+    return int(logical_shape[0]) > int(logical_shape[1])
 
 
 def muon_scale_factor(m: int, n: int, mode: str = "spectral") -> float:
@@ -579,22 +625,42 @@ def newton_schulz(
         raise RuntimeError(f"[MUON_INVALID_GRAM_SIDE] gram_side={gram_side!r}")
 
     original_dtype = x.dtype
+    first_gram = None
+    fused_norm = _dist_world_size(tp_group) > 1
     if transpose is None:
-        x_work, transposed = _normalize_ns_input(x, eps=eps, group=tp_group)
+        transposed = x.size(-2) > x.size(-1)
+        x_oriented = x.mT if transposed else x
+        dtype = torch.float64 if x_oriented.dtype == torch.float64 else torch.float32
+        x_work = x_oriented.to(dtype=dtype)
     else:
         x_oriented = x.mT if transpose else x
         dtype = torch.float64 if x_oriented.dtype == torch.float64 else torch.float32
-        x_work = _normalize_frobenius(x_oriented.to(dtype=dtype), eps=eps, group=tp_group)
+        x_work = x_oriented.to(dtype=dtype)
         transposed = bool(transpose)
 
     with _matmul_precision(fp32_matmul_prec):
+        if fused_norm:
+            first_gram = x_work @ x_work.mT if gram_side == "left" else x_work.mT @ x_work
+            dist.all_reduce(first_gram, op=dist.ReduceOp.SUM, group=tp_group)
+            norm_sq = torch.diagonal(first_gram.float(), dim1=-2, dim2=-1).sum(dim=-1)
+            norm_sq = norm_sq.view(*norm_sq.shape, 1, 1)
+            inv_norm = norm_sq.sqrt().clamp_min(float(eps)).reciprocal()
+            x_work = x_work * inv_norm
+            first_gram = first_gram * inv_norm.square()
+        else:
+            x_work = _normalize_frobenius(x_work, eps=eps, group=tp_group)
         for a, b, c in _coefficients(
             steps,
             coefficient_type=coefficient_type,
             custom_coefficient_sets=custom_coefficient_sets,
         ):
-            gram = x_work @ x_work.mT if gram_side == "left" else x_work.mT @ x_work
-            if _dist_world_size(tp_group) > 1:
+            use_first_gram = first_gram is not None
+            if use_first_gram:
+                gram = first_gram
+                first_gram = None
+            else:
+                gram = x_work @ x_work.mT if gram_side == "left" else x_work.mT @ x_work
+            if _dist_world_size(tp_group) > 1 and not use_first_gram:
                 dist.all_reduce(gram, op=dist.ReduceOp.SUM, group=tp_group)
             gram2 = gram @ gram
             poly = b * gram + c * gram2
@@ -612,11 +678,33 @@ def _all_gather_matrix(
     *,
     partition_dim: int,
     tp_group: dist.ProcessGroup,
-) -> Tensor:
+    return_sizes: bool = False,
+) -> Tensor | tuple[Tensor, tuple[int, ...]]:
     world_size = dist.get_world_size(tp_group)
-    shards = [torch.empty_like(x) for _ in range(world_size)]
-    dist.all_gather(shards, x.contiguous(), group=tp_group)
-    return torch.cat(shards, dim=int(partition_dim))
+    matrix_dim = x.ndim - 2 + int(partition_dim)
+    local_size = torch.tensor([int(x.size(matrix_dim))], device=x.device, dtype=torch.int64)
+    gathered_sizes = [torch.empty_like(local_size) for _ in range(world_size)]
+    dist.all_gather(gathered_sizes, local_size, group=tp_group)
+    sizes = [int(size.item()) for size in gathered_sizes]
+    max_size = max(sizes)
+    if max_size == int(local_size.item()):
+        send = x.contiguous()
+    else:
+        padded_shape = list(x.shape)
+        padded_shape[matrix_dim] = max_size
+        send = x.new_zeros(tuple(padded_shape))
+        index = [slice(None)] * x.ndim
+        index[matrix_dim] = slice(0, int(local_size.item()))
+        send[tuple(index)].copy_(x.contiguous())
+    gathered = [torch.empty_like(send) for _ in range(world_size)]
+    dist.all_gather(gathered, send, group=tp_group)
+    shards = []
+    for shard, size in zip(gathered, sizes):
+        index = [slice(None)] * x.ndim
+        index[matrix_dim] = slice(0, int(size))
+        shards.append(shard[tuple(index)])
+    gathered = torch.cat(shards, dim=matrix_dim)
+    return (gathered, tuple(sizes)) if return_sizes else gathered
 
 
 def _slice_tp_matrix(
@@ -624,14 +712,27 @@ def _slice_tp_matrix(
     *,
     partition_dim: int,
     tp_group: dist.ProcessGroup,
+    partition_sizes: Optional[tuple[int, ...]] = None,
 ) -> Tensor:
     world_size = dist.get_world_size(tp_group)
     rank = dist.get_rank(tp_group)
-    chunks = torch.chunk(x, world_size, dim=int(partition_dim))
-    return chunks[rank].contiguous()
+    matrix_dim = x.ndim - 2 + int(partition_dim)
+    if partition_sizes is None:
+        start, end = _split_range(int(x.size(matrix_dim)), int(world_size), int(rank))
+    else:
+        if len(partition_sizes) != int(world_size):
+            raise RuntimeError(
+                "[MUON_INVALID_PARTITION_SIZES] "
+                f"num_sizes={len(partition_sizes)} world_size={int(world_size)}"
+            )
+        start = sum(int(size) for size in partition_sizes[: int(rank)])
+        end = start + int(partition_sizes[int(rank)])
+    index = [slice(None)] * x.ndim
+    index[matrix_dim] = slice(start, end)
+    return x[tuple(index)].contiguous()
 
 
-def newton_schulz_tp(
+def newton_schulz_1d(
     x: Tensor,
     *,
     steps: int = 5,
@@ -640,13 +741,12 @@ def newton_schulz_tp(
     partition_dim: Optional[int] = None,
     mode: Optional[str] = None,
     tp_mode: Optional[str] = None,
+    logical_shape: Optional[tuple[int, int]] = None,
     eps: float = 1e-7,
     fp32_matmul_prec: str = "medium",
 ) -> Tensor:
-    """TP-aware Newton-Schulz using explicit collectives."""
-    mode = tp_mode if tp_mode is not None else ("blockwise" if mode is None else mode)
-    if mode == "duplicated":
-        mode = "duplicated_debug"
+    """1D-shard-aware Newton-Schulz using explicit collectives."""
+    mode = _normalize_shard_mode(tp_mode if tp_mode is not None else mode)
     if tp_group is None or partition_dim is None or int(partition_dim) < 0:
         return newton_schulz(
             x,
@@ -664,8 +764,13 @@ def newton_schulz_tp(
             fp32_matmul_prec=fp32_matmul_prec,
         )
 
-    if mode == "duplicated_debug":
-        full = _all_gather_matrix(x, partition_dim=int(partition_dim), tp_group=tp_group)
+    if mode == "duplicated":
+        full, partition_sizes = _all_gather_matrix(
+            x,
+            partition_dim=int(partition_dim),
+            tp_group=tp_group,
+            return_sizes=True,
+        )
         full_update = newton_schulz(
             full,
             steps=steps,
@@ -673,12 +778,18 @@ def newton_schulz_tp(
             eps=eps,
             fp32_matmul_prec=fp32_matmul_prec,
         )
-        return _slice_tp_matrix(full_update, partition_dim=int(partition_dim), tp_group=tp_group)
+        return _slice_tp_matrix(
+            full_update,
+            partition_dim=int(partition_dim),
+            tp_group=tp_group,
+            partition_sizes=partition_sizes,
+        )
 
-    if mode != "distributed":
-        raise RuntimeError(f"[MUON_INVALID_TP_MODE] mode={mode!r}")
-
-    transposed, oriented_partition_dim = _tp_oriented_partition_dim(x, int(partition_dim))
+    transposed, oriented_partition_dim = _oriented_partition_dim(
+        x,
+        int(partition_dim),
+        logical_shape=logical_shape,
+    )
     return newton_schulz(
         x,
         steps=steps,
@@ -689,6 +800,11 @@ def newton_schulz_tp(
         tp_group=tp_group,
         gram_side="left" if oriented_partition_dim == 1 else "right",
     )
+
+
+def newton_schulz_tp(x: Tensor, **kwargs) -> Tensor:
+    """Compatibility wrapper for the generic 1D-sharded Newton-Schulz helper."""
+    return newton_schulz_1d(x, **kwargs)
 
 
 def _gram_eye(r: Tensor) -> Tensor:
@@ -720,10 +836,19 @@ def _form_distributed_gram(
     return gram
 
 
-def _tp_oriented_partition_dim(x: Tensor, partition_dim: int) -> tuple[bool, int]:
-    transposed = x.size(-2) > x.size(-1)
+def _oriented_partition_dim(
+    x: Tensor,
+    partition_dim: int,
+    *,
+    logical_shape: Optional[tuple[int, int]] = None,
+) -> tuple[bool, int]:
+    transposed = _logical_transpose(x, logical_shape)
     oriented_partition_dim = 1 - int(partition_dim) if transposed else int(partition_dim)
     return transposed, oriented_partition_dim
+
+
+def _tp_oriented_partition_dim(x: Tensor, partition_dim: int) -> tuple[bool, int]:
+    return _oriented_partition_dim(x, partition_dim)
 
 
 def _gram_newton_schulz_impl(
@@ -737,6 +862,7 @@ def _gram_newton_schulz_impl(
     eps: float = 1e-7,
     fp32_matmul_prec: str = "medium",
     tp_group: Optional[dist.ProcessGroup] = None,
+    transpose: Optional[bool] = None,
     gram_side: str = "left",
     gram_kernel_policy: str = "torch",
 ) -> Tensor:
@@ -748,38 +874,87 @@ def _gram_newton_schulz_impl(
     if restart_iterations is not None:
         restart_steps = restart_iterations
     original_dtype = x.dtype
-    x_work, transposed = _normalize_ns_input(x, eps=eps, group=tp_group)
+    policy = _normalize_gram_kernel_policy(gram_kernel_policy)
+    if transpose is None:
+        transposed = x.size(-2) > x.size(-1)
+        x_oriented = x.mT if transposed else x
+        dtype = torch.float64 if x_oriented.dtype == torch.float64 else torch.float32
+        x_work = x_oriented.to(dtype=dtype)
+    else:
+        x_oriented = x.mT if bool(transpose) else x
+        dtype = torch.float64 if x_oriented.dtype == torch.float64 else torch.float32
+        x_work = x_oriented.to(dtype=dtype)
+        transposed = bool(transpose)
     dtype = _str_to_dtype(gram_dtype)
-    if dtype is None and x_work.is_cuda:
-        dtype = torch.float16
+    if dtype is None:
+        dtype = (
+            None
+            if _dist_world_size(tp_group) > 1
+            else _default_gram_dtype(x_work, policy=policy)
+        )
     if dtype is not None:
         x_work = x_work.to(dtype=dtype)
-    ops = _select_gram_backend(x_work, policy=gram_kernel_policy)
+    ops = _select_gram_backend(x_work, policy=policy)
+    first_gram = None
+    if _dist_world_size(tp_group) > 1:
+        first_gram = _form_distributed_gram(
+            x_work,
+            group=tp_group,
+            side=gram_side,
+            ops=ops,
+        )
+        norm_sq = torch.diagonal(first_gram.float(), dim1=-2, dim2=-1).sum(dim=-1)
+        norm_sq = norm_sq.view(*norm_sq.shape, 1, 1)
+        inv_norm = norm_sq.sqrt().clamp_min(float(eps)).reciprocal()
+        x_work = x_work * inv_norm
+        first_gram = first_gram * inv_norm.square()
+    else:
+        x_work = _normalize_frobenius(x_work, eps=eps)
 
     coeffs = tuple(_coefficients(steps, coefficient_type=coefficient_type))
     if gram_side == "right":
+        restarts = _normalize_gram_restart_steps(restart_steps, len(coeffs))
         with _matmul_precision(fp32_matmul_prec):
-            for a, b, c in coeffs:
-                gram = _form_distributed_gram(
-                    x_work,
-                    group=tp_group,
-                    side="right",
-                    ops=ops,
-                )
-                poly = ops.sym_baddmm(gram, gram, C=gram, alpha=c, beta=b)
-                x_work = ops.mm_add(x_work, poly, C=x_work, beta=a)
+            r = first_gram
+            first_gram = None
+            if r is None:
+                r = _form_distributed_gram(x_work, group=tp_group, side="right", ops=ops)
+            eye = _gram_eye(r)
+            q: Optional[Tensor] = None
+            for step, (a, b, c) in enumerate(coeffs):
+                if step in restarts and step != 0:
+                    if q is None:
+                        raise RuntimeError("[MUON_GRAM_NS_MISSING_Q_AT_RESTART]")
+                    x_work = ops.mm(x_work, q)
+                    r = _form_distributed_gram(x_work, group=tp_group, side="right", ops=ops)
+                    q = None
+
+                z = ops.sym_baddmm(r, r, C=r, alpha=c, beta=b)
+                q = z + a * eye if q is None else ops.sym_baddmm(q, z, C=q, beta=a)
+
+                if step < len(coeffs) - 1 and (step + 1) not in restarts:
+                    rz = ops.sym_baddmm(r, z, C=r, beta=a)
+                    r = ops.sym_baddmm(z, rz, C=rz, beta=a)
+            if q is None:
+                raise RuntimeError("[MUON_GRAM_NS_MISSING_FINAL_Q]")
+            x_work = ops.mm(x_work, q)
     elif x_work.size(-2) == x_work.size(-1):
         with _matmul_precision(fp32_matmul_prec):
             for a, b, c in coeffs:
-                gram = _form_distributed_gram(x_work, group=tp_group, ops=ops)
+                if first_gram is not None:
+                    gram = first_gram
+                    first_gram = None
+                else:
+                    gram = _form_distributed_gram(x_work, group=tp_group, ops=ops)
                 poly = ops.sym_baddmm(gram, gram, C=gram, alpha=c, beta=b)
                 x_work = ops.mm_add(poly, x_work, C=x_work, beta=a)
     else:
-        restarts = {int(step) for step in restart_steps}
-        if any(step < 0 or step >= len(coeffs) for step in restarts):
-            raise RuntimeError(f"[MUON_INVALID_GRAM_RESTART_STEPS] steps={tuple(restarts)}")
+        restarts = _normalize_gram_restart_steps(restart_steps, len(coeffs))
         with _matmul_precision(fp32_matmul_prec):
-            r = _form_distributed_gram(x_work, group=tp_group, ops=ops)
+            r = first_gram
+            first_gram = None
+            if r is None:
+                r = _form_distributed_gram(x_work, group=tp_group, ops=ops)
             eye = _gram_eye(r)
             q: Optional[Tensor] = None
             for step, (a, b, c) in enumerate(coeffs):
@@ -817,6 +992,7 @@ def gram_newton_schulz(
     eps: float = 1e-7,
     fp32_matmul_prec: str = "medium",
     tp_group: Optional[dist.ProcessGroup] = None,
+    transpose: Optional[bool] = None,
     gram_side: str = "left",
     gram_kernel_policy: str = "torch",
 ) -> Tensor:
@@ -824,7 +1000,7 @@ def gram_newton_schulz(
         restart_steps = restart_iterations
     policy = _normalize_gram_kernel_policy(gram_kernel_policy)
     compile_requested = policy == "compile" or os.getenv("MEGATRON_MUON_COMPILE_GRAM_NS", "0") == "1"
-    if compile_requested and tp_group is None and gram_side == "left":
+    if compile_requested and tp_group is None and transpose is None and gram_side == "left":
         backend_name = "torch" if policy == "torch" else "dao"
         return _compiled_gram_newton_schulz(
             x,
@@ -846,12 +1022,13 @@ def gram_newton_schulz(
         eps=eps,
         fp32_matmul_prec=fp32_matmul_prec,
         tp_group=tp_group,
+        transpose=transpose,
         gram_side=gram_side,
         gram_kernel_policy=policy,
     )
 
 
-def gram_newton_schulz_tp(
+def gram_newton_schulz_1d(
     x: Tensor,
     *,
     steps: int = 5,
@@ -862,13 +1039,13 @@ def gram_newton_schulz_tp(
     tp_group: Optional[dist.ProcessGroup] = None,
     partition_dim: Optional[int] = None,
     mode: str = "blockwise",
+    logical_shape: Optional[tuple[int, int]] = None,
     eps: float = 1e-7,
     fp32_matmul_prec: str = "medium",
     gram_kernel_policy: str = "torch",
 ) -> Tensor:
-    """TP-aware Gram Newton-Schulz using no full gather outside debug mode."""
-    if mode == "duplicated":
-        mode = "duplicated_debug"
+    """1D-shard-aware Gram Newton-Schulz using no full gather outside duplicated mode."""
+    mode = _normalize_shard_mode(mode)
     if tp_group is None or partition_dim is None or int(partition_dim) < 0:
         return gram_newton_schulz(
             x,
@@ -893,8 +1070,13 @@ def gram_newton_schulz_tp(
             fp32_matmul_prec=fp32_matmul_prec,
             gram_kernel_policy=gram_kernel_policy,
         )
-    if mode == "duplicated_debug":
-        full = _all_gather_matrix(x, partition_dim=int(partition_dim), tp_group=tp_group)
+    if mode == "duplicated":
+        full, partition_sizes = _all_gather_matrix(
+            x,
+            partition_dim=int(partition_dim),
+            tp_group=tp_group,
+            return_sizes=True,
+        )
         full_update = gram_newton_schulz(
             full,
             steps=steps,
@@ -906,11 +1088,17 @@ def gram_newton_schulz_tp(
             fp32_matmul_prec=fp32_matmul_prec,
             gram_kernel_policy=gram_kernel_policy,
         )
-        return _slice_tp_matrix(full_update, partition_dim=int(partition_dim), tp_group=tp_group)
-    if mode != "distributed":
-        raise RuntimeError(f"[MUON_INVALID_TP_MODE] mode={mode!r}")
-
-    _, oriented_partition_dim = _tp_oriented_partition_dim(x, int(partition_dim))
+        return _slice_tp_matrix(
+            full_update,
+            partition_dim=int(partition_dim),
+            tp_group=tp_group,
+            partition_sizes=partition_sizes,
+        )
+    transposed, oriented_partition_dim = _oriented_partition_dim(
+        x,
+        int(partition_dim),
+        logical_shape=logical_shape,
+    )
     return gram_newton_schulz(
         x,
         steps=steps,
@@ -921,9 +1109,218 @@ def gram_newton_schulz_tp(
         eps=eps,
         fp32_matmul_prec=fp32_matmul_prec,
         tp_group=tp_group,
+        transpose=transposed,
         gram_side="left" if oriented_partition_dim == 1 else "right",
         gram_kernel_policy=gram_kernel_policy,
     )
+
+
+def gram_newton_schulz_tp(x: Tensor, **kwargs) -> Tensor:
+    """Compatibility wrapper for the generic 1D-sharded Gram NS helper."""
+    return gram_newton_schulz_1d(x, **kwargs)
+
+
+def _oriented_2d_groups(
+    x: Tensor,
+    *,
+    logical_shape: Optional[tuple[int, int]],
+    fs_group: Optional[dist.ProcessGroup],
+    fs_partition_dim: int,
+    tp_group: Optional[dist.ProcessGroup],
+    tp_partition_dim: int,
+) -> tuple[Tensor, bool, dist.ProcessGroup, dist.ProcessGroup]:
+    if fs_partition_dim not in (0, 1) or tp_partition_dim not in (0, 1):
+        raise RuntimeError(
+            "[MUON_2D_DISTRIBUTED_INVALID_DIMS] "
+            f"fs_partition_dim={fs_partition_dim} tp_partition_dim={tp_partition_dim}"
+        )
+    transposed = _logical_transpose(x, logical_shape)
+    fs_dim = 1 - int(fs_partition_dim) if transposed else int(fs_partition_dim)
+    tp_dim = 1 - int(tp_partition_dim) if transposed else int(tp_partition_dim)
+    if fs_dim == tp_dim:
+        raise RuntimeError(
+            "[MUON_2D_DISTRIBUTED_NON_ORTHOGONAL_DIMS] "
+            f"fs_partition_dim={fs_partition_dim} tp_partition_dim={tp_partition_dim} "
+            f"transposed={int(transposed)}"
+        )
+    if fs_group is None or tp_group is None:
+        raise RuntimeError("[MUON_2D_DISTRIBUTED_REQUIRES_FS_AND_TP_GROUPS]")
+
+    x_work = x.mT if transposed else x
+    row_group = fs_group if fs_dim == 0 else tp_group
+    col_group = fs_group if fs_dim == 1 else tp_group
+    return x_work, transposed, row_group, col_group
+
+
+def _form_2d_left_gram(slab: Tensor, *, col_group=None, ops=_TORCH_GRAM_BACKEND) -> Tensor:
+    gram = ops.sym_mm(slab, slab.mT)
+    if _dist_world_size(col_group) > 1:
+        dist.all_reduce(gram, op=dist.ReduceOp.SUM, group=col_group)
+        _record_gram_all_reduce(gram)
+    return gram
+
+
+def _finish_2d_slab(
+    slab: Tensor,
+    *,
+    row_group,
+    transposed: bool,
+    row_partition_sizes: Optional[tuple[int, ...]] = None,
+) -> Tensor:
+    local = _slice_tp_matrix(
+        slab,
+        partition_dim=0,
+        tp_group=row_group,
+        partition_sizes=row_partition_sizes,
+    )
+    return local.mT.contiguous() if transposed else local
+
+
+def newton_schulz_2d(
+    x: Tensor,
+    *,
+    steps: int = 5,
+    coefficient_type: str = "quintic",
+    fs_group: Optional[dist.ProcessGroup] = None,
+    fs_partition_dim: int = -1,
+    tp_group: Optional[dist.ProcessGroup] = None,
+    tp_partition_dim: int = -1,
+    logical_shape: Optional[tuple[int, int]] = None,
+    eps: float = 1e-7,
+    fp32_matmul_prec: str = "medium",
+) -> Tensor:
+    """Exact 2D-sharded standard NS without materializing the full matrix."""
+    if x.ndim < 2:
+        raise RuntimeError(f"[MUON_NS_REQUIRES_MATRIX] ndim={x.ndim}")
+    original_dtype = x.dtype
+    x_work, transposed, row_group, col_group = _oriented_2d_groups(
+        x,
+        logical_shape=logical_shape,
+        fs_group=fs_group,
+        fs_partition_dim=fs_partition_dim,
+        tp_group=tp_group,
+        tp_partition_dim=tp_partition_dim,
+    )
+    dtype = torch.float64 if x_work.dtype == torch.float64 else torch.float32
+    slab, row_partition_sizes = _all_gather_matrix(
+        x_work.to(dtype=dtype),
+        partition_dim=0,
+        tp_group=row_group,
+        return_sizes=True,
+    )
+
+    first_gram = None
+    with _matmul_precision(fp32_matmul_prec):
+        first_gram = _form_2d_left_gram(slab, col_group=col_group)
+        norm_sq = torch.diagonal(first_gram.float(), dim1=-2, dim2=-1).sum(dim=-1)
+        norm_sq = norm_sq.view(*norm_sq.shape, 1, 1)
+        inv_norm = norm_sq.sqrt().clamp_min(float(eps)).reciprocal()
+        slab = slab * inv_norm
+        first_gram = first_gram * inv_norm.square()
+        for a, b, c in _coefficients(steps, coefficient_type=coefficient_type):
+            if first_gram is not None:
+                gram = first_gram
+                first_gram = None
+            else:
+                gram = _form_2d_left_gram(slab, col_group=col_group)
+            gram2 = gram @ gram
+            poly = b * gram + c * gram2
+            slab = a * slab + poly @ slab
+
+    result = _finish_2d_slab(
+        slab,
+        row_group=row_group,
+        transposed=transposed,
+        row_partition_sizes=row_partition_sizes,
+    )
+    return result.to(dtype=original_dtype)
+
+
+def gram_newton_schulz_2d(
+    x: Tensor,
+    *,
+    steps: int = 5,
+    coefficient_type: str = "quintic",
+    restart_steps: tuple[int, ...] = (2,),
+    restart_iterations: Optional[tuple[int, ...]] = None,
+    gram_dtype: Optional[torch.dtype | str] = None,
+    fs_group: Optional[dist.ProcessGroup] = None,
+    fs_partition_dim: int = -1,
+    tp_group: Optional[dist.ProcessGroup] = None,
+    tp_partition_dim: int = -1,
+    logical_shape: Optional[tuple[int, int]] = None,
+    eps: float = 1e-7,
+    fp32_matmul_prec: str = "medium",
+    gram_kernel_policy: str = "torch",
+) -> Tensor:
+    """Exact 2D-sharded Gram NS without materializing the full matrix."""
+    if restart_iterations is not None:
+        restart_steps = restart_iterations
+    if x.ndim < 2:
+        raise RuntimeError(f"[MUON_GRAM_NS_REQUIRES_MATRIX] ndim={x.ndim}")
+    original_dtype = x.dtype
+    policy = _normalize_gram_kernel_policy(gram_kernel_policy)
+    x_work, transposed, row_group, col_group = _oriented_2d_groups(
+        x,
+        logical_shape=logical_shape,
+        fs_group=fs_group,
+        fs_partition_dim=fs_partition_dim,
+        tp_group=tp_group,
+        tp_partition_dim=tp_partition_dim,
+    )
+    dtype = _str_to_dtype(gram_dtype)
+    if dtype is None:
+        dtype = torch.float64 if x_work.dtype == torch.float64 else torch.float32
+        collective = _dist_world_size(fs_group) > 1 or _dist_world_size(tp_group) > 1
+        if dtype == torch.float32 and not collective:
+            default_dtype = _default_gram_dtype(x_work, policy=policy)
+            if default_dtype is not None:
+                dtype = default_dtype
+    slab, row_partition_sizes = _all_gather_matrix(
+        x_work.to(dtype=dtype),
+        partition_dim=0,
+        tp_group=row_group,
+        return_sizes=True,
+    )
+    ops = _select_gram_backend(slab, policy=policy)
+    coeffs = tuple(_coefficients(steps, coefficient_type=coefficient_type))
+    restarts = _normalize_gram_restart_steps(restart_steps, len(coeffs))
+
+    with _matmul_precision(fp32_matmul_prec):
+        r = _form_2d_left_gram(slab, col_group=col_group, ops=ops)
+        norm_sq = torch.diagonal(r.float(), dim1=-2, dim2=-1).sum(dim=-1)
+        norm_sq = norm_sq.view(*norm_sq.shape, 1, 1)
+        inv_norm = norm_sq.sqrt().clamp_min(float(eps)).reciprocal()
+        slab = slab * inv_norm
+        r = r * inv_norm.square()
+        eye = _gram_eye(r)
+        q: Optional[Tensor] = None
+        for step, (a, b, c) in enumerate(coeffs):
+            if step in restarts and step != 0:
+                if q is None:
+                    raise RuntimeError("[MUON_GRAM_NS_MISSING_Q_AT_RESTART]")
+                slab = ops.mm(q, slab)
+                r = _form_2d_left_gram(slab, col_group=col_group, ops=ops)
+                q = None
+
+            z = ops.sym_baddmm(r, r, C=r, alpha=c, beta=b)
+            q = z + a * eye if q is None else ops.sym_baddmm(q, z, C=q, beta=a)
+
+            if step < len(coeffs) - 1 and (step + 1) not in restarts:
+                rz = ops.sym_baddmm(r, z, C=r, beta=a)
+                r = ops.sym_baddmm(z, rz, C=rz, beta=a)
+        if q is None:
+            raise RuntimeError("[MUON_GRAM_NS_MISSING_FINAL_Q]")
+        slab = ops.mm(q, slab)
+
+    slab = slab.to(dtype=torch.float32 if original_dtype != torch.float64 else torch.float64)
+    result = _finish_2d_slab(
+        slab,
+        row_group=row_group,
+        transposed=transposed,
+        row_partition_sizes=row_partition_sizes,
+    )
+    return result.to(dtype=original_dtype)
 
 
 def standard_newton_schulz(
@@ -953,6 +1350,7 @@ def orthogonalize_muon(
     tp_group: Optional[dist.ProcessGroup] = None,
     partition_dim: Optional[int] = None,
     tp_mode: str = "blockwise",
+    logical_shape: Optional[tuple[int, int]] = None,
     gram_restart_steps: tuple[int, ...] = (2,),
     gram_dtype: Optional[torch.dtype | str] = None,
     gram_kernel_policy: str = "torch",
@@ -961,18 +1359,19 @@ def orthogonalize_muon(
 ) -> Tensor:
     """Dispatch Muon orthogonalization backend."""
     if ns_backend == "standard":
-        return newton_schulz_tp(
+        return newton_schulz_1d(
             x,
             steps=steps,
             coefficient_type=coefficient_type,
             tp_group=tp_group,
             partition_dim=partition_dim,
             mode=tp_mode,
+            logical_shape=logical_shape,
             eps=eps,
             fp32_matmul_prec=fp32_matmul_prec,
         )
     if ns_backend == "gram":
-        return gram_newton_schulz_tp(
+        return gram_newton_schulz_1d(
             x,
             steps=steps,
             coefficient_type=coefficient_type,
@@ -981,6 +1380,57 @@ def orthogonalize_muon(
             tp_group=tp_group,
             partition_dim=partition_dim,
             mode=tp_mode,
+            logical_shape=logical_shape,
+            eps=eps,
+            fp32_matmul_prec=fp32_matmul_prec,
+            gram_kernel_policy=gram_kernel_policy,
+        )
+    raise RuntimeError(f"[MUON_INVALID_NS_BACKEND] ns_backend={ns_backend!r}")
+
+
+def orthogonalize_muon_2d(
+    x: Tensor,
+    *,
+    ns_backend: str = "standard",
+    steps: int = 5,
+    coefficient_type: str = "quintic",
+    fs_group: Optional[dist.ProcessGroup] = None,
+    fs_partition_dim: int = -1,
+    tp_group: Optional[dist.ProcessGroup] = None,
+    tp_partition_dim: int = -1,
+    logical_shape: Optional[tuple[int, int]] = None,
+    gram_restart_steps: tuple[int, ...] = (2,),
+    gram_dtype: Optional[torch.dtype | str] = None,
+    gram_kernel_policy: str = "torch",
+    eps: float = 1e-7,
+    fp32_matmul_prec: str = "medium",
+) -> Tensor:
+    """Dispatch exact 2D-sharded Muon orthogonalization."""
+    if ns_backend == "standard":
+        return newton_schulz_2d(
+            x,
+            steps=steps,
+            coefficient_type=coefficient_type,
+            fs_group=fs_group,
+            fs_partition_dim=fs_partition_dim,
+            tp_group=tp_group,
+            tp_partition_dim=tp_partition_dim,
+            logical_shape=logical_shape,
+            eps=eps,
+            fp32_matmul_prec=fp32_matmul_prec,
+        )
+    if ns_backend == "gram":
+        return gram_newton_schulz_2d(
+            x,
+            steps=steps,
+            coefficient_type=coefficient_type,
+            restart_steps=gram_restart_steps,
+            gram_dtype=gram_dtype,
+            fs_group=fs_group,
+            fs_partition_dim=fs_partition_dim,
+            tp_group=tp_group,
+            tp_partition_dim=tp_partition_dim,
+            logical_shape=logical_shape,
             eps=eps,
             fp32_matmul_prec=fp32_matmul_prec,
             gram_kernel_policy=gram_kernel_policy,
@@ -1035,6 +1485,7 @@ def orthogonalize_muon_update(
     scale_mode: str = "spectral",
     extra_scale_factor: float = 1.0,
     global_shape: Optional[tuple[int, int]] = None,
+    logical_shape: Optional[tuple[int, int]] = None,
     tp_group: Optional[dist.ProcessGroup] = None,
     partition_dim: Optional[int] = None,
     tp_mode: str = "blockwise",
@@ -1052,6 +1503,52 @@ def orthogonalize_muon_update(
         tp_group=tp_group,
         partition_dim=partition_dim,
         tp_mode=tp_mode,
+        logical_shape=logical_shape,
+        gram_restart_steps=gram_restart_iterations,
+        gram_dtype=gram_dtype,
+        gram_kernel_policy=gram_kernel_policy,
+        eps=eps,
+        fp32_matmul_prec=fp32_matmul_prec,
+    )
+    if global_shape is None:
+        global_shape = tuple(int(dim) for dim in update.shape[-2:])
+    scale = get_muon_scale_factor(int(global_shape[0]), int(global_shape[1]), mode=scale_mode)
+    return orth_update * float(scale) * float(extra_scale_factor)
+
+
+def orthogonalize_muon_update_2d(
+    update: Tensor,
+    *,
+    ns_backend: str = "standard",
+    coefficient_type: str = "quintic",
+    num_ns_steps: int = 5,
+    eps: float = 1e-7,
+    scale_mode: str = "spectral",
+    extra_scale_factor: float = 1.0,
+    global_shape: Optional[tuple[int, int]] = None,
+    logical_shape: Optional[tuple[int, int]] = None,
+    fs_group: Optional[dist.ProcessGroup] = None,
+    fs_partition_dim: int = -1,
+    tp_group: Optional[dist.ProcessGroup] = None,
+    tp_partition_dim: int = -1,
+    gram_restart_iterations: tuple[int, ...] = (2,),
+    gram_dtype: Optional[torch.dtype | str] = None,
+    gram_kernel_policy: str = "torch",
+    fp32_matmul_prec: str = "medium",
+) -> Tensor:
+    """Orthogonalize and scale one 2D-sharded Muon update tensor."""
+    if logical_shape is None:
+        logical_shape = global_shape
+    orth_update = orthogonalize_muon_2d(
+        update,
+        ns_backend=ns_backend,
+        steps=num_ns_steps,
+        coefficient_type=coefficient_type,
+        fs_group=fs_group,
+        fs_partition_dim=fs_partition_dim,
+        tp_group=tp_group,
+        tp_partition_dim=tp_partition_dim,
+        logical_shape=logical_shape,
         gram_restart_steps=gram_restart_iterations,
         gram_dtype=gram_dtype,
         gram_kernel_policy=gram_kernel_policy,
@@ -1077,6 +1574,7 @@ def compute_muon_update(
     scale_mode: str = "spectral",
     extra_scale_factor: float = 1.0,
     global_shape: Optional[tuple[int, int]] = None,
+    logical_shape: Optional[tuple[int, int]] = None,
     tp_group: Optional[dist.ProcessGroup] = None,
     partition_dim: Optional[int] = None,
     tp_mode: str = "blockwise",
@@ -1096,6 +1594,7 @@ def compute_muon_update(
         scale_mode=scale_mode,
         extra_scale_factor=extra_scale_factor,
         global_shape=global_shape,
+        logical_shape=logical_shape,
         tp_group=tp_group,
         partition_dim=partition_dim,
         tp_mode=tp_mode,
@@ -1112,14 +1611,20 @@ __all__ = [
     "get_muon_scale_factor",
     "get_and_reset_gram_profile",
     "gram_newton_schulz",
+    "gram_newton_schulz_1d",
+    "gram_newton_schulz_2d",
     "gram_newton_schulz_tp",
     "logical_shape_for_tp",
     "muon_scale_factor",
     "nesterov_update",
     "newton_schulz",
+    "newton_schulz_1d",
+    "newton_schulz_2d",
     "newton_schulz_tp",
     "orthogonalize_muon",
+    "orthogonalize_muon_2d",
     "orthogonalize_muon_update",
+    "orthogonalize_muon_update_2d",
     "scaled_lr_for_shape",
     "standard_newton_schulz",
     "update_momentum",

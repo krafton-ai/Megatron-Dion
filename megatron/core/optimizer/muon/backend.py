@@ -119,6 +119,12 @@ class MuonBackend(MatrixBackend):
                 entry.param.add_(entry.param, alpha=-lr * weight_decay)
 
             partition_dim = config.tp_shard_dim if config.use_tp_shard else None
+            logical_shape = None
+            if config.tp_mode == "distributed" and partition_dim in (0, 1):
+                logical_shape = [int(entry.param.size(-2)), int(entry.param.size(-1))]
+                global_shape = entry.global_shape or logical_shape
+                logical_shape[int(partition_dim)] = int(global_shape[int(partition_dim)])
+                logical_shape = tuple(logical_shape)
             update = compute_muon_update(
                 entry.grad,
                 entry.momentum,
@@ -131,11 +137,13 @@ class MuonBackend(MatrixBackend):
                 scale_mode=config.scale_mode,
                 extra_scale_factor=config.extra_scale_factor,
                 global_shape=entry.global_shape or None,
+                logical_shape=logical_shape,
                 tp_group=getattr(entry.dist_meta, "tp_group", None),
                 partition_dim=partition_dim,
                 tp_mode=config.tp_mode,
                 gram_restart_iterations=config.gram_restart_iterations,
                 gram_dtype=config.gram_dtype,
+                gram_kernel_policy=config.gram_kernel_policy,
             )
             entry.param.add_(update.to(dtype=entry.param.dtype), alpha=-lr)
             if entry.commit_update is not None:

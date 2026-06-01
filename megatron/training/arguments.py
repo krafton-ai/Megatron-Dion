@@ -1914,10 +1914,10 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
-                       choices=['blockwise', 'duplicated', 'duplicated_debug', 'distributed'],
+                       choices=['blockwise', 'duplicated', 'distributed'],
                        help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--muon-fs-mode', type=str, default='blockwise',
-                       choices=['blockwise', 'distributed', 'duplicated_debug'],
+                       choices=['blockwise', 'duplicated', 'distributed'],
                        help='How distributed optimizer FS shards participate in Muon NS calculation')
     group.add_argument('--muon-ns-backend', type=str, default='standard',
                        choices=['standard', 'gram'],
@@ -1927,6 +1927,10 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-gram-ns-kernel-policy', type=str, default='torch',
                        choices=['torch', 'auto', 'dao', 'quack', 'compile', 'disabled'],
                        help='Kernel policy for Gram Newton-Schulz')
+    group.add_argument('--muon-gram-ns-dtype', type=str, default=None,
+                       choices=['float32', 'float', 'fp32', 'float16', 'fp16', 'half',
+                                'bfloat16', 'bf16'],
+                       help='Optional compute dtype override for Gram Newton-Schulz')
     group.add_argument('--muon-split-linear', action=argparse.BooleanOptionalAction,
                        default=True,
                        help='Treat fused linear_fc1 weights as optimizer-only children for Muon')
