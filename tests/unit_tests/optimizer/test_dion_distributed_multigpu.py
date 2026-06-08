@@ -19,7 +19,7 @@ from megatron.core.optimizer.dion.distributed.integration import (
     _get_dion_replica_group,
     _resolve_fs_group,
 )
-from megatron.core.optimizer.dion.params import is_dion_param
+from megatron.core.optimizer.dion.params import is_dion_matrix_param
 from megatron.core.optimizer.matrix.parameter import resolve_grad_rank_to_fs_rank
 
 
@@ -548,7 +548,7 @@ def test_32gpu_pp_cp_partial_dp_and_split_children_run_real_nccl_collectives():
         _destroy_model_parallel()
 
 
-def test_32gpu_dense_tp_pp_cp_dp_fs_rp_sp_contracts_run_real_nccl_collectives():
+def test_32gpu_dense_tp_pp_cp_dp_fs_rp_sp_invariants_run_real_nccl_collectives():
     _require_multigpu(32)
     _init_model_parallel(
         tensor_model_parallel_size=2,
@@ -691,13 +691,13 @@ def test_32gpu_dense_tp_pp_cp_dp_fs_rp_sp_contracts_run_real_nccl_collectives():
         _assert_same_group_ranks(collectives.fs_p_collectives[0].process_group, fs_group)
 
         dense_param = torch.nn.Parameter(torch.empty(2, 2, device=torch.cuda.current_device()))
-        dense_param.dion_candidate = True
-        assert is_dion_param(dense_param, "layers.0.mlp.linear_fc1.weight")
+        dense_param.matrix_optimizer_ready = True
+        assert is_dion_matrix_param(dense_param, "layers.0.mlp.linear_fc1.weight")
 
         sp_param = torch.nn.Parameter(torch.empty(2, 2, device=torch.cuda.current_device()))
-        sp_param.dion_candidate = True
+        sp_param.matrix_optimizer_ready = True
         sp_param.sequence_parallel = True
-        assert not is_dion_param(sp_param, "layers.0.mlp.linear_fc1.weight")
+        assert not is_dion_matrix_param(sp_param, "layers.0.mlp.linear_fc1.weight")
         dist.barrier()
     finally:
         _destroy_model_parallel()

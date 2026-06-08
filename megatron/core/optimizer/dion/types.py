@@ -81,7 +81,7 @@ class DionBatchGroup:
 
 @dataclass
 class DionDistMeta(MatrixDistMeta):
-    """Dion-specific metadata layered on the matrix distributed contract."""
+    """Dion-specific metadata layered on the matrix distributed invariant."""
 
     rank_fraction: float = 0.25
     is_dion_param: bool = False
@@ -192,7 +192,7 @@ class DionBatch:
 
 @dataclass
 class DionQLayout:
-    """Q-state layout contract for one Dion parameter."""
+    """Q-state layout invariant for one Dion parameter."""
 
     q_global_shape: Tuple[int, int] | None = None
     q_local_shape: Tuple[int, int] | None = None
@@ -207,7 +207,7 @@ class DionQLayout:
 
 @dataclass
 class DionQInit:
-    """State-init contract for one Dion parameter."""
+    """State-init invariant for one Dion parameter."""
 
     tp_world_size: int = 1
     tp_rank: int = 0

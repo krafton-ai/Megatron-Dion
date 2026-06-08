@@ -49,7 +49,7 @@ def _normalize_shape(shape) -> tuple:
     return tuple(int(dim) for dim in shape)
 
 
-def _build_update_contract_key(
+def _build_update_invariant_key(
     optim_group: Dict[str, Any] | None,
     optimizer_state: Dict[str, Any] | None,
 ) -> tuple:
@@ -272,7 +272,7 @@ def _batch_key_for_sync(
     param_uids: tuple = (),
     rank_cache: dict | None = None,
 ) -> tuple:
-    """Project one local full batch key into the contract visible to one sync group."""
+    """Project one local full batch key into the invariant visible to one sync group."""
     if sync_group is None:
         return batch_key
     update_key, optimizer_key, group_key = batch_key
@@ -795,7 +795,7 @@ def group_and_order_param_batches(
                     tensor_row_shard_sizes=getattr(dist_meta, "tensor_row_shard_sizes", None),
                     row_shard_sizes=getattr(dist_meta, "row_shard_sizes", None),
                 ),
-                _build_update_contract_key(
+                _build_update_invariant_key(
                     routed_param.optim_group,
                     routed_param.optimizer_state,
                 ),
@@ -876,7 +876,7 @@ def _build_batch_entries(
     entries: list[DionBatchEntry],
     batch_size: int,
 ) -> dict:
-    """Assemble typed batch entries into the final DionBatch contract."""
+    """Assemble typed batch entries into the final DionBatch invariant."""
     real_batch_size = len(entries)
     if real_batch_size <= 0:
         raise RuntimeError("[DION_EMPTY_BATCH_ENTRIES]")

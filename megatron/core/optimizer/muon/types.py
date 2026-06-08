@@ -119,7 +119,7 @@ class MuonBatchGroup:
 
 @dataclass
 class MuonDistMeta(MatrixDistMeta):
-    """Muon-specific metadata layered on the matrix distributed contract."""
+    """Muon-specific metadata layered on the matrix distributed invariant."""
 
     is_muon_param: bool = False
     param_config: Optional[MuonParamConfig] = None

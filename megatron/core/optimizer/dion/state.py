@@ -1,4 +1,4 @@
-"""Dion state helpers matching the dion_reference.py contract.
+"""Dion state helpers matching the dion_reference.py invariant.
 
 This module isolates Dion-local state-init semantics from Megatron runtime.
 The caller remains responsible for:

@@ -130,6 +130,7 @@ from megatron.core.enums import ModelType
 from megatron.core.optimizer import (
     get_megatron_optimizer,
     AdamOptimizerConfig,
+    AroOptimizerConfig,
     DionOptimizerConfig,
     MuonOptimizerConfig,
     OptimizerConfig,
@@ -1483,6 +1484,12 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
             if hasattr(args, f.name):
                 kwargs[f.name] = getattr(args, f.name)
         config = DionOptimizerConfig(**kwargs)
+    elif args.optimizer == 'aro':
+        kwargs = {}
+        for f in dataclasses.fields(AroOptimizerConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        config = AroOptimizerConfig(**kwargs)
     else:
         raise ValueError("Invalid optimizer type!")
 

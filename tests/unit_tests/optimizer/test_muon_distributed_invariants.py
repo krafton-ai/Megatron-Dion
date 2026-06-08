@@ -121,7 +121,7 @@ def test_muon_backend_delegates_to_muon_adapter_surface():
     ]
 
 
-def test_muon_batch_key_uses_logical_shape_and_named_modes():
+def test_muon_build_batch_key_uses_logical_shape_and_named_modes():
     batches = _import_required("megatron.core.optimizer.muon.distributed.batches")
     build_batch_key = getattr(batches, "build_batch_key", None)
     if build_batch_key is None:
@@ -146,7 +146,7 @@ def test_muon_batch_key_uses_logical_shape_and_named_modes():
     assert "low_rank" not in key_text
 
 
-def test_muon_batch_key_is_tp_rank_invariant_for_fs_distributed_schedule():
+def test_muon_build_batch_key_is_tp_rank_invariant_for_fs_distributed_schedule():
     batches = _import_required("megatron.core.optimizer.muon.distributed.batches")
     build_batch_key = getattr(batches, "build_batch_key", None)
     if build_batch_key is None:
@@ -667,7 +667,7 @@ def test_muon_checkpoint_topology_signature_includes_rp_group():
 
 
 @pytest.mark.parametrize("rp_size", (1, 2))
-def test_muon_checkpoint_metadata_carries_matrix_backend_contract(rp_size):
+def test_muon_checkpoint_metadata_carries_matrix_backend_invariant(rp_size):
     backend_module = _import_required("megatron.core.optimizer.muon.backend")
     checkpoint_io = _import_required(
         "megatron.core.optimizer.muon.distributed.checkpoint_io"

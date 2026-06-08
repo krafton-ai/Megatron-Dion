@@ -1,4 +1,4 @@
-"""Backend contract for matrix-aware optimizers."""
+"""Backend invariant for matrix-aware optimizers."""
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class MatrixStateSpec:
-    """Backend-owned checkpoint state contract."""
+    """Backend-owned checkpoint state invariant."""
 
     backend: str
     state_keys: tuple[str, ...]

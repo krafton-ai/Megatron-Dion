@@ -10,15 +10,14 @@ import megatron.core.optimizer.muon.kernels as muon_kernels
 from megatron.core.optimizer.muon.backend import MuonBackend
 from megatron.core.optimizer.muon.kernels import (
     apply_muon_momentum,
-    get_muon_scale_factor,
     gram_newton_schulz,
     gram_newton_schulz_1d,
     gram_newton_schulz_2d,
+    muon_scale_factor,
     newton_schulz,
     newton_schulz_1d,
     newton_schulz_2d,
     orthogonalize_muon_update,
-    standard_newton_schulz,
 )
 from megatron.core.optimizer.muon.state import build_param_config, init_param_state
 from megatron.core.optimizer.muon.types import (
@@ -82,10 +81,10 @@ def _manual_standard_ns(x, *, steps, coeff):
 
 
 @pytest.mark.parametrize("device", _devices())
-def test_standard_newton_schulz_matches_reference_loop(device):
+def test_newton_schulz_matches_reference_loop(device):
     x = torch.arange(1, 13, dtype=torch.float32, device=device).view(3, 4) / 13.0
 
-    actual = standard_newton_schulz(x, steps=3, coefficient_type="simple")
+    actual = newton_schulz(x, steps=3, coefficient_type="simple")
     expected = _manual_standard_ns(x, steps=3, coeff=(3.4445, -4.7750, 2.0315))
 
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
@@ -97,7 +96,7 @@ def test_gram_newton_schulz_matches_standard_backend(shape, device):
     torch.manual_seed(1234)
     x = torch.randn(shape, dtype=torch.float32, device=device)
 
-    standard = standard_newton_schulz(
+    standard = newton_schulz(
         x,
         steps=5,
         coefficient_type="polar_express",
@@ -144,7 +143,7 @@ def test_right_gram_backend_matches_standard_backend(shape, device):
     torch.manual_seed(5678)
     x = torch.randn(shape, dtype=torch.float32, device=device)
 
-    standard = standard_newton_schulz(
+    standard = newton_schulz(
         x,
         steps=5,
         coefficient_type="polar_express",
@@ -637,7 +636,7 @@ def test_gram_kernel_policy_auto_falls_back_when_dao_unavailable(monkeypatch):
         gram_dtype=torch.float32,
         gram_kernel_policy="auto",
     )
-    with pytest.raises(RuntimeError, match="MUON_DAO_GRAM_BACKEND_UNAVAILABLE"):
+    with pytest.raises(RuntimeError, match="MUON_GRAM_DAO_UNAVAILABLE") as exc_info:
         gram_newton_schulz(
             x,
             steps=1,
@@ -645,16 +644,19 @@ def test_gram_kernel_policy_auto_falls_back_when_dao_unavailable(monkeypatch):
             gram_dtype=torch.float32,
             gram_kernel_policy="dao",
         )
+    message = str(exc_info.value)
+    assert "uv sync --extra muon-gram" in message
+    assert "setup_muon_gram_deps.sh" not in message
 
 
 def test_muon_scale_factors_match_reference_formulas():
-    assert get_muon_scale_factor(4, 16, mode="spectral") == math.sqrt(16)
-    assert get_muon_scale_factor(4, 16, mode="unit_rms_norm") == math.sqrt(4 / 16)
-    assert get_muon_scale_factor(4, 16, mode="shape_scaling") == 1.0
-    assert get_muon_scale_factor(16, 4, mode="shape_scaling") == 2.0
+    assert muon_scale_factor(4, 16, mode="spectral") == math.sqrt(16)
+    assert muon_scale_factor(4, 16, mode="unit_rms_norm") == math.sqrt(4 / 16)
+    assert muon_scale_factor(4, 16, mode="shape_scaling") == 1.0
+    assert muon_scale_factor(16, 4, mode="shape_scaling") == 2.0
 
     with pytest.raises(ValueError):
-        get_muon_scale_factor(4, 16, mode="bad")
+        muon_scale_factor(4, 16, mode="bad")
 
 
 @pytest.mark.parametrize("device", _devices())

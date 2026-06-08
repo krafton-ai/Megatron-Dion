@@ -100,7 +100,6 @@ def _scaled_orthogonalize(optimizer, param, momentum):
         "scaled_orthogonalize",
         "scaled_newton_schulz",
         "orthogonalize",
-        "standard_newton_schulz",
         "newton_schulz",
     ):
         fn = getattr(kernels, name, None)
@@ -125,7 +124,7 @@ def _scaled_orthogonalize(optimizer, param, momentum):
 
 def _muon_scale_factor(global_shape, *, scale_mode="spectral", extra_scale_factor=1.0):
     kernels = _import_required("megatron.core.optimizer.muon.kernels")
-    for name in ("get_muon_scale_factor", "muon_scale_factor", "compute_muon_scale_factor"):
+    for name in ("muon_scale_factor", "compute_muon_scale_factor"):
         fn = getattr(kernels, name, None)
         if fn is None:
             continue
@@ -358,7 +357,7 @@ def test_muon_package_does_not_import_dtensor_or_device_mesh():
     assert offenders == []
 
 
-def test_muon_backend_and_types_extend_matrix_contracts():
+def test_muon_backend_and_types_extend_matrix_invariants():
     backend_module = _import_required("megatron.core.optimizer.muon.backend")
     types_module = _import_required("megatron.core.optimizer.muon.types")
 

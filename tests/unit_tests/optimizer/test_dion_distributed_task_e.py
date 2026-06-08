@@ -42,7 +42,7 @@ from megatron.core.optimizer.dion.distributed.batches import (
     build_batch_key,
 )
 from megatron.core.optimizer.dion.distributed import integration as dion_integration
-from megatron.core.optimizer.dion.params import is_dion_param, mark_dion_bucket_params
+from megatron.core.optimizer.dion.params import is_dion_matrix_param, mark_dion_bucket_params
 from megatron.core.optimizer.matrix.parameter import (
     is_combined_grouped_mlp_param,
     resolve_grad_rank_to_fs_rank,
@@ -200,13 +200,13 @@ def test_resolve_grad_rank_to_fs_rank_rejects_unproved_order(monkeypatch):
         )
 
 
-def test_combined_grouped_mlp_params_are_not_dion_candidates():
+def test_combined_grouped_mlp_params_do_not_use_dion():
     param = torch.nn.Parameter(torch.empty(4, 8))
-    param.dion_candidate = True
+    param.matrix_optimizer_ready = True
     param.num_local_experts = 2
 
     assert is_combined_grouped_mlp_param(param, "decoder.layers.0.mlp.experts.weight1")
-    assert not is_dion_param(param, "decoder.layers.0.mlp.experts.weight1")
+    assert not is_dion_matrix_param(param, "decoder.layers.0.mlp.experts.weight1")
     assert not is_combined_grouped_mlp_param(
         param,
         "decoder.layers.0.mlp.experts.linear_fc1.weight1",
@@ -215,7 +215,7 @@ def test_combined_grouped_mlp_params_are_not_dion_candidates():
 
 def test_per_expert_named_grouped_linear_keeps_full_local_shape():
     param = torch.nn.Parameter(torch.empty(4, 8))
-    param.dion_candidate = True
+    param.matrix_optimizer_ready = True
     param.num_local_experts = 2
     param.tensor_model_parallel = False
     param._param_name = "decoder.layers.0.mlp.experts.linear_fc1.weight0"
@@ -430,15 +430,15 @@ def test_dion_split_qkv_tags_qwen_style_grouped_qkv_shapes(monkeypatch):
     assert any(param_in_group is param for group in param_groups for param_in_group in group["params"])
 
 
-def test_tp_late_reduction_params_are_not_dion_candidates():
+def test_tp_late_reduction_params_do_not_use_dion():
     param = torch.nn.Parameter(torch.empty(4, 8))
-    param.dion_candidate = True
+    param.matrix_optimizer_ready = True
     param.sequence_parallel = True
-    assert not is_dion_param(param, "router.weight")
+    assert not is_dion_matrix_param(param, "router.weight")
 
     param.sequence_parallel = False
     param.average_gradients_across_tp_domain = True
-    assert not is_dion_param(param, "hf_adapter.weight")
+    assert not is_dion_matrix_param(param, "hf_adapter.weight")
 
 
 def test_qkv_child_overlap_skips_non_owner_fs_rank():

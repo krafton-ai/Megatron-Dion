@@ -3,7 +3,7 @@
 from .integration import build_muon_distributed_optimizer
 from .optimizer import DistributedMuonOptimizer
 from ..backend import MuonBackend
-from ..state import is_muon_matrix_param, mark_muon_candidates
+from ..state import is_muon_matrix_param, prepare_muon_params
 from ..types import MuonBatch, MuonBatchEntry, MuonDistMeta, MuonParamConfig
 
 __all__ = [
@@ -15,5 +15,5 @@ __all__ = [
     "MuonParamConfig",
     "build_muon_distributed_optimizer",
     "is_muon_matrix_param",
-    "mark_muon_candidates",
+    "prepare_muon_params",
 ]

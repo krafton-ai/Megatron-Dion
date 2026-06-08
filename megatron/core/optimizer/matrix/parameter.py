@@ -30,19 +30,23 @@ from .types import (
 )
 
 
-def mark_matrix_candidates(module: torch.nn.Module) -> None:
-    """Mark all local parameters as potential Matrix candidates."""
+def prepare_matrix_params(module: torch.nn.Module) -> None:
+    """Prepare local parameters for matrix optimizer routing."""
     for param in module.parameters():
-        param.matrix_candidate = True
-        param.matrix_optimizer_candidate = True
+        param.matrix_optimizer_ready = True
 
 
-def is_matrix_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool:
+def is_matrix_param(
+    param: torch.Tensor,
+    param_name: Optional[str] = None,
+    *,
+    include_embedding_and_lm_head: bool = False,
+) -> bool:
     """Return True iff this parameter should use Matrix FS sharding."""
     resolved_name = param_name or getattr(param, "_param_name", None)
     if getattr(param, "use_matrix", None) is False:
         return False
-    if not getattr(param, "matrix_optimizer_candidate", getattr(param, "matrix_candidate", False)):
+    if not getattr(param, "matrix_optimizer_ready", False):
         return False
     if param.ndim != 2:
         return False
@@ -50,10 +54,11 @@ def is_matrix_param(param: torch.Tensor, param_name: Optional[str] = None) -> bo
         return False
     if getattr(param, "average_gradients_across_tp_domain", False):
         return False
-    if getattr(param, "is_embedding_or_output_parameter", False):
-        return False
-    if getattr(param, "is_lm_head_parameter", False):
-        return False
+    if not include_embedding_and_lm_head:
+        if getattr(param, "is_embedding_or_output_parameter", False):
+            return False
+        if getattr(param, "is_lm_head_parameter", False):
+            return False
     if is_float8tensor(param):
         return False
     if is_combined_grouped_mlp_param(param, resolved_name):
@@ -512,6 +517,37 @@ def serialize_bucket_gather_layout(matrix_layout: MatrixBucketLayout) -> tuple[i
     return tuple(payload)
 
 
+def _layout_collective_device(group) -> torch.device:
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    try:
+        backend = str(dist.get_backend(group)).lower()
+    except Exception:
+        backend = ""
+    if "gloo" in backend:
+        return torch.device("cpu")
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def _all_gather_layout_tuples(local_layout: tuple[int, ...], group, group_size: int) -> list[tuple[int, ...]]:
+    device = _layout_collective_device(group)
+    local_len = torch.tensor([len(local_layout)], dtype=torch.int64, device=device)
+    gathered_lens = [torch.empty_like(local_len) for _ in range(int(group_size))]
+    dist.all_gather(gathered_lens, local_len, group=group)
+    lengths = [int(item.item()) for item in gathered_lens]
+    max_len = max(lengths) if lengths else 0
+
+    payload = torch.zeros(max_len, dtype=torch.int64, device=device)
+    if local_layout:
+        payload[: len(local_layout)] = torch.tensor(local_layout, dtype=torch.int64, device=device)
+    gathered_payloads = [torch.empty_like(payload) for _ in range(int(group_size))]
+    dist.all_gather(gathered_payloads, payload, group=group)
+    return [
+        tuple(int(value) for value in gathered_payload[:length].cpu().tolist())
+        for gathered_payload, length in zip(gathered_payloads, lengths)
+    ]
+
+
 def validate_bucket_gather_layout(
     *,
     bucket,
@@ -526,8 +562,7 @@ def validate_bucket_gather_layout(
         return
 
     local_layout = serialize_bucket_gather_layout(matrix_layout)
-    gathered_layouts = [None for _ in range(shard_group_size)]
-    dist.all_gather_object(gathered_layouts, local_layout, group=shard_group)
+    gathered_layouts = _all_gather_layout_tuples(local_layout, shard_group, shard_group_size)
     mismatched_ranks = [
         rank for rank, gathered_layout in enumerate(gathered_layouts) if gathered_layout != local_layout
     ]
@@ -787,9 +822,14 @@ def build_bucket_param_map(
     return canonical_param_map
 
 
-def mark_matrix_bucket_params(cls, param_map, param_to_name, fs_size):
+def mark_matrix_bucket_params(
+    param_map,
+    param_to_name,
+    fs_size,
+    *,
+    include_embedding_and_lm_head: bool = False,
+):
     """Classify bucket params and build static Matrix metadata once."""
-    del cls
     from ... import parallel_state
 
     fs_size = int(fs_size)
@@ -810,11 +850,14 @@ def mark_matrix_bucket_params(cls, param_map, param_to_name, fs_size):
             is_combined_grouped_mlp_param(param, param_name)
             or is_unindexed_multi_local_expert_param(param, param_name)
         )
-        param.is_matrix_param = is_matrix_param(param, param_name)
+        param.is_matrix_param = is_matrix_param(
+            param,
+            param_name,
+            include_embedding_and_lm_head=include_embedding_and_lm_head,
+        )
         param.is_matrix_param = bool(param.is_matrix_param)
         if not param.is_matrix_param and fallback_to_scalar:
-            param.matrix_candidate = False
-            param.matrix_optimizer_candidate = False
+            param.matrix_optimizer_ready = False
 
         is_expert = is_moe_expert_param(param, param_name)
         raw_tp_split_dim = get_tp_split_dim(param)
@@ -833,9 +876,7 @@ def mark_matrix_bucket_params(cls, param_map, param_to_name, fs_size):
         split_size = m_local if fs_shard_dim == 0 else n_local
         if fs_size > 1 and split_size < fs_size:
             param.is_matrix_param = False
-            param.is_matrix_param = False
-            param.matrix_candidate = False
-            param.matrix_optimizer_candidate = False
+            param.matrix_optimizer_ready = False
             continue
 
         matrix_param_count += 1

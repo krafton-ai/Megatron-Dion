@@ -302,10 +302,10 @@ def _select_gram_backend(x: Tensor, *, policy: Optional[str]):
         if policy == "auto":
             return _TORCH_GRAM_BACKEND
         raise RuntimeError(
-            "[MUON_DAO_GRAM_BACKEND_UNAVAILABLE] "
-            "Install optional Gram NS dependencies with "
-            "`source scripts/setup_muon_gram_deps.sh`, or use "
-            "--muon-gram-ns-kernel-policy=auto/torch."
+            "[MUON_GRAM_DAO_UNAVAILABLE] "
+            "Dao/Quack Gram NS backend was requested, but optional dependencies "
+            "are not installed. Install them with `uv sync --extra muon-gram`, "
+            "or use --muon-gram-ns-kernel-policy=auto/torch."
         ) from exc
     if os.getenv("MEGATRON_MUON_GRAM_LOG", "0") == "1" and not _DAO_GRAM_LOGGED:
         print(
@@ -565,11 +565,6 @@ def muon_scale_factor(m: int, n: int, mode: str = "spectral") -> float:
     raise ValueError(f"[MUON_INVALID_SCALE_MODE] scale_mode={mode!r}")
 
 
-def get_muon_scale_factor(m: int, n: int, mode: str = "spectral") -> float:
-    """Compatibility alias for the reference scale helper name."""
-    return muon_scale_factor(m, n, mode=mode)
-
-
 def scaled_lr_for_shape(
     *,
     lr: float,
@@ -800,11 +795,6 @@ def newton_schulz_1d(
         tp_group=tp_group,
         gram_side="left" if oriented_partition_dim == 1 else "right",
     )
-
-
-def newton_schulz_tp(x: Tensor, **kwargs) -> Tensor:
-    """Compatibility wrapper for the generic 1D-sharded Newton-Schulz helper."""
-    return newton_schulz_1d(x, **kwargs)
 
 
 def _gram_eye(r: Tensor) -> Tensor:
@@ -1115,11 +1105,6 @@ def gram_newton_schulz_1d(
     )
 
 
-def gram_newton_schulz_tp(x: Tensor, **kwargs) -> Tensor:
-    """Compatibility wrapper for the generic 1D-sharded Gram NS helper."""
-    return gram_newton_schulz_1d(x, **kwargs)
-
-
 def _oriented_2d_groups(
     x: Tensor,
     *,
@@ -1323,24 +1308,6 @@ def gram_newton_schulz_2d(
     return result.to(dtype=original_dtype)
 
 
-def standard_newton_schulz(
-    x: Tensor,
-    *,
-    steps: int = 5,
-    coefficient_type: str = "quintic",
-    eps: float = 1e-7,
-    fp32_matmul_prec: str = "medium",
-) -> Tensor:
-    """Compatibility alias for the standard local Newton-Schulz backend."""
-    return newton_schulz(
-        x,
-        steps=steps,
-        coefficient_type=coefficient_type,
-        eps=eps,
-        fp32_matmul_prec=fp32_matmul_prec,
-    )
-
-
 def orthogonalize_muon(
     x: Tensor,
     *,
@@ -1512,7 +1479,7 @@ def orthogonalize_muon_update(
     )
     if global_shape is None:
         global_shape = tuple(int(dim) for dim in update.shape[-2:])
-    scale = get_muon_scale_factor(int(global_shape[0]), int(global_shape[1]), mode=scale_mode)
+    scale = muon_scale_factor(int(global_shape[0]), int(global_shape[1]), mode=scale_mode)
     return orth_update * float(scale) * float(extra_scale_factor)
 
 
@@ -1557,7 +1524,7 @@ def orthogonalize_muon_update_2d(
     )
     if global_shape is None:
         global_shape = tuple(int(dim) for dim in update.shape[-2:])
-    scale = get_muon_scale_factor(int(global_shape[0]), int(global_shape[1]), mode=scale_mode)
+    scale = muon_scale_factor(int(global_shape[0]), int(global_shape[1]), mode=scale_mode)
     return orth_update * float(scale) * float(extra_scale_factor)
 
 
@@ -1608,24 +1575,20 @@ def compute_muon_update(
 __all__ = [
     "apply_muon_momentum",
     "compute_muon_update",
-    "get_muon_scale_factor",
     "get_and_reset_gram_profile",
     "gram_newton_schulz",
     "gram_newton_schulz_1d",
     "gram_newton_schulz_2d",
-    "gram_newton_schulz_tp",
     "logical_shape_for_tp",
     "muon_scale_factor",
     "nesterov_update",
     "newton_schulz",
     "newton_schulz_1d",
     "newton_schulz_2d",
-    "newton_schulz_tp",
     "orthogonalize_muon",
     "orthogonalize_muon_2d",
     "orthogonalize_muon_update",
     "orthogonalize_muon_update_2d",
     "scaled_lr_for_shape",
-    "standard_newton_schulz",
     "update_momentum",
 ]

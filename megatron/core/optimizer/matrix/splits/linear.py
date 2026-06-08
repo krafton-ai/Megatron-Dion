@@ -137,6 +137,24 @@ def linear_child_global_shape(
     return (child_rows, parent_cols)
 
 
+def linear_child_row_range(
+    *,
+    parent_row_start: int,
+    parent_row_end: int,
+    split_rows: Tuple[int, int],
+    child_kind: str,
+) -> Optional[Tuple[int, int]]:
+    """Project a fused linear_fc1 parent row interval to one child row interval."""
+    child_index = _linear_child_index(child_kind)
+    child_row_start = 0 if child_index == 0 else int(split_rows[0])
+    child_row_end = child_row_start + int(split_rows[child_index])
+    overlap_start = max(int(parent_row_start), child_row_start)
+    overlap_end = min(int(parent_row_end), child_row_end)
+    if overlap_end <= overlap_start:
+        return None
+    return int(overlap_start - child_row_start), int(overlap_end - child_row_start)
+
+
 def _direct_linear_rows(
     *,
     local_rows: int,
@@ -301,20 +319,25 @@ def _linear_child_segments(
             )
         ]
 
-    child_row_start = 0 if child_index == 0 else int(split_rows[0])
-    child_row_end = child_row_start + int(split_rows[child_index])
-    overlap_start = max(int(parent_row_start), child_row_start)
-    overlap_end = min(int(parent_row_end), child_row_end)
-    if overlap_end <= overlap_start:
+    child_range = linear_child_row_range(
+        parent_row_start=parent_row_start,
+        parent_row_end=parent_row_end,
+        split_rows=split_rows,
+        child_kind=child_kind,
+    )
+    if child_range is None:
         return []
+    child_start, child_end = child_range
+    child_row_start = 0 if child_index == 0 else int(split_rows[0])
+    overlap_start = child_start + child_row_start
+    overlap_end = child_end + child_row_start
     source_start = overlap_start - int(parent_row_start)
-    child_start = overlap_start - child_row_start
     return [
         (
             int(source_start),
             int(source_start + overlap_end - overlap_start),
             int(child_start),
-            int(child_start + overlap_end - overlap_start),
+            int(child_end),
         )
     ]
 

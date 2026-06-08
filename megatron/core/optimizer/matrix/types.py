@@ -1,4 +1,4 @@
-"""Backend-neutral data contracts for matrix-aware optimizers."""
+"""Backend-neutral data invariants for matrix-aware optimizers."""
 
 from __future__ import annotations
 

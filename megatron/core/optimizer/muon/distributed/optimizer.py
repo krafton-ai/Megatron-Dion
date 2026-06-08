@@ -79,10 +79,10 @@ from ..algorithm import MegatronMuon
 from ..kernels import (
     apply_muon_momentum,
     get_and_reset_gram_profile,
-    get_muon_scale_factor,
     orthogonalize_muon,
     orthogonalize_muon_update,
     orthogonalize_muon_update_2d,
+    muon_scale_factor,
 )
 from ..state import build_param_config, is_muon_matrix_param
 from ..types import MuonBatch, MuonDistMeta, MuonParamConfig, MuonStepParam
@@ -126,14 +126,14 @@ def _is_moe_expert_param(param: torch.Tensor, param_name: Optional[str] = None) 
     return num_local_experts is not None and int(num_local_experts) > 1
 
 
-def _mark_muon_bucket_params(param_map, param_to_name, fs_size: int):
+def mark_muon_bucket_params(param_map, param_to_name, fs_size: int):
     """Classify bucket params and build static Muon matrix metadata."""
     fs_size = int(fs_size)
     if fs_size <= 0:
         raise RuntimeError(f"[Muon] invalid FS size while marking bucket params: {fs_size}")
 
     muon_param_count = 0
-    muon_info_by_param = {}
+    matrix_info_by_param = {}
 
     for param in param_map.keys():
         param_name = None
@@ -163,8 +163,7 @@ def _mark_muon_bucket_params(param_map, param_to_name, fs_size: int):
         if fs_size > 1 and split_size < fs_size:
             param.is_muon_param = False
             param.is_matrix_param = False
-            param.muon_candidate = False
-            param.matrix_optimizer_candidate = False
+            param.matrix_optimizer_ready = False
             continue
 
         muon_param_count += 1
@@ -179,7 +178,7 @@ def _mark_muon_bucket_params(param_map, param_to_name, fs_size: int):
             m_global = m_local
             n_global = n_local
 
-        muon_info_by_param[param] = {
+        matrix_info_by_param[param] = {
             "is_muon": True,
             "global_shape": (m_global, n_global),
             "fs_shard_dim": fs_shard_dim,
@@ -187,7 +186,7 @@ def _mark_muon_bucket_params(param_map, param_to_name, fs_size: int):
             "per_expert_global_shape": None,
         }
 
-    return muon_param_count, muon_info_by_param
+    return muon_param_count, matrix_info_by_param
 
 
 class DistributedMuonOptimizer(DistributedMatrixOptimizer):
@@ -277,7 +276,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             fs_size=fs_size,
             bucket_id=bucket.bucket_id,
         )
-        muon_param_count, muon_info_by_param = _mark_muon_bucket_params(
+        muon_param_count, matrix_info_by_param = mark_muon_bucket_params(
             param_map=param_map,
             param_to_name=getattr(param_and_grad_buffer, "param_to_name", None),
             fs_size=fs_size,
@@ -285,19 +284,19 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
 
         (
             muon_layout,
-            muon_shard_layout_by_param,
+            shard_layout_by_param,
             muon_param_count,
         ) = build_matrix_shard_entries(
             bucket=bucket,
             param_map=param_map,
-            matrix_info_by_param=muon_info_by_param,
+            matrix_info_by_param=matrix_info_by_param,
             fs_size=fs_size,
             fs_rank=fs_rank,
             grad_shard_group_size=dp_world_size,
             grad_rank_to_fs_rank=grad_rank_to_fs_rank,
         )
         for param, range_info in param_map.items():
-            shard_layout = muon_shard_layout_by_param.get(param)
+            shard_layout = shard_layout_by_param.get(param)
             range_info["matrix_shard_layout"] = shard_layout
 
         parent_result["local_total"] = 0 if muon_layout is None else muon_layout.shard_size
@@ -1524,7 +1523,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
     def _scale_update(update, entry, meta):
         cfg = entry.config
         global_shape = tuple(int(dim) for dim in getattr(meta, "global_shape", entry.global_shape))
-        scale = get_muon_scale_factor(int(global_shape[0]), int(global_shape[1]), mode=cfg.scale_mode)
+        scale = muon_scale_factor(int(global_shape[0]), int(global_shape[1]), mode=cfg.scale_mode)
         return update * float(scale) * float(cfg.extra_scale_factor)
 
     def _orthogonalize_stacked_unscaled(
@@ -2284,4 +2283,4 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         return result
 
 
-__all__ = ["DistributedMuonOptimizer"]
+__all__ = ["DistributedMuonOptimizer", "mark_muon_bucket_params"]

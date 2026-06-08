@@ -305,11 +305,6 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             param_to_name=param_to_name,
         )
 
-    @classmethod
-    def _mark_dion_bucket_params(cls, param_map, param_to_name, fs_size):
-        """Classify bucket params and build static Dion metadata once."""
-        return mark_dion_bucket_params(param_map, param_to_name, fs_size)
-
     def _init_groups(self) -> None:
         """Resolve the standard runtime groups that Dion math consumes."""
         self.validation_data_parallel_group = (
@@ -403,26 +398,26 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
 
         model_param = getattr(shard_param, "_model_param", None)
         if model_param is not None:
-            for candidate in (
+            for source_param in (
                 self._get_opt_shard(model_param),
                 self._get_data_shard(model_param),
                 model_param,
             ):
-                if candidate is None:
+                if source_param is None:
                     continue
-                param_uid = getattr(candidate, "_dion_param_uid", None)
+                param_uid = getattr(source_param, "_dion_param_uid", None)
                 if param_uid is not None:
                     shard_param._dion_param_uid = param_uid
-                    candidate_meta = getattr(self, "_dion_dist_meta_by_uid", {}).get(param_uid)
-                    if candidate_meta is not None:
-                        dist_metas[shard_param] = candidate_meta
+                    source_meta = getattr(self, "_dion_dist_meta_by_uid", {}).get(param_uid)
+                    if source_meta is not None:
+                        dist_metas[shard_param] = source_meta
                     return param_uid
 
-                candidate_meta = dist_metas.get(candidate)
-                if candidate_meta is not None and getattr(candidate_meta, "param_uid", None) is not None:
-                    shard_param._dion_param_uid = candidate_meta.param_uid
-                    dist_metas[shard_param] = candidate_meta
-                    return candidate_meta.param_uid
+                source_meta = dist_metas.get(source_param)
+                if source_meta is not None and getattr(source_meta, "param_uid", None) is not None:
+                    shard_param._dion_param_uid = source_meta.param_uid
+                    dist_metas[shard_param] = source_meta
+                    return source_meta.param_uid
 
         raise RuntimeError(
             "[Dion] missing param_uid for optimizer shard "
@@ -646,14 +641,14 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             fs_size=fs_size,
             bucket_id=bucket.bucket_id,
         )
-        dion_param_count, dion_info_by_param = cls._mark_dion_bucket_params(
+        dion_param_count, matrix_info_by_param = mark_dion_bucket_params(
             param_map=param_map,
             param_to_name=getattr(param_and_grad_buffer, "param_to_name", None),
             fs_size=fs_size,
         )
-        canonical_param_map_snapshot = {}
+        param_map_snapshot = {}
         for param, range_info in param_map.items():
-            canonical_param_map_snapshot[param] = {
+            param_map_snapshot[param] = {
                 "param": (int(range_info["param"].start), int(range_info["param"].end)),
                 "gbuf_local": (
                     int(range_info["gbuf_local"].start),
@@ -674,20 +669,20 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
 
         (
             dion_layout,
-            dion_shard_layout_by_param,
+            shard_layout_by_param,
             dion_param_count,
         ) = (
             build_matrix_shard_entries(
                 bucket=bucket,
                 param_map=param_map,
-                matrix_info_by_param=dion_info_by_param,
+                matrix_info_by_param=matrix_info_by_param,
                 fs_size=fs_size,
                 fs_rank=fs_rank,
                 grad_shard_group_size=dp_world_size,
                 grad_rank_to_fs_rank=grad_rank_to_fs_rank,
             )
         )
-        for param, snapshot in canonical_param_map_snapshot.items():
+        for param, snapshot in param_map_snapshot.items():
             range_info = param_map[param]
             current = {
                 "param": (int(range_info["param"].start), int(range_info["param"].end)),
@@ -714,7 +709,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
                 )
 
         for param, range_info in param_map.items():
-            range_info["matrix_shard_layout"] = dion_shard_layout_by_param.get(param)
+            range_info["matrix_shard_layout"] = shard_layout_by_param.get(param)
         parent_result["local_total"] = 0 if dion_layout is None else dion_layout.shard_size
 
         # Calculate param counts for summary
@@ -805,15 +800,15 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
         # cheap lookup tables used later in the optimizer.
         total_params = 0
         total_dion_params = 0
-        unique_param_ids = set()
-        unique_two_d_total = 0
-        unique_two_d_dion = 0
-        unique_two_d_fp8_skipped = 0
-        unique_two_d_manual_disabled = 0
-        unique_two_d_not_candidate = 0
-        unique_two_d_role_excluded = 0
-        unique_two_d_tp_late_reduction_excluded = 0
-        unexpected_two_d_leftovers = []
+        seen_param_ids = set()
+        n_2d = 0
+        n_dion_2d = 0
+        n_fp8 = 0
+        n_disabled = 0
+        n_unprepared = 0
+        n_role_excluded = 0
+        n_tp_late = 0
+        unexpected_2d_params = []
 
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             buffer = self.buffers[gbuf_idx]
@@ -862,87 +857,87 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
 
                         self._shard_layouts_by_param[param] = shard_layout
 
-                        if id(param) in unique_param_ids:
+                        if id(param) in seen_param_ids:
                             continue
 
-                        unique_param_ids.add(id(param))
+                        seen_param_ids.add(id(param))
                         if param.ndim != 2:
                             continue
 
-                        unique_two_d_total += 1
-                        unique_two_d_dion += 1
+                        n_2d += 1
+                        n_dion_2d += 1
 
                     for param in gbuf_range_map["param_map"].keys():
-                        if id(param) in unique_param_ids:
+                        if id(param) in seen_param_ids:
                             continue
 
-                        unique_param_ids.add(id(param))
+                        seen_param_ids.add(id(param))
                         if param.ndim != 2:
                             continue
 
-                        unique_two_d_total += 1
+                        n_2d += 1
                         pname = ""
                         try:
                             pname = buffer.param_to_name.get(param, "")
                         except Exception:
                             pname = ""
                         if getattr(param, "use_dion", None) is False:
-                            unique_two_d_manual_disabled += 1
+                            n_disabled += 1
                             continue
 
                         if not getattr(
                             param,
-                            "matrix_optimizer_candidate",
-                            getattr(param, "dion_candidate", False),
+                            "matrix_optimizer_ready",
+                            False,
                         ):
-                            unique_two_d_not_candidate += 1
+                            n_unprepared += 1
                             continue
 
                         if (
                             getattr(param, "is_embedding_or_output_parameter", False)
                             or getattr(param, "is_lm_head_parameter", False)
                         ):
-                            unique_two_d_role_excluded += 1
+                            n_role_excluded += 1
                             continue
 
                         if (
                             getattr(param, "sequence_parallel", False)
                             or getattr(param, "average_gradients_across_tp_domain", False)
                         ):
-                            unique_two_d_tp_late_reduction_excluded += 1
+                            n_tp_late += 1
                             continue
 
                         if is_float8tensor(param):
-                            unique_two_d_fp8_skipped += 1
+                            n_fp8 += 1
                             continue
 
-                        unexpected_two_d_leftovers.append(pname or f"id_{id(param)}")
+                        unexpected_2d_params.append(pname or f"id_{id(param)}")
 
-        expected_dion_two_d = (
-            unique_two_d_total
-            - unique_two_d_fp8_skipped
-            - unique_two_d_manual_disabled
-            - unique_two_d_not_candidate
-            - unique_two_d_role_excluded
-            - unique_two_d_tp_late_reduction_excluded
+        expected_dion_2d = (
+            n_2d
+            - n_fp8
+            - n_disabled
+            - n_unprepared
+            - n_role_excluded
+            - n_tp_late
         )
-        if unique_two_d_dion != expected_dion_two_d:
+        if n_dion_2d != expected_dion_2d:
             raise RuntimeError(
                 "[Dion] 2D Dion classification count mismatch "
-                f"(two_d_total={unique_two_d_total} "
-                f"dion_two_d={unique_two_d_dion} "
-                f"fp8_skipped={unique_two_d_fp8_skipped} "
-                f"manual_disabled={unique_two_d_manual_disabled} "
-                f"not_candidate={unique_two_d_not_candidate} "
-                f"role_excluded={unique_two_d_role_excluded} "
-                f"tp_late_reduction_excluded={unique_two_d_tp_late_reduction_excluded} "
-                f"expected_dion_two_d={expected_dion_two_d})"
+                f"(2d_total={n_2d} "
+                f"dion_2d={n_dion_2d} "
+                f"fp8_skipped={n_fp8} "
+                f"manual_disabled={n_disabled} "
+                f"not_prepared={n_unprepared} "
+                f"role_excluded={n_role_excluded} "
+                f"tp_late_reduction_excluded={n_tp_late} "
+                f"expected_dion_2d={expected_dion_2d})"
             )
 
-        if unexpected_two_d_leftovers:
+        if unexpected_2d_params:
             raise RuntimeError(
                 "[Dion] unexpected standard 2D parameters remain after classification: "
-                + ", ".join(unexpected_two_d_leftovers[:32])
+                + ", ".join(unexpected_2d_params[:32])
             )
 
     def _build_param_groups(
@@ -3581,7 +3576,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
         - This method should only bridge those canonical reduced grads onto optimizer
           shard params.
 
-        Contract:
+        Invariant:
         - standard model side canonical grad: `model_param.main_grad`
         - Dion step grad: adapter-stored local shard surface
         - optimizer shard grad: stock DO local view on `shard_param.grad` or `shard_param.decoupled_grad`

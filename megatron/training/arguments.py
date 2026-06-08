@@ -663,6 +663,10 @@ def validate_args(args, defaults={}):
         args.dion_q_dtype = map_dtype(args.dion_q_dtype)
     if hasattr(args, "dion_variance_dtype") and args.dion_variance_dtype is not None:
         args.dion_variance_dtype = map_dtype(args.dion_variance_dtype)
+    if hasattr(args, "aro_momentum_dtype") and args.aro_momentum_dtype is not None:
+        args.aro_momentum_dtype = map_dtype(args.aro_momentum_dtype)
+    if hasattr(args, "aro_rotation_dtype") and args.aro_rotation_dtype is not None:
+        args.aro_rotation_dtype = map_dtype(args.aro_rotation_dtype)
     if hasattr(args, "muon_gram_ns_restart_iters"):
         restart_iters = args.muon_gram_ns_restart_iters
         if isinstance(restart_iters, str):
@@ -1245,6 +1249,19 @@ def validate_args(args, defaults={}):
                 "--ckpt-format torch_dist. Use --no-save-optim/--no-load-optim for "
                 "model-only checkpoints."
             )
+
+    if args.optimizer == "aro" and args.use_distributed_optimizer:
+        if not args.no_save_optim or not args.no_load_optim:
+            assert args.ckpt_format == "torch_dist", (
+                "ARO distributed optimizer supports optimizer checkpointing only with "
+                "--ckpt-format torch_dist. Use --no-save-optim/--no-load-optim for "
+                "model-only checkpoints."
+            )
+    if args.optimizer == "aro" and not args.use_distributed_optimizer:
+        assert not args.aro_split_qkv and not args.aro_split_linear, (
+            "ARO split flags require --use-distributed-optimizer; the local ARO path "
+            "does not expand optimizer-only split children."
+        )
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -2135,7 +2152,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'dion', 'muon', 'dist_muon'],
+                       choices=['adam', 'sgd', 'dion', 'muon', 'dist_muon', 'aro'],
                        help='Optimizer function')
     group.add_argument('--dion-momentum', type=float, default=0.95,
                        help='Dion error-feedback momentum (mu parameter).')
@@ -2188,6 +2205,46 @@ def _add_training_args(parser):
     group.add_argument('--dion-variance-dtype', type=str, default=None,
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
                        help='Dtype for Dion scalar second-moment state.')
+    group.add_argument('--aro-momentum', type=float, default=0.95,
+                       help='ARO momentum coefficient.')
+    group.add_argument('--aro-base-optimizer', type=str, default='sinkhorn',
+                       choices=['sinkhorn'],
+                       help='ARO base optimizer in rotated coordinates.')
+    group.add_argument('--aro-sinkhorn-iters', type=int, default=5,
+                       help='Number of ARO Sinkhorn normalization iterations.')
+    group.add_argument('--aro-qr-backend', type=str, default='scqr',
+                       choices=['scqr', 'qr'],
+                       help='QR backend for ARO rotation updates.')
+    group.add_argument('--aro-scqr-eps', type=float, default=1e-6,
+                       help='Shift/epsilon used by ARO shifted Cholesky QR.')
+    group.add_argument('--aro-update-rms-scale', type=float, default=0.2,
+                       help='RMS scale target for ARO matrix updates.')
+    group.add_argument('--aro-scalar-optimizer', type=str, default='adam',
+                       choices=['adam', 'adamw', 'lion'],
+                       help='Scalar optimizer used for non-matrix ARO parameters.')
+    group.add_argument('--aro-scalar-lr-scale', type=float, default=1.0,
+                       help='Additional multiplicative constant for ARO scalar updates.')
+    group.add_argument('--aro-beta1', type=float, default=0.9,
+                       help='Beta1 for the ARO scalar optimizer.')
+    group.add_argument('--aro-beta2', type=float, default=0.95,
+                       help='Beta2 for the ARO scalar optimizer.')
+    group.add_argument('--aro-scalar-eps', type=float, default=1e-8,
+                       help='Epsilon for the ARO scalar optimizer.')
+    group.add_argument('--aro-split-qkv', action='store_true', dest='aro_split_qkv',
+                       help='Treat fused QKV weights as optimizer-only children for ARO.')
+    group.add_argument('--no-aro-split-qkv', action='store_false', dest='aro_split_qkv',
+                       help='Do not split fused QKV weights for ARO.')
+    group.add_argument('--aro-split-linear', action='store_true', dest='aro_split_linear',
+                       help='Treat fused linear_fc1 weights as optimizer-only children for ARO.')
+    group.add_argument('--no-aro-split-linear', action='store_false', dest='aro_split_linear',
+                       help='Do not split fused linear_fc1 weights for ARO.')
+    group.set_defaults(aro_split_qkv=False, aro_split_linear=False)
+    group.add_argument('--aro-momentum-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for ARO momentum state.')
+    group.add_argument('--aro-rotation-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for ARO rotation state.')
     group.add_argument('--fully-shard-model-parallel-size', type=int, default=1,
                        help='Matrix optimizer fully-sharded axis size.')
     group.add_argument('--replicate-model-parallel-size', type=int, default=1,

@@ -42,7 +42,7 @@ class MegatronDion(Optimizer):
     standard optimizer data-parallel group size.
 
     Maintains mathematical equivalence with the reference implementation on top
-    of the DistributedOptimizer runtime contract.
+    of the DistributedOptimizer runtime invariant.
     """
 
     def __init__(
@@ -253,7 +253,7 @@ class MegatronDion(Optimizer):
         default_scalar_lr_scale = float(self.defaults.get('scalar_lr_scale', 1.0))
         default_betas = self.defaults.get('betas', (0.9, 0.95))
         default_eps = self.defaults.get('scalar_eps', 1e-8)
-        scalar_contract_order: list[tuple] = []
+        scalar_invariant_order: list[tuple] = []
         scalar_batches = OrderedDict()
 
         def _effective_weight_decay(param, optim_group) -> float:
@@ -363,7 +363,7 @@ class MegatronDion(Optimizer):
             if scalar_opt == "adamw":
                 second_moment = _ensure_scalar_second_moment(p, state)
 
-            scalar_contract_key = (
+            scalar_invariant_key = (
                 scalar_opt,
                 id(optim_group),
                 str(p.device),
@@ -377,8 +377,8 @@ class MegatronDion(Optimizer):
                 float(beta2),
                 int(step),
             )
-            if scalar_contract_key not in scalar_batches:
-                scalar_batches[scalar_contract_key] = {
+            if scalar_invariant_key not in scalar_batches:
+                scalar_batches[scalar_invariant_key] = {
                     "scalar_optimizer": scalar_opt,
                     "params": [],
                     "grads": [],
@@ -391,16 +391,16 @@ class MegatronDion(Optimizer):
                     "beta1": beta1,
                     "beta2": beta2,
                 }
-                scalar_contract_order.append(scalar_contract_key)
-            scalar_batch = scalar_batches[scalar_contract_key]
+                scalar_invariant_order.append(scalar_invariant_key)
+            scalar_batch = scalar_batches[scalar_invariant_key]
             scalar_batch["params"].append(p)
             scalar_batch["grads"].append(grad)
             scalar_batch["first_moments"].append(first_moment)
             if second_moment is not None:
                 scalar_batch["second_moments"].append(second_moment)
 
-        for scalar_contract_key in scalar_contract_order:
-            scalar_batch = scalar_batches[scalar_contract_key]
+        for scalar_invariant_key in scalar_invariant_order:
+            scalar_batch = scalar_batches[scalar_invariant_key]
             if scalar_batch["scalar_optimizer"] == "lion":
                 lion_update_foreach(
                     scalar_batch["params"],

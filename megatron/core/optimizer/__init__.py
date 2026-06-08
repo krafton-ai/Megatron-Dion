@@ -46,12 +46,18 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
+from .aro.distributed.integration import (
+    build_aro_distributed_optimizer,
+    build_aro_optimizer,
+    get_aro_param_override,
+)
+from .aro.state import init_aro_state, prepare_aro_params
 from .dion.distributed.integration import (
     build_dion_distributed_optimizer,
     build_dion_optimizer,
     get_dion_param_override,
 )
-from .dion.params import mark_dion_candidates
+from .dion.params import prepare_dion_params
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .muon import (
@@ -59,7 +65,7 @@ from .muon import (
     build_muon_optimizer,
     get_muon_param_override,
     init_muon_state,
-    mark_muon_candidates,
+    prepare_muon_params,
 )
 from .optimizer import (
     ChainedOptimizer,
@@ -70,6 +76,7 @@ from .optimizer import (
 )
 from .optimizer_config import (
     AdamOptimizerConfig,
+    AroOptimizerConfig,
     DionOptimizerConfig,
     MuonOptimizerConfig,
     OptimizerConfig,
@@ -210,7 +217,7 @@ def _get_param_groups(
                         global_rows *= int(parallel_state.get_tensor_model_parallel_world_size())
                 if global_rows % 2 != 0:
                     raise RuntimeError(
-                        "[DION_LINEAR_FC1_INVALID_ROWS] "
+                        "[MATRIX_LINEAR_FC1_INVALID_ROWS] "
                         f"param={name} global_rows={global_rows}"
                     )
                 split_rows = global_rows // 2
@@ -246,6 +253,15 @@ def _get_param_groups(
                 else:
                     param_override = combine_param_group_overrides(
                         [param_override, muon_param_override]
+                    )
+
+            aro_param_override = get_aro_param_override(config, param, param_override, name)
+            if aro_param_override is not None:
+                if param_override is None:
+                    param_override = aro_param_override
+                else:
+                    param_override = combine_param_group_overrides(
+                        [param_override, aro_param_override]
                     )
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
@@ -520,6 +536,18 @@ def _get_megatron_optimizer_based_on_param_groups(
                 is_expert_parallel=is_expert_parallel,
             )
             init_state = init_muon_state
+        elif config.optimizer == 'aro':
+            optimizer = build_aro_optimizer(
+                config=config,
+                param_groups=param_groups,
+                data_parallel_group=data_parallel_group,
+                pure_data_parallel_group=pure_data_parallel_group,
+                dense_fs_group=intra_dist_opt_dp_group,
+                aro_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
+                pg_collection=pg_collection,
+                is_expert_parallel=is_expert_parallel,
+            )
+            init_state = init_aro_state
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:
@@ -584,6 +612,22 @@ def _get_megatron_optimizer_based_on_param_groups(
                     pure_data_parallel_group=pure_data_parallel_group,
                     dense_fs_group=intra_dist_opt_dp_group,
                     muon_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                    pg_collection=pg_collection,
+                    is_expert_parallel=is_expert_parallel,
+                )
+            elif config.optimizer == 'aro':
+                optimizer = build_aro_distributed_optimizer(
+                    optimizer_args=optimizer_args,
+                    config=config,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    pure_data_parallel_group=pure_data_parallel_group,
+                    dense_fs_group=intra_dist_opt_dp_group,
+                    aro_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
                     data_parallel_group_gloo=data_parallel_group_gloo,
                     data_parallel_group_idx=data_parallel_group_idx,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
@@ -683,10 +727,13 @@ def get_megatron_optimizer(
 
     if getattr(config, 'optimizer', None) == 'dion':
         for model_chunk in model_chunks:
-            mark_dion_candidates(model_chunk)
+            prepare_dion_params(model_chunk)
     elif getattr(config, 'optimizer', None) == 'muon':
         for model_chunk in model_chunks:
-            mark_muon_candidates(model_chunk)
+            prepare_muon_params(model_chunk)
+    elif getattr(config, 'optimizer', None) == 'aro':
+        for model_chunk in model_chunks:
+            prepare_aro_params(model_chunk)
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:

@@ -1,4 +1,4 @@
-"""Muon state helpers matching the local MCore backend contract."""
+"""Muon state helpers matching the local MCore backend invariant."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from torch import Tensor
 from ..matrix.splits.linear import get_linear_split_rows_from_dist_meta
 from ..matrix.splits.qkv import get_qkv_split_shapes_from_dist_meta
 from ..matrix.splits.qkvg import get_qkvg_split_shapes_from_dist_meta
-from .kernels import get_muon_scale_factor
+from .kernels import muon_scale_factor
 from .types import MuonDistMeta, MuonMixedPrecisionConfig, MuonParamConfig
 
 
@@ -116,7 +116,7 @@ def has_multiple_local_experts(dist_meta: Optional[MuonDistMeta]) -> bool:
     )
 
 
-def is_muon_eligible_param(param: Tensor, dist_meta: Optional[MuonDistMeta] = None) -> bool:
+def _supports_muon_matrix(param: Tensor, dist_meta: Optional[MuonDistMeta] = None) -> bool:
     """Return whether a tensor should use Muon instead of scalar fallback."""
     if getattr(param, "use_muon", None) is False:
         return False
@@ -151,18 +151,17 @@ def is_muon_matrix_param(param: Tensor, dist_meta: Optional[MuonDistMeta] = None
         return False
     if dist_meta is not None and getattr(dist_meta, "is_muon_param", False):
         return True
-    if not getattr(param, "matrix_optimizer_candidate", getattr(param, "muon_candidate", True)):
+    if not getattr(param, "matrix_optimizer_ready", False):
         return False
-    if not is_muon_eligible_param(param, dist_meta):
+    if not _supports_muon_matrix(param, dist_meta):
         return False
     return True
 
 
-def mark_muon_candidates(module: torch.nn.Module) -> None:
-    """Mark local parameters as potential Muon matrix candidates."""
+def prepare_muon_params(module: torch.nn.Module) -> None:
+    """Prepare local parameters for Muon routing."""
     for name, param in module.named_parameters():
-        param.muon_candidate = True
-        param.matrix_optimizer_candidate = True
+        param.matrix_optimizer_ready = True
         param.use_muon = is_muon_matrix_param(param)
         if "linear_qkv.weight" in name and int(param.ndim) == 2:
             param.is_qkv = True
@@ -234,7 +233,7 @@ def build_param_config(
     m_local, n_local = (int(local_shape[0]), int(local_shape[1]))
     global_shape = get_global_shape(dist_meta, m_local, n_local)
     config.is_transposed = int(global_shape[0]) > int(global_shape[1])
-    config.scale_factor = get_muon_scale_factor(*global_shape, mode=scale_mode) * float(
+    config.scale_factor = muon_scale_factor(*global_shape, mode=scale_mode) * float(
         extra_scale_factor
     )
 
@@ -356,9 +355,8 @@ __all__ = [
     "init_matrix_state",
     "init_param_state",
     "init_scalar_state",
-    "is_muon_eligible_param",
     "is_muon_matrix_param",
-    "mark_muon_candidates",
+    "prepare_muon_params",
     "require_2d_local_shape",
     "state_backend_keys",
     "str_to_dtype",

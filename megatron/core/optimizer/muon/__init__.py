@@ -9,13 +9,13 @@ from .algorithm import (
 )
 from .backend import MuonBackend
 from .distributed import DistributedMuonOptimizer, build_muon_distributed_optimizer
-from .state import is_muon_matrix_param, mark_muon_candidates
+from .state import is_muon_matrix_param, prepare_muon_params
 
 
 def get_muon_param_override(config, param, param_override, name):
     """Return Muon-specific param override.
 
-    Muon uses the standard Megatron weight-decay and LR override contract for
+    Muon uses the standard Megatron weight-decay and LR override invariant for
     now; scalar-vs-matrix routing is decided inside the optimizer.
     """
     del config, param, param_override, name
@@ -32,5 +32,5 @@ __all__ = [
     "get_muon_param_override",
     "init_muon_state",
     "is_muon_matrix_param",
-    "mark_muon_candidates",
+    "prepare_muon_params",
 ]

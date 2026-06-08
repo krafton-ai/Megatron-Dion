@@ -139,7 +139,7 @@ def _seeded_normal_tensor(
 def sketch_keys(
     *,
     dist_metas: Optional[List],
-    contract: str,
+    invariant: str,
     step_count: int,
 ) -> Optional[List[object]]:
     """Return topology-invariant sketch keys for one Dion update batch."""
@@ -149,11 +149,11 @@ def sketch_keys(
     keys: List[object] = []
     for dist_meta in dist_metas:
         if dist_meta is None:
-            keys.append((contract, step_count, None))
+            keys.append((invariant, step_count, None))
             continue
         keys.append(
             (
-                contract,
+                invariant,
                 step_count,
                 getattr(dist_meta, "param_uid", None),
                 getattr(dist_meta, "param_name", ""),
@@ -165,7 +165,7 @@ def sketch_keys(
 def make_sketch(
     *,
     dist_metas: Optional[List],
-    contract: str,
+    invariant: str,
     step_count: int,
 ):
     """Build a topology-independent sketch generator for one Dion update batch."""
@@ -174,7 +174,7 @@ def make_sketch(
 
     keys = sketch_keys(
         dist_metas=dist_metas,
-        contract=contract,
+        invariant=invariant,
         step_count=step_count,
     )
     seeds = [_sketch_seed(seed_key) for seed_key in keys]
@@ -189,19 +189,19 @@ def make_sketch(
         else:
             raise RuntimeError(
                 "[DION_INVALID_SKETCH_BATCH] "
-                f"contract={contract} expected batched 3D tensor, got shape={tuple(P.shape)}"
+                f"invariant={invariant} expected batched 3D tensor, got shape={tuple(P.shape)}"
             )
         if batch != len(seeds):
             raise RuntimeError(
                 "[DION_SKETCH_META_MISMATCH] "
-                f"contract={contract} batch={batch} sketch_keys={len(seeds)}"
+                f"invariant={invariant} batch={batch} sketch_keys={len(seeds)}"
             )
         m = P.size(-2)
         r = P.size(-1)
         k = math.ceil(oversample * r / 128.0) * 128
         if k <= 0:
             raise RuntimeError(
-                f"[DION_INVALID_SKETCH_RANK] contract={contract} r={r} oversample={oversample} k={k}"
+                f"[DION_INVALID_SKETCH_RANK] invariant={invariant} r={r} oversample={oversample} k={k}"
             )
         std = math.sqrt(1.0 / k)
         if batch == 1 and len(batch_shape) == 0:
@@ -630,7 +630,7 @@ def generate_random_sketch_matrix(
     oversample: float = 1.25,
     make_sketch=None,
 ) -> Tensor:
-    """Local sketch generation contract for regular-tensor orthogonalization."""
+    """Local sketch generation invariant for regular-tensor orthogonalization."""
     assert P.ndim >= 3, "P must have batch dimension"
 
     batch_shape = P.shape[:-2]
@@ -706,7 +706,7 @@ def distributed_orthogonalize(
 
     batch_sketch_keys = sketch_keys(
         dist_metas=dist_metas[:active_batch_size] if dist_metas is not None else None,
-        contract="distributed",
+        invariant="distributed",
         step_count=optimizer._step_count,
     )
     if batch_sketch_keys is None or len(batch_sketch_keys) != active_batch_size:

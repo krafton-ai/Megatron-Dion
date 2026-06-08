@@ -483,6 +483,65 @@ class MuonOptimizerConfig(AdamOptimizerConfig):
 
 
 @dataclass
+class AroOptimizerConfig(OptimizerConfig):
+    """ARO optimizer configuration object."""
+
+    optimizer: str = 'aro'
+    """Optimizer name."""
+
+    aro_momentum: float = 0.95
+    """Momentum coefficient for ARO's momentum-first update."""
+
+    aro_base_optimizer: str = "sinkhorn"
+    """Stateless base optimizer used in rotated coordinates."""
+
+    aro_sinkhorn_iters: int = 5
+    """Number of simultaneous Sinkhorn normalization iterations."""
+
+    aro_qr_backend: str = "scqr"
+    """QR backend used for ARO rotation updates."""
+
+    aro_scqr_eps: float = 1e-6
+    """Shift used by shifted Cholesky QR and normalization eps."""
+
+    aro_update_rms_scale: float = 0.2
+    """RMS scale target for ARO matrix updates."""
+
+    aro_scalar_optimizer: str = "adam"
+    """Scalar optimizer used for non-matrix ARO parameters."""
+
+    aro_scalar_lr_scale: float = 1.0
+    """Additional multiplicative constant used by ARO scalar optimizer updates."""
+
+    aro_beta1: float = 0.9
+    """Beta1 for ARO scalar optimizer states."""
+
+    aro_beta2: float = 0.95
+    """Beta2 for ARO scalar optimizer states."""
+
+    aro_scalar_eps: float = 1e-8
+    """Epsilon for ARO scalar optimizer updates."""
+
+    aro_split_qkv: bool = False
+    """Whether ARO should treat fused QKV weights as optimizer-only children."""
+
+    aro_split_linear: bool = False
+    """Whether ARO should treat fused linear_fc1 weights as optimizer-only children."""
+
+    aro_momentum_dtype: Optional[torch.dtype] = None
+    """Dtype for ARO momentum state."""
+
+    aro_rotation_dtype: Optional[torch.dtype] = None
+    """Dtype for ARO rotation state."""
+
+    fully_shard_model_parallel_size: int = 1
+    """ARO fully-sharded model-parallel size."""
+
+    replicate_model_parallel_size: int = 1
+    """ARO replicate-parallel size."""
+
+
+@dataclass
 class SGDOptimizerConfig(OptimizerConfig):
     """SGD optimizer configuration object."""
 

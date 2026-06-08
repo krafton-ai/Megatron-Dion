@@ -45,7 +45,7 @@ def build_batch_key(
     )
 
 
-def muon_batch_key(step_param, *, fs_mode: str, tp_mode: str, ns_backend: str):
+def _batch_key(step_param, *, fs_mode: str, tp_mode: str, ns_backend: str):
     """Return a topology-aware key for a Muon batch."""
     dist_meta = step_param.dist_meta
     config = step_param.config
@@ -92,7 +92,7 @@ def build_muon_batches(
     groups = defaultdict(list)
     for step_param in matrix_params:
         groups[
-            muon_batch_key(
+            _batch_key(
                 step_param,
                 fs_mode=fs_mode,
                 tp_mode=tp_mode,

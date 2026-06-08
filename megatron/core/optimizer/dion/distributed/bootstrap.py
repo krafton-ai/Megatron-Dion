@@ -59,7 +59,7 @@ def build_q_init(
     get_replicate_group: Callable,
     make_group_broadcast: Callable,
 ) -> DionQInit:
-    """Return the adapter-authored Q-init contract for one Dion param."""
+    """Return the adapter-authored Q-init invariant for one Dion param."""
     if dist_meta is None:
         raise RuntimeError(
             "[DION_MISSING_STATE_INIT_META] "

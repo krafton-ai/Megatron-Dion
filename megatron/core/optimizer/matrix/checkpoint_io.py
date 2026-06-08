@@ -1122,7 +1122,7 @@ def write_standard_shards_to_model_(
     get_param_range_map: Callable[[torch.nn.Parameter], dict],
     get_bucket_param_data: Callable[[torch.nn.Parameter], torch.Tensor] | None,
 ) -> int:
-    """Write back standard optimizer shards using the standard DO local-shard contract."""
+    """Write back standard optimizer shards using the standard DO local-shard invariant."""
     param_count = 0
     for model_group, shard_param_group in zip(model_groups, shard_groups):
         for model_param, shard_param in zip(model_group, shard_param_group):

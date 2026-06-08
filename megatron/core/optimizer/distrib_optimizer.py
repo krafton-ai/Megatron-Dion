@@ -46,6 +46,10 @@ try:
     from megatron.core.optimizer.muon.algorithm import MegatronMuon
 except ImportError:
     MegatronMuon = None
+try:
+    from megatron.core.optimizer.aro.algorithm import MegatronAro
+except ImportError:
+    MegatronAro = None
 
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -534,10 +538,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             allowed_optimizers = allowed_optimizers + (MegatronDion,)
         if MegatronMuon is not None:
             allowed_optimizers = allowed_optimizers + (MegatronMuon,)
+        if MegatronAro is not None:
+            allowed_optimizers = allowed_optimizers + (MegatronAro,)
 
         assert isinstance(optimizer, allowed_optimizers) or optimizer is None, (
-            "Only Adam, HybridDeviceOptimizer, MegatronDion, and MegatronMuon currently supported, "
-            "due to checkpointing requirements."
+            "Only Adam, HybridDeviceOptimizer, MegatronDion, MegatronMuon, and MegatronAro "
+            "currently supported, due to checkpointing requirements."
         )
 
         # when freezing sub-models we have no real optimizer

@@ -132,26 +132,26 @@ class DistributedMatrixOptimizer(DistributedOptimizer):
 
         model_param = getattr(shard_param, "_model_param", None)
         if model_param is not None:
-            for candidate in (
+            for source_param in (
                 self._get_opt_shard(model_param),
                 self._get_data_shard(model_param),
                 model_param,
             ):
-                if candidate is None:
+                if source_param is None:
                     continue
-                param_uid = getattr(candidate, "_matrix_param_uid", None)
+                param_uid = getattr(source_param, "_matrix_param_uid", None)
                 if param_uid is not None:
                     shard_param._matrix_param_uid = param_uid
-                    candidate_meta = dist_metas.get(candidate)
-                    if candidate_meta is not None:
-                        dist_metas[shard_param] = candidate_meta
+                    source_meta = dist_metas.get(source_param)
+                    if source_meta is not None:
+                        dist_metas[shard_param] = source_meta
                     return param_uid
 
-                candidate_meta = dist_metas.get(candidate)
-                if candidate_meta is not None and getattr(candidate_meta, "param_uid", None) is not None:
-                    shard_param._matrix_param_uid = candidate_meta.param_uid
-                    dist_metas[shard_param] = candidate_meta
-                    return candidate_meta.param_uid
+                source_meta = dist_metas.get(source_param)
+                if source_meta is not None and getattr(source_meta, "param_uid", None) is not None:
+                    shard_param._matrix_param_uid = source_meta.param_uid
+                    dist_metas[shard_param] = source_meta
+                    return source_meta.param_uid
 
         raise RuntimeError(
             "[Matrix] missing param_uid for optimizer shard "

@@ -193,7 +193,7 @@ def resolve_async_task_limit(
     return min(task_count, limit)
 
 
-def validate_update_contract(
+def validate_update_invariant(
     optimizer,
     *,
     optim_groups: List[dict],
@@ -205,7 +205,7 @@ def validate_update_contract(
     if real_batch_size <= 0:
         return
 
-    update_contract_rows = []
+    update_invariant_rows = []
     for index in range(real_batch_size):
         optimizer_state = optimizer_states[index]
         dist_meta = dist_metas[index]
@@ -233,7 +233,7 @@ def validate_update_contract(
             optim_group.get("weight_decay", optimizer.defaults["weight_decay"] * wd_mult)
         )
         mu = float(optim_group.get("mu", optimizer.defaults["mu"]))
-        update_contract_rows.append(
+        update_invariant_rows.append(
             {
                 "batch_index": int(index),
                 "param_uid": (
@@ -262,8 +262,8 @@ def validate_update_contract(
             }
         )
 
-    expected_contract = {
-        key: update_contract_rows[0][key]
+    expected_invariant = {
+        key: update_invariant_rows[0][key]
         for key in (
             "global_shape",
             "per_expert_global_shape",
@@ -280,14 +280,14 @@ def validate_update_contract(
     }
     mismatched_rows = [
         row
-        for row in update_contract_rows[1:]
-        if any(row[key] != expected_contract[key] for key in expected_contract)
+        for row in update_invariant_rows[1:]
+        if any(row[key] != expected_invariant[key] for key in expected_invariant)
     ]
     if mismatched_rows:
         raise RuntimeError(
-            "[DION_BATCH_UPDATE_CONTRACT_MISMATCH] "
+            "[DION_BATCH_UPDATE_INVARIANT_MISMATCH] "
             f"step={optimizer._step_count} rank={optimizer._global_rank} "
-            f"expected={expected_contract} mismatched_rows={mismatched_rows}"
+            f"expected={expected_invariant} mismatched_rows={mismatched_rows}"
         )
 
 
@@ -1036,7 +1036,7 @@ def apply_batch_updates(
     del R_batch
     if real_batch_size <= 0:
         return
-    validate_update_contract(
+    validate_update_invariant(
         optimizer,
         optim_groups=optim_groups,
         optimizer_states=optimizer_states,
@@ -1529,7 +1529,7 @@ def batch_dion_update_async(
             "[DION_MISSING_BATCH_COLLECTIVES] "
             f"step={optimizer._step_count} rank={optimizer._global_rank}"
         )
-    validate_update_contract(
+    validate_update_invariant(
         optimizer,
         optim_groups=optim_groups,
         optimizer_states=optimizer_states,

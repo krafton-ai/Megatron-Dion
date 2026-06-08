@@ -17,19 +17,19 @@ from ..matrix.parameter import (
 from ..matrix.sharding import get_fs_split_dim, get_tp_split_dim, is_tp_enabled
 
 
-def mark_dion_candidates(module: torch.nn.Module) -> None:
-    """Mark all local parameters as potential Dion candidates."""
+def prepare_dion_params(module: torch.nn.Module) -> None:
+    """Prepare local parameters for Dion routing."""
     for param in module.parameters():
-        param.dion_candidate = True
-        param.matrix_optimizer_candidate = True
+        param.matrix_optimizer_ready = True
+        param.use_dion = is_dion_matrix_param(param)
 
 
-def is_dion_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool:
+def is_dion_matrix_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool:
     """Return True iff this parameter should use Dion matrix updates."""
     resolved_name = param_name or getattr(param, "_param_name", None)
     if getattr(param, "use_dion", None) is False:
         return False
-    if not getattr(param, "matrix_optimizer_candidate", getattr(param, "dion_candidate", False)):
+    if not getattr(param, "matrix_optimizer_ready", False):
         return False
     if param.ndim != 2:
         return False
@@ -57,7 +57,7 @@ def mark_dion_bucket_params(param_map, param_to_name, fs_size: int):
         raise RuntimeError(f"[Dion] invalid FS size while marking bucket params: {fs_size}")
 
     dion_param_count = 0
-    dion_info_by_param = {}
+    matrix_info_by_param = {}
 
     for param in param_map.keys():
         param_name = None
@@ -70,11 +70,10 @@ def mark_dion_bucket_params(param_map, param_to_name, fs_size: int):
             is_combined_grouped_mlp_param(param, param_name)
             or is_unindexed_multi_local_expert_param(param, param_name)
         )
-        param.is_dion_param = is_dion_param(param, param_name)
+        param.is_dion_param = is_dion_matrix_param(param, param_name)
         param.is_matrix_param = bool(param.is_dion_param)
         if not param.is_dion_param and fallback_to_scalar:
-            param.dion_candidate = False
-            param.matrix_optimizer_candidate = False
+            param.matrix_optimizer_ready = False
 
         is_expert = is_moe_expert_param(param, param_name)
         raw_tp_split_dim = get_tp_split_dim(param)
@@ -94,8 +93,7 @@ def mark_dion_bucket_params(param_map, param_to_name, fs_size: int):
         if fs_size > 1 and split_size < fs_size:
             param.is_dion_param = False
             param.is_matrix_param = False
-            param.dion_candidate = False
-            param.matrix_optimizer_candidate = False
+            param.matrix_optimizer_ready = False
             continue
 
         dion_param_count += 1
@@ -122,7 +120,7 @@ def mark_dion_bucket_params(param_map, param_to_name, fs_size: int):
         else:
             per_expert_global_shape = None
 
-        dion_info_by_param[param] = {
+        matrix_info_by_param[param] = {
             "is_dion": True,
             "global_shape": (m_global, n_global),
             "fs_shard_dim": fs_shard_dim,
@@ -130,4 +128,4 @@ def mark_dion_bucket_params(param_map, param_to_name, fs_size: int):
             "per_expert_global_shape": per_expert_global_shape,
         }
 
-    return dion_param_count, dion_info_by_param
+    return dion_param_count, matrix_info_by_param
