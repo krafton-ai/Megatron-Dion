@@ -76,7 +76,7 @@ _PP_BOUNDARY_PROBE_BWD_CALL_IDX = {}
 
 
 def _pp_boundary_probe_phase_enabled(boundary: str) -> bool:
-    phases_raw = os.getenv("DION_DEBUG_PP_BOUNDARY_PHASES", "post").strip().lower()
+    phases_raw = os.getenv("MATRIX_DEBUG_PP_BOUNDARY_PHASES", "post").strip().lower()
     phases = {token.strip() for token in phases_raw.split(",") if token.strip()}
     if not phases:
         phases = {"post"}
@@ -86,32 +86,32 @@ def _pp_boundary_probe_phase_enabled(boundary: str) -> bool:
 def _maybe_register_pp_boundary_probe(
     hidden_states: Tensor, *, layer_number: int, boundary: str
 ) -> None:
-    if os.getenv("DION_DEBUG_PP_BOUNDARY_PROBE", "0") != "1":
+    if os.getenv("MATRIX_DEBUG_PP_BOUNDARY_PROBE", "0") != "1":
         return
     if not isinstance(hidden_states, torch.Tensor):
         return
     if not _pp_boundary_probe_phase_enabled(boundary):
         return
 
-    dump_dir = os.getenv("DION_DEBUG_PP_BOUNDARY_PROBE_DIR", "").strip()
+    dump_dir = os.getenv("MATRIX_DEBUG_PP_BOUNDARY_PROBE_DIR", "").strip()
     if not dump_dir:
         raise RuntimeError(
-            "[DION_INVALID_ENV] DION_DEBUG_PP_BOUNDARY_PROBE=1 requires "
-            "DION_DEBUG_PP_BOUNDARY_PROBE_DIR"
+            "[MATRIX_INVALID_ENV] MATRIX_DEBUG_PP_BOUNDARY_PROBE=1 requires "
+            "MATRIX_DEBUG_PP_BOUNDARY_PROBE_DIR"
         )
 
-    target_layer_raw = os.getenv("DION_DEBUG_PP_BOUNDARY_LAYER", "").strip()
+    target_layer_raw = os.getenv("MATRIX_DEBUG_PP_BOUNDARY_LAYER", "").strip()
     if not target_layer_raw:
         raise RuntimeError(
-            "[DION_INVALID_ENV] DION_DEBUG_PP_BOUNDARY_PROBE=1 requires "
-            "DION_DEBUG_PP_BOUNDARY_LAYER"
+            "[MATRIX_INVALID_ENV] MATRIX_DEBUG_PP_BOUNDARY_PROBE=1 requires "
+            "MATRIX_DEBUG_PP_BOUNDARY_LAYER"
         )
 
     target_layer = int(target_layer_raw)
     if int(layer_number) != target_layer:
         return
 
-    max_calls_raw = os.getenv("DION_DEBUG_PP_BOUNDARY_MAX_CALLS", "1").strip()
+    max_calls_raw = os.getenv("MATRIX_DEBUG_PP_BOUNDARY_MAX_CALLS", "1").strip()
     max_calls = int(max_calls_raw) if max_calls_raw else 1
 
     global _PP_BOUNDARY_PROBE_FWD_CALL_IDX

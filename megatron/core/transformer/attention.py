@@ -127,11 +127,11 @@ _ATTN_PHASE_PROFILE_COUNTS = {}
 
 
 def _attn_probe_enabled() -> bool:
-    return os.getenv("DION_DEBUG_ATTN_PROBE", "0") == "1"
+    return os.getenv("MATRIX_DEBUG_ATTN_PROBE", "0") == "1"
 
 
 def _attn_phase_profile_enabled() -> bool:
-    return os.getenv("DION_PROFILE_ATTN_PHASES", "0") == "1"
+    return os.getenv("MATRIX_PROFILE_ATTN_PHASES", "0") == "1"
 
 
 def _parse_int_set(raw: str) -> set[int] | None:
@@ -150,13 +150,13 @@ def _begin_attn_phase_profile(
     if not _attn_phase_profile_enabled():
         return None
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    selected_ranks = _parse_int_set(os.getenv("DION_PROFILE_ATTN_PHASE_RANKS", "0"))
+    selected_ranks = _parse_int_set(os.getenv("MATRIX_PROFILE_ATTN_PHASE_RANKS", "0"))
     if selected_ranks is not None and rank not in selected_ranks:
         return None
-    selected_layers = _parse_int_set(os.getenv("DION_PROFILE_ATTN_PHASE_LAYERS", "1"))
+    selected_layers = _parse_int_set(os.getenv("MATRIX_PROFILE_ATTN_PHASE_LAYERS", "1"))
     if selected_layers is not None and int(layer_number) not in selected_layers:
         return None
-    max_calls = int(os.getenv("DION_PROFILE_ATTN_PHASE_MAX_CALLS", "4"))
+    max_calls = int(os.getenv("MATRIX_PROFILE_ATTN_PHASE_MAX_CALLS", "4"))
     key = (rank, int(layer_number), tag)
     count = _ATTN_PHASE_PROFILE_COUNTS.get(key, 0)
     if count >= max_calls:
@@ -175,21 +175,21 @@ def _end_attn_phase_profile(token: tuple[int, int, str, float] | None) -> None:
     rank, layer_number, tag, start_time = token
     elapsed = time.perf_counter() - start_time
     print(
-        f"[DION_ATTN_PHASE] rank={rank} layer={layer_number} tag={tag} "
+        f"[MATRIX_ATTN_PHASE] rank={rank} layer={layer_number} tag={tag} "
         f"elapsed={elapsed:.6f}s",
         flush=True,
     )
 
 
 def _attn_probe_selected_ranks() -> set[int] | None:
-    raw = os.getenv("DION_DEBUG_ATTN_PROBE_RANKS", "").strip()
+    raw = os.getenv("MATRIX_DEBUG_ATTN_PROBE_RANKS", "").strip()
     if not raw:
         return None
     return {int(token.strip()) for token in raw.split(",") if token.strip()}
 
 
 def _attn_probe_full_tags() -> set[str]:
-    raw = os.getenv("DION_DEBUG_ATTN_PROBE_FULL_TAGS", "").strip()
+    raw = os.getenv("MATRIX_DEBUG_ATTN_PROBE_FULL_TAGS", "").strip()
     if not raw:
         return set()
     return {token.strip() for token in raw.split(",") if token.strip()}
@@ -207,29 +207,31 @@ def _maybe_dump_attn_probe_tensor(
     if not isinstance(tensor, torch.Tensor):
         return
 
-    dump_dir = os.getenv("DION_DEBUG_ATTN_PROBE_DIR", "").strip()
+    dump_dir = os.getenv("MATRIX_DEBUG_ATTN_PROBE_DIR", "").strip()
     if not dump_dir:
         raise RuntimeError(
-            "[DION_INVALID_ENV] DION_DEBUG_ATTN_PROBE=1 requires DION_DEBUG_ATTN_PROBE_DIR"
+            "[MATRIX_INVALID_ENV] MATRIX_DEBUG_ATTN_PROBE=1 requires "
+            "MATRIX_DEBUG_ATTN_PROBE_DIR"
         )
 
-    target_layer_raw = os.getenv("DION_DEBUG_ATTN_PROBE_LAYER", "").strip()
+    target_layer_raw = os.getenv("MATRIX_DEBUG_ATTN_PROBE_LAYER", "").strip()
     if not target_layer_raw:
         raise RuntimeError(
-            "[DION_INVALID_ENV] DION_DEBUG_ATTN_PROBE=1 requires DION_DEBUG_ATTN_PROBE_LAYER"
+            "[MATRIX_INVALID_ENV] MATRIX_DEBUG_ATTN_PROBE=1 requires "
+            "MATRIX_DEBUG_ATTN_PROBE_LAYER"
         )
     if int(layer_number) != int(target_layer_raw):
         return
 
     tags_raw = os.getenv(
-        "DION_DEBUG_ATTN_PROBE_TAGS",
+        "MATRIX_DEBUG_ATTN_PROBE_TAGS",
         "mixed_qkv,core_attn_out,proj_out,linear_qkv_weight,linear_proj_weight",
     ).strip()
     tags = {token.strip() for token in tags_raw.split(",") if token.strip()}
     if tags and tag not in tags:
         return
 
-    max_calls_raw = os.getenv("DION_DEBUG_ATTN_PROBE_MAX_CALLS", "1").strip()
+    max_calls_raw = os.getenv("MATRIX_DEBUG_ATTN_PROBE_MAX_CALLS", "1").strip()
     max_calls = int(max_calls_raw) if max_calls_raw else 1
     key = (int(layer_number), tag)
     call_idx = _ATTN_PROBE_CALL_IDX.get(key, 0)
@@ -291,7 +293,7 @@ def _maybe_dump_attn_probe_weight(
 
     weight = getattr(module, "weight", None)
     if weight is None:
-        raise RuntimeError(f"[DION_ATTN_PROBE] module for tag={tag} has no weight")
+        raise RuntimeError(f"[MATRIX_ATTN_PROBE] module for tag={tag} has no weight")
 
     _ATTN_PROBE_SEEN_WEIGHTS.add(key)
     _maybe_dump_attn_probe_tensor(
@@ -1569,7 +1571,7 @@ class SelfAttention(Attention):
             self.k_layernorm = None
 
     def _tag_linear_qkv_split_metadata(self) -> None:
-        """Attach Dion/Muon split metadata to the actual layer-local QKV weight."""
+        """Attach fused-QKV/QKVG split metadata to the actual layer-local QKV weight."""
         if not hasattr(self.linear_qkv, "weight"):
             return
         weight = self.linear_qkv.weight

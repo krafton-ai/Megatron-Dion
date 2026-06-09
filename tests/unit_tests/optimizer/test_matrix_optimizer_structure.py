@@ -22,9 +22,7 @@ from megatron.core.optimizer.matrix.grad_norm import grad_norm_inputs
 from megatron.core.optimizer.matrix.topology import resolve_fs_rp_topology
 from megatron.core.optimizer.matrix.checkpoint_io import (
     MATRIX_SUBSTRATE_FORMAT_VERSION,
-    build_matrix_checkpoint_metadata as build_dion_checkpoint_metadata,
     build_matrix_checkpoint_metadata,
-    validate_matrix_checkpoint_metadata as validate_dion_checkpoint_metadata,
     validate_matrix_checkpoint_metadata,
 )
 from megatron.core.optimizer.dion.types import (
@@ -128,6 +126,27 @@ def test_matrix_package_has_no_optimizer_backend_dependency():
             if token in text:
                 offenders.append((path.relative_to(matrix_root), token))
 
+    assert offenders == []
+
+
+def test_distributed_optimizer_resolves_matrix_classes_lazily():
+    source = (
+        Path(__file__).parents[3]
+        / "megatron"
+        / "core"
+        / "optimizer"
+        / "distrib_optimizer.py"
+    ).read_text()
+
+    assert "_matrix_optimizer_classes" in source
+    assert "importlib.import_module" in source
+
+    forbidden_static_imports = (
+        "from megatron.core.optimizer.dion import MegatronDion",
+        "from megatron.core.optimizer.muon.algorithm import MegatronMuon",
+        "from megatron.core.optimizer.aro.algorithm import MegatronAro",
+    )
+    offenders = [token for token in forbidden_static_imports if token in source]
     assert offenders == []
 
 
@@ -1034,6 +1053,30 @@ def test_shared_split_tagging_uses_backend_neutral_error_tags():
     assert "[MUON_LINEAR_FC1_INVALID_ROWS]" not in optimizer_init_text
 
 
+def test_shared_matrix_surfaces_do_not_use_dion_debug_names():
+    repo_root = Path(__file__).parents[3]
+    shared_paths = (
+        "megatron/training/utils.py",
+        "megatron/training/training.py",
+        "megatron/core/extensions/transformer_engine.py",
+        "megatron/core/transformer/attention.py",
+        "megatron/core/transformer/transformer_layer.py",
+        "megatron/core/transformer/transformer_block.py",
+        "megatron/core/pipeline_parallel/schedules.py",
+        "megatron/core/models/gpt/gpt_model.py",
+    )
+    forbidden = ("DION", "_dion", "Dion/Muon")
+
+    offenders = []
+    for relative_path in shared_paths:
+        text = (repo_root / relative_path).read_text()
+        for token in forbidden:
+            if token in text:
+                offenders.append((relative_path, token))
+
+    assert offenders == []
+
+
 def test_aro_config_surface_matches_public_invariant():
     repo_root = Path(__file__).parents[3]
     required_fields = {
@@ -1119,7 +1162,7 @@ def test_matrix_split_helpers_are_canonical():
 
 def test_dion_checkpoint_metadata_carries_matrix_backend_invariant():
     spec = DionBackend().state_spec()
-    metadata = build_dion_checkpoint_metadata(
+    metadata = build_matrix_checkpoint_metadata(
         dp_size=2,
         fs_size=2,
         tp_size=1,
@@ -1136,7 +1179,7 @@ def test_dion_checkpoint_metadata_carries_matrix_backend_invariant():
         "backend_state_version": spec.version,
         "state_keys": spec.state_keys,
     }
-    validate_dion_checkpoint_metadata(
+    validate_matrix_checkpoint_metadata(
         metadata,
         dp_size=2,
         fs_size=2,
@@ -1150,7 +1193,7 @@ def test_dion_checkpoint_metadata_carries_matrix_backend_invariant():
 
 def test_dion_checkpoint_topology_allows_singleton_group_identity_changes():
     spec = DionBackend().state_spec()
-    metadata = build_dion_checkpoint_metadata(
+    metadata = build_matrix_checkpoint_metadata(
         dp_size=16,
         fs_size=16,
         tp_size=1,
@@ -1167,7 +1210,7 @@ def test_dion_checkpoint_topology_allows_singleton_group_identity_changes():
         backend_state_spec=spec,
     )
 
-    validate_dion_checkpoint_metadata(
+    validate_matrix_checkpoint_metadata(
         metadata,
         dp_size=16,
         fs_size=16,
@@ -1185,7 +1228,7 @@ def test_dion_checkpoint_topology_allows_singleton_group_identity_changes():
     )
 
 
-def test_grad_norm_inputs_use_standard_and_dion_step_surfaces():
+def test_grad_norm_inputs_use_standard_and_matrix_step_surfaces():
     class FakeRange:
         start = 1
         end = 3
@@ -1196,23 +1239,22 @@ def test_grad_norm_inputs_use_standard_and_dion_step_surfaces():
     std_shard = torch.nn.Parameter(torch.zeros(2))
     std_shard.tensor_model_parallel = True
 
-    dion_model = torch.nn.Parameter(torch.zeros(4, 4))
-    dion_model.is_dion_param = True
-    dion_model.is_matrix_param = True
-    dion_shard = torch.nn.Parameter(torch.zeros(2, 4))
-    dion_shard._model_param = dion_model
-    dion_shard.tensor_model_parallel = True
-    dion_local_grad = torch.arange(8, dtype=torch.float32).view(2, 4)
+    matrix_model = torch.nn.Parameter(torch.zeros(4, 4))
+    matrix_model.is_matrix_param = True
+    matrix_shard = torch.nn.Parameter(torch.zeros(2, 4))
+    matrix_shard._model_param = matrix_model
+    matrix_shard.tensor_model_parallel = True
+    matrix_local_grad = torch.arange(8, dtype=torch.float32).view(2, 4)
 
     optimizer = SimpleNamespace(
         config=SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False),
         model_float16_groups=[],
-        model_fp32_groups=[[std_model, dion_model]],
+        model_fp32_groups=[[std_model, matrix_model]],
         shard_fp32_from_float16_groups=[],
-        shard_fp32_groups=[[std_shard, dion_shard]],
+        shard_fp32_groups=[[std_shard, matrix_shard]],
         _get_model_param_range_map=lambda param: {"param": FakeRange()},
-        _get_local_grad=lambda model_param, shard_param: dion_local_grad,
-        _shard_param_uid=lambda shard_param: ("dion", 0),
+        _get_local_grad=lambda model_param, shard_param: matrix_local_grad,
+        _shard_param_uid=lambda shard_param: ("matrix", 0),
         _resolve_matrix_tp_group=lambda: None,
     )
 
@@ -1220,7 +1262,7 @@ def test_grad_norm_inputs_use_standard_and_dion_step_surfaces():
 
     assert len(grads) == 2
     assert torch.equal(grads[0], std_model.main_grad[1:3])
-    assert torch.equal(grads[1], dion_local_grad)
+    assert torch.equal(grads[1], matrix_local_grad)
 
 
 def test_grad_norm_inputs_use_aro_matrix_step_surface():

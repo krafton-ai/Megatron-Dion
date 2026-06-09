@@ -1492,9 +1492,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.is_first_microbatch = True
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
             self.layer_number: Optional[int] = None
-            self._dion_is_expert = bool(is_expert)
-            self._dion_expert_linear_tag = tp_comm_buffer_name or "expert"
-            self._dion_expert_init_method = init_method
+            self._is_expert = bool(is_expert)
+            self._expert_linear_tag = tp_comm_buffer_name or "expert"
+            self._expert_init_method = init_method
 
             extra_kwargs = _get_extra_te_kwargs(config)
 
@@ -1650,7 +1650,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         @torch.no_grad()
         def set_layer_number(self, layer_number: int):
             self.layer_number = int(layer_number)
-            if not (self._dion_is_expert and self.config.perform_initialization):
+            if not (self._is_expert and self.config.perform_initialization):
                 return
 
             tp_world_size = get_pg_size(self._tp_group) if self._tp_group is not None else 1
@@ -1675,7 +1675,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     os.getenv("VLM_DEBUG_TE_EXPERT_REINIT", "0") == "1"
                     and int(self.layer_number) == 1
                     and int(global_expert_idx) == 0
-                    and self._dion_expert_linear_tag in ("fc1", "fc2")
+                    and self._expert_linear_tag in ("fc1", "fc2")
                 )
                 if should_debug_reinit:
                     rank = -1
@@ -1698,7 +1698,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         "VLM_TE_EXPERT_REINIT_BEFORE "
                         f"rank={rank} "
                         f"layer={int(self.layer_number)} "
-                        f"linear={self._dion_expert_linear_tag} "
+                        f"linear={self._expert_linear_tag} "
                         f"expert={int(global_expert_idx)} "
                         f"gemm={int(gemm_idx)} "
                         f"shape={tuple(weight.shape)} "
@@ -1719,12 +1719,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     full_rows=full_rows,
                     full_cols=full_cols,
                     partition_dim=partition_dim,
-                    init_method=self._dion_expert_init_method,
+                    init_method=self._expert_init_method,
                     params_dtype=weight.dtype,
                     tp_rank=int(tp_rank),
                     tp_world_size=int(tp_world_size),
                     layer_number=self.layer_number,
-                    linear_tag=self._dion_expert_linear_tag,
+                    linear_tag=self._expert_linear_tag,
                     global_expert_idx=int(global_expert_idx),
                 )
                 if should_debug_reinit:
@@ -1748,7 +1748,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         "VLM_TE_EXPERT_REINIT_AFTER "
                         f"rank={rank} "
                         f"layer={int(self.layer_number)} "
-                        f"linear={self._dion_expert_linear_tag} "
+                        f"linear={self._expert_linear_tag} "
                         f"expert={int(global_expert_idx)} "
                         f"gemm={int(gemm_idx)} "
                         f"shape={tuple(weight.shape)} "

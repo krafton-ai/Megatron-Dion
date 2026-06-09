@@ -39,33 +39,33 @@ _TLAYER_PROBE_CALL_IDX = {}
 
 
 def _maybe_dump_tlayer_probe(tensor: Tensor, *, layer_number: int, tag: str) -> None:
-    if os.getenv("DION_DEBUG_TLAYER_PROBE", "0") != "1":
+    if os.getenv("MATRIX_DEBUG_TLAYER_PROBE", "0") != "1":
         return
     if not isinstance(tensor, torch.Tensor):
         return
 
-    dump_dir = os.getenv("DION_DEBUG_TLAYER_PROBE_DIR", "").strip()
+    dump_dir = os.getenv("MATRIX_DEBUG_TLAYER_PROBE_DIR", "").strip()
     if not dump_dir:
         raise RuntimeError(
-            "[DION_INVALID_ENV] DION_DEBUG_TLAYER_PROBE=1 requires "
-            "DION_DEBUG_TLAYER_PROBE_DIR"
+            "[MATRIX_INVALID_ENV] MATRIX_DEBUG_TLAYER_PROBE=1 requires "
+            "MATRIX_DEBUG_TLAYER_PROBE_DIR"
         )
 
-    target_layer_raw = os.getenv("DION_DEBUG_TLAYER_PROBE_LAYER", "").strip()
+    target_layer_raw = os.getenv("MATRIX_DEBUG_TLAYER_PROBE_LAYER", "").strip()
     if not target_layer_raw:
         raise RuntimeError(
-            "[DION_INVALID_ENV] DION_DEBUG_TLAYER_PROBE=1 requires "
-            "DION_DEBUG_TLAYER_PROBE_LAYER"
+            "[MATRIX_INVALID_ENV] MATRIX_DEBUG_TLAYER_PROBE=1 requires "
+            "MATRIX_DEBUG_TLAYER_PROBE_LAYER"
         )
     if int(layer_number) != int(target_layer_raw):
         return
 
-    tags_raw = os.getenv("DION_DEBUG_TLAYER_PROBE_TAGS", "input_ln,attn_out,attn_bda").strip()
+    tags_raw = os.getenv("MATRIX_DEBUG_TLAYER_PROBE_TAGS", "input_ln,attn_out,attn_bda").strip()
     tags = {token.strip() for token in tags_raw.split(",") if token.strip()}
     if tags and tag not in tags:
         return
 
-    max_calls_raw = os.getenv("DION_DEBUG_TLAYER_PROBE_MAX_CALLS", "1").strip()
+    max_calls_raw = os.getenv("MATRIX_DEBUG_TLAYER_PROBE_MAX_CALLS", "1").strip()
     max_calls = int(max_calls_raw) if max_calls_raw else 1
     key = (int(layer_number), tag)
     call_idx = _TLAYER_PROBE_CALL_IDX.get(key, 0)

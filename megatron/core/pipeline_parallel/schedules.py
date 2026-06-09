@@ -84,17 +84,17 @@ def _maybe_dump_pp_backward_step_probe(
     output_tensor_grad: Union[torch.Tensor, List[torch.Tensor], None],
     input_tensor_grad: Optional[Union[torch.Tensor, List[torch.Tensor]]],
 ) -> None:
-    if os.getenv("DION_DEBUG_PP_BACKWARD_STEP_PROBE", "0") != "1":
+    if os.getenv("MATRIX_DEBUG_PP_BACKWARD_STEP_PROBE", "0") != "1":
         return
 
-    dump_dir = os.getenv("DION_DEBUG_PP_BACKWARD_STEP_PROBE_DIR", "").strip()
+    dump_dir = os.getenv("MATRIX_DEBUG_PP_BACKWARD_STEP_PROBE_DIR", "").strip()
     if not dump_dir:
         raise RuntimeError(
-            "[DION_INVALID_ENV] DION_DEBUG_PP_BACKWARD_STEP_PROBE=1 requires "
-            "DION_DEBUG_PP_BACKWARD_STEP_PROBE_DIR"
+            "[MATRIX_INVALID_ENV] MATRIX_DEBUG_PP_BACKWARD_STEP_PROBE=1 requires "
+            "MATRIX_DEBUG_PP_BACKWARD_STEP_PROBE_DIR"
         )
 
-    max_calls_raw = os.getenv("DION_DEBUG_PP_BACKWARD_STEP_MAX_CALLS", "1").strip()
+    max_calls_raw = os.getenv("MATRIX_DEBUG_PP_BACKWARD_STEP_MAX_CALLS", "1").strip()
     max_calls = int(max_calls_raw) if max_calls_raw else 1
 
     global _PP_BACKWARD_STEP_PROBE_CALL_IDX

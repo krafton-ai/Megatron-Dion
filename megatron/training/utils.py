@@ -44,15 +44,15 @@ from megatron.core.utils import (
 )
 from megatron.legacy.model.module import param_is_not_shared
 
-_DION_INPUT_BATCH_TRACE_DONE = False
+_MATRIX_INPUT_BATCH_TRACE_DONE = False
 
 
 def _maybe_trace_input_batch(batch) -> None:
     """Log one global first-batch fingerprint for topology-span debugging."""
-    global _DION_INPUT_BATCH_TRACE_DONE
-    if os.getenv("DION_TRACE_INPUT_BATCH", "0") != "1":
+    global _MATRIX_INPUT_BATCH_TRACE_DONE
+    if os.getenv("MATRIX_TRACE_INPUT_BATCH", "0") != "1":
         return
-    if _DION_INPUT_BATCH_TRACE_DONE:
+    if _MATRIX_INPUT_BATCH_TRACE_DONE:
         return
     if not mpu.is_pipeline_first_stage():
         return
@@ -82,7 +82,7 @@ def _maybe_trace_input_batch(batch) -> None:
     if torch.distributed.get_rank(group=dp_group) == 0:
         dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
         print(
-            "[DION_INPUT_BATCH] "
+            "[MATRIX_INPUT_BATCH] "
             f"global_rank={torch.distributed.get_rank()} "
             f"dp_ranks={dp_ranks} "
             f"tokens_numel={int(payload[0].item())} tokens_sum={payload[1].item():.9e} "
@@ -94,7 +94,7 @@ def _maybe_trace_input_batch(batch) -> None:
             flush=True,
         )
 
-    _DION_INPUT_BATCH_TRACE_DONE = True
+    _MATRIX_INPUT_BATCH_TRACE_DONE = True
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):

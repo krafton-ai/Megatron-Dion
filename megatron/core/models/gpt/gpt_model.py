@@ -626,18 +626,18 @@ class GPTModel(LanguageModule):
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
         if (
-            os.getenv("DION_DEBUG_GPT_PREDECODER_PROBE", "0") == "1"
+            os.getenv("MATRIX_DEBUG_GPT_PREDECODER_PROBE", "0") == "1"
             and isinstance(decoder_input, torch.Tensor)
         ):
-            dump_dir = os.getenv("DION_DEBUG_GPT_PREDECODER_PROBE_DIR", "").strip()
+            dump_dir = os.getenv("MATRIX_DEBUG_GPT_PREDECODER_PROBE_DIR", "").strip()
             if not dump_dir:
                 raise RuntimeError(
-                    "[DION_INVALID_ENV] DION_DEBUG_GPT_PREDECODER_PROBE=1 requires "
-                    "DION_DEBUG_GPT_PREDECODER_PROBE_DIR"
+                    "[MATRIX_INVALID_ENV] MATRIX_DEBUG_GPT_PREDECODER_PROBE=1 requires "
+                    "MATRIX_DEBUG_GPT_PREDECODER_PROBE_DIR"
                 )
-            max_calls_raw = os.getenv("DION_DEBUG_GPT_PREDECODER_MAX_CALLS", "1").strip()
+            max_calls_raw = os.getenv("MATRIX_DEBUG_GPT_PREDECODER_MAX_CALLS", "1").strip()
             max_calls = int(max_calls_raw) if max_calls_raw else 1
-            call_idx = int(getattr(self, "_dion_debug_gpt_predecoder_call_idx", 0))
+            call_idx = int(getattr(self, "_matrix_debug_gpt_predecoder_call_idx", 0))
             if call_idx < max_calls:
                 os.makedirs(dump_dir, exist_ok=True)
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -677,7 +677,7 @@ class GPTModel(LanguageModule):
                         f"cp{cp_rank:02d}_call{call_idx:04d}.pt",
                     ),
                 )
-                setattr(self, "_dion_debug_gpt_predecoder_call_idx", call_idx + 1)
+                setattr(self, "_matrix_debug_gpt_predecoder_call_idx", call_idx + 1)
 
         # Run decoder.
         hidden_states = self.decoder(

@@ -4,6 +4,7 @@
 
 
 import gc
+import importlib
 import itertools
 import logging
 import os
@@ -38,19 +39,6 @@ except ImportError:
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
-try:
-    from megatron.core.optimizer.dion import MegatronDion
-except ImportError:
-    MegatronDion = None
-try:
-    from megatron.core.optimizer.muon.algorithm import MegatronMuon
-except ImportError:
-    MegatronMuon = None
-try:
-    from megatron.core.optimizer.aro.algorithm import MegatronAro
-except ImportError:
-    MegatronAro = None
-
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
@@ -73,6 +61,27 @@ from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_g
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
+
+
+def _optional_optimizer_class(module_name: str, class_name: str):
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        return None
+    return getattr(module, class_name, None)
+
+
+def _matrix_optimizer_classes():
+    classes = []
+    for module_name, class_name in (
+        ("megatron.core.optimizer.dion", "MegatronDion"),
+        ("megatron.core.optimizer.muon.algorithm", "MegatronMuon"),
+        ("megatron.core.optimizer.aro.algorithm", "MegatronAro"),
+    ):
+        optimizer_class = _optional_optimizer_class(module_name, class_name)
+        if optimizer_class is not None:
+            classes.append(optimizer_class)
+    return tuple(classes)
 
 
 class Range:
@@ -533,13 +542,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
-        allowed_optimizers = (Adam, torch.optim.AdamW, HybridDeviceOptimizer)
-        if MegatronDion is not None:
-            allowed_optimizers = allowed_optimizers + (MegatronDion,)
-        if MegatronMuon is not None:
-            allowed_optimizers = allowed_optimizers + (MegatronMuon,)
-        if MegatronAro is not None:
-            allowed_optimizers = allowed_optimizers + (MegatronAro,)
+        allowed_optimizers = (
+            Adam,
+            torch.optim.AdamW,
+            HybridDeviceOptimizer,
+            *_matrix_optimizer_classes(),
+        )
 
         assert isinstance(optimizer, allowed_optimizers) or optimizer is None, (
             "Only Adam, HybridDeviceOptimizer, MegatronDion, MegatronMuon, and MegatronAro "

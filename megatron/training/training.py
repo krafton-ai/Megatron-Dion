@@ -214,13 +214,13 @@ _TRAIN_PHASE_DEBUG_RANKS = None
 
 
 def _debug_train_phases_enabled() -> bool:
-    return os.getenv("DION_DEBUG_TRAIN_PHASES", "").lower() in ("1", "true", "yes")
+    return os.getenv("MATRIX_DEBUG_TRAIN_PHASES", "").lower() in ("1", "true", "yes")
 
 
 def _debug_train_phase_selected(rank: int) -> bool:
     global _TRAIN_PHASE_DEBUG_RANKS
     if _TRAIN_PHASE_DEBUG_RANKS is None:
-        raw = os.getenv("DION_DEBUG_TRAIN_PHASE_RANKS", "").strip()
+        raw = os.getenv("MATRIX_DEBUG_TRAIN_PHASE_RANKS", "").strip()
         if raw:
             _TRAIN_PHASE_DEBUG_RANKS = {
                 int(token.strip()) for token in raw.split(",") if token.strip()
@@ -236,11 +236,11 @@ def _debug_train_phase(label: str, iteration: Optional[int]) -> None:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     if not _debug_train_phase_selected(rank):
         return
-    if torch.cuda.is_available() and os.getenv("DION_DEBUG_TRAIN_PHASE_SYNC", "1") == "1":
+    if torch.cuda.is_available() and os.getenv("MATRIX_DEBUG_TRAIN_PHASE_SYNC", "1") == "1":
         torch.cuda.synchronize()
     step = (int(iteration) + 1) if iteration is not None else -1
     print(
-        f"[DION_TRAIN_PHASE] rank={rank} step={step} label={label} "
+        f"[MATRIX_TRAIN_PHASE] rank={rank} step={step} label={label} "
         f"time={time.perf_counter():.6f}",
         flush=True,
     )

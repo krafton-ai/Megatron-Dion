@@ -535,10 +535,10 @@ class AroOptimizerConfig(OptimizerConfig):
     """Dtype for ARO rotation state."""
 
     fully_shard_model_parallel_size: int = 1
-    """ARO fully-sharded model-parallel size."""
+    """Matrix optimizer fully-sharded model-parallel size."""
 
     replicate_model_parallel_size: int = 1
-    """ARO replicate-parallel size."""
+    """Matrix optimizer replicate-parallel size."""
 
 
 @dataclass
@@ -624,7 +624,7 @@ class DionOptimizerConfig(OptimizerConfig):
     """Dion async task width. Defaults to the reference runtime width of 3."""
 
     fully_shard_model_parallel_size: int = 1
-    """Dion fully-sharded model-parallel size."""
+    """Matrix optimizer fully-sharded model-parallel size."""
 
     replicate_model_parallel_size: int = 1
-    """Dion replicate-parallel size."""
+    """Matrix optimizer replicate-parallel size."""
