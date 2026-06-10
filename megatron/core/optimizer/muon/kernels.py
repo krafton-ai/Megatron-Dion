@@ -570,7 +570,7 @@ def scaled_lr_for_shape(
     m_global: int,
     n_global: int,
     scale_mode: str = "spectral",
-    extra_scale_factor: float = 1.0,
+    extra_scale_factor: float = 0.2,
 ) -> float:
     """Return ``lr`` multiplied by the reference Muon logical-shape scale."""
     return (
@@ -1639,7 +1639,7 @@ def orthogonalize_muon_update(
     num_ns_steps: int = 5,
     eps: float = 1e-7,
     scale_mode: str = "spectral",
-    extra_scale_factor: float = 1.0,
+    extra_scale_factor: float = 0.2,
     global_shape: Optional[tuple[int, int]] = None,
     logical_shape: Optional[tuple[int, int]] = None,
     tp_group: Optional[dist.ProcessGroup] = None,
@@ -1680,7 +1680,7 @@ def orthogonalize_muon_update_2d(
     num_ns_steps: int = 5,
     eps: float = 1e-7,
     scale_mode: str = "spectral",
-    extra_scale_factor: float = 1.0,
+    extra_scale_factor: float = 0.2,
     global_shape: Optional[tuple[int, int]] = None,
     logical_shape: Optional[tuple[int, int]] = None,
     fs_group: Optional[dist.ProcessGroup] = None,
@@ -1730,7 +1730,7 @@ def compute_muon_update(
     num_ns_steps: int = 5,
     eps: float = 1e-7,
     scale_mode: str = "spectral",
-    extra_scale_factor: float = 1.0,
+    extra_scale_factor: float = 0.2,
     global_shape: Optional[tuple[int, int]] = None,
     logical_shape: Optional[tuple[int, int]] = None,
     tp_group: Optional[dist.ProcessGroup] = None,

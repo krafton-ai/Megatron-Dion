@@ -1551,7 +1551,10 @@ def validate_args(args, defaults={}):
             "Muon optimizer supports torch and torch_dist checkpoint format."
         )
 
-    if args.optimizer == "dion" and args.use_distributed_optimizer:
+    if args.optimizer == "dion":
+        assert args.use_distributed_optimizer, (
+            "Dion optimizer requires --use-distributed-optimizer."
+        )
         if not args.no_save_optim or not args.no_load_optim:
             assert args.ckpt_format == "torch_dist", (
                 "Dion distributed optimizer supports optimizer checkpointing only with "
@@ -2319,7 +2322,7 @@ def _add_regularization_args(parser):
     group.add_argument('--split-parameters', action=argparse.BooleanOptionalAction,
                        default=None,
                        help='Split fused parameters into optimizer-only children for matrix optimizers.')
-    group.add_argument('--muon-momentum', type=float, default=0.9,
+    group.add_argument('--muon-momentum', type=float, default=0.95,
                        help='Momentum factor for Muon optimizer')
     group.add_argument('--muon-split-parameters', action=argparse.BooleanOptionalAction,
                        default=True,
@@ -2359,7 +2362,7 @@ def _add_regularization_args(parser):
                        choices=['float32', 'float', 'fp32', 'float16', 'fp16', 'half',
                                 'bfloat16', 'bf16'],
                        help='Optional compute dtype override for Gram Newton-Schulz')
-    group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
+    group.add_argument('--muon-extra-scale-factor', type=float, default=0.2,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
                        choices=['adam', 'lion'],

@@ -4576,6 +4576,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
         use_precision_aware_optimizer = bool(
             getattr(self.config, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False)
         )
+        main_shard_groups = getattr(self, "shard_fp32_from_float16_groups", None)
         if (
             not self.is_stub_optimizer
             and not self.ddp_config.use_megatron_fsdp

@@ -79,7 +79,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
         scale_mode: str = "spectral",
-        extra_scale_factor: float = 1.0,
+        extra_scale_factor: float = 0.2,
         pg_collection: Optional[ProcessGroupCollection] = None,
         mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
     ) -> None:

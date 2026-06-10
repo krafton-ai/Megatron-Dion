@@ -74,7 +74,7 @@ def test_muon_optimizer_smoke():
         fp32_matmul_prec="medium",
         num_ns_steps=5,
         scale_mode="spectral",
-        extra_scale_factor=1.0,
+        extra_scale_factor=0.2,
         pg_collection=None,
         mode="duplicated",
     )

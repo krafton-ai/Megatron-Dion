@@ -114,7 +114,7 @@ class MegatronMuon(torch.optim.AdamW):
         gram_dtype: Optional[torch.dtype | str] = None,
         gram_kernel_policy: str = "torch",
         scale_mode: str = "spectral",
-        extra_scale_factor: float = 1.0,
+        extra_scale_factor: float = 0.2,
         fs_mode: str = "blockwise",
         tp_mode: str = "blockwise",
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -293,7 +293,7 @@ class MegatronMuon(torch.optim.AdamW):
         )
         m, n = logical_shape
         scale = muon_scale_factor(m, n, group.get("scale_mode", self.defaults["scale_mode"]))
-        return orth_update * (scale * float(group.get("extra_scale_factor", 1.0)))
+        return orth_update * (scale * float(group.get("extra_scale_factor", 0.2)))
 
     def orthogonalize(self, param: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
         """Return the scaled Muon orthogonalized update for a parameter."""
@@ -325,7 +325,7 @@ class MegatronMuon(torch.optim.AdamW):
         )
         m, n = logical_shape
         scale = muon_scale_factor(m, n, group.get("scale_mode", self.defaults["scale_mode"]))
-        return orth_update * (scale * float(group.get("extra_scale_factor", 1.0)))
+        return orth_update * (scale * float(group.get("extra_scale_factor", 0.2)))
 
     def _step_matrix_param(self, param: torch.Tensor, grad: torch.Tensor, state: dict, group: dict):
         momentum = state["momentum_buffer"]

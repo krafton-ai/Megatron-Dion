@@ -297,7 +297,7 @@ class OptimizerConfig:
     muon_gram_ns_dtype: Optional[str] = None
     """Optional compute dtype override for Gram Newton-Schulz."""
 
-    muon_extra_scale_factor: float = 1.0
+    muon_extra_scale_factor: float = 0.2
     """Additional scale factor for the muon update."""
 
     muon_scalar_optimizer: str = 'adam'

@@ -213,7 +213,7 @@ def build_param_config(
     gram_kernel_policy: str = "torch",
     gram_dtype: Optional[torch.dtype | str] = None,
     scale_mode: str = "spectral",
-    extra_scale_factor: float = 1.0,
+    extra_scale_factor: float = 0.2,
     fs_mode: str = "blockwise",
     tp_mode: str = "blockwise",
     split_parameters: bool = False,
