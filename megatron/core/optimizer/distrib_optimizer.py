@@ -4,6 +4,7 @@
 
 
 import gc
+import importlib
 import itertools
 import logging
 from collections import ChainMap
@@ -54,10 +55,32 @@ from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_s
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
+from .matrix.splits.parameters import copy_parameter_split_metadata
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
+
+
+def _optional_optimizer_class(module_name: str, class_name: str):
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        return None
+    return getattr(module, class_name, None)
+
+
+def _matrix_optimizer_classes():
+    classes = []
+    for module_name, class_name in (
+        ("megatron.core.optimizer.dion.algorithm", "MegatronDion"),
+        ("megatron.core.optimizer.muon.algorithm", "MegatronMuon"),
+        ("megatron.core.optimizer.aro.algorithm", "MegatronAro"),
+    ):
+        optimizer_class = _optional_optimizer_class(module_name, class_name)
+        if optimizer_class is not None:
+            classes.append(optimizer_class)
+    return tuple(classes)
 
 
 class Range:
@@ -376,6 +399,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
+                        copy_parameter_split_metadata(shard_model_param, model_param)
                         if hasattr(model_param, 'shared'):
                             shard_model_param.shared = model_param.shared
 
@@ -406,6 +430,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
+                        copy_parameter_split_metadata(shard_main_param, model_param)
                         if hasattr(model_param, 'shared'):
                             shard_main_param.shared = model_param.shared
                     else:
@@ -429,6 +454,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
+                    copy_parameter_split_metadata(shard_model_param, model_param)
                     if hasattr(model_param, 'shared'):
                         shard_model_param.shared = model_param.shared
 
@@ -516,12 +542,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
-        assert (
-            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
-            or optimizer is None
-        ), (
-            "Only Adam and HybridDeviceOptimizer currently supported, "
-            "due to checkpointing requirements."
+        allowed_optimizers = (
+            Adam,
+            torch.optim.AdamW,
+            HybridDeviceOptimizer,
+            *_matrix_optimizer_classes(),
+        )
+        assert isinstance(optimizer, allowed_optimizers) or optimizer is None, (
+            "Only Adam, HybridDeviceOptimizer, MegatronMuon, MegatronDion, and MegatronAro "
+            "currently supported, due to checkpointing requirements."
         )
 
         # when freezing sub-models we have no real optimizer
@@ -2597,6 +2626,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 while name.startswith("module."):
                     name = name[len("module.") :]
                 matched_keys = [k for k in names_in_state_dict if k.endswith(name)]
+                if len(matched_keys) == 0 and name.endswith("linear_qkv_down_proj.weight"):
+                    q_name = name[: -len("linear_qkv_down_proj.weight")] + "linear_q_down_proj.weight"
+                    kv_name = (
+                        name[: -len("linear_qkv_down_proj.weight")]
+                        + "linear_kv_down_proj.weight"
+                    )
+                    q_keys = [k for k in names_in_state_dict if k.endswith(q_name)]
+                    kv_keys = [k for k in names_in_state_dict if k.endswith(kv_name)]
+                    if len(q_keys) == 1 and len(kv_keys) == 1:
+                        q_param = state_dict_list[chunk_idx][q_keys[0]]
+                        kv_param = state_dict_list[chunk_idx][kv_keys[0]]
+                        state_dict_param = torch.cat((q_param, kv_param), dim=0)
+                        assert model_param.shape == state_dict_param.shape
+                        model_param_to_state_dict_param_map[model_param] = state_dict_param
+                        names_in_state_dict.remove(q_keys[0])
+                        names_in_state_dict.remove(kv_keys[0])
+                        continue
                 assert (
                     len(matched_keys) == 1
                 ), f"Parameter {name} has {len(matched_keys)} matches in state dict"

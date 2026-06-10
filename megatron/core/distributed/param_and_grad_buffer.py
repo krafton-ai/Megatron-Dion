@@ -56,6 +56,19 @@ class BufferType(Enum):
     GRAD = 2
 
 
+class _HandleGroup:
+    """Aggregate multiple waitable handles behind a single wait surface."""
+
+    def __init__(self, handles):
+        self._handles = [handle for handle in handles if handle is not None]
+
+    def wait(self):
+        for handle in self._handles:
+            if hasattr(handle, "wait"):
+                handle.wait()
+        self._handles = []
+
+
 def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     """
     Shard buffer into data_parallel_world_size chunks of equal size.
@@ -124,6 +137,37 @@ class _ParamAndGradBucket:
         self.layerwise_param_flat_sizes = None
         self.layerwise_gather_list = None
         self._layerwise_src_buffer = None
+
+        # Matrix-optimizer transport metadata. Matrix optimizers populate this after
+        # distributed optimizer range construction; stock optimizer buckets leave it empty.
+        self.matrix_shard_group = None
+        self.matrix_layout = None
+        self.matrix_optimizer = None
+        self._has_standard_params_cache = None
+
+    @property
+    def matrix_param_ids(self):
+        layout = self.matrix_layout
+        if layout is None:
+            return frozenset()
+        return layout.param_ids
+
+    @property
+    def has_matrix_params(self) -> bool:
+        layout = self.matrix_layout
+        return layout is not None and layout.has_params
+
+    @property
+    def has_standard_params(self) -> bool:
+        layout = self.matrix_layout
+        cache_key = (id(layout), len(self.params))
+        cached = self._has_standard_params_cache
+        if cached is not None and cached[0] == cache_key:
+            return bool(cached[1])
+        matrix_param_ids = self.matrix_param_ids
+        has_standard = any(id(param) not in matrix_param_ids for param in self.params)
+        self._has_standard_params_cache = (cache_key, has_standard)
+        return has_standard
 
     def set_layerwise_params_list(self, layerwise_params_list: List[List[torch.nn.Parameter]]):
         """Set per-rank parameter lists for layer-wise async all-gather.
@@ -195,6 +239,12 @@ class _ParamAndGradBucketGroup:
         self.param_to_bucket = {}
         self.params = set()
         for bucket in self.buckets:
+            if self.ddp_config.use_distributed_optimizer:
+                bucket.intra_distributed_optimizer_instance_group = collective_group
+                bucket.intra_distributed_optimizer_instance_size = collective_group_size
+                bucket.intra_distributed_optimizer_instance_rank = collective_group.rank()
+            else:
+                bucket.data_parallel_group = collective_group
             for param in bucket.params_list:
                 self.param_to_bucket[param] = bucket
                 self.params.add(param)
@@ -236,6 +286,7 @@ class _ParamAndGradBucketGroup:
         self.param_gather_handle = None
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
+        self.grad_sync_launched = False
 
         # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
         # introduces some CPU overheads. We use these two lists to cache the created local
@@ -245,10 +296,69 @@ class _ParamAndGradBucketGroup:
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
+    def _check_matrix_param_sync_ready(self):
+        for bucket in self.buckets:
+            if not getattr(bucket, "_tracks_matrix_param_views", False):
+                continue
+            optimizer = getattr(bucket, "matrix_optimizer", None)
+            if optimizer is None:
+                continue
+            optimizer._check_bucket_param_views(bucket, context="finish_param_sync")
+
+    def _get_standard_local_grad_view(self, idx: int, bucket: _ParamAndGradBucket) -> torch.Tensor:
+        if self.cached_grad_buffer_shard_list[idx] is None:
+            self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                bucket.grad_data, self.intra_distributed_optimizer_instance_size
+            )
+        return self.cached_grad_buffer_shard_list[idx][
+            self.intra_distributed_optimizer_instance_rank
+        ]
+
+    def _collect_param_gather_launches(self, async_op: bool):
+        standard_bucket_indices = []
+        matrix_handles = []
+
+        for idx, bucket in enumerate(self.buckets):
+            if bucket.has_matrix_params:
+                optimizer = getattr(bucket, "matrix_optimizer", None)
+                gather_bucket_params = getattr(bucket, "_matrix_gather_bucket_params", None)
+                if gather_bucket_params is None and optimizer is not None:
+                    gather_bucket_params = getattr(optimizer, "_all_gather_bucket_params_", None)
+                    if gather_bucket_params is not None:
+                        bucket._matrix_gather_bucket_params = gather_bucket_params
+                if gather_bucket_params is None:
+                    raise RuntimeError(
+                        "[MatrixOptimizer] missing bucket-wise param-gather helper "
+                        f"for bucket={getattr(bucket, 'bucket_id', -1)}"
+                    )
+                handle = gather_bucket_params(bucket, async_op=async_op)
+                if handle is not None:
+                    matrix_handles.append(handle)
+                continue
+
+            if bucket.has_standard_params:
+                standard_bucket_indices.append(idx)
+
+        return standard_bucket_indices, matrix_handles
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
         """
+        for bucket in self.buckets:
+            optimizer = getattr(bucket, "matrix_optimizer", None)
+            matrix_layout = getattr(bucket, "matrix_layout", None)
+            if optimizer is not None and matrix_layout is not None and matrix_layout.has_params:
+                if hasattr(optimizer, "_clear_matrix_local_grads"):
+                    local_grad_params = getattr(bucket, "_matrix_local_grad_params", None)
+                    if local_grad_params is None:
+                        local_grad_params = tuple(entry.param for entry in matrix_layout.entries)
+                        bucket._matrix_local_grad_params = local_grad_params
+                    optimizer._clear_matrix_local_grads(
+                        local_grad_params
+                    )
+                if hasattr(optimizer, "_clear_matrix_grad_transport"):
+                    optimizer._clear_matrix_grad_transport(bucket)
         if self.is_first_batch and len(self.per_param_grad_ready_counts) > 0:
             # Record golden per_param_grad_ready_counts.
             assert len(self.per_param_grad_ready_counts) == len(self.params)
@@ -256,6 +366,7 @@ class _ParamAndGradBucketGroup:
             self.is_first_batch = False
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
+        self.grad_sync_launched = False
 
     def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
@@ -315,6 +426,7 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                self._check_matrix_param_sync_ready()
                 return
         else:
             assert self.param_gather_handle is None
@@ -401,33 +513,41 @@ class _ParamAndGradBucketGroup:
                     bucket._layerwise_src_buffer = None
                 self.param_gather_handle = None
         else:
-            # Standard distributed optimizer path: use _coalescing_manager.
-            # all_gather_into_tensor writes directly into a contiguous output buffer and
-            # does not need a copy-back step, so coalescing works correctly.
-            with _coalescing_manager(
-                self.intra_distributed_optimizer_instance_group, async_ops=async_op
-            ) as cm:
-                for idx, bucket in enumerate(self.buckets):
-                    if self.cached_param_buffer_shard_list[idx] is None:
-                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                            bucket.param_data, self.intra_distributed_optimizer_instance_size
+            standard_bucket_indices, matrix_handles = self._collect_param_gather_launches(
+                async_op=async_op
+            )
+            standard_handle = None
+            if standard_bucket_indices:
+                # Standard distributed optimizer path: use _coalescing_manager.
+                # all_gather_into_tensor writes directly into a contiguous output buffer and
+                # does not need a copy-back step, so coalescing works correctly.
+                with _coalescing_manager(
+                    self.intra_distributed_optimizer_instance_group, async_ops=async_op
+                ) as cm:
+                    for idx in standard_bucket_indices:
+                        bucket = self.buckets[idx]
+                        if self.cached_param_buffer_shard_list[idx] is None:
+                            self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                                bucket.param_data, self.intra_distributed_optimizer_instance_size
+                            )
+                        local_data_view = self.cached_param_buffer_shard_list[idx][
+                            self.intra_distributed_optimizer_instance_rank
+                        ]
+                        dist_all_gather_func(
+                            bucket.param_data,
+                            local_data_view,
+                            group=self.intra_distributed_optimizer_instance_group,
+                            async_op=async_op,
                         )
-                    local_data_view = self.cached_param_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-                    dist_all_gather_func(
-                        bucket.param_data,
-                        local_data_view,
-                        group=self.intra_distributed_optimizer_instance_group,
-                        async_op=async_op,
-                    )
+                standard_handle = cm if async_op else None
             if async_op:
-                self.param_gather_handle = cm
+                self.param_gather_handle = _HandleGroup([standard_handle, *matrix_handles])
             else:
                 # When using `_coalescing_manager`, even if a synchronous op
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
                 # consistency with prior code.
                 self.param_gather_handle = None
+                self._check_matrix_param_sync_ready()
         self.param_gather_dispatched = True
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -455,6 +575,7 @@ class _ParamAndGradBucketGroup:
         if self.param_gather_handle is not None:
             self.param_gather_handle.wait()
             self.param_gather_handle = None
+            self._check_matrix_param_sync_ready()
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
                 if self.next_param_gather_bucket_group.param_gather_dispatched:
@@ -527,7 +648,9 @@ class _ParamAndGradBucketGroup:
         communication call. When ddp_config.overlap_grad_reduce is set to False, makes
         synchronous call.
         """
-        if self.is_first_batch and self.grad_reduce_handle is not None:
+        if self.is_first_batch and (
+            self.grad_reduce_handle is not None or self.grad_sync_launched
+        ):
             # Make this start_grad_sync call a no-op if in first batch and collective has
             # already been dispatched.
             return
@@ -598,25 +721,48 @@ class _ParamAndGradBucketGroup:
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
-                    if self.cached_grad_buffer_shard_list[idx] is None:
-                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
-                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                        )
-                    local_data_view = self.cached_grad_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-                    grad_reduce_handle = dist_reduce_scatter_func(
-                        local_data_view,
-                        bucket.grad_data,
-                        op=reduce_op,
-                        group=communication_group,
-                        async_op=async_op,
+                    optimizer = getattr(bucket, "matrix_optimizer", None)
+                    has_matrix = bucket.has_matrix_params
+                    has_standard = bucket.has_standard_params
+                    local_data_view = (
+                        self._get_standard_local_grad_view(idx, bucket)
+                        if (not has_matrix or has_standard)
+                        else None
                     )
+                    if has_matrix:
+                        start_matrix_grad_sync = getattr(bucket, "_matrix_start_grad_sync", None)
+                        if start_matrix_grad_sync is None and optimizer is not None:
+                            start_matrix_grad_sync = getattr(optimizer, "_start_matrix_grad_sync", None)
+                            if start_matrix_grad_sync is not None:
+                                bucket._matrix_start_grad_sync = start_matrix_grad_sync
+                        if start_matrix_grad_sync is None:
+                            raise RuntimeError(
+                                "[MatrixOptimizer] missing adapter grad launch hook "
+                                f"for bucket={getattr(bucket, 'bucket_id', -1)}"
+                            )
+                        grad_reduce_handle = start_matrix_grad_sync(
+                            bucket=bucket,
+                            local_data_view=local_data_view,
+                            communication_group=communication_group,
+                            reduce_op=reduce_op,
+                            async_op=async_op,
+                            reduce_scatter=dist_reduce_scatter_func,
+                        )
+                    elif local_data_view is not None:
+                        grad_reduce_handle = dist_reduce_scatter_func(
+                            local_data_view,
+                            bucket.grad_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
                 else:
                     if torch.distributed.get_rank() == 0 and force_all_reduce:
                         logger.info(
                             f"Performing reduction using all_reduce because {force_all_reduce=}"
                         )
+                    if bucket.has_matrix_params:
+                        bucket._matrix_use_full_grad_after_sync = True
                     torch.distributed.all_reduce(
                         bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                     )
@@ -635,20 +781,36 @@ class _ParamAndGradBucketGroup:
                 ) as cm,
             ):
                 for idx, bucket in enumerate(self.buckets):
-                    if self.cached_grad_buffer_shard_list[idx] is None:
-                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
-                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                    if not bucket.has_matrix_params:
+                        local_data_view = self._get_standard_local_grad_view(idx, bucket)
+                        if local_data_view is not None and local_data_view.numel() > 0:
+                            torch.distributed.all_reduce(
+                                local_data_view,
+                                op=reduce_op,
+                                group=self.inter_distributed_optimizer_instance_group,
+                                async_op=async_op,
+                            )
+                    else:
+                        optimizer = getattr(bucket, "matrix_optimizer", None)
+                        get_inter_instance_grad_buffers = (
+                            getattr(optimizer, "_get_inter_instance_grad_buffers", None)
+                            if optimizer is not None
+                            else None
                         )
-                    local_data_view = self.cached_grad_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-
-                    torch.distributed.all_reduce(
-                        local_data_view,
-                        op=reduce_op,
-                        group=self.inter_distributed_optimizer_instance_group,
-                        async_op=async_op,
-                    )
+                        if get_inter_instance_grad_buffers is None:
+                            raise RuntimeError(
+                                "[MatrixOptimizer] missing adapter inter-instance grad hook "
+                                f"for bucket={getattr(bucket, 'bucket_id', -1)}"
+                            )
+                        for grad_buffer in get_inter_instance_grad_buffers(bucket):
+                            if grad_buffer is None or grad_buffer.numel() == 0:
+                                continue
+                            torch.distributed.all_reduce(
+                                grad_buffer,
+                                op=reduce_op,
+                                group=self.inter_distributed_optimizer_instance_group,
+                                async_op=async_op,
+                            )
 
         if async_op:
             if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
@@ -668,6 +830,36 @@ class _ParamAndGradBucketGroup:
             # maintain consistency with prior code, we need to manually set communication handle to
             # None.
             self.grad_reduce_handle = None
+        self.grad_sync_launched = True
+
+    def _finish_matrix_grad_transports(self) -> None:
+        communication_group = (
+            self.intra_distributed_optimizer_instance_group
+            if self.ddp_config.use_distributed_optimizer
+            else self.data_parallel_group
+        )
+
+        for idx, bucket in enumerate(self.buckets):
+            matrix_layout = getattr(bucket, "matrix_layout", None)
+            if matrix_layout is None or not matrix_layout.has_params:
+                continue
+            optimizer = getattr(bucket, "matrix_optimizer", None)
+            if optimizer is None or not hasattr(optimizer, "_apply_bucket_grads"):
+                raise RuntimeError(
+                    "[MatrixOptimizer] missing adapter grad transport hook "
+                    f"for bucket={getattr(bucket, 'bucket_id', -1)}"
+                )
+
+            local_data_view = (
+                self._get_standard_local_grad_view(idx, bucket)
+                if bucket.has_standard_params
+                else None
+            )
+            optimizer._apply_bucket_grads(
+                bucket=bucket,
+                local_data_view=local_data_view,
+                communication_group=communication_group,
+            )
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
@@ -682,6 +874,7 @@ class _ParamAndGradBucketGroup:
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
+            self._finish_matrix_grad_transports()
             self._copy_back_extra_main_grads()
             return
         # If first batch, start asynchronous communication here. register_grad_ready() launches
@@ -693,6 +886,7 @@ class _ParamAndGradBucketGroup:
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.current_stream().wait_stream(self.communication_stream)
+            self._finish_matrix_grad_transports()
             self._copy_back_extra_main_grads()
             return
         assert self.grad_reduce_handle is not None, (
@@ -702,6 +896,7 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
+        self._finish_matrix_grad_transports()
         self._copy_back_extra_main_grads()
 
     def free_overlap_buffers(self):
@@ -718,6 +913,14 @@ class _ParamAndGradBucketGroup:
         for bucket in self.buckets:
             bucket.layerwise_gather_list = None
             bucket._layerwise_src_buffer = None
+            optimizer = getattr(bucket, "matrix_optimizer", None)
+            free_matrix_buffers = (
+                getattr(optimizer, "_free_matrix_overlap_buffers", None)
+                if optimizer is not None
+                else None
+            )
+            if free_matrix_buffers is not None:
+                free_matrix_buffers(bucket)
 
     def _copy_back_extra_main_grads(self):
         """
@@ -824,6 +1027,10 @@ class _ParamAndGradBuffer:
         self.data_parallel_world_size = self.data_parallel_group.size()
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
+        self.param_to_name = param_to_name
+        for param in self.params:
+            if not getattr(param, "_param_name", ""):
+                param._param_name = self.param_to_name.get(param, "")
 
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
@@ -1212,7 +1419,39 @@ class _ParamAndGradBuffer:
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
-        self.grad_data *= scaling_factor
+        for idx, bucket in enumerate(self.buckets):
+            if not bucket.has_matrix_params:
+                bucket.grad_data *= scaling_factor
+                continue
+
+            optimizer = getattr(bucket, "matrix_optimizer", None)
+            scale_matrix_bucket_grads = (
+                getattr(optimizer, "_scale_matrix_bucket_grads", None)
+                if optimizer is not None
+                else None
+            )
+            if scale_matrix_bucket_grads is None:
+                raise RuntimeError(
+                    "[MatrixOptimizer] missing adapter grad scaling hook "
+                    f"for bucket={getattr(bucket, 'bucket_id', -1)}"
+                )
+            local_data_view = None
+            if self.ddp_config.use_distributed_optimizer and bucket.has_standard_params:
+                group_size = int(getattr(bucket, "intra_distributed_optimizer_instance_size"))
+                group_rank = int(getattr(bucket, "intra_distributed_optimizer_instance_rank"))
+                local_data_view = shard_buffer(bucket.grad_data, group_size)[group_rank]
+            communication_group = (
+                getattr(bucket, "intra_distributed_optimizer_instance_group")
+                if self.ddp_config.use_distributed_optimizer
+                else getattr(bucket, "data_parallel_group", None)
+            )
+            scale_matrix_bucket_grads(
+                bucket=bucket,
+                local_data_view=local_data_view,
+                communication_group=communication_group,
+                scaling_factor=scaling_factor,
+                use_distributed_optimizer=bool(self.ddp_config.use_distributed_optimizer),
+            )
         for grad in self.extra_main_grads:
             grad *= scaling_factor
 

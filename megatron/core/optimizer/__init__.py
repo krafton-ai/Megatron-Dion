@@ -60,8 +60,27 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
+from .aro.distributed.integration import (
+    build_aro_distributed_optimizer,
+    build_aro_optimizer,
+    get_aro_param_override,
+)
+from .aro.state import init_aro_state, prepare_aro_params
+from .dion.distributed.integration import (
+    build_dion_distributed_optimizer,
+    build_dion_optimizer,
+    get_dion_param_override,
+)
+from .dion.params import prepare_dion_params
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
+from .muon import (
+    build_muon_distributed_optimizer,
+    build_muon_optimizer,
+    get_muon_param_override,
+    init_muon_state,
+    prepare_muon_params,
+)
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -71,6 +90,9 @@ from .optimizer import (
 )
 from .optimizer_config import (
     AdamOptimizerConfig,
+    AroOptimizerConfig,
+    DionOptimizerConfig,
+    MuonOptimizerConfig,
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
@@ -326,9 +348,182 @@ def _get_param_groups(
         config_overrides = get_standard_config_overrides(config=config)
 
     for model_chunk in model_chunks:
+        modules_by_name = dict(model_chunk.named_modules())
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+
+            if name.endswith('.in_proj.weight') and len(param.shape) == 2:
+                module_name = name[: -len('.in_proj.weight')]
+                module = modules_by_name.get(module_name)
+                in_proj = getattr(module, 'in_proj', None)
+                if (
+                    module is not None
+                    and in_proj is not None
+                    and getattr(in_proj, 'weight', None) is param
+                    and all(
+                        hasattr(module, attr)
+                        for attr in ('qk_dim', 'v_dim', 'num_value_heads', 'in_proj_dim')
+                    )
+                ):
+                    qk_dim = int(module.qk_dim)
+                    v_dim = int(module.v_dim)
+                    value_heads = int(module.num_value_heads)
+                    split_shapes = (
+                        qk_dim,
+                        qk_dim,
+                        v_dim,
+                        v_dim,
+                        value_heads,
+                        value_heads,
+                    )
+                    if int(sum(split_shapes)) != int(module.in_proj_dim):
+                        raise RuntimeError(
+                            "[MATRIX_GDN_IN_PROJ_LAYOUT_MISMATCH] "
+                            f"param={name} split_shapes={split_shapes} "
+                            f"in_proj_dim={int(module.in_proj_dim)}"
+                        )
+                    split_axis = 0
+                    tp_world_size = int(getattr(module, 'tp_size', 1))
+                    if (
+                        bool(getattr(param, 'tensor_model_parallel', False))
+                        and int(getattr(param, 'partition_dim', -1)) == split_axis
+                    ):
+                        if tp_world_size <= 1:
+                            tp_world_size = int(parallel_state.get_tensor_model_parallel_world_size())
+                        if any(dim % tp_world_size != 0 for dim in split_shapes):
+                            raise RuntimeError(
+                                "[MATRIX_GDN_TP_SPLIT_SHAPES_NOT_DIVISIBLE] "
+                                f"param={name} split_shapes={split_shapes} "
+                                f"tp_world_size={tp_world_size}"
+                            )
+                        local_split_dim = int(sum(dim // tp_world_size for dim in split_shapes))
+                        if local_split_dim != int(param.shape[split_axis]):
+                            raise RuntimeError(
+                                "[MATRIX_GDN_LOCAL_SPLIT_DIM_MISMATCH] "
+                                f"param={name} split_axis={split_axis} "
+                                f"expected_local_dim={local_split_dim} "
+                                f"actual_local_dim={int(param.shape[split_axis])} "
+                                f"split_shapes={split_shapes} tp_world_size={tp_world_size}"
+                            )
+                    param.is_gdn = True
+                    param.gdn_split_shapes = split_shapes
+                    param.gdn_split_axis = split_axis
+
+            if 'linear_qkv.weight' in name and len(param.shape) == 2:
+                split_axis = 0
+                num_attention_heads = int(model_chunk.config.num_attention_heads)
+                num_query_groups = int(model_chunk.config.num_query_groups)
+                kv_channels = int(model_chunk.config.kv_channels)
+                q_rows_per_group = num_attention_heads // num_query_groups * kv_channels
+                if hasattr(param, "qkvg_split_shapes") or bool(
+                    getattr(model_chunk.config, 'attention_output_gate', False)
+                ):
+                    param.is_qkvg = True
+                    param.is_qkv = False
+                    param.qkvg_split_axis = split_axis
+                    if not hasattr(param, "qkvg_split_shapes"):
+                        param.qkvg_split_shapes = (
+                            q_rows_per_group,
+                            q_rows_per_group,
+                            kv_channels,
+                            kv_channels,
+                        )
+                    if hasattr(param, "qkv_split_shapes"):
+                        delattr(param, "qkv_split_shapes")
+                else:
+                    param.is_qkv = True
+                    param.is_qkvg = False
+                    param.qkv_split_axis = split_axis
+                    if not hasattr(param, "qkv_split_shapes"):
+                        param.qkv_split_shapes = (
+                            q_rows_per_group,
+                            kv_channels,
+                            kv_channels,
+                        )
+                    if hasattr(param, "qkvg_split_shapes"):
+                        delattr(param, "qkvg_split_shapes")
+
+            if name.endswith('.linear_qkv_down_proj.weight') and len(param.shape) == 2:
+                module_name = name[: -len('.linear_qkv_down_proj.weight')]
+                module = modules_by_name.get(module_name)
+                linear_qkv_down_proj = getattr(module, 'linear_qkv_down_proj', None)
+                if (
+                    module is not None
+                    and linear_qkv_down_proj is not None
+                    and getattr(linear_qkv_down_proj, 'weight', None) is param
+                    and all(
+                        hasattr(module.config, attr)
+                        for attr in ('q_lora_rank', 'kv_lora_rank', 'qk_pos_emb_head_dim')
+                    )
+                ):
+                    if (
+                        module.config.q_lora_rank is None
+                        or module.config.kv_lora_rank is None
+                        or module.config.qk_pos_emb_head_dim is None
+                    ):
+                        raise RuntimeError(
+                            "[MATRIX_MLA_QKV_DOWN_SPLIT_CONFIG_MISSING] "
+                            f"param={name} q_lora_rank={module.config.q_lora_rank} "
+                            f"kv_lora_rank={module.config.kv_lora_rank} "
+                            f"qk_pos_emb_head_dim={module.config.qk_pos_emb_head_dim}"
+                        )
+                    q_rows = int(module.config.q_lora_rank)
+                    kv_rows = int(module.config.kv_lora_rank) + int(module.config.qk_pos_emb_head_dim)
+                    split_rows = (q_rows, kv_rows)
+                    split_axis = 0
+                    local_split_dim = int(sum(split_rows))
+                    if (
+                        bool(getattr(param, 'tensor_model_parallel', False))
+                        and int(getattr(param, 'partition_dim', -1)) == split_axis
+                    ):
+                        tp_world_size = int(parallel_state.get_tensor_model_parallel_world_size())
+                        if any(dim % tp_world_size != 0 for dim in split_rows):
+                            raise RuntimeError(
+                                "[MATRIX_MLA_QKV_DOWN_TP_SPLIT_ROWS_NOT_DIVISIBLE] "
+                                f"param={name} split_rows={split_rows} tp_world_size={tp_world_size}"
+                            )
+                        local_split_dim = int(sum(dim // tp_world_size for dim in split_rows))
+                    if local_split_dim != int(param.shape[split_axis]):
+                        raise RuntimeError(
+                            "[MATRIX_MLA_QKV_DOWN_LOCAL_SPLIT_DIM_MISMATCH] "
+                            f"param={name} split_axis={split_axis} "
+                            f"expected_local_dim={local_split_dim} "
+                            f"actual_local_dim={int(param.shape[split_axis])} "
+                            f"split_rows={split_rows}"
+                        )
+                    param.is_linear_split = True
+                    param.linear_split_rows = split_rows
+                    param.linear_child_kinds = ("q", "kv")
+                    param.linear_split_axis = split_axis
+                    param.linear_partition_stride = len(split_rows)
+
+            if (
+                '.linear_fc1.weight' in name
+                and len(param.shape) == 2
+                and int(getattr(param, 'partition_stride', 1)) == 2
+            ):
+                param.is_linear_split = True
+                param.linear_child_kinds = ("gate", "up")
+                split_axis = 0
+                param.linear_split_axis = split_axis
+                param.linear_partition_stride = int(getattr(param, 'partition_stride', 1))
+                global_rows = int(param.shape[split_axis])
+                if (
+                    bool(getattr(param, 'tensor_model_parallel', False))
+                    and int(getattr(param, 'partition_dim', 0)) == split_axis
+                ):
+                    if not getattr(param, 'allreduce', True):
+                        global_rows *= int(parallel_state.get_expert_tensor_parallel_world_size())
+                    else:
+                        global_rows *= int(parallel_state.get_tensor_model_parallel_world_size())
+                if global_rows % 2 != 0:
+                    raise RuntimeError(
+                        "[MATRIX_LINEAR_FC1_INVALID_ROWS] "
+                        f"param={name} global_rows={global_rows}"
+                    )
+                split_rows = global_rows // 2
+                param.linear_split_rows = (split_rows, split_rows)
 
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
@@ -344,6 +539,33 @@ def _get_param_groups(
                 )
             else:
                 param_override = None
+
+            dion_param_override = get_dion_param_override(config, param, param_override, name)
+            if dion_param_override is not None:
+                if param_override is None:
+                    param_override = dion_param_override
+                else:
+                    param_override = combine_param_group_overrides(
+                        [param_override, dion_param_override]
+                    )
+
+            muon_param_override = get_muon_param_override(config, param, param_override, name)
+            if muon_param_override is not None:
+                if param_override is None:
+                    param_override = muon_param_override
+                else:
+                    param_override = combine_param_group_overrides(
+                        [param_override, muon_param_override]
+                    )
+
+            aro_param_override = get_aro_param_override(config, param, param_override, name)
+            if aro_param_override is not None:
+                if param_override is None:
+                    param_override = aro_param_override
+                else:
+                    param_override = combine_param_group_overrides(
+                        [param_override, aro_param_override]
+                    )
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
@@ -454,11 +676,15 @@ def _get_megatron_optimizer_based_on_param_groups(
     per_model_buffers: Optional[Dict[int, List[_ParamAndGradBuffer]]] = None,
     model_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    pure_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_idx: Optional[int] = None,
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
+    intra_dist_opt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expert_tensor_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    is_expert_parallel: bool = False,
 ) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
 
@@ -609,6 +835,42 @@ def _get_megatron_optimizer_based_on_param_groups(
                 momentum=config.sgd_momentum,
             )
             init_state_fn = None
+        elif config.optimizer == 'dion':
+            optimizer = build_dion_optimizer(
+                config=config,
+                param_groups=param_groups,
+                data_parallel_group=data_parallel_group,
+                pure_data_parallel_group=pure_data_parallel_group,
+                dense_fs_group=intra_dist_opt_dp_group,
+                dion_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
+                pg_collection=pg_collection,
+                is_expert_parallel=is_expert_parallel,
+            )
+            init_state_fn = None
+        elif config.optimizer == 'muon':
+            optimizer = build_muon_optimizer(
+                config=config,
+                param_groups=param_groups,
+                data_parallel_group=data_parallel_group,
+                pure_data_parallel_group=pure_data_parallel_group,
+                dense_fs_group=intra_dist_opt_dp_group,
+                muon_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
+                pg_collection=pg_collection,
+                is_expert_parallel=is_expert_parallel,
+            )
+            init_state_fn = init_muon_state
+        elif config.optimizer == 'aro':
+            optimizer = build_aro_optimizer(
+                config=config,
+                param_groups=param_groups,
+                data_parallel_group=data_parallel_group,
+                pure_data_parallel_group=pure_data_parallel_group,
+                dense_fs_group=intra_dist_opt_dp_group,
+                aro_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
+                pg_collection=pg_collection,
+                is_expert_parallel=is_expert_parallel,
+            )
+            init_state_fn = init_aro_state
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:
@@ -647,15 +909,64 @@ def _get_megatron_optimizer_based_on_param_groups(
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
-            optimizer = DistributedOptimizer(
-                *optimizer_args,
-                model_chunks=model_chunks,
-                per_model_buffers=per_model_buffers,
-                data_parallel_group=data_parallel_group,
-                data_parallel_group_gloo=data_parallel_group_gloo,
-                data_parallel_group_idx=data_parallel_group_idx,
-                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-            )
+            if config.optimizer == 'dion':
+                optimizer = build_dion_distributed_optimizer(
+                    optimizer_args=optimizer_args,
+                    config=config,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    pure_data_parallel_group=pure_data_parallel_group,
+                    dense_fs_group=intra_dist_opt_dp_group,
+                    dion_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                    pg_collection=pg_collection,
+                    is_expert_parallel=is_expert_parallel,
+                )
+            elif config.optimizer == 'muon':
+                optimizer = build_muon_distributed_optimizer(
+                    optimizer_args=optimizer_args,
+                    config=config,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    pure_data_parallel_group=pure_data_parallel_group,
+                    dense_fs_group=intra_dist_opt_dp_group,
+                    muon_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                    pg_collection=pg_collection,
+                    is_expert_parallel=is_expert_parallel,
+                )
+            elif config.optimizer == 'aro':
+                optimizer = build_aro_distributed_optimizer(
+                    optimizer_args=optimizer_args,
+                    config=config,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    pure_data_parallel_group=pure_data_parallel_group,
+                    dense_fs_group=intra_dist_opt_dp_group,
+                    aro_tp_group=expert_tensor_parallel_group if is_expert_parallel else None,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                    pg_collection=pg_collection,
+                    is_expert_parallel=is_expert_parallel,
+                )
+            else:
+                optimizer = DistributedOptimizer(
+                    *optimizer_args,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                )
             # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
             # weight gradients are all-reduced across optimizer instances, so each instance has
             # the duplicated weight gradients, need to reduce gradient stats inside each instance.
@@ -668,7 +979,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    if pg_collection is None or not hasattr(pg_collection, 'tp'):
+    if is_expert_parallel and expert_tensor_parallel_group is not None:
+        tp_group = expert_tensor_parallel_group
+    elif pg_collection is None or not hasattr(pg_collection, 'tp'):
         tp_group = parallel_state.get_tensor_model_parallel_group()
     else:
         tp_group = pg_collection.tp
@@ -736,6 +1049,16 @@ def get_megatron_optimizer(
 
     check_config_overrides_consistency(config, config_overrides)
 
+    if getattr(config, 'optimizer', None) == 'dion':
+        for model_chunk in model_chunks:
+            prepare_dion_params(model_chunk)
+    elif getattr(config, 'optimizer', None) == 'muon':
+        for model_chunk in model_chunks:
+            prepare_muon_params(model_chunk)
+    elif getattr(config, 'optimizer', None) == 'aro':
+        for model_chunk in model_chunks:
+            prepare_aro_params(model_chunk)
+
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
         all_dense_model_chunks = [[model_chunks[0]], model_chunks[1:]]
@@ -749,6 +1072,7 @@ def get_megatron_optimizer(
         pg_collection, model_chunks, use_gloo_process_groups
     )
 
+    dp_group = process_groups_dict['dp_group']
     dp_cp_group = process_groups_dict['dp_cp_group']
     intra_dp_cp_group = process_groups_dict['intra_dp_cp_group']
     intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
@@ -757,6 +1081,8 @@ def get_megatron_optimizer(
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
+    intra_dist_opt_dp_group = process_groups_dict.get('intra_dist_opt_dp_group')
+    expt_tp_group = process_groups_dict.get('expt_tp_group')
 
     model_parallel_rank = get_pg_rank(mp_group)
 
@@ -790,9 +1116,11 @@ def get_megatron_optimizer(
                     per_model_buffers=buffers,
                     model_parallel_group=mp_group,
                     data_parallel_group=dp_cp_group,
+                    pure_data_parallel_group=dp_group,
                     data_parallel_group_gloo=intra_dp_cp_group_gloo,
                     data_parallel_group_idx=model_parallel_rank,
                     intra_dist_opt_group=intra_dist_opt_group,
+                    intra_dist_opt_dp_group=intra_dist_opt_dp_group,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                     pg_collection=pg_collection,
                 )
@@ -838,9 +1166,11 @@ def get_megatron_optimizer(
                 per_model_buffers=buffers,
                 model_parallel_group=mp_group,
                 data_parallel_group=intra_dp_cp_group,
+                pure_data_parallel_group=dp_group,
                 data_parallel_group_gloo=intra_dp_cp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
+                intra_dist_opt_dp_group=intra_dist_opt_dp_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )
@@ -876,11 +1206,15 @@ def get_megatron_optimizer(
                 per_model_buffers=moe_buffers,
                 model_parallel_group=expt_tp_pp_group,
                 data_parallel_group=intra_expt_dp_group,
+                pure_data_parallel_group=intra_expt_dp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
                 intra_dist_opt_group=intra_dist_opt_group,
+                intra_dist_opt_dp_group=intra_expt_dp_group,
+                expert_tensor_parallel_group=expt_tp_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
+                is_expert_parallel=True,
             )
         )
 

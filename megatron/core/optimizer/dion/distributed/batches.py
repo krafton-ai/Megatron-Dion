@@ -1,0 +1,1078 @@
+"""Batch assembly for distributed Dion."""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, List, Sequence, Tuple
+
+import torch
+import torch.distributed as dist
+
+from ..state import require_2d_local_shape
+from ..state import (
+    is_fs_without_tp,
+    should_reduce_p_over_fs,
+    should_reduce_r_over_tp,
+    is_p_tp_sharded,
+)
+from ..utils import get_local_shape, has_multiple_local_experts, local_expert_tensor_view
+from ..types import (
+    DionAxisCollective,
+    DionBatch,
+    DionBatchEntry,
+    DionBatchCollectives,
+    DionBatchGroup,
+    DionStepParam,
+)
+
+
+_VALIDATED_REPLICATE_GROUPS: dict[tuple[int, int], tuple[object, object]] = {}
+_PAD_TENSOR_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _missing_local_shard_error(*, batch_key, batch_group, global_rank: int) -> None:
+    raise RuntimeError(
+        "[DION_MISSING_LOCAL_SHARD] "
+        f"batch_key={batch_key} rank={global_rank} "
+        f"sync_groups={list(batch_group.sync_groups) if batch_group is not None else []}"
+    )
+
+
+def _normalize_shard_dim(dim, has_axis: bool) -> int:
+    if dim is None and not has_axis:
+        return -1
+    if dim is None:
+        raise RuntimeError(
+            "[Dion] missing shard tensor dim for active sharded axis in batch key construction"
+        )
+    return int(dim)
+
+
+def _normalize_shape(shape) -> tuple:
+    if shape is None:
+        return ()
+    return tuple(int(dim) for dim in shape)
+
+
+def _build_update_invariant_key(
+    optim_group: Dict[str, Any] | None,
+    optimizer_state: Dict[str, Any] | None,
+) -> tuple:
+    if optim_group is None:
+        lr = None
+        rank_fraction = None
+        weight_decay = None
+        wd_mult = None
+        mu = None
+    else:
+        lr = float(optim_group["lr"]) if "lr" in optim_group else None
+        rank_fraction = (
+            float(optim_group["rank_fraction"]) if "rank_fraction" in optim_group else None
+        )
+        weight_decay = (
+            float(optim_group["weight_decay"]) if "weight_decay" in optim_group else None
+        )
+        wd_mult = float(optim_group["wd_mult"]) if "wd_mult" in optim_group else None
+        mu = float(optim_group["mu"]) if "mu" in optim_group else None
+    r = int(optimizer_state.get("r", -1)) if optimizer_state is not None else -1
+    return (lr, weight_decay, wd_mult, mu, rank_fraction, r)
+
+
+def build_batch_key(
+    shape,
+    cfg,
+    dtype: torch.dtype,
+    *,
+    global_shape=None,
+    per_expert_global_shape=None,
+    tensor_row_shard_sizes=None,
+    row_shard_sizes=None,
+) -> tuple:
+    """Build the canonical Dion batch key used by local/distributed runtimes."""
+    key_shape = per_expert_global_shape or global_shape or shape
+    if len(key_shape) == 2:
+        resolved_shape = (int(key_shape[0]), int(key_shape[1]))
+    else:
+        resolved_shape = tuple(int(dim) for dim in key_shape)
+    return (
+        resolved_shape,
+        bool(cfg.has_fs_shard),
+        bool(getattr(cfg, "use_fs_shard", cfg.has_fs_shard)),
+        bool(cfg.has_tp_shard),
+        bool(getattr(cfg, "use_tp_shard", cfg.has_tp_shard)),
+        bool(cfg.is_transposed),
+        bool(cfg.use_low_rank_sync),
+        _normalize_shard_dim(cfg.tp_shard_dim, cfg.has_tp_shard),
+        _normalize_shard_dim(cfg.fs_shard_dim, cfg.has_fs_shard),
+        dtype,
+        _normalize_shape(global_shape),
+        _normalize_shape(per_expert_global_shape),
+        _normalize_shape(tensor_row_shard_sizes),
+        _normalize_shape(row_shard_sizes),
+    )
+
+
+def unique_preserve_order(items: Sequence[Any]) -> list[Any]:
+    """Deduplicate while preserving first-seen order."""
+    return list(dict.fromkeys(items))
+
+
+def _batch_key_sort_key(batch_key: tuple) -> str:
+    """Return a deterministic sort key for one canonical batch key."""
+    return repr(batch_key)
+
+
+def _batch_sort_key_cache(batch_key_cache: dict | None) -> dict | None:
+    if batch_key_cache is None:
+        return None
+    return batch_key_cache.setdefault("batch_sort_keys", {})
+
+
+def _cached_batch_sort_key(batch_key: tuple, sort_key_cache: dict | None) -> str:
+    if sort_key_cache is None:
+        return _batch_key_sort_key(batch_key)
+    cached = sort_key_cache.get(batch_key)
+    if cached is None:
+        cached = _batch_key_sort_key(batch_key)
+        sort_key_cache[batch_key] = cached
+    return cached
+
+
+def _rank_tuple_cache(batch_key_cache: dict | None) -> dict | None:
+    if batch_key_cache is None:
+        return None
+    return batch_key_cache.setdefault("process_group_ranks", {})
+
+
+def _sync_group_batch_metadata(
+    *,
+    sync_group,
+    local_batch_keys: Sequence[tuple],
+    batch_group_by_key: Dict[tuple, DionBatchGroup],
+    batch_key_cache: dict,
+) -> tuple[list[tuple], dict[tuple, int]]:
+    """Return canonical cross-rank batch order plus per-key chunk multiplicity.
+
+    The Dion update must not depend on local batch-key discovery order.
+    Canonicalize the batch schedule over each concrete sync group, then validate that
+    every participating rank contributes the same number of local params for each
+    batch key.
+    """
+    sort_key_cache = _batch_sort_key_cache(batch_key_cache)
+
+    def sort_key(batch_key: tuple) -> str:
+        return _cached_batch_sort_key(batch_key, sort_key_cache)
+
+    if sync_group is None or dist.get_world_size(sync_group) <= 1:
+        ordered = sorted(local_batch_keys, key=sort_key)
+        multiplicity = {
+            batch_key: len(batch_group_by_key[batch_key].params or [])
+            for batch_key in ordered
+        }
+        return ordered, multiplicity
+
+    local_counts = {
+        batch_key: len(batch_group_by_key[batch_key].params or [])
+        for batch_key in local_batch_keys
+    }
+    local_batch_keys_by_sync_key = {}
+    local_counts_by_sync_key = {}
+    for batch_key, count in local_counts.items():
+        sync_key = _batch_key_for_sync(
+            batch_key,
+            sync_group,
+            param_uids=_batch_group_param_uids(batch_group_by_key[batch_key]),
+            rank_cache=_rank_tuple_cache(batch_key_cache),
+        )
+        local_batch_keys_by_sync_key.setdefault(sync_key, []).append(batch_key)
+        local_counts_by_sync_key[sync_key] = (
+            int(local_counts_by_sync_key.get(sync_key, 0)) + int(count)
+        )
+    for sync_key in local_batch_keys_by_sync_key:
+        local_batch_keys_by_sync_key[sync_key] = sorted(
+            local_batch_keys_by_sync_key[sync_key],
+            key=sort_key,
+        )
+
+    group_cache_key = ("batch_metadata", _group_ranks_key(sync_group, _rank_tuple_cache(batch_key_cache)))
+    local_signature = tuple(
+        (sync_key, int(local_counts_by_sync_key[sync_key]))
+        for sync_key in sorted(local_counts_by_sync_key, key=sort_key)
+    )
+    cached = batch_key_cache.get(group_cache_key)
+    if cached is not None:
+        if cached.get("local_signature") == local_signature:
+            return _local_batch_keys_from_sync_order(
+                ordered_sync_keys=list(cached["ordered"]),
+                local_batch_keys_by_sync_key=local_batch_keys_by_sync_key,
+                local_counts_by_key=local_counts,
+            )
+
+    gathered = [None] * dist.get_world_size(sync_group)
+    dist.all_gather_object(
+        gathered,
+        {sync_key: int(count) for sync_key, count in local_counts_by_sync_key.items()},
+        group=sync_group,
+    )
+
+    all_sync_keys = set()
+    for rank_counts in gathered:
+        all_sync_keys.update(rank_counts.keys())
+    ordered = sorted(all_sync_keys, key=sort_key)
+
+    for sync_key in ordered:
+        counts = [int(rank_counts.get(sync_key, 0)) for rank_counts in gathered]
+        max_count = max(counts)
+        min_count = min(counts)
+        if min_count != max_count:
+            raise RuntimeError(
+                "[DION_BATCH_KEY_MULTIPLICITY_MISMATCH] "
+                f"rank={dist.get_rank()} sync_key={sync_key} counts={counts} "
+                f"group_ranks={tuple(dist.get_process_group_ranks(sync_group))}"
+            )
+
+    batch_key_cache[group_cache_key] = {
+        "local_signature": local_signature,
+        "ordered": tuple(ordered),
+    }
+    return _local_batch_keys_from_sync_order(
+        ordered_sync_keys=ordered,
+        local_batch_keys_by_sync_key=local_batch_keys_by_sync_key,
+        local_counts_by_key=local_counts,
+    )
+
+
+def _group_ranks_key(process_group, rank_cache: dict | None = None) -> tuple[int, ...]:
+    if process_group is None:
+        return ()
+    if rank_cache is None:
+        return tuple(int(rank) for rank in dist.get_process_group_ranks(process_group))
+    cache_key = id(process_group)
+    cached = rank_cache.get(cache_key)
+    if cached is not None and cached[0] is process_group:
+        return cached[1]
+    ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(process_group))
+    rank_cache[cache_key] = (process_group, ranks)
+    return ranks
+
+
+def _batch_group_key(batch_group: DionBatchGroup, rank_cache: dict | None = None) -> tuple:
+    return (
+        str(batch_group.kernel_kind),
+        int(batch_group.batch_world_size),
+        _group_ranks_key(batch_group.replicate_group, rank_cache),
+        _group_ranks_key(batch_group.ortho_group, rank_cache),
+        _group_ranks_key(batch_group.q_norm_group, rank_cache),
+        _group_ranks_key(batch_group.low_rank_replicate_group, rank_cache),
+        tuple(_group_ranks_key(group, rank_cache) for group in batch_group.sync_groups),
+    )
+
+
+def _project_group_for_sync(group_ranks: tuple[int, ...], sync_group_ranks: tuple[int, ...]) -> tuple:
+    if not group_ranks:
+        return ()
+    if group_ranks == sync_group_ranks:
+        return ("self", len(group_ranks))
+    return ("other", len(group_ranks))
+
+
+def _optimizer_key_for_sync(optimizer_key: tuple) -> tuple:
+    if isinstance(optimizer_key, tuple) and len(optimizer_key) == 6:
+        _, _, _, _, rank_fraction, r = optimizer_key
+        return (rank_fraction, r)
+    return optimizer_key
+
+
+def _batch_group_param_uids(batch_group: DionBatchGroup) -> tuple:
+    uids = []
+    for dist_meta in batch_group.dist_metas or []:
+        param_uid = getattr(dist_meta, "param_uid", None)
+        uids.append(tuple(param_uid) if param_uid is not None else None)
+    return tuple(uids)
+
+
+def _batch_key_for_sync(
+    batch_key: tuple,
+    sync_group,
+    *,
+    param_uids: tuple = (),
+    rank_cache: dict | None = None,
+) -> tuple:
+    """Project one local full batch key into the invariant visible to one sync group."""
+    if sync_group is None:
+        return batch_key
+    update_key, optimizer_key, group_key = batch_key
+    (
+        kernel_kind,
+        batch_world_size,
+        replicate_ranks,
+        ortho_ranks,
+        q_norm_ranks,
+        low_rank_replicate_ranks,
+        sync_group_ranks_by_role,
+    ) = group_key
+    sync_group_ranks = _group_ranks_key(sync_group, rank_cache)
+    return (
+        update_key,
+        _optimizer_key_for_sync(optimizer_key),
+        tuple(param_uids),
+        (
+            kernel_kind,
+            batch_world_size,
+            _project_group_for_sync(replicate_ranks, sync_group_ranks),
+            _project_group_for_sync(ortho_ranks, sync_group_ranks),
+            _project_group_for_sync(q_norm_ranks, sync_group_ranks),
+            _project_group_for_sync(low_rank_replicate_ranks, sync_group_ranks),
+            tuple(
+                _project_group_for_sync(group_ranks, sync_group_ranks)
+                for group_ranks in sync_group_ranks_by_role
+            ),
+        ),
+    )
+
+
+def _local_batch_keys_from_sync_order(
+    *,
+    ordered_sync_keys: Sequence[tuple],
+    local_batch_keys_by_sync_key: Dict[tuple, List[tuple]],
+    local_counts_by_key: Dict[tuple, int],
+) -> tuple[list[tuple], dict[tuple, int]]:
+    ordered_local_keys = []
+    multiplicity = {}
+    for sync_key in ordered_sync_keys:
+        local_keys = local_batch_keys_by_sync_key.get(sync_key, [])
+        if not local_keys:
+            raise RuntimeError(
+                "[DION_BATCH_SYNC_KEY_MISSING_LOCAL_KEY] "
+                f"sync_key={sync_key}"
+            )
+        if len(local_keys) != 1:
+            raise RuntimeError(
+                "[DION_BATCH_SYNC_KEY_AMBIGUOUS] "
+                f"sync_key={sync_key} local_keys={tuple(local_keys)}"
+            )
+        local_key = local_keys[0]
+        ordered_local_keys.append(local_key)
+        multiplicity[local_key] = int(local_counts_by_key[local_key])
+    return ordered_local_keys, multiplicity
+
+
+def group_items_by_batch_key(
+    items: Sequence[Any],
+    batch_keys: Sequence[tuple],
+) -> list[tuple[tuple, list[Any]]]:
+    """Group items by canonical batch key while preserving first-seen key order."""
+    if len(items) != len(batch_keys):
+        raise RuntimeError(
+            f"[Dion] item/key length mismatch for batching: items={len(items)} keys={len(batch_keys)}"
+        )
+    grouped: dict[tuple, list[Any]] = {}
+    for item, batch_key in zip(items, batch_keys):
+        grouped.setdefault(batch_key, []).append(item)
+    return list(grouped.items())
+
+
+def pad_batch(
+    batch: List[torch.Tensor],
+    batch_size: int,
+    *,
+    item: torch.Tensor | None = None,
+) -> List[torch.Tensor]:
+    """Extend one tensor batch to the required runtime size."""
+    assert len(batch) > 0
+    assert len(batch) <= batch_size
+    if item is not None:
+        pad_item = item
+    else:
+        first = batch[0]
+        key = (tuple(int(dim) for dim in first.shape), first.dtype, first.device)
+        pad_item = _PAD_TENSOR_CACHE.get(key)
+        if pad_item is None:
+            pad_item = torch.zeros_like(first)
+            _PAD_TENSOR_CACHE[key] = pad_item
+    while len(batch) < batch_size:
+        batch.append(pad_item)
+    return batch
+
+
+def _local_expert_q_view(
+    q_tensor: torch.Tensor,
+    *,
+    config,
+    dist_meta,
+    local_shape: Tuple[int, int],
+) -> torch.Tensor:
+    if not has_multiple_local_experts(dist_meta):
+        return q_tensor
+
+    expert_axis = int(getattr(dist_meta, "expert_axis", -1))
+    num_local_experts = int(getattr(dist_meta, "num_local_experts", 1))
+    local_expert_index = int(getattr(dist_meta, "local_expert_index", -1))
+    q_base_axis = 0 if bool(getattr(config, "is_transposed", False)) else 1
+    m_local, n_local = local_shape
+    expected_q_rows = int(m_local if q_base_axis == 0 else n_local)
+
+    if int(q_tensor.size(0)) == expected_q_rows:
+        return q_tensor
+    if expert_axis != q_base_axis:
+        raise RuntimeError(
+            "[DION_EXPERT_Q_SHAPE_MISMATCH] "
+            f"q_shape={tuple(int(dim) for dim in q_tensor.shape)} local_shape={local_shape} "
+            f"expert_axis={expert_axis} q_base_axis={q_base_axis}"
+        )
+    return local_expert_tensor_view(
+        q_tensor,
+        axis=0,
+        num_local_experts=num_local_experts,
+        local_expert_index=local_expert_index,
+        local_shape=(expected_q_rows, int(q_tensor.size(1))),
+        context=f"q:param_uid={getattr(dist_meta, 'param_uid', None)}",
+    )
+
+
+def _local_expert_views(*, param, grad, optimizer_state, config, dist_meta):
+    physical_shape = tuple(int(dim) for dim in optimizer_state["momentum"].shape)
+    local_shape = get_local_shape(dist_meta, physical_shape[0], physical_shape[1])
+    if not has_multiple_local_experts(dist_meta):
+        return param, grad, optimizer_state["momentum"], optimizer_state["Q"], local_shape
+
+    expert_axis = int(getattr(dist_meta, "expert_axis", -1))
+    num_local_experts = int(getattr(dist_meta, "num_local_experts", 1))
+    local_expert_index = int(getattr(dist_meta, "local_expert_index", -1))
+    context = (
+        f"param_uid={getattr(dist_meta, 'param_uid', None)} "
+        f"param_name={getattr(dist_meta, 'param_name', '')}"
+    )
+    param_view = local_expert_tensor_view(
+        param,
+        axis=expert_axis,
+        num_local_experts=num_local_experts,
+        local_expert_index=local_expert_index,
+        local_shape=local_shape,
+        context=f"param:{context}",
+    )
+    grad_view = local_expert_tensor_view(
+        grad.view(*physical_shape),
+        axis=expert_axis,
+        num_local_experts=num_local_experts,
+        local_expert_index=local_expert_index,
+        local_shape=local_shape,
+        context=f"grad:{context}",
+    )
+    momentum_view = local_expert_tensor_view(
+        optimizer_state["momentum"].view(*physical_shape),
+        axis=expert_axis,
+        num_local_experts=num_local_experts,
+        local_expert_index=local_expert_index,
+        local_shape=local_shape,
+        context=f"momentum:{context}",
+    )
+    q_view = _local_expert_q_view(
+        optimizer_state["Q"],
+        config=config,
+        dist_meta=dist_meta,
+        local_shape=local_shape,
+    )
+    return param_view, grad_view, momentum_view, q_view, local_shape
+
+
+def _validate_exact_replicate_group(*, replicate_group, validation_group) -> None:
+    """Fail fast unless the adapter already resolved the exact Dion replica group."""
+    if replicate_group is None:
+        return
+
+    if validation_group is None:
+        raise RuntimeError(
+            "[DION_MISSING_REPLICA_VALIDATION_GROUP] "
+            f"rank={dist.get_rank()}"
+        )
+
+    cache_key = (id(replicate_group), id(validation_group))
+    cached = _VALIDATED_REPLICATE_GROUPS.get(cache_key)
+    if cached is not None and cached[0] is replicate_group and cached[1] is validation_group:
+        return
+
+    replicate_ranks = dist.get_process_group_ranks(replicate_group)
+    validation_ranks = tuple(dist.get_process_group_ranks(validation_group))
+    validation_rank_set = set(validation_ranks)
+    leaked_ranks = [rank for rank in replicate_ranks if rank not in validation_rank_set]
+    if leaked_ranks:
+        raise RuntimeError(
+            "[DION_INVALID_REPLICA_GROUP_DOMAIN] "
+            f"rank={dist.get_rank()} replicate_ranks={replicate_ranks} "
+            f"validation_ranks={validation_ranks} leaked_ranks={leaked_ranks}"
+        )
+    _VALIDATED_REPLICATE_GROUPS[cache_key] = (replicate_group, validation_group)
+
+
+def resolve_batch_group(
+    *,
+    config,
+    dist_meta,
+    use_fs_collectives: bool,
+    state_replica_group,
+    replica_validation_group,
+    group_size: Callable,
+    get_replicate_group: Callable,
+    resolve_ortho_group: Callable,
+) -> DionBatchGroup:
+    """Return the batch execution groups from adapter runtime state."""
+    replicate_group = get_replicate_group()
+    if replicate_group is not None and group_size(replicate_group) > 1:
+        _validate_exact_replicate_group(
+            replicate_group=replicate_group,
+            validation_group=replica_validation_group,
+        )
+    ortho_group = resolve_ortho_group(config, dist_meta)
+    fs_group = getattr(dist_meta, "fs_group", None) if dist_meta is not None else None
+    tp_group = getattr(dist_meta, "tp_group", None) if dist_meta is not None else None
+    tp_active = bool(getattr(config, "use_tp_shard", False))
+
+    sync_groups = []
+    if (
+        config.use_low_rank_sync
+        and replicate_group is not None
+        and group_size(replicate_group) > 1
+    ):
+        sync_groups.append(replicate_group)
+
+    if (
+        state_replica_group is not None
+        and group_size(state_replica_group) > 1
+        and all(id(state_replica_group) != id(existing) for existing in sync_groups)
+    ):
+        sync_groups.append(state_replica_group)
+
+    if tp_active:
+        if tp_group is None:
+            raise RuntimeError(
+                "[DION_MISSING_BATCH_TP_GROUP] "
+                f"rank={dist.get_rank()} param={getattr(dist_meta, 'param_name', '')} "
+                f"param_uid={getattr(dist_meta, 'param_uid', None)}"
+            )
+        if group_size(tp_group) > 1 and all(id(tp_group) != id(existing) for existing in sync_groups):
+            sync_groups.append(tp_group)
+    if bool(getattr(config, "use_fs_shard", False)):
+        if fs_group is None:
+            raise RuntimeError(
+                "[DION_MISSING_BATCH_FS_GROUP] "
+                f"rank={dist.get_rank()} param={getattr(dist_meta, 'param_name', '')} "
+                f"param_uid={getattr(dist_meta, 'param_uid', None)}"
+            )
+        if group_size(fs_group) > 1 and all(id(fs_group) != id(existing) for existing in sync_groups):
+            sync_groups.append(fs_group)
+
+    if tp_active:
+        batch_world_size = group_size(tp_group)
+    elif bool(getattr(config, "use_fs_shard", False)):
+        batch_world_size = group_size(fs_group)
+    elif config.use_low_rank_sync and replicate_group is not None:
+        batch_world_size = group_size(replicate_group)
+    else:
+        batch_world_size = group_size(replicate_group) if replicate_group is not None else 1
+
+    q_norm_group = None
+    if (
+        use_fs_collectives
+        and bool(getattr(config, "use_fs_shard", False))
+        and fs_group is not None
+        and group_size(fs_group) > 1
+    ):
+        q_norm_group = fs_group
+
+    kernel_kind = "ddp"
+    if (
+        is_p_tp_sharded(config, tp_active=tp_active)
+        and ortho_group is not None
+        and group_size(ortho_group) > 1
+    ):
+        kernel_kind = "fsdp_tp"
+    elif (
+        use_fs_collectives
+        and is_fs_without_tp(config)
+        and fs_group is not None
+        and group_size(fs_group) > 1
+    ):
+        kernel_kind = "fsdp"
+
+    low_rank_replicate_group = None
+    if (
+        config.use_low_rank_sync
+        and kernel_kind == "fsdp"
+        and replicate_group is not None
+        and group_size(replicate_group) > 1
+    ):
+        low_rank_replicate_group = replicate_group
+
+    return DionBatchGroup(
+        sync_groups=tuple(sync_groups),
+        kernel_kind=kernel_kind,
+        replicate_group=replicate_group,
+        ortho_group=ortho_group,
+        q_norm_group=q_norm_group,
+        low_rank_replicate_group=low_rank_replicate_group,
+        batch_world_size=batch_world_size,
+    )
+
+
+def build_batch_collectives(
+    *,
+    q_tensors,
+    configs,
+    dist_metas,
+    real_batch_size: int,
+    use_fs_collectives: bool,
+    resolve_tp_group: Callable,
+    resolve_fs_group_from_meta: Callable,
+) -> DionBatchCollectives:
+    """Return the TP/FS collectives for one concrete batch."""
+    tp_q_gather_groups = {}
+    fs_p_reduce_groups = {}
+    tp_r_reduce_groups = {}
+    tp_q_reshard_groups = {}
+    fs_collective_group = None
+    fs_indices = []
+    ortho_group = None
+
+    dist_metas = dist_metas or []
+    q_tensors = q_tensors or []
+    template_dist_meta = next((dist_meta for dist_meta in dist_metas if dist_meta is not None), None)
+    real_batch_size = int(real_batch_size)
+    if real_batch_size < 0 or real_batch_size > len(configs):
+        raise RuntimeError(
+            "[DION_INVALID_REAL_BATCH_SIZE] "
+            f"rank={dist.get_rank()} real_batch_size={real_batch_size} batch_size={len(configs)}"
+        )
+
+    def register_ortho_group(process_group, *, idx: int, axis: str) -> None:
+        nonlocal ortho_group
+        if process_group is None:
+            return
+        world_size = dist.get_world_size(process_group)
+        rank = dist.get_rank(process_group)
+        if world_size <= 1:
+            return
+        group_key = (id(process_group), world_size, rank)
+        if ortho_group is None:
+            ortho_group = process_group
+            return
+        current_key = (
+            id(ortho_group),
+            dist.get_world_size(ortho_group),
+            dist.get_rank(ortho_group),
+        )
+        if current_key != group_key:
+            raise RuntimeError(
+                "[DION_ORTHO_GROUP_MISMATCH] "
+                f"rank={dist.get_rank()} idx={idx} axis={axis} "
+                f"expected={current_key} got={group_key}"
+            )
+
+    for idx, config in enumerate(configs):
+        dist_meta = dist_metas[idx] if idx < len(dist_metas) else None
+        if dist_meta is None:
+            if idx < real_batch_size:
+                raise RuntimeError(
+                    "[DION_UNEXPECTED_MISSING_DIST_META_IN_REAL_ENTRY] "
+                    f"rank={dist.get_rank()} idx={idx} real_batch_size={real_batch_size}"
+                )
+            dist_meta = template_dist_meta
+        tp_active = bool(getattr(config, "use_tp_shard", False))
+
+        if tp_active:
+            tp_group = resolve_tp_group(dist_meta, expect_group=True)
+            if tp_group is None or dist.get_world_size(tp_group) <= 1:
+                raise RuntimeError(
+                    "[DION_MISSING_TP_GROUP_FOR_BATCH_COLLECTIVES] "
+                    f"rank={dist.get_rank()} idx={idx} "
+                    f"param={getattr(dist_meta, 'param_name', '')} "
+                    f"param_uid={getattr(dist_meta, 'param_uid', None)}"
+                )
+            tp_key = (id(tp_group), dist.get_world_size(tp_group), dist.get_rank(tp_group))
+            if tp_key not in tp_q_reshard_groups:
+                tp_q_reshard_groups[tp_key] = (tp_group, [])
+            tp_q_reshard_groups[tp_key][1].append(idx)
+            if idx < len(q_tensors):
+                q_local = q_tensors[idx]
+                q_key = (
+                    id(tp_group),
+                    dist.get_world_size(tp_group),
+                    dist.get_rank(tp_group),
+                    q_local.size(0),
+                    q_local.size(1),
+                    q_local.dtype,
+                    q_local.device,
+                )
+                if q_key not in tp_q_gather_groups:
+                    tp_q_gather_groups[q_key] = (tp_group, [])
+                tp_q_gather_groups[q_key][1].append(idx)
+            if should_reduce_r_over_tp(config, tp_active=tp_active):
+                if tp_key not in tp_r_reduce_groups:
+                    tp_r_reduce_groups[tp_key] = (tp_group, [])
+                tp_r_reduce_groups[tp_key][1].append(idx)
+            register_ortho_group(tp_group, idx=idx, axis="tp")
+
+        if should_reduce_p_over_fs(config):
+            fs_group = resolve_fs_group_from_meta(dist_meta, expect_group=True)
+            if fs_group is None or dist.get_world_size(fs_group) <= 1:
+                raise RuntimeError(
+                    "[DION_MISSING_FS_GROUP_FOR_BATCH_COLLECTIVES] "
+                    f"rank={dist.get_rank()} idx={idx} "
+                    f"param={getattr(dist_meta, 'param_name', '')} "
+                    f"param_uid={getattr(dist_meta, 'param_uid', None)}"
+                )
+            fs_key = (id(fs_group), dist.get_world_size(fs_group), dist.get_rank(fs_group))
+            if fs_key not in fs_p_reduce_groups:
+                fs_p_reduce_groups[fs_key] = (fs_group, [])
+            fs_p_reduce_groups[fs_key][1].append(idx)
+
+        if use_fs_collectives and bool(getattr(config, "use_fs_shard", False)) and not tp_active:
+            fs_group = resolve_fs_group_from_meta(dist_meta, expect_group=True)
+            if fs_group is None or dist.get_world_size(fs_group) <= 1:
+                raise RuntimeError(
+                    "[DION_MISSING_FS_ONLY_ORTHO_GROUP] "
+                    f"rank={dist.get_rank()} idx={idx} "
+                    f"param={getattr(dist_meta, 'param_name', '')} "
+                    f"param_uid={getattr(dist_meta, 'param_uid', None)}"
+                )
+            fs_key = (id(fs_group), dist.get_world_size(fs_group), dist.get_rank(fs_group))
+            if fs_collective_group is None:
+                fs_collective_group = fs_group
+            else:
+                current_key = (
+                    id(fs_collective_group),
+                    dist.get_world_size(fs_collective_group),
+                    dist.get_rank(fs_collective_group),
+                )
+                if current_key != fs_key:
+                    raise RuntimeError(
+                        "[DION_FS_ONLY_ORTHO_GROUP_MISMATCH] "
+                        f"rank={dist.get_rank()} idx={idx} expected={current_key} got={fs_key}"
+                    )
+            fs_indices.append(idx)
+            register_ortho_group(fs_group, idx=idx, axis="fs")
+
+    def finalize(grouped_collectives):
+        collectives = []
+        for process_group, indices in grouped_collectives.values():
+            collectives.append(
+                DionAxisCollective(
+                    indices=tuple(indices),
+                    process_group=process_group,
+                    world_size=dist.get_world_size(process_group),
+                    rank=dist.get_rank(process_group),
+                )
+            )
+        return tuple(collectives)
+
+    fs_collective = None
+    if fs_collective_group is not None:
+        fs_collective = DionAxisCollective(
+            indices=tuple(fs_indices),
+            process_group=fs_collective_group,
+            world_size=dist.get_world_size(fs_collective_group),
+            rank=dist.get_rank(fs_collective_group),
+        )
+
+    return DionBatchCollectives(
+        tp_q_gathers=finalize(tp_q_gather_groups),
+        fs_p_collectives=finalize(fs_p_reduce_groups),
+        tp_r_collectives=finalize(tp_r_reduce_groups),
+        tp_q_reshards=finalize(tp_q_reshard_groups),
+        fs_collective=fs_collective,
+    )
+
+
+def group_and_order_param_batches(
+    *,
+    routed_params: list[DionStepParam],
+    batch_key_cache: dict,
+    use_fs_collectives: bool,
+    state_replica_group,
+    replica_validation_group,
+    global_rank: int,
+    group_size: Callable,
+    get_replicate_group: Callable,
+    resolve_ortho_group: Callable,
+):
+    """Group Dion params by batch key, then canonicalize and validate cross-rank order."""
+    batch_group_by_key = {}
+    batch_items = []
+    batch_keys = []
+    for routed_param in routed_params:
+        param = routed_param.param
+        state = routed_param.optimizer_state
+        dist_meta = routed_param.dist_meta
+        config = routed_param.config
+        local_shape = state.get("local_shape", None)
+        if local_shape is None:
+            local_shape = require_2d_local_shape(param, dist_meta)
+            state["local_shape"] = local_shape
+        global_shape = state.get("global_shape", None)
+        if global_shape is None and dist_meta is not None:
+            global_shape = getattr(dist_meta, "global_shape", None)
+        per_expert_global_shape = state.get("per_expert_global_shape", None)
+        if per_expert_global_shape is None and dist_meta is not None:
+            per_expert_global_shape = getattr(dist_meta, "per_expert_global_shape", None)
+        resolved_group = resolve_batch_group(
+            config=config,
+            dist_meta=dist_meta,
+            use_fs_collectives=use_fs_collectives,
+            state_replica_group=state_replica_group,
+            replica_validation_group=replica_validation_group,
+            group_size=group_size,
+            get_replicate_group=get_replicate_group,
+            resolve_ortho_group=resolve_ortho_group,
+        )
+        batch_items.append((routed_param, resolved_group))
+        batch_keys.append(
+            (
+                build_batch_key(
+                    local_shape,
+                    config,
+                    routed_param.grad.dtype,
+                    global_shape=global_shape,
+                    per_expert_global_shape=per_expert_global_shape,
+                    tensor_row_shard_sizes=getattr(dist_meta, "tensor_row_shard_sizes", None),
+                    row_shard_sizes=getattr(dist_meta, "row_shard_sizes", None),
+                ),
+                _build_update_invariant_key(
+                    routed_param.optim_group,
+                    routed_param.optimizer_state,
+                ),
+                _batch_group_key(resolved_group, _rank_tuple_cache(batch_key_cache)),
+            )
+        )
+
+    for batch_key, grouped_items in group_items_by_batch_key(batch_items, batch_keys):
+        first_group = grouped_items[0][1]
+        params = [item[0] for item in grouped_items]
+        batch_group_by_key[batch_key] = DionBatchGroup(
+            params=[item.param for item in params],
+            grads=[item.grad for item in params],
+            optimizer_states=[item.optimizer_state for item in params],
+            optim_groups=[item.optim_group for item in params],
+            configs=[item.config for item in params],
+            dist_metas=[item.dist_meta for item in params],
+            commit_updates=[item.commit_update for item in params],
+            sync_groups=first_group.sync_groups,
+            kernel_kind=first_group.kernel_kind,
+            replicate_group=first_group.replicate_group,
+            ortho_group=first_group.ortho_group,
+            q_norm_group=first_group.q_norm_group,
+            low_rank_replicate_group=first_group.low_rank_replicate_group,
+            batch_world_size=first_group.batch_world_size,
+        )
+
+    local_batch_keys = list(batch_group_by_key.keys())
+    grouped_batch_keys = {}
+    for batch_key in local_batch_keys:
+        batch_group = batch_group_by_key[batch_key]
+        if not batch_group.sync_groups:
+            grouped_batch_keys.setdefault(None, (None, []))[1].append(batch_key)
+            continue
+        for sync_group in batch_group.sync_groups:
+            grouped_batch_keys.setdefault(id(sync_group), (sync_group, []))[1].append(batch_key)
+
+    all_batch_keys = []
+    batch_multiplicity_by_key: dict[tuple, int] = {}
+    for sync_group, group_keys in grouped_batch_keys.values():
+        ordered_keys, multiplicity = _sync_group_batch_metadata(
+            sync_group=sync_group,
+            local_batch_keys=group_keys,
+            batch_group_by_key=batch_group_by_key,
+            batch_key_cache=batch_key_cache,
+        )
+        all_batch_keys.extend(ordered_keys)
+        for batch_key, count in multiplicity.items():
+            existing = batch_multiplicity_by_key.get(batch_key, count)
+            if existing != count:
+                raise RuntimeError(
+                    "[DION_BATCH_KEY_MULTIPLICITY_INCONSISTENT_ACROSS_GROUPS] "
+                    f"rank={dist.get_rank()} batch_key={batch_key} "
+                    f"existing={existing} new={count}"
+                )
+            batch_multiplicity_by_key[batch_key] = count
+    all_batch_keys = unique_preserve_order(all_batch_keys)
+
+    ordered_batches = []
+    for batch_key in all_batch_keys:
+        if batch_key not in batch_group_by_key:
+            batch_group = batch_group_by_key.get(batch_key)
+            _missing_local_shard_error(
+                batch_key=batch_key,
+                batch_group=batch_group,
+                global_rank=global_rank,
+            )
+
+        batch_group = batch_group_by_key[batch_key]
+        batch_group.local_param_count = int(batch_multiplicity_by_key.get(batch_key, 0))
+        ordered_batches.append((batch_key, batch_group))
+
+    return ordered_batches
+
+
+def _build_batch_entries(
+    *,
+    entries: list[DionBatchEntry],
+    batch_size: int,
+) -> dict:
+    """Assemble typed batch entries into the final DionBatch invariant."""
+    real_batch_size = len(entries)
+    if real_batch_size <= 0:
+        raise RuntimeError("[DION_EMPTY_BATCH_ENTRIES]")
+
+    padded_entries = list(entries)
+    params = [entry.param for entry in entries]
+    grads = [entry.grad.view(*entry.param_shape) for entry in entries]
+    momentums = [entry.momentum.view(*entry.param_shape) for entry in entries]
+    q_tensors = [entry.q_tensor for entry in entries]
+    configs = [entry.config for entry in entries]
+    dist_metas = [entry.dist_meta for entry in entries]
+    optim_groups = [entry.optim_group for entry in entries]
+    optimizer_states = [entry.optimizer_state for entry in entries]
+    param_shapes = [entry.param_shape for entry in entries]
+
+    params = pad_batch(params, batch_size, item=params[0])
+    grads = pad_batch(grads, batch_size)
+    momentums = pad_batch(momentums, batch_size)
+    q_tensors = pad_batch(q_tensors, batch_size)
+
+    template = entries[0]
+    while len(configs) < batch_size:
+        configs.append(template.config)
+    while len(dist_metas) < batch_size:
+        dist_metas.append(None)
+    while len(optim_groups) < batch_size:
+        optim_groups.append(template.optim_group)
+    while len(optimizer_states) < batch_size:
+        optimizer_states.append(None)
+    while len(param_shapes) < batch_size:
+        param_shapes.append(template.param_shape)
+    while len(padded_entries) < batch_size:
+        padded_index = len(padded_entries)
+        padded_entries.append(
+            DionBatchEntry(
+                param=params[padded_index],
+                grad=grads[padded_index],
+                optimizer_state=None,
+                optim_group=template.optim_group,
+                config=template.config,
+                dist_meta=None,
+                momentum=momentums[padded_index],
+                q_tensor=q_tensors[padded_index],
+                param_shape=template.param_shape,
+            )
+        )
+
+    return {
+        "entries": tuple(padded_entries),
+        "params": params,
+        "grads": grads,
+        "momentums": momentums,
+        "q_tensors": q_tensors,
+        "configs": configs,
+        "dist_metas": dist_metas,
+        "optim_groups": optim_groups,
+        "optimizer_states": optimizer_states,
+        "param_shapes": tuple(param_shapes),
+        "real_batch_size": real_batch_size,
+    }
+
+
+def build_dion_batches(
+    *,
+    dion_params: list[DionStepParam],
+    use_fs_collectives: bool,
+    state_replica_group,
+    replica_validation_group,
+    batch_key_cache: dict,
+    global_rank: int,
+    group_size: Callable,
+    get_replicate_group: Callable,
+    resolve_ortho_group: Callable,
+    resolve_tp_group: Callable,
+    resolve_fs_group_from_meta: Callable,
+) -> List[DionBatch]:
+    """Build Dion batches from explicit runtime state."""
+    ordered_batches = group_and_order_param_batches(
+        routed_params=dion_params,
+        batch_key_cache=batch_key_cache,
+        use_fs_collectives=use_fs_collectives,
+        state_replica_group=state_replica_group,
+        replica_validation_group=replica_validation_group,
+        global_rank=global_rank,
+        group_size=group_size,
+        get_replicate_group=get_replicate_group,
+        resolve_ortho_group=resolve_ortho_group,
+    )
+
+    dion_batches: List[DionBatch] = []
+    batch_cache_key = 0
+    for batch_key, batch_group in ordered_batches:
+        batch_size = batch_group.batch_world_size
+        local_num_params = int(getattr(batch_group, "local_param_count", len(batch_group.params or [])))
+
+        for batch_start in range(0, local_num_params, batch_size):
+            batch_end = min(batch_start + batch_size, local_num_params)
+            entries: list[DionBatchEntry] = []
+            for idx in range(batch_start, batch_end):
+                param = batch_group.params[idx]
+                optimizer_state = batch_group.optimizer_states[idx]
+                config = batch_group.configs[idx]
+                dist_meta = batch_group.dist_metas[idx]
+                param_view, grad_view, momentum_view, q_view, param_shape = _local_expert_views(
+                    param=param,
+                    grad=batch_group.grads[idx],
+                    optimizer_state=optimizer_state,
+                    config=config,
+                    dist_meta=dist_meta,
+                )
+                entries.append(
+                    DionBatchEntry(
+                        param=param_view,
+                        grad=grad_view,
+                        optimizer_state=optimizer_state,
+                        optim_group=batch_group.optim_groups[idx],
+                        config=config,
+                        dist_meta=dist_meta,
+                        momentum=momentum_view,
+                        q_tensor=q_view,
+                        param_shape=param_shape,
+                        commit_update=batch_group.commit_updates[idx]
+                        if batch_group.commit_updates is not None
+                        else None,
+                    )
+                )
+
+            batch_data = _build_batch_entries(entries=entries, batch_size=batch_size)
+            batch_collectives = build_batch_collectives(
+                q_tensors=batch_data["q_tensors"],
+                configs=batch_data["configs"],
+                dist_metas=batch_data["dist_metas"],
+                real_batch_size=batch_data["real_batch_size"],
+                use_fs_collectives=use_fs_collectives,
+                resolve_tp_group=resolve_tp_group,
+                resolve_fs_group_from_meta=resolve_fs_group_from_meta,
+            )
+            dion_batches.append(
+                DionBatch(
+                    batch_key=batch_key,
+                    entries=batch_data["entries"],
+                    real_batch_size=batch_data["real_batch_size"],
+                    batch_cache_key=batch_cache_key,
+                    batch_group=batch_group,
+                    batch_collectives=batch_collectives,
+                )
+            )
+            batch_cache_key += batch_data["real_batch_size"]
+
+        batch_group.params = []
+        batch_group.grads = []
+        batch_group.optimizer_states = []
+        batch_group.optim_groups = []
+        batch_group.configs = []
+        batch_group.dist_metas = []
+        if hasattr(batch_group, "commit_updates"):
+            batch_group.commit_updates = []
+
+    return dion_batches

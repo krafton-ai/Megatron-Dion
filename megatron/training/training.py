@@ -170,8 +170,19 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
-from megatron.core.optimizer.muon import get_megatron_muon_optimizer
+from megatron.core.optimizer import (
+    get_megatron_optimizer,
+    AdamOptimizerConfig,
+    AroOptimizerConfig,
+    DionOptimizerConfig,
+    MuonOptimizerConfig,
+    OptimizerConfig,
+    ParamKey,
+    SGDOptimizerConfig,
+)
+from megatron.core.optimizer.muon_reference import (
+    get_megatron_muon_optimizer as get_reference_muon_optimizer,
+)
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1565,23 +1576,29 @@ def get_optimizer_param_scheduler(optimizer):
 def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
-    config = None
-    if args.optimizer == 'adam' or 'muon' in args.optimizer:
-        # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
-        # So for now we keep using adam config that's back compat with old way
-        kwargs = {}
-        for f in dataclasses.fields(AdamOptimizerConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        config = AdamOptimizerConfig(**kwargs)
+    reference_muon = args.optimizer == 'dist_muon' or (
+        args.optimizer == 'muon' and not args.use_distributed_optimizer
+    )
+    if args.optimizer == 'adam' or reference_muon:
+        config_class = AdamOptimizerConfig
     elif args.optimizer == 'sgd':
-        kwargs = {}
-        for f in dataclasses.fields(SGDOptimizerConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        config = SGDOptimizerConfig(**kwargs)
+        config_class = SGDOptimizerConfig
+    elif args.optimizer == 'lion':
+        config_class = OptimizerConfig
+    elif args.optimizer == 'muon':
+        config_class = MuonOptimizerConfig
+    elif args.optimizer == 'dion':
+        config_class = DionOptimizerConfig
+    elif args.optimizer == 'aro':
+        config_class = AroOptimizerConfig
     else:
         raise ValueError("Invalid optimizer type!")
+
+    kwargs = {}
+    for f in dataclasses.fields(config_class):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+    config = config_class(**kwargs)
 
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
@@ -1630,7 +1647,10 @@ def setup_model_and_optimizer(
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
-        if 'muon' not in config.optimizer:
+        reference_muon = config.optimizer == 'dist_muon' or (
+            config.optimizer == 'muon' and not config.use_distributed_optimizer
+        )
+        if not reference_muon:
             # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
             # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
             # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
@@ -1642,12 +1662,12 @@ def setup_model_and_optimizer(
                 dump_param_to_param_group_map=args.dump_param_to_param_group_map,
             )
         else:
-            optimizer = get_megatron_muon_optimizer(
+            optimizer = get_reference_muon_optimizer(
                 config,
                 model,
                 config_overrides=config_overrides,
                 use_gloo_process_groups=args.use_gloo_process_groups,
-                layer_wise_distributed_optimizer='dist' in config.optimizer,
+                layer_wise_distributed_optimizer=config.optimizer == 'dist_muon',
             )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 

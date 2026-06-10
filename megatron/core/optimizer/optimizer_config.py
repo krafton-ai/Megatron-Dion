@@ -260,8 +260,8 @@ class OptimizerConfig:
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD."""
 
-    muon_split_qkv: bool = True
-    """Whether to split QKV parameters for Muon optimizer."""
+    muon_split_parameters: bool = True
+    """Whether Muon should split fused parameters into optimizer-only children."""
 
     muon_use_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
@@ -281,6 +281,21 @@ class OptimizerConfig:
 
     muon_tp_mode: str = "blockwise"
     """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
+
+    muon_fs_mode: str = "blockwise"
+    """How distributed-optimizer FS shards participate in Muon NS calculation."""
+
+    muon_ns_backend: str = "standard"
+    """Newton-Schulz backend for Muon. Valid values are "standard" and "gram"."""
+
+    muon_gram_ns_restart_iters: Tuple[int, ...] = (2,)
+    """Restart iterations for the Gram Newton-Schulz backend."""
+
+    muon_gram_ns_kernel_policy: str = "torch"
+    """Kernel policy for Gram Newton-Schulz. Valid values include "torch", "auto", and "dao"."""
+
+    muon_gram_ns_dtype: Optional[str] = None
+    """Optional compute dtype override for Gram Newton-Schulz."""
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
@@ -361,6 +376,12 @@ class OptimizerConfig:
 
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
+
+    fully_shard_model_parallel_size: int = 1
+    """Matrix optimizer fully-sharded model-parallel size."""
+
+    replicate_model_parallel_size: int = 1
+    """Matrix optimizer replicate-parallel size."""
 
     def __post_init__(self):
         """Check the validity of the config."""
@@ -467,6 +488,14 @@ class AdamOptimizerConfig(OptimizerConfig):
 
 
 @dataclass
+class MuonOptimizerConfig(AdamOptimizerConfig):
+    """Matrix Muon optimizer configuration object."""
+
+    optimizer: str = 'muon'
+    """Optimizer name."""
+
+
+@dataclass
 class SGDOptimizerConfig(OptimizerConfig):
     """SGD optimizer configuration object."""
 
@@ -475,3 +504,118 @@ class SGDOptimizerConfig(OptimizerConfig):
 
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
+
+
+@dataclass
+class DionOptimizerConfig(OptimizerConfig):
+    """Dion optimizer configuration object."""
+
+    optimizer: str = 'dion'
+    """Optimizer name."""
+
+    dion_momentum: float = 0.95
+    """Momentum factor for Dion error feedback."""
+
+    dion_rank_fraction: float = 0.25
+    """Logical low-rank fraction."""
+
+    dion_rank_multiple_of: int = 1
+    """Round the effective rank to a multiple of this value."""
+
+    dion_normalize_eps: float = 1e-8
+    """Numerical epsilon used when normalizing Dion right factors."""
+
+    dion_oversample: float = 1.25
+    """Oversampling factor used by Dion orthogonalization."""
+
+    dion_use_fs_collectives: bool = True
+    """Enable Dion FS-aware communication when distributed optimizer is active."""
+
+    dion_use_low_rank_sync: bool = True
+    """Enable Dion low-rank P/R synchronization."""
+
+    dion_scalar_optimizer: str = "adam"
+    """Scalar optimizer used for standard parameter surfaces."""
+
+    dion_scalar_lr_scale: float = 1.0
+    """Additional multiplicative constant used by Dion scalar optimizer updates."""
+
+    dion_scale_mode: str = "spectral"
+    """Dion 2D scale mode."""
+
+    dion_extra_scale_factor: float = 0.2
+    """Additional multiplicative constant used by Dion 2D scaling."""
+
+    dion_beta1: float = 0.9
+    """Beta1 for Dion scalar optimizer states."""
+
+    dion_beta2: float = 0.95
+    """Beta2 for Dion scalar optimizer states."""
+
+    dion_scalar_eps: float = 1e-8
+    """Epsilon for Dion scalar optimizer updates."""
+
+    dion_split_parameters: bool = False
+    """Whether Dion should split fused parameters into optimizer-only children."""
+
+    dion_momentum_dtype: Optional[torch.dtype] = None
+    """Dtype for Dion momentum state."""
+
+    dion_q_dtype: Optional[torch.dtype] = None
+    """Dtype for Dion right-factor state."""
+
+    dion_variance_dtype: Optional[torch.dtype] = None
+    """Dtype for Dion scalar second-moment state."""
+
+    dion_max_concurrent_tasks: Optional[int] = 3
+    """Dion async task width. Defaults to the reference runtime width of 3."""
+
+
+@dataclass
+class AroOptimizerConfig(OptimizerConfig):
+    """ARO optimizer configuration object."""
+
+    optimizer: str = 'aro'
+    """Optimizer name."""
+
+    aro_momentum: float = 0.95
+    """Momentum coefficient for ARO's momentum-first update."""
+
+    aro_base_optimizer: str = "sinkhorn"
+    """Stateless base optimizer used in rotated coordinates."""
+
+    aro_sinkhorn_iters: int = 5
+    """Number of simultaneous Sinkhorn normalization iterations."""
+
+    aro_qr_backend: str = "scqr"
+    """QR backend used for ARO rotation updates."""
+
+    aro_scqr_eps: float = 1e-6
+    """Shift used by shifted Cholesky QR and normalization eps."""
+
+    aro_update_rms_scale: float = 0.2
+    """RMS scale target for ARO matrix updates."""
+
+    aro_scalar_optimizer: str = "adam"
+    """Scalar optimizer used for non-matrix ARO parameters."""
+
+    aro_scalar_lr_scale: float = 1.0
+    """Additional multiplicative constant used by ARO scalar optimizer updates."""
+
+    aro_beta1: float = 0.9
+    """Beta1 for ARO scalar optimizer states."""
+
+    aro_beta2: float = 0.95
+    """Beta2 for ARO scalar optimizer states."""
+
+    aro_scalar_eps: float = 1e-8
+    """Epsilon for ARO scalar optimizer updates."""
+
+    aro_split_parameters: bool = False
+    """Whether ARO should split fused parameters into optimizer-only children."""
+
+    aro_momentum_dtype: Optional[torch.dtype] = None
+    """Dtype for ARO momentum state."""
+
+    aro_rotation_dtype: Optional[torch.dtype] = None
+    """Dtype for ARO rotation state."""

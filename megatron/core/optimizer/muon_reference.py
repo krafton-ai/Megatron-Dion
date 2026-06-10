@@ -310,7 +310,7 @@ def get_megatron_muon_optimizer(
         "coefficient_type": config.muon_coefficient_type,
         "num_ns_steps": config.muon_num_ns_steps,
         "scale_mode": config.muon_scale_mode,
-        "split_qkv": config.muon_split_qkv,
+        "split_qkv": config.muon_split_parameters,
         "is_qkv_fn": lambda p: getattr(p, "is_qkv", False),
         "qkv_split_shapes": qkv_split_shapes,
         "extra_scale_factor": config.muon_extra_scale_factor,

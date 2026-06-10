@@ -909,7 +909,17 @@ def validate_args(args, defaults={}):
 
     # Map string data-type to torch.dtype.
     dtype_map = {
-        'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8, 'auto': None, None: None,
+        'fp32': torch.float32,
+        'float32': torch.float32,
+        'float': torch.float32,
+        'bf16': torch.bfloat16,
+        'bfloat16': torch.bfloat16,
+        'fp16': torch.float16,
+        'float16': torch.float16,
+        'half': torch.float16,
+        'fp8': torch.uint8,
+        'auto': None,
+        None: None,
     }
     map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
 
@@ -923,6 +933,26 @@ def validate_args(args, defaults={}):
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
     args.megatron_fsdp_grad_comm_dtype = map_dtype(args.megatron_fsdp_grad_comm_dtype)
+    if hasattr(args, "dion_momentum_dtype") and args.dion_momentum_dtype is not None:
+        args.dion_momentum_dtype = map_dtype(args.dion_momentum_dtype)
+    if hasattr(args, "dion_q_dtype") and args.dion_q_dtype is not None:
+        args.dion_q_dtype = map_dtype(args.dion_q_dtype)
+    if hasattr(args, "dion_variance_dtype") and args.dion_variance_dtype is not None:
+        args.dion_variance_dtype = map_dtype(args.dion_variance_dtype)
+    if hasattr(args, "aro_momentum_dtype") and args.aro_momentum_dtype is not None:
+        args.aro_momentum_dtype = map_dtype(args.aro_momentum_dtype)
+    if hasattr(args, "aro_rotation_dtype") and args.aro_rotation_dtype is not None:
+        args.aro_rotation_dtype = map_dtype(args.aro_rotation_dtype)
+    if hasattr(args, "muon_gram_ns_restart_iters"):
+        restart_iters = args.muon_gram_ns_restart_iters
+        if isinstance(restart_iters, str):
+            restart_iters = restart_iters.strip()
+            if restart_iters:
+                args.muon_gram_ns_restart_iters = tuple(
+                    int(item.strip()) for item in restart_iters.split(",") if item.strip()
+                )
+            else:
+                args.muon_gram_ns_restart_iters = tuple()
     if args.grad_reduce_in_bf16:
         args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
@@ -1480,17 +1510,67 @@ def validate_args(args, defaults={}):
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
 
-    # Muon optimizer check
-    if 'muon' in args.optimizer:
+    if getattr(args, "split_parameters", None) is not None:
+        split_parameters = bool(args.split_parameters)
+        if args.optimizer in ('muon', 'dist_muon'):
+            args.muon_split_parameters = split_parameters
+        elif args.optimizer == 'dion':
+            args.dion_split_parameters = split_parameters
+        elif args.optimizer == 'aro':
+            args.aro_split_parameters = split_parameters
+        elif split_parameters:
+            assert False, "--split-parameters is only supported by Muon, Dion, and ARO."
 
-        if args.optimizer == 'muon':
-            assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce. Use dist_muon instead."
-            assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather. Use dist_muon instead."
+    # Muon optimizer check.
+    if args.optimizer in ('muon', 'dist_muon'):
 
-        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
+        if args.optimizer == 'dist_muon':
+            assert not args.use_distributed_optimizer, (
+                "dist_muon uses the reference layer-wise distributed Muon path, not MCore's "
+                "distributed optimizer."
+            )
+        if args.optimizer == 'muon' and not args.use_distributed_optimizer:
+            assert not args.overlap_grad_reduce, (
+                "Reference Muon optimizer does not support overlap grad reduce. "
+                "Use dist_muon instead."
+            )
+            assert not args.overlap_param_gather, (
+                "Reference Muon optimizer does not support overlap param gather. "
+                "Use dist_muon instead."
+            )
+        if args.optimizer == 'muon' and args.use_distributed_optimizer:
+            if not args.no_save_optim or not args.no_load_optim:
+                assert args.ckpt_format == "torch_dist", (
+                    "Muon distributed optimizer supports optimizer checkpointing only with "
+                    "--ckpt-format torch_dist. Use --no-save-optim/--no-load-optim for "
+                    "model-only checkpoints."
+                )
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+        assert args.ckpt_format in ["torch", "torch_dist"], (
+            "Muon optimizer supports torch and torch_dist checkpoint format."
+        )
+
+    if args.optimizer == "dion" and args.use_distributed_optimizer:
+        if not args.no_save_optim or not args.no_load_optim:
+            assert args.ckpt_format == "torch_dist", (
+                "Dion distributed optimizer supports optimizer checkpointing only with "
+                "--ckpt-format torch_dist. Use --no-save-optim/--no-load-optim for "
+                "model-only checkpoints."
+            )
+
+    if args.optimizer == "aro" and args.use_distributed_optimizer:
+        if not args.no_save_optim or not args.no_load_optim:
+            assert args.ckpt_format == "torch_dist", (
+                "ARO distributed optimizer supports optimizer checkpointing only with "
+                "--ckpt-format torch_dist. Use --no-save-optim/--no-load-optim for "
+                "model-only checkpoints."
+            )
+    if args.optimizer == "aro" and not args.use_distributed_optimizer:
+        assert not args.aro_split_parameters, (
+            "ARO split-parameters requires --use-distributed-optimizer; the local ARO path "
+            "does not expand optimizer-only split children."
+        )
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -2236,11 +2316,14 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--split-parameters', action=argparse.BooleanOptionalAction,
+                       default=None,
+                       help='Split fused parameters into optimizer-only children for matrix optimizers.')
     group.add_argument('--muon-momentum', type=float, default=0.9,
                        help='Momentum factor for Muon optimizer')
-    group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
-                       dest='muon_split_qkv',
-                       help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-split-parameters', action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='Split fused parameters into optimizer-only children for Muon')
     group.add_argument('--muon-use-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
@@ -2261,6 +2344,21 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
                        choices=['blockwise', 'duplicated', 'distributed'],
                        help='How to perform NS calculation for tensor model parallel weights')
+    group.add_argument('--muon-fs-mode', type=str, default='blockwise',
+                       choices=['blockwise', 'duplicated', 'distributed'],
+                       help='How distributed optimizer FS shards participate in Muon NS calculation')
+    group.add_argument('--muon-ns-backend', type=str, default='standard',
+                       choices=['standard', 'gram'],
+                       help='Newton-Schulz backend for Muon optimizer')
+    group.add_argument('--muon-gram-ns-restart-iters', type=str, default='2',
+                       help='Comma-separated restart iterations for Gram Newton-Schulz')
+    group.add_argument('--muon-gram-ns-kernel-policy', type=str, default='torch',
+                       choices=['torch', 'auto', 'dao', 'quack', 'compile', 'disabled'],
+                       help='Kernel policy for Gram Newton-Schulz')
+    group.add_argument('--muon-gram-ns-dtype', type=str, default=None,
+                       choices=['float32', 'float', 'fp32', 'float16', 'fp16', 'half',
+                                'bfloat16', 'bf16'],
+                       help='Optional compute dtype override for Gram Newton-Schulz')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
@@ -2489,8 +2587,90 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion'],
+                       choices=['adam', 'sgd', 'dion', 'muon', 'dist_muon', 'aro', 'lion'],
                        help='Optimizer function')
+    group.add_argument('--dion-momentum', type=float, default=0.95,
+                       help='Dion error-feedback momentum.')
+    group.add_argument('--dion-rank-fraction', type=float, default=0.25,
+                       help='Dion low-rank approximation fraction.')
+    group.add_argument('--dion-rank-multiple-of', type=int, default=1,
+                       help='Round the Dion rank up to a multiple of this value.')
+    group.add_argument('--dion-normalize-eps', type=float, default=1e-8,
+                       help='Dion epsilon used when normalizing right factors.')
+    group.add_argument('--dion-oversample', type=float, default=1.25,
+                       help='Oversampling factor for Dion RCQR.')
+    group.add_argument('--dion-use-fs-collectives', action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='Use Dion FS collectives when distributed Dion runs on sharded layouts.')
+    group.add_argument('--dion-use-low-rank-sync', action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='Use Dion low-rank synchronization when its invariant applies.')
+    group.add_argument('--dion-scalar-optimizer', type=str, default='adam',
+                       choices=['adam', 'lion'],
+                       help='Scalar optimizer used for non-2D Dion parameters.')
+    group.add_argument('--dion-scalar-lr-scale', type=float, default=1.0,
+                       help='Additional multiplicative constant used by Dion scalar updates.')
+    group.add_argument('--dion-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       help='2D Dion scale mode.')
+    group.add_argument('--dion-extra-scale-factor', type=float, default=0.2,
+                       help='Additional multiplicative constant used by Dion 2D scaling.')
+    group.add_argument('--dion-beta1', type=float, default=0.9,
+                       help='Beta1 for the Dion scalar optimizer.')
+    group.add_argument('--dion-beta2', type=float, default=0.95,
+                       help='Beta2 for the Dion scalar optimizer.')
+    group.add_argument('--dion-scalar-eps', type=float, default=1e-8,
+                       help='Epsilon for the Dion scalar optimizer.')
+    group.add_argument('--dion-split-parameters', action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Split fused parameters into optimizer-only children for Dion.')
+    group.add_argument('--dion-momentum-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for Dion momentum state.')
+    group.add_argument('--dion-q-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for Dion Q state.')
+    group.add_argument('--dion-variance-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for Dion scalar second-moment state.')
+    group.add_argument('--aro-momentum', type=float, default=0.95,
+                       help='ARO momentum coefficient.')
+    group.add_argument('--aro-base-optimizer', type=str, default='sinkhorn',
+                       choices=['sinkhorn'],
+                       help='ARO base optimizer in rotated coordinates.')
+    group.add_argument('--aro-sinkhorn-iters', type=int, default=5,
+                       help='Number of ARO Sinkhorn normalization iterations.')
+    group.add_argument('--aro-qr-backend', type=str, default='scqr',
+                       choices=['scqr', 'qr'],
+                       help='QR backend for ARO rotation updates.')
+    group.add_argument('--aro-scqr-eps', type=float, default=1e-6,
+                       help='Shift/epsilon used by ARO shifted Cholesky QR.')
+    group.add_argument('--aro-update-rms-scale', type=float, default=0.2,
+                       help='RMS scale target for ARO matrix updates.')
+    group.add_argument('--aro-scalar-optimizer', type=str, default='adam',
+                       choices=['adam', 'adamw', 'lion'],
+                       help='Scalar optimizer used for non-matrix ARO parameters.')
+    group.add_argument('--aro-scalar-lr-scale', type=float, default=1.0,
+                       help='Additional multiplicative constant for ARO scalar updates.')
+    group.add_argument('--aro-beta1', type=float, default=0.9,
+                       help='Beta1 for the ARO scalar optimizer.')
+    group.add_argument('--aro-beta2', type=float, default=0.95,
+                       help='Beta2 for the ARO scalar optimizer.')
+    group.add_argument('--aro-scalar-eps', type=float, default=1e-8,
+                       help='Epsilon for the ARO scalar optimizer.')
+    group.add_argument('--aro-split-parameters', action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Split fused parameters into optimizer-only children for ARO.')
+    group.add_argument('--aro-momentum-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for ARO momentum state.')
+    group.add_argument('--aro-rotation-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for ARO rotation state.')
+    group.add_argument('--fully-shard-model-parallel-size', type=int, default=1,
+                       help='Matrix optimizer fully-sharded axis size.')
+    group.add_argument('--replicate-model-parallel-size', type=int, default=1,
+                       help='Matrix optimizer replicate axis size.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-cuda-graph', action='store_true',
