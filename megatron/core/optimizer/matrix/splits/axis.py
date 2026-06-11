@@ -8,6 +8,31 @@ from typing import Optional, Tuple
 import torch
 
 
+SPLIT_METADATA_ATTRS: tuple[str, ...] = (
+    "is_qkv",
+    "qkv_split_shapes",
+    "qkv_split_axis",
+    "is_qkvg",
+    "qkvg_split_shapes",
+    "qkvg_split_axis",
+    "is_gdn",
+    "gdn_split_shapes",
+    "gdn_split_axis",
+    "is_linear_split",
+    "linear_split_rows",
+    "linear_child_kinds",
+    "linear_partition_stride",
+    "linear_split_axis",
+)
+
+
+def clear_split_metadata(tensor: torch.Tensor) -> None:
+    """Remove optimizer-only split metadata from one tensor."""
+    for attr in SPLIT_METADATA_ATTRS:
+        if hasattr(tensor, attr):
+            delattr(tensor, attr)
+
+
 def normalize_split_axis(split_axis: int | None) -> int:
     """Return a validated 2D split axis."""
     split_axis = 0 if split_axis is None else int(split_axis)
@@ -93,7 +118,7 @@ def axis_tensor(tensor: torch.Tensor, split_axis: int) -> torch.Tensor:
 
 
 def original_tensor(tensor: torch.Tensor, split_axis: int) -> torch.Tensor:
-    """Return a contiguous tensor in original coordinates."""
+    """Return a tensor in original coordinates."""
     split_axis = normalize_split_axis(split_axis)
     return tensor if split_axis == 0 else tensor.transpose(0, 1).contiguous()
 

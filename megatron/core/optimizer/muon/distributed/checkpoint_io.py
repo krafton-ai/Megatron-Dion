@@ -11,6 +11,28 @@ from ..backend import MuonBackend
 
 _MUON_PARAM_STATE_FORMAT = "muon_rank_local_state_v1"
 _MUON_TENSOR_STATE_FORMAT = "muon_rank_local_tensor_shards_v1"
+_MUON_STATE_TYPES = {"muon_rank_local_state"}
+
+
+def resolve_muon_state_type(sharding_type, metadata) -> str:
+    """Return the checkpoint state format requested for Muon optimizer state."""
+    requested_type = (
+        sharding_type
+        if sharding_type is not None
+        else (metadata or {}).get("distrib_optim_sharding_type", "muon_rank_local_state")
+    )
+    if requested_type in {"fully_reshardable", "fully_sharded_model_space", "fsdp_dtensor"}:
+        raise NotImplementedError(
+            "[Muon] optimizer checkpoint format "
+            f"{requested_type!r} requires tensor-level Muon state resharding, "
+            "which is not implemented. Use muon_rank_local_state with unchanged topology."
+        )
+    if requested_type not in _MUON_STATE_TYPES:
+        raise NotImplementedError(
+            "[Muon] unsupported optimizer checkpoint format "
+            f"{requested_type!r}; supported formats are {sorted(_MUON_STATE_TYPES)}"
+        )
+    return str(requested_type)
 
 
 def build_muon_checkpoint_metadata(
@@ -25,6 +47,7 @@ def build_muon_checkpoint_metadata(
     backend_state_spec=None,
 ) -> dict:
     """Return backend-owned checkpoint metadata for Muon optimizer state."""
+    requested_type = resolve_muon_state_type(requested_type, None)
     spec = backend_state_spec if backend_state_spec is not None else MuonBackend().state_spec()
     metadata = {
         "param_state_format": _MUON_PARAM_STATE_FORMAT,
@@ -63,7 +86,12 @@ def validate_muon_checkpoint_metadata(
         checkpoint_metadata = metadata
     checkpoint_metadata = _unwrap_checkpoint_leaf(checkpoint_metadata)
     if checkpoint_metadata is None:
-        return
+        if topology_signature is None:
+            return
+        raise RuntimeError(
+            "[Muon] checkpoint is missing Muon optimizer metadata. "
+            "Muon rank-local state requires unchanged topology."
+        )
     expected = build_muon_checkpoint_metadata(
         dp_size=dp_size,
         fs_size=fs_size,
@@ -82,16 +110,20 @@ def validate_muon_checkpoint_metadata(
                 f"saved={saved_value} current={expected[key]}"
             )
     saved_topology = checkpoint_metadata.get("topology_signature", None)
-    if saved_topology is not None and topology_signature is not None:
-        normalize = lambda sig: {
-            str(key): tuple(int(rank) for rank in ranks)
-            for key, ranks in sig.items()
-        }
-        if normalize(saved_topology) != normalize(topology_signature):
-            raise RuntimeError(
-                "[Muon] unsupported checkpoint topology identity change: "
-                f"saved={saved_topology} current={topology_signature}"
-            )
+    if saved_topology is None or topology_signature is None:
+        raise RuntimeError(
+            "[Muon] checkpoint is missing Muon topology signature. "
+            "Refusing restore because group membership/order cannot be proven."
+        )
+    normalize = lambda sig: {
+        str(key): (() if str(key) in {"fs", "tp", "rp", "state_replica"} and len(ranks) <= 1 else tuple(int(rank) for rank in ranks))
+        for key, ranks in sig.items()
+    }
+    if normalize(saved_topology) != normalize(topology_signature):
+        raise RuntimeError(
+            "[Muon] unsupported checkpoint topology identity change: "
+            f"saved={saved_topology} current={topology_signature}"
+        )
     saved_matrix = checkpoint_metadata.get("matrix_optimizer", {})
     expected_matrix = expected["matrix_optimizer"]
     for key in ("backend", "backend_state_version", "state_keys"):
@@ -109,14 +141,13 @@ def validate_muon_checkpoint_metadata(
 def build_muon_param_state(param_groups, optimizer_state, get_param_key) -> dict:
     """Build a rank-local tensor state."""
     state_data = {"format": _MUON_PARAM_STATE_FORMAT, "states": {}}
-    ordinal = 0
     for group in param_groups:
         for param in group.get("params", ()):
             state = optimizer_state.get(param, None)
             if state:
                 key = get_param_key(param)
                 if key is None:
-                    key = f"ordinal_{ordinal}"
+                    continue
                 param_state = {"param": param.detach().clone()}
                 for state_key, value in state.items():
                     if str(state_key).startswith("_"):
@@ -127,46 +158,84 @@ def build_muon_param_state(param_groups, optimizer_state, get_param_key) -> dict
                         param_state[state_key] = value
                 if param_state:
                     state_data["states"][repr(key)] = param_state
-            ordinal += 1
     return state_data
 
 
-def restore_muon_param_state_(param_groups, optimizer_state, param_state, get_param_key) -> None:
+def restore_muon_param_state_(param_groups, optimizer_state, param_state, get_param_key) -> dict:
     """Restore a rank-local tensor state."""
     if param_state is None:
-        return
+        raise RuntimeError("[Muon] checkpoint is missing Muon param state")
     param_state = _materialize_param_state(param_state)
     if not isinstance(param_state, dict) or param_state.get("format") != _MUON_PARAM_STATE_FORMAT:
         raise RuntimeError("[Muon] invalid Muon param state")
     saved = param_state.get("states", {})
-    ordinal = 0
+    if not isinstance(saved, dict):
+        raise RuntimeError("[Muon] invalid Muon param-state mapping")
+    summary = {
+        "restored": 0,
+        "missing_state_entry": 0,
+        "unnamed": 0,
+    }
+    missing = []
     for group in param_groups:
         for param in group.get("params", ()):
             key = get_param_key(param)
             if key is None:
-                key = f"ordinal_{ordinal}"
-            saved_state = saved.get(repr(key), None)
-            if saved_state:
-                state = optimizer_state.setdefault(param, {})
-                for state_key, value in saved_state.items():
-                    value = _unwrap_checkpoint_leaf(value)
-                    if torch.is_tensor(value):
-                        if state_key == "param":
-                            if tuple(param.shape) != tuple(value.shape):
-                                raise RuntimeError(
-                                    "[Muon] checkpoint tensor shape mismatch for param: "
-                                    f"saved={tuple(value.shape)} current={tuple(param.shape)}"
-                                )
-                            param.data.copy_(value.to(device=param.device, dtype=param.dtype))
-                            continue
-                        current = state.get(state_key, None)
-                        if torch.is_tensor(current) and tuple(current.shape) == tuple(value.shape):
-                            current.copy_(value.to(device=current.device, dtype=current.dtype))
-                        else:
-                            state[state_key] = value.detach().clone().to(device=param.device)
+                current_state = optimizer_state.get(param, None)
+                if current_state:
+                    summary["unnamed"] += 1
+                    if len(missing) < 8:
+                        missing.append("<unnamed>")
+                continue
+            saved_key = repr(key)
+            saved_state = saved.get(saved_key, None)
+            if saved_state is None:
+                current_state = optimizer_state.get(param, None)
+                if current_state:
+                    summary["missing_state_entry"] += 1
+                    if len(missing) < 8:
+                        missing.append(saved_key)
+                continue
+            if "param" not in saved_state:
+                raise RuntimeError(f"[Muon] checkpoint state for {key!r} is missing 'param'")
+            current_state = optimizer_state.setdefault(param, {})
+            state = {
+                state_key: value
+                for state_key, value in current_state.items()
+                if str(state_key).startswith("_")
+            }
+            for state_key, value in saved_state.items():
+                value = _unwrap_checkpoint_leaf(value)
+                if torch.is_tensor(value):
+                    if state_key == "param":
+                        if tuple(param.shape) != tuple(value.shape):
+                            raise RuntimeError(
+                                "[Muon] checkpoint tensor shape mismatch for param: "
+                                f"saved={tuple(value.shape)} current={tuple(param.shape)}"
+                            )
+                        param.data.copy_(value.to(device=param.device, dtype=param.dtype))
+                        continue
+                    current = current_state.get(state_key, None)
+                    if torch.is_tensor(current) and tuple(current.shape) == tuple(value.shape):
+                        current.copy_(value.to(device=current.device, dtype=current.dtype))
+                        state[state_key] = current
                     else:
-                        state[state_key] = value
-            ordinal += 1
+                        state[state_key] = value.detach().clone().to(device=param.device)
+                else:
+                    state[state_key] = value
+            optimizer_state[param] = state
+            summary["restored"] += 1
+    if summary["unnamed"]:
+        raise RuntimeError(
+            "[Muon] checkpoint cannot restore unnamed Muon state entries: "
+            f"count={summary['unnamed']} sample={missing}"
+        )
+    if summary["missing_state_entry"]:
+        raise RuntimeError(
+            "[Muon] checkpoint is missing Muon state entries for current params: "
+            f"count={summary['missing_state_entry']} sample={missing}"
+        )
+    return summary
 
 
 def _stable_param_key_id(value) -> str:
@@ -208,16 +277,14 @@ def build_muon_tensor_param_state(
     """Build Muon rank-local optimizer state as sharded tensor leaves."""
     metadata_state = {"format": _MUON_TENSOR_STATE_FORMAT, "params": {}}
     tensor_state = {}
-    ordinal = 0
     for group in param_groups:
         for param in group.get("params", ()):
             state = optimizer_state.get(param, None)
             if not state:
-                ordinal += 1
                 continue
             param_key = get_param_key(param)
             if param_key is None:
-                param_key = f"ordinal_{ordinal}"
+                continue
             param_id = _stable_param_key_id(param_key)
             state_items = {}
             tensor_keys = []
@@ -243,7 +310,6 @@ def build_muon_tensor_param_state(
                 "values": state_items,
                 "tensor_keys": tuple(tensor_keys),
             }
-            ordinal += 1
     return {
         "metadata": sharded_object_cls(
             f"{base_key}.muon_param_state.{rank_key}.metadata",
@@ -269,7 +335,7 @@ def _materialize_param_state(param_state):
         raise RuntimeError("[Muon] invalid sharded Muon param-state metadata")
     tensors_by_param = param_state.get("tensors", {})
     state_data = {"format": _MUON_PARAM_STATE_FORMAT, "states": {}}
-    for ordinal, (param_key, entry) in enumerate(metadata.get("params", {}).items()):
+    for param_key, entry in metadata.get("params", {}).items():
         param_id = entry.get("id", None)
         state_items = dict(entry.get("values", {}))
         tensor_state = tensors_by_param.get(param_id, {})
@@ -277,10 +343,9 @@ def _materialize_param_state(param_state):
             if state_key not in tensor_state:
                 raise RuntimeError(
                     f"[Muon] sharded checkpoint missing tensor state {state_key!r}"
-                )
+            )
             state_items[state_key] = _unwrap_checkpoint_leaf(tensor_state[state_key])
         state_data["states"][repr(param_key)] = state_items
-        state_data["states"][repr(f"ordinal_{ordinal}")] = state_items
     return state_data
 
 
@@ -361,6 +426,7 @@ __all__ = [
     "build_distributed_checkpoint_state",
     "build_muon_param_state",
     "build_muon_tensor_param_state",
+    "resolve_muon_state_type",
     "restore_muon_param_state_",
     "split_distributed_checkpoint_state",
     "validate_muon_checkpoint_metadata",

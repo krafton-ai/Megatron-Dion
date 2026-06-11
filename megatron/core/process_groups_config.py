@@ -515,6 +515,9 @@ class ProcessGroupCollection:
                     partial_expert_data_parallel=True
                 ),
                 'tp_group': parallel_state.get_tensor_model_parallel_group(),
+                'expt_tp_group': parallel_state.get_expert_tensor_parallel_group(
+                    check_initialized=False
+                ),
                 'pp_group': parallel_state.get_pipeline_model_parallel_group(),
                 'ep_group': parallel_state.get_expert_model_parallel_group(),
                 'inter_dist_opt_group': (
@@ -599,6 +602,7 @@ class ProcessGroupCollection:
                     "tp, pp and ep process groups are required but not provided in pg_collection"
                 )
             result['tp_group'] = pg_collection.tp
+            result['expt_tp_group'] = getattr(pg_collection, 'expt_tp', None)
             result['pp_group'] = pg_collection.pp
             result['ep_group'] = pg_collection.ep
 

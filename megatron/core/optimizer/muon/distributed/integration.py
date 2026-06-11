@@ -50,6 +50,7 @@ def build_muon_distributed_optimizer(
     """Build a DistributedMuonOptimizer with MCore distributed-optimizer ownership."""
     config = kwargs.pop("config", None)
     pure_data_parallel_group = kwargs.pop("pure_data_parallel_group", None)
+    replica_dp_group = kwargs.pop("replica_dp_group", pure_data_parallel_group)
     pg_collection = kwargs.pop("pg_collection", None)
     is_expert_parallel = bool(kwargs.pop("is_expert_parallel", False))
     requested_fs_size = 1
@@ -73,6 +74,7 @@ def build_muon_distributed_optimizer(
             requested_fs_size,
             requested_rp_size,
             is_expert_parallel,
+            replica_dp_group=replica_dp_group,
             optimizer_name="Muon optimizer",
         )
         kwargs.setdefault("fully_shard_model_parallel_size", fs_size)

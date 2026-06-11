@@ -221,16 +221,26 @@ def _get_dion_replica_group(
     requested_fs_world_size: int,
     requested_rp_world_size: int,
     is_expert_parallel: bool,
+    replica_dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Optional[torch.distributed.ProcessGroup]:
     if requested_rp_world_size <= 1:
         return None
+    if replica_dp_group is None:
+        if is_expert_parallel:
+            replica_dp_group = getattr(pg_collection, 'expt_dp', None) if pg_collection is not None else None
+            if replica_dp_group is None:
+                replica_dp_group = parallel_state.get_expert_data_parallel_group(
+                    check_initialized=False
+                )
+        else:
+            replica_dp_group = pure_dp_group
 
     if pg_collection is not None and hasattr(pg_collection, 'inter_dist_opt'):
         group = pg_collection.inter_dist_opt
         if group is not None and dist.get_world_size(group) == requested_rp_world_size:
             return _validate_replica_group(
                 group=group,
-                pure_dp_group=pure_dp_group,
+                pure_dp_group=replica_dp_group,
                 requested_rp_world_size=requested_rp_world_size,
                 source="pg_collection_inter_dist_opt",
                 is_expert_parallel=is_expert_parallel,
@@ -240,17 +250,17 @@ def _get_dion_replica_group(
     if group is not None and dist.get_world_size(group) == requested_rp_world_size:
         return _validate_replica_group(
             group=group,
-            pure_dp_group=pure_dp_group,
+            pure_dp_group=replica_dp_group,
             requested_rp_world_size=requested_rp_world_size,
             source="runtime_inter_dist_opt",
             is_expert_parallel=is_expert_parallel,
         )
 
-    if is_expert_parallel and pure_dp_group is not None:
-        if dist.get_world_size(pure_dp_group) == requested_rp_world_size:
+    if is_expert_parallel and replica_dp_group is not None:
+        if dist.get_world_size(replica_dp_group) == requested_rp_world_size:
             return _validate_replica_group(
-                group=pure_dp_group,
-                pure_dp_group=pure_dp_group,
+                group=replica_dp_group,
+                pure_dp_group=replica_dp_group,
                 requested_rp_world_size=requested_rp_world_size,
                 source="expert_pure_dp",
                 is_expert_parallel=is_expert_parallel,
@@ -296,9 +306,11 @@ def _resolve_fs_group(
     requested_rp_world_size: int,
 ) -> Optional[torch.distributed.ProcessGroup]:
     if is_expert_parallel:
-        expert_fs_group = parallel_state.get_expert_data_parallel_group(
-            partial_expert_data_parallel=True
-        )
+        expert_fs_group = pure_data_parallel_group
+        if expert_fs_group is None:
+            expert_fs_group = parallel_state.get_expert_data_parallel_group(
+                partial_expert_data_parallel=True
+            )
         expert_fs_world_size = (
             requested_fs_world_size
             if expert_fs_group is None
@@ -307,7 +319,7 @@ def _resolve_fs_group(
         return _validate_expert_fs_group(
             group=expert_fs_group,
             requested_world_size=expert_fs_world_size,
-            source="expert_partial_data_parallel",
+            source="expert_pure_data_parallel",
         )
     return _get_dense_fs_group(
         dense_fs_group=dense_fs_group,
@@ -440,6 +452,7 @@ def build_dion_distributed_optimizer(
     distributed_optimizer_instance_id: int,
     pg_collection: Optional[ProcessGroupCollection],
     is_expert_parallel: bool,
+    replica_dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     from megatron.core.optimizer.dion.distributed.optimizer import DistributedDionOptimizer
 
@@ -470,6 +483,7 @@ def build_dion_distributed_optimizer(
         per_model_buffers=per_model_buffers,
         data_parallel_group=data_parallel_group,
         pure_data_parallel_group=pure_data_parallel_group,
+        replica_dp_group=replica_dp_group,
         dion_fs_group=fs_group,
         dion_tp_group=dion_tp_group,
         replica_group=_get_dion_replica_group(
@@ -478,6 +492,7 @@ def build_dion_distributed_optimizer(
             requested_fs_size,
             requested_rp_size,
             is_expert_parallel,
+            replica_dp_group=replica_dp_group,
         ),
         data_parallel_group_gloo=data_parallel_group_gloo,
         data_parallel_group_idx=data_parallel_group_idx,

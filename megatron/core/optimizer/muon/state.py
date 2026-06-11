@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch import Tensor
 
+from ..matrix.parameter import is_matrix_param, is_vocab_param, prepare_matrix_params
 from ..matrix.splits.gdn import (
     get_gdn_split_axis_from_dist_meta,
     get_gdn_split_shapes_from_dist_meta,
@@ -119,63 +120,19 @@ def require_2d_local_shape(param: Tensor, dist_meta: Optional[MuonDistMeta]) -> 
     return local_shape
 
 
-def has_multiple_local_experts(dist_meta: Optional[MuonDistMeta]) -> bool:
-    """Return whether one local tensor contains multiple expert Muon objects."""
-    if dist_meta is None:
-        return False
-    return (
-        int(getattr(dist_meta, "expert_axis", -1)) in (0, 1)
-        and int(getattr(dist_meta, "num_local_experts", 1)) > 1
-        and int(getattr(dist_meta, "local_expert_index", -1)) >= 0
-    )
-
-
-def _supports_muon_matrix(param: Tensor, dist_meta: Optional[MuonDistMeta] = None) -> bool:
-    """Return whether a tensor should use Muon instead of scalar fallback."""
-    if getattr(param, "use_muon", None) is False:
-        return False
-    if param.ndim != 2:
-        return False
-    if getattr(param, "sequence_parallel", False):
-        return False
-    if getattr(param, "average_gradients_across_tp_domain", False):
-        return False
-    if getattr(param, "is_embedding_or_output_parameter", False):
-        return False
-    if getattr(param, "is_lm_head_parameter", False):
-        return False
-    if getattr(param, "is_expert_parallel_output_parameter", False):
-        return False
-    if getattr(param, "dtype", None) in {
-        getattr(torch, "float8_e4m3fn", None),
-        getattr(torch, "float8_e5m2", None),
-    }:
-        return False
-    num_local_experts = getattr(param, "num_local_experts", None)
-    if num_local_experts is not None and int(num_local_experts) > 1:
-        return False
-    if has_multiple_local_experts(dist_meta):
-        return False
-    return True
-
-
 def is_muon_matrix_param(param: Tensor, dist_meta: Optional[MuonDistMeta] = None) -> bool:
     """Return whether a tensor should use Muon matrix math."""
     if getattr(param, "use_muon", None) is False:
         return False
     if dist_meta is not None and getattr(dist_meta, "is_muon_param", False):
         return True
-    if not getattr(param, "matrix_optimizer_ready", False):
-        return False
-    if not _supports_muon_matrix(param, dist_meta):
-        return False
-    return True
+    return is_matrix_param(param) and not is_vocab_param(param)
 
 
 def prepare_muon_params(module: torch.nn.Module) -> None:
     """Prepare local parameters for Muon routing."""
+    prepare_matrix_params(module)
     for param in module.parameters():
-        param.matrix_optimizer_ready = True
         param.use_muon = is_muon_matrix_param(param)
 
 
@@ -377,7 +334,6 @@ __all__ = [
     "build_param_config",
     "get_global_shape",
     "get_local_shape",
-    "has_multiple_local_experts",
     "init_matrix_state",
     "init_param_state",
     "init_scalar_state",

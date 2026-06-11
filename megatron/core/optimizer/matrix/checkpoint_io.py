@@ -257,6 +257,15 @@ def validate_matrix_checkpoint_metadata(
             "[Matrix] unsupported Matrix backend checkpoint state version: "
             f"saved={saved_backend_state_version} current={backend_state_spec.version}"
         )
+    saved_state_keys = saved_matrix.get("state_keys", None)
+    if saved_state_keys is not None:
+        saved_state_keys = tuple(str(key) for key in saved_state_keys)
+        current_state_keys = tuple(str(key) for key in backend_state_spec.state_keys)
+        if saved_state_keys != current_state_keys:
+            raise RuntimeError(
+                "[Matrix] unsupported Matrix backend checkpoint state keys: "
+                f"saved={saved_state_keys} current={current_state_keys}"
+            )
 
 
 def _is_q_state_key(key: str) -> bool:
@@ -287,6 +296,9 @@ def _target_tensor_dtype(
         return current_value.dtype
     if key == "momentum":
         dtype = str_to_dtype(getattr(mixed_precision_config, "momentum_dtype", None))
+        return dtype if dtype is not None else param.dtype
+    if key == "rotation" or key.endswith("_rotation"):
+        dtype = str_to_dtype(getattr(mixed_precision_config, "rotation_dtype", None))
         return dtype if dtype is not None else param.dtype
     if _is_q_state_key(key):
         dtype = str_to_dtype(getattr(mixed_precision_config, "q_dtype", None))
@@ -474,7 +486,7 @@ def _materialize_param_state(param_state_data) -> dict:
 
     tensors_by_param = tensor_state.get("tensors", {})
     key_to_state = {}
-    for ordinal, (param_key, entry) in enumerate(metadata.get("params", {}).items()):
+    for param_key, entry in metadata.get("params", {}).items():
         if not isinstance(entry, dict):
             raise RuntimeError(f"[Matrix] invalid param-state metadata entry for {param_key}")
         param_id = entry.get("id", None)
@@ -493,11 +505,10 @@ def _materialize_param_state(param_state_data) -> dict:
         key_to_state[param_key] = state_items
         if param_id is not None:
             key_to_state[("__matrix_param_id__", str(param_id))] = state_items
-        key_to_state[("__matrix_param_ordinal__", int(ordinal))] = state_items
     return key_to_state
 
 
-def _find_saved_param_state(key_to_state: dict, param_key, ordinal: int):
+def _find_saved_param_state(key_to_state: dict, param_key):
     saved_state = key_to_state.get(param_key, None)
     if saved_state is not None:
         return saved_state
@@ -507,7 +518,7 @@ def _find_saved_param_state(key_to_state: dict, param_key, ordinal: int):
     )
     if saved_state is not None:
         return saved_state
-    return key_to_state.get(("__matrix_param_ordinal__", int(ordinal)), None)
+    return None
 
 
 def restore_persistent_param_state_(
@@ -535,7 +546,6 @@ def restore_persistent_param_state_(
         "missing_state_entry": 0,
     }
 
-    restore_ordinal = 0
     for param_group in param_groups:
         for param in param_group["params"]:
             param_key = get_param_key(param)
@@ -543,8 +553,7 @@ def restore_persistent_param_state_(
             if param_key is None:
                 summary["unnamed"] += 1
                 continue
-            saved_state = _find_saved_param_state(key_to_state, param_key, restore_ordinal)
-            restore_ordinal += 1
+            saved_state = _find_saved_param_state(key_to_state, param_key)
             if saved_state is None:
                 summary["missing_state_entry"] += 1
                 continue
@@ -914,27 +923,29 @@ def copy_param_to_main_shard_(
         else:
             source_2d = source_param_fp32.view(shard_main_param.shape)
 
-        shard_model_param = (
-            fs_shard_view_2d(source_2d, fs_shard_dim, start_idx, end_idx).clone().view(-1)
-        )
-        assert shard_model_param.numel() == shard_main_param.numel(), (
-            f"FS shard size mismatch: shard_model_param={shard_model_param.numel()}, "
-            f"shard_main_param={shard_main_param.numel()}, "
-            f"fs_shard_dim={fs_shard_dim}, start_idx={start_idx}, end_idx={end_idx}, "
-            f"source_shape={source_param_fp32.shape}, "
-            f"global_shape={tuple(matrix_shard_layout.global_shape)}"
-        )
-        shard_main_param.data.copy_(shard_model_param.reshape(shard_main_param.shape))
+        local_source = fs_shard_view_2d(source_2d, fs_shard_dim, start_idx, end_idx)
+        if local_source.numel() != shard_main_param.numel():
+            raise RuntimeError(
+                "[Matrix] FS shard size mismatch: "
+                f"local_source={local_source.numel()}, "
+                f"shard_main_param={shard_main_param.numel()}, "
+                f"fs_shard_dim={fs_shard_dim}, start_idx={start_idx}, end_idx={end_idx}, "
+                f"source_shape={source_param_fp32.shape}, "
+                f"global_shape={tuple(matrix_shard_layout.global_shape)}"
+            )
+        shard_main_param.data.view(local_source.shape).copy_(local_source)
         return
 
     shard_model_param = source_param_fp32.view(-1)[param_range.start : param_range.end]
-    assert param_range.size == shard_main_param.nelement(), (
-        f"standard param size mismatch: param_range.size={param_range.size}, "
-        f"shard_main={shard_main_param.nelement()}, "
-        f"source_shape={source_param.shape}, "
-        f"param_range=[{param_range.start}:{param_range.end}], "
-        f"is_2D={source_param.dim() >= 2}"
-    )
+    if param_range.size != shard_main_param.nelement():
+        raise RuntimeError(
+            "[Matrix] standard param size mismatch: "
+            f"param_range.size={param_range.size}, "
+            f"shard_main={shard_main_param.nelement()}, "
+            f"source_shape={source_param.shape}, "
+            f"param_range=[{param_range.start}:{param_range.end}], "
+            f"is_2D={source_param.dim() >= 2}"
+        )
     if shard_model_param.shape != shard_main_param.shape:
         shard_model_param = shard_model_param.view_as(shard_main_param)
     shard_main_param.data.copy_(shard_model_param)

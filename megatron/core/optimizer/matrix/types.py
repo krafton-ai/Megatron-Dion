@@ -147,6 +147,7 @@ class MatrixBucketLayout:
 class MatrixStandardGatherRoute:
     """Bucket all-gather layout for scalar params inside a mixed bucket."""
 
+    layout_key: int
     group_size: int
     group_rank: int
     standard_shard_size: int

@@ -85,7 +85,10 @@ def adamw_update_foreach_(
         grouped.setdefault(key, []).append(index)
     for indices in grouped.values():
         chunk_params = [params[index] for index in indices]
-        max_numel = max(1, _SCALAR_FOREACH_TEMP_BYTES_CAP // max(1, chunk_params[0].element_size()))
+        max_numel = max(
+            1,
+            _SCALAR_FOREACH_TEMP_BYTES_CAP // max(1, 4 * chunk_params[0].element_size()),
+        )
         for start, end in _chunk_ranges(chunk_params, max_numel):
             local = indices[start:end]
             p = [params[index] for index in local]
@@ -94,9 +97,15 @@ def adamw_update_foreach_(
             v = [exp_avg_sqs[index] for index in local]
             step = steps[local[0]]
             torch._foreach_lerp_(m, g, [1.0 - float(beta1)] * len(local))
-            g_sq = torch._foreach_mul(g, g)
-            g_sq = [item.to(dtype=v[0].dtype) for item in g_sq]
-            torch._foreach_lerp_(v, g_sq, [1.0 - float(beta2)] * len(local))
+            if any(grad.dtype != exp_avg_sq.dtype for grad, exp_avg_sq in zip(g, v)):
+                g_for_v = [
+                    grads[index].to(dtype=exp_avg_sqs[index].dtype)
+                    for index in local
+                ]
+            else:
+                g_for_v = g
+            torch._foreach_mul_(v, float(beta2))
+            torch._foreach_addcmul_(v, g_for_v, g_for_v, value=1.0 - float(beta2))
             bias_correction1 = 1.0 - float(beta1) ** int(step)
             bias_correction2 = 1.0 - float(beta2) ** int(step)
             denom = torch._foreach_sqrt(v)

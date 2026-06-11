@@ -14,6 +14,7 @@ import torch
 from .axis import (
     axis_shape,
     axis_tensor,
+    clear_split_metadata,
     copy_split_axis,
     dist_meta_for_split_axis,
     get_split_axis_from_dist_meta,
@@ -151,14 +152,12 @@ def resolve_qkvg_split_axis(
 
 def copy_qkvg_split_metadata(destination_tensor: torch.Tensor, source_tensor: torch.Tensor) -> None:
     """Copy fused-QKVG split metadata when the source tensor is tagged as QKVG."""
+    clear_split_metadata(destination_tensor)
     if not is_qkvg_param(source_tensor) and not hasattr(source_tensor, "qkvg_split_shapes"):
         return
     destination_tensor.is_qkvg = True
     destination_tensor.qkvg_split_shapes = get_qkvg_split_shapes(source_tensor)
     copy_split_axis(destination_tensor, source_tensor, "qkvg_split_axis")
-    destination_tensor.is_qkv = False
-    if hasattr(destination_tensor, "qkv_split_shapes"):
-        delattr(destination_tensor, "qkv_split_shapes")
 
 
 def qkvg_child_name(parent_name: str, child_kind: str) -> str:
@@ -212,7 +211,7 @@ def _validate_qkvg_layout_rows(
             "[MATRIX_QKVG_LOCAL_LAYOUT_MISMATCH] "
             f"context={context} rows={rows} total_per_group={total_per_group} "
             f"split_shapes={split_shapes} "
-            "matrix_split_qkv requires an integral global grouped-QKVG row layout."
+            "matrix_split_qkvg requires an integral global grouped-QKVG row layout."
         )
     return rows // total_per_group
 
@@ -531,7 +530,7 @@ def extract_qkvg_child(
     dist_meta=None,
     split_axis: int = 0,
 ) -> torch.Tensor:
-    """Read one Q/Gate/K/V child from a fused QKVG tensor into a contiguous 2D tensor."""
+    """Read one Q/Gate/K/V child from a fused QKVG tensor."""
     if tensor.ndim != 2:
         raise RuntimeError(
             "[MATRIX_QKVG_READ_REQUIRES_2D] "
@@ -561,7 +560,7 @@ def extract_qkvg_child(
     if len(segments) == 1:
         source_start, source_end, _, _ = segments[0]
         return original_tensor(
-            tensor_axis.narrow(0, source_start, source_end - source_start).contiguous(),
+            tensor_axis.narrow(0, source_start, source_end - source_start),
             split_axis,
         )
 
@@ -595,7 +594,7 @@ def scatter_qkvg_child_(
     split_axis = normalize_split_axis(split_axis)
     axis_meta = dist_meta_for_split_axis(dist_meta, split_axis)
     dest_axis = axis_tensor(dest, split_axis)
-    child_axis = axis_tensor(child, split_axis).contiguous()
+    child_axis = axis_tensor(child, split_axis)
     rows, cols = int(dest_axis.size(0)), int(dest_axis.size(1))
     parent_row_start, parent_row_end = _parent_row_range(
         local_rows=rows,

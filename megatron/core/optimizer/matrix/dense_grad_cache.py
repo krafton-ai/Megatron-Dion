@@ -138,6 +138,15 @@ def dense_cache_state(
     return state
 
 
+def clear_dense_grad_cache(owner) -> None:
+    cache = getattr(owner, DENSE_GRAD_REDUCTION_CACHE, None)
+    if cache is None:
+        return
+    entries = cache.get("entries", [])
+    _ENTRY_INDEX_BY_LIST_ID.pop(id(entries), None)
+    delattr(owner, DENSE_GRAD_REDUCTION_CACHE)
+
+
 def mark_dense_grad_reduced(
     owner,
     tensor: torch.Tensor,

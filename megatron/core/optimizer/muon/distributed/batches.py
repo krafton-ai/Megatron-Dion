@@ -1,51 +1,32 @@
-"""Muon distributed batch-planning helpers."""
+"""Muon distributed batch helpers."""
 
 from __future__ import annotations
 
 from collections import defaultdict
 
+import torch.distributed as dist
+
 from ..types import MuonBatch, MuonBatchEntry
 
 
-def build_batch_key(
-    *,
-    shape=None,
-    cfg=None,
-    dtype=None,
-    global_shape=None,
-    per_expert_global_shape=None,
-    tensor_row_shard_sizes=None,
-    row_shard_sizes=None,
-    param_uid=None,
-    fs_group=None,
-    tp_group=None,
-    dist_meta=None,
-):
-    """Return a TP-rank-invariant key for a distributed Muon batch."""
-    del tensor_row_shard_sizes, row_shard_sizes
-    if dist_meta is not None:
-        global_shape = global_shape or getattr(dist_meta, "global_shape", None)
-        shape = shape or getattr(dist_meta, "shape", None)
-        param_uid = param_uid or getattr(dist_meta, "param_uid", None)
-        fs_group = fs_group or getattr(dist_meta, "fs_group", None)
-        tp_group = tp_group or getattr(dist_meta, "tp_group", None)
-    return (
-        tuple(int(dim) for dim in (global_shape or ())),
-        tuple(int(dim) for dim in (per_expert_global_shape or ())),
-        tuple(int(dim) for dim in (shape or ())),
-        getattr(cfg, "fs_mode", "blockwise"),
-        getattr(cfg, "tp_mode", "blockwise"),
-        getattr(cfg, "ns_backend", "standard"),
-        getattr(cfg, "coefficient_type", "quintic"),
-        int(getattr(cfg, "num_ns_steps", 5)),
-        dtype,
-        param_uid,
-        id(fs_group) if fs_group is not None else None,
-        id(tp_group) if tp_group is not None else None,
-    )
+def _group_key(group, *, rank_cache=None):
+    if group is None:
+        return None
+    cache_key = id(group)
+    if rank_cache is not None:
+        cached = rank_cache.get(cache_key)
+        if cached is not None and cached[0] is group:
+            return cached[1]
+    if dist.is_available() and dist.is_initialized():
+        ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+    else:
+        ranks = ("uninitialized",)
+    if rank_cache is not None:
+        rank_cache[cache_key] = (group, ranks)
+    return ranks
 
 
-def _batch_key(step_param, *, fs_mode: str, tp_mode: str, ns_backend: str):
+def _batch_key(step_param, *, fs_mode: str, tp_mode: str, ns_backend: str, rank_cache=None):
     """Return a topology-aware key for a Muon batch."""
     dist_meta = step_param.dist_meta
     config = step_param.config
@@ -63,12 +44,8 @@ def _batch_key(step_param, *, fs_mode: str, tp_mode: str, ns_backend: str):
         int(getattr(dist_meta, "fs_world_size", 1)),
         int(getattr(dist_meta, "tp_shard_dim", -1)),
         int(getattr(dist_meta, "tp_world_size", 1)),
-        id(getattr(dist_meta, "fs_group", None))
-        if getattr(dist_meta, "fs_group", None) is not None
-        else None,
-        id(getattr(dist_meta, "tp_group", None))
-        if getattr(dist_meta, "tp_group", None) is not None
-        else None,
+        _group_key(getattr(dist_meta, "fs_group", None), rank_cache=rank_cache),
+        _group_key(getattr(dist_meta, "tp_group", None), rank_cache=rank_cache),
     )
 
 
@@ -87,6 +64,7 @@ def build_muon_batches(
     fs_mode: str = "blockwise",
     tp_mode: str = "blockwise",
     ns_backend: str = "standard",
+    rank_cache=None,
 ):
     """Group routed Muon step params into stable batches."""
     groups = defaultdict(list)
@@ -97,6 +75,7 @@ def build_muon_batches(
                 fs_mode=fs_mode,
                 tp_mode=tp_mode,
                 ns_backend=ns_backend,
+                rank_cache=rank_cache,
             )
         ].append(step_param)
 

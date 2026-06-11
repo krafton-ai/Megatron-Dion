@@ -1498,7 +1498,7 @@ class SelfAttention(Attention):
             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
             if self.config.num_query_groups < self.world_size:
-                idx = get_tensor_model_parallel_rank() % (
+                idx = get_pg_rank(self.pg_collection.tp) % (
                     self.world_size // self.config.num_query_groups
                 )
                 size = self.num_attention_heads_per_partition // (

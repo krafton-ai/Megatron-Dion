@@ -563,24 +563,33 @@ def init_param_state(
     if algorithm != "dion" or not is_dion_eligible or local_shape is None:
         return
     qkvg_split_shapes = get_qkvg_split_shapes_from_dist_meta(dist_meta)
+    split_shapes = get_qkv_split_shapes_from_dist_meta(dist_meta)
+    gdn_split_shapes = get_gdn_split_shapes_from_dist_meta(dist_meta)
+    linear_split_rows = get_linear_split_rows_from_dist_meta(dist_meta)
+    if bool(split_parameters_default) and (
+        qkvg_split_shapes is not None
+        or split_shapes is not None
+        or gdn_split_shapes is not None
+        or linear_split_rows is not None
+    ):
+        state.pop("Q", None)
+        state.pop("r", None)
+        state.pop("_needs_state_replica_q_sync", None)
     if bool(split_parameters_default) and qkvg_split_shapes is not None:
         state["qkvg_split_qkvg"] = True
         state["qkvg_split_shapes"] = qkvg_split_shapes
         state["qkvg_split_axis"] = get_qkvg_split_axis_from_dist_meta(dist_meta)
         return
-    split_shapes = get_qkv_split_shapes_from_dist_meta(dist_meta)
     if bool(split_parameters_default) and split_shapes is not None:
         state["qkv_split_qkv"] = True
         state["qkv_split_shapes"] = split_shapes
         state["qkv_split_axis"] = get_qkv_split_axis_from_dist_meta(dist_meta)
         return
-    gdn_split_shapes = get_gdn_split_shapes_from_dist_meta(dist_meta)
     if bool(split_parameters_default) and gdn_split_shapes is not None:
         state["gdn_split_gdn"] = True
         state["gdn_split_shapes"] = gdn_split_shapes
         state["gdn_split_axis"] = get_gdn_split_axis_from_dist_meta(dist_meta)
         return
-    linear_split_rows = get_linear_split_rows_from_dist_meta(dist_meta)
     if bool(split_parameters_default) and linear_split_rows is not None:
         state["linear_split_linear"] = True
         state["linear_split_rows"] = linear_split_rows

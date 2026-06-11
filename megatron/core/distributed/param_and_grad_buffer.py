@@ -27,22 +27,14 @@ from ..fp8_utils import (
     modify_underlying_storage,
     post_all_gather_processing,
 )
-from ..utils import is_torch_min_version, log_on_each_pipeline_stage
+from ..utils import log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
 
-try:
-    if is_torch_min_version("1.13.0"):
-        dist_all_gather_func = torch.distributed.all_gather_into_tensor
-        dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
-    else:
-        dist_all_gather_func = torch.distributed._all_gather_base
-        dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
-except:
-    dist_all_gather_func = torch.distributed._all_gather_base
-    dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+dist_all_gather_func = torch.distributed.all_gather_into_tensor
+dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
 
 import megatron.core.nccl_allocator as nccl_allocator
 
@@ -747,6 +739,7 @@ class _ParamAndGradBucketGroup:
                             reduce_op=reduce_op,
                             async_op=async_op,
                             reduce_scatter=dist_reduce_scatter_func,
+                            own_handle=False,
                         )
                     elif local_data_view is not None:
                         grad_reduce_handle = dist_reduce_scatter_func(
@@ -825,10 +818,7 @@ class _ParamAndGradBucketGroup:
                 self.grad_reduce_handle = cm
         else:
             # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
-            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
-            # which case the torch.distributed._reduce_scatter_base() will return None. In order to
-            # maintain consistency with prior code, we need to manually set communication handle to
-            # None.
+            # `cm` is not None. Maintain the prior contract by exposing no communication handle.
             self.grad_reduce_handle = None
         self.grad_sync_launched = True
 
@@ -919,7 +909,7 @@ class _ParamAndGradBucketGroup:
                 if optimizer is not None
                 else None
             )
-            if free_matrix_buffers is not None:
+            if bucket.has_matrix_params and free_matrix_buffers is not None:
                 free_matrix_buffers(bucket)
 
     def _copy_back_extra_main_grads(self):
@@ -1437,9 +1427,7 @@ class _ParamAndGradBuffer:
                 )
             local_data_view = None
             if self.ddp_config.use_distributed_optimizer and bucket.has_standard_params:
-                group_size = int(getattr(bucket, "intra_distributed_optimizer_instance_size"))
-                group_rank = int(getattr(bucket, "intra_distributed_optimizer_instance_rank"))
-                local_data_view = shard_buffer(bucket.grad_data, group_size)[group_rank]
+                local_data_view = self._get_standard_local_grad_view(idx, bucket)
             communication_group = (
                 getattr(bucket, "intra_distributed_optimizer_instance_group")
                 if self.ddp_config.use_distributed_optimizer

@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 
+from megatron.core import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp4_utils import is_nvfp4tensor
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
@@ -82,6 +83,13 @@ class DistributedDataParallel(_BaseDataParallel):
         self.expt_dp_group = process_group_dict['expt_dp_group']
         self.intra_expt_dp_group = process_group_dict['intra_expt_dp_group']
         self.tp_group = process_group_dict['tp_group']
+        self.expt_tp_group = process_group_dict.get('expt_tp_group', None)
+        if self.expt_tp_group is None:
+            self.expt_tp_group = parallel_state.get_expert_tensor_parallel_group(
+                check_initialized=False
+            )
+        if self.expt_tp_group is None:
+            self.expt_tp_group = self.tp_group
         self.pp_group = process_group_dict['pp_group']
         self.ep_group = process_group_dict['ep_group']
 
@@ -126,7 +134,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 expert_parallel_params.append((param, name))
 
         def _allocate_buffers_for_parameters(
-            input_params, data_parallel_group, gradient_scaling_factor
+            input_params, data_parallel_group, gradient_scaling_factor, tp_group
         ):
             param_and_grad_dtype_to_params = {}
             param_and_grad_dtype_to_offsets = {}
@@ -194,7 +202,7 @@ class DistributedDataParallel(_BaseDataParallel):
             # Allocate the grad buffers and map the grads.
             buffers = []
             pg_collection = ProcessGroupCollection()
-            pg_collection.tp = self.tp_group
+            pg_collection.tp = tp_group
             pg_collection.dp_cp = self.dp_cp_group
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
                 buffers.append(
@@ -293,7 +301,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
-            dense_params, self.intra_dp_cp_group, gradient_scaling_factor=gradient_scaling_factor
+            dense_params,
+            self.intra_dp_cp_group,
+            gradient_scaling_factor=gradient_scaling_factor,
+            tp_group=self.tp_group,
         )
 
         # Allocate separate param+grad buffers for expert parallel params' grads.
@@ -302,6 +313,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 expert_parallel_params,
                 self.intra_expt_dp_group,
                 gradient_scaling_factor=expert_gradient_scaling_factor,
+                tp_group=self.expt_tp_group,
             )
         )
 

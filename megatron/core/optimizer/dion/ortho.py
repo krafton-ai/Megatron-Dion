@@ -87,7 +87,8 @@ def orthogonalize(
     Returns:
         Orthogonalized matrix Q, same shape as P
     """
-    assert P.ndim >= 3, "Expected P to have batch dimension"
+    if P.ndim < 3:
+        raise RuntimeError(f"[DION_ORTHO_REQUIRES_BATCH] shape={tuple(P.shape)}")
     original_dtype = P.dtype
     P_local = P.to(dtype=torch.float32)
 
@@ -593,15 +594,39 @@ def _make_sharded_sketch(
         dtype=dtype,
     )
     for index, seed in enumerate(sketch_seeds):
-        full_sketch = _seeded_normal_tensor(
-            (k, global_rows),
-            seed=seed,
-            offset=0,
-            device=device,
-            dtype=dtype,
-            std=std,
-        )
-        sketch[index].copy_(full_sketch[:, prior_rows : prior_rows + local_rows])
+        element_size = torch.empty((), dtype=dtype).element_size()
+        max_chunk_bytes = 16 * 1024 * 1024
+        max_chunk_rows = max(1, max_chunk_bytes // max(1, global_rows * element_size))
+        if device.type != "cuda" or k <= max_chunk_rows:
+            full_sketch = _seeded_normal_tensor(
+                (k, global_rows),
+                seed=seed,
+                offset=0,
+                device=device,
+                dtype=dtype,
+                std=std,
+            )
+            sketch[index].copy_(full_sketch[:, prior_rows : prior_rows + local_rows])
+            continue
+
+        for sketch_row in range(0, k, max_chunk_rows):
+            sketch_row_end = min(k, sketch_row + max_chunk_rows)
+            chunk_rows = sketch_row_end - sketch_row
+            element_start = int(sketch_row) * global_rows
+            aligned_start = (element_start // 4) * 4
+            prefix = element_start - aligned_start
+            flat = _seeded_normal_tensor(
+                (prefix + chunk_rows * global_rows,),
+                seed=seed,
+                offset=aligned_start,
+                device=device,
+                dtype=dtype,
+                std=std,
+            )
+            chunk = flat[prefix:].view(chunk_rows, global_rows)
+            sketch[index, sketch_row:sketch_row_end].copy_(
+                chunk[:, prior_rows : prior_rows + local_rows]
+            )
     return sketch
 
 
@@ -611,7 +636,8 @@ def generate_random_sketch_matrix(
     make_sketch=None,
 ) -> Tensor:
     """Local sketch generation invariant for regular-tensor orthogonalization."""
-    assert P.ndim >= 3, "P must have batch dimension"
+    if P.ndim < 3:
+        raise RuntimeError(f"[DION_SKETCH_REQUIRES_BATCH] shape={tuple(P.shape)}")
 
     batch_shape = P.shape[:-2]
     m = P.size(-2)

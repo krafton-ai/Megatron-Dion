@@ -47,7 +47,7 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
-from ..utils import log_single_rank
+from ..utils import log_single_rank, to_local_if_dtensor
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
@@ -147,7 +147,7 @@ class MegatronOptimizer(ABC):
         grads_for_norm = []
         for param in params:
             if getattr(param, "__fsdp_param__", False):
-                grad = param.grad._local_tensor if param.grad is not None else None
+                grad = to_local_if_dtensor(param.grad) if param.grad is not None else None
             elif self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
             else:
@@ -1279,7 +1279,11 @@ class ChainedOptimizer(MegatronOptimizer):
     def get_grad_norm(self):
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].get_grad_norm()
-        if self.grads_states_parallel_group_is_shared():
+        needs_individual_norm = any(
+            bool(getattr(optimizer, "needs_own_grad_norm", lambda: False)())
+            for optimizer in self.chained_optimizers
+        )
+        if self.grads_states_parallel_group_is_shared() and not needs_individual_norm:
             grads_for_norm = []
             for optimizer in self.chained_optimizers:
                 grads_for_norm += optimizer.get_main_grads_for_grad_norm()
@@ -1318,6 +1322,10 @@ class ChainedOptimizer(MegatronOptimizer):
         """ChainedOptimizer will step all optimizers one by one."""
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
+            for optimizer in self.chained_optimizers:
+                clear_step_state = getattr(optimizer, "clear_step_state", None)
+                if clear_step_state is not None:
+                    clear_step_state()
             return False, None, None
 
         grad_norm = self.get_grad_norm()
@@ -1326,18 +1334,22 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
                 continue
-            parameters = optimizer.get_parameters()
-            if len(parameters) == 0:
-                continue
             if optimizer.config.clip_grad > 0.0:
-                clip_grad_by_total_norm_fp32(
-                    parameters,
-                    max_norm=optimizer.config.clip_grad,
-                    total_norm=grad_norm,
-                    use_decoupled_grad=(
-                        optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-                    ),
-                )
+                clip_by_norm = getattr(optimizer, "clip_grad_by_total_norm", None)
+                if clip_by_norm is not None:
+                    clip_by_norm(optimizer.config.clip_grad, grad_norm)
+                else:
+                    parameters = optimizer.get_parameters()
+                    if len(parameters) == 0:
+                        continue
+                    clip_grad_by_total_norm_fp32(
+                        parameters,
+                        max_norm=optimizer.config.clip_grad,
+                        total_norm=grad_norm,
+                        use_decoupled_grad=(
+                            optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                        ),
+                    )
 
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None

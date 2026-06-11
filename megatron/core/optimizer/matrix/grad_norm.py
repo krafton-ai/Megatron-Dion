@@ -36,7 +36,10 @@ def _can_reuse_dense_rp_grad(optimizer, shard_param) -> bool:
     dist_meta = _dist_meta_for_shard(optimizer, shard_param)
     if dist_meta is None:
         return False
-    return getattr(dist_meta, "param_config", None) is not None
+    param_config = getattr(dist_meta, "param_config", None)
+    if param_config is None:
+        return False
+    return not bool(getattr(param_config, "use_low_rank_sync", False))
 
 
 def _matrix_grads_are_replicate_synced(optimizer) -> bool:
@@ -319,11 +322,23 @@ def contributes_matrix_grad(optimizer) -> bool:
     return contributes
 
 
-def _grad_norm_routes(optimizer):
+def _stats_grad(optimizer, param, main_grad_view=None):
+    if main_grad_view is not None:
+        return main_grad_view
+    model_param = getattr(param, "_model_param", None)
+    if model_param is not None and getattr(model_param, "is_matrix_param", False):
+        return None
+    if getattr(param, "__fsdp_param__", False):
+        return to_local_if_dtensor(param.grad) if param.grad is not None else None
+    if optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+        return param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+    return param.grad
+
+
+def _build_grad_norm_routes(optimizer):
     from ...transformer.module import param_is_not_shared
 
-    main_grad_view_by_param_id = {}
-    params = []
+    standard_params = []
     matrix_params = []
     seen_param_ids = set()
     for model_group, shard_group in zip(
@@ -342,50 +357,43 @@ def _grad_norm_routes(optimizer):
             if shard_param_id in seen_param_ids:
                 continue
             seen_param_ids.add(shard_param_id)
-            params.append(shard_param)
+            is_not_shared = param_is_not_shared(shard_param)
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                shard_param, optimizer._resolve_matrix_tp_group()
+            )
+            if not is_not_shared or not is_not_tp_duplicate:
+                continue
             if getattr(model_param, "is_matrix_param", False):
+                matrix_params.append((model_param, shard_param))
                 continue
+            main_grad_view = None
             model_grad = getattr(model_param, "main_grad", None)
-            if model_grad is None:
-                continue
-            param_range = optimizer._get_model_param_range_map(model_param)["param"]
-            if param_range.size == 0:
-                continue
-            main_grad_view_by_param_id[shard_param_id] = model_grad.view(-1)[
-                int(param_range.start) : int(param_range.end)
-            ]
+            if model_grad is not None:
+                param_range = optimizer._get_model_param_range_map(model_param)["param"]
+                if param_range.size != 0:
+                    main_grad_view = model_grad.view(-1)[
+                        int(param_range.start) : int(param_range.end)
+                    ]
+            standard_params.append((shard_param, main_grad_view))
+
+    return tuple(standard_params), tuple(matrix_params)
+
+
+def _grad_norm_routes(optimizer):
+    cached = getattr(optimizer, "_matrix_grad_norm_routes_cache", None)
+    if cached is None:
+        cached = _build_grad_norm_routes(optimizer)
+        setattr(optimizer, "_matrix_grad_norm_routes_cache", cached)
+
+    standard_params, matrix_params = cached
     grads_for_norm = []
     count_matrix_grad = contributes_matrix_grad(optimizer)
-
-    def _stats_grad(param):
-        main_grad_view = main_grad_view_by_param_id.get(id(param), None)
-        if main_grad_view is not None:
-            return main_grad_view
-        model_param = getattr(param, "_model_param", None)
-        if model_param is not None and getattr(model_param, "is_matrix_param", False):
-            return None
-        if getattr(param, "__fsdp_param__", False):
-            return param.grad._local_tensor if param.grad is not None else None
-        if optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-            return param.decoupled_grad if hasattr(param, "decoupled_grad") else None
-        return param.grad
-
-    for param in params:
-        grad = _stats_grad(param)
-        is_not_shared = param_is_not_shared(param)
-        is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
-            param, optimizer._resolve_matrix_tp_group()
-        )
-        model_param = getattr(param, "_model_param", None)
-        if model_param is not None and getattr(model_param, "is_matrix_param", False):
-            if is_not_shared and is_not_tp_duplicate:
-                matrix_params.append((model_param, param))
-            continue
-
-        if grad is not None and is_not_shared and is_not_tp_duplicate:
+    for param, main_grad_view in standard_params:
+        grad = _stats_grad(optimizer, param, main_grad_view)
+        if grad is not None:
             grads_for_norm.append(grad)
 
-    return grads_for_norm, matrix_params, count_matrix_grad
+    return grads_for_norm, list(matrix_params), count_matrix_grad
 
 
 def grad_norm_inputs(optimizer) -> List[torch.Tensor]:

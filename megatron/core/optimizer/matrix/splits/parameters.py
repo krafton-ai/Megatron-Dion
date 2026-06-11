@@ -10,6 +10,7 @@ from typing import Optional
 
 import torch
 
+from .axis import clear_split_metadata
 from .gdn import copy_gdn_split_metadata, is_gdn_param
 from .linear import copy_linear_split_metadata, is_linear_split_param
 from .qkv import copy_qkv_split_metadata, is_qkv_param
@@ -21,6 +22,7 @@ def copy_parameter_split_metadata(
     source_tensor: torch.Tensor,
 ) -> None:
     """Copy optimizer-only split metadata from a model tensor to a shard tensor."""
+    clear_split_metadata(destination_tensor)
     split_tags = (
         bool(is_qkvg_param(source_tensor) or hasattr(source_tensor, "qkvg_split_shapes")),
         bool(is_qkv_param(source_tensor) or hasattr(source_tensor, "qkv_split_shapes")),

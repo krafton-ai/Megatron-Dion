@@ -90,8 +90,8 @@ from ...matrix.splits.qkvg import (
     resolve_qkvg_split_shapes,
     scatter_qkvg_child_,
 )
+from ...matrix.splits.row_child import finalize_row_child_groups, resolve_row_child_layout
 from ..utils import get_global_shape, get_local_shape, local_expert_tensor_view
-from ...optimizer import param_group_identifier_keys
 from ...matrix.parameter import (
     all_gather_bucket_params_,
     build_bucket_param_map,
@@ -116,9 +116,14 @@ from ...matrix.checkpoint_io import (
     split_distributed_checkpoint_state,
     validate_matrix_checkpoint_metadata,
 )
-from ...matrix.dense_grad_cache import dense_cache_state, mark_dense_grad_reduced
+from ...matrix.dense_grad_cache import (
+    clear_dense_grad_cache,
+    dense_cache_state,
+    mark_dense_grad_reduced,
+)
 from ...matrix.gradients import (
     finish_bucket_group_grad_sync,
+    get_standard_inter_instance_grad_buffer,
     set_optimizer_shard_grads,
 )
 from ...matrix.grad_norm import (
@@ -127,7 +132,6 @@ from ...matrix.grad_norm import (
 )
 from ...matrix.utils import env_flag
 from ...matrix.runtime import replicate_reduce_op
-from .row_child import resolve_row_child_layout
 from .split_child import build_split_child_dist_meta
 from .bootstrap import (
     build_q_init,
@@ -141,10 +145,9 @@ from .bootstrap import (
 )
 from .dist_meta import (
     add_standard_metas,
-    assert_same_group_ranks,
     build_param_dist_meta,
     build_all_dist_metas,
-    get_expected_expert_fs_group,
+    resolve_expert_fs_group,
     validate_dist_meta_uids,
 )
 from ...matrix.sharding import (
@@ -212,33 +215,6 @@ def _has_active_expert_layout(dist_meta: DionDistMeta) -> bool:
     )
 
 
-_CHILD_GROUP_CACHE: dict[tuple[int, ...], Optional[torch.distributed.ProcessGroup]] = {}
-
-
-def _ensure_child_group(
-    ranks: tuple[int, ...],
-    *,
-    create_group: bool,
-) -> Optional[torch.distributed.ProcessGroup]:
-    """Return a cached child-specific subgroup for split optimizer-only children."""
-    if len(ranks) <= 1:
-        return None
-    if ranks in _CHILD_GROUP_CACHE:
-        return _CHILD_GROUP_CACHE[ranks]
-    if not create_group:
-        raise RuntimeError(
-            "[DION_SPLIT_CHILD_GROUP_NOT_PREPARED] "
-            f"ranks={tuple(int(rank) for rank in ranks)}"
-        )
-    group = parallel_state.create_group(
-        list(ranks),
-        use_local_synchronization=True,
-        group_desc="DION_SPLIT_CHILD_GROUP",
-    )
-    _CHILD_GROUP_CACHE[ranks] = group
-    return group
-
-
 class DistributedDionOptimizer(DistributedMatrixOptimizer):
     """
     Dion-specific adapter on top of the generic distributed matrix optimizer.
@@ -256,6 +232,48 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
 
     Provides automatic configuration of 2D process groups and FS-aware annotation.
     """
+
+    @staticmethod
+    def _get_inter_instance_grad_buffers(bucket):
+        if bool(getattr(bucket, "_matrix_use_full_grad_after_sync", False)):
+            return DistributedMatrixOptimizer._get_inter_instance_grad_buffers(bucket)
+        standard_grad = get_standard_inter_instance_grad_buffer(bucket)
+        return (standard_grad,) if standard_grad is not None and standard_grad.numel() > 0 else ()
+
+    def _apply_bucket_grads(self, *, bucket, local_data_view, communication_group) -> None:
+        full_grad = bool(getattr(bucket, "_matrix_use_full_grad_after_sync", False))
+        super()._apply_bucket_grads(
+            bucket=bucket,
+            local_data_view=local_data_view,
+            communication_group=communication_group,
+        )
+        if full_grad:
+            self._mark_bucket_grads_reduced(bucket)
+
+    def _mark_bucket_grads_reduced(self, bucket) -> None:
+        replica_group = self._get_replicate_group()
+        if replica_group is None or self._group_size(replica_group) <= 1:
+            return
+        before_step = int(getattr(self.optimizer, "_step_count", 0))
+        reduce_op = replicate_reduce_op(self.optimizer)
+        matrix_layout = getattr(bucket, "matrix_layout", None)
+        for entry in getattr(matrix_layout, "entries", ()):
+            grad = self._matrix_local_grad_by_param.get(entry.param)
+            if grad is None:
+                continue
+            mark_dense_grad_reduced(
+                self.optimizer,
+                grad,
+                replica_group=replica_group,
+                op=reduce_op,
+                before_step=before_step,
+            )
+        self.optimizer._dion_full_grad_reduced_before_step = before_step
+
+    def _matrix_grads_are_replicate_synced(self) -> bool:
+        return int(
+            getattr(self.optimizer, "_dion_full_grad_reduced_before_step", -1)
+        ) == int(getattr(self.optimizer, "_step_count", 0))
 
     def _resolve_dion_tp_group(self):
         """Return the TP group used by Dion math and optimizer state."""
@@ -333,8 +351,8 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
     def _init_groups(self) -> None:
         """Resolve the standard runtime groups that Dion math consumes."""
         self.validation_data_parallel_group = (
-            self._pure_data_parallel_group
-            if self._pure_data_parallel_group is not None
+            self._replica_dp_group
+            if self._replica_dp_group is not None
             else self.data_parallel_group
         )
         if self._dion_fs_group is not None:
@@ -404,10 +422,22 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             rp_size=int(configured_rp_size),
             tp_size=int(tp_size),
             is_expert=bool(self._is_expert_dion),
-            split_parameters=bool(
-                getattr(self.optimizer, "defaults", {}).get("split_parameters", False)
-            ),
+            split_parameters=self._split_enabled(),
         )
+
+    def _split_enabled(self) -> bool:
+        default = self._split_for_group(None)
+        for group in getattr(self.optimizer, "param_groups", ()):
+            if self._split_for_group(group):
+                return True
+        return default
+
+    def _split_for_group(self, group) -> bool:
+        defaults = getattr(self.optimizer, "defaults", {}) or {}
+        default = bool(getattr(self.config, "dion_split_parameters", defaults.get("split_parameters", False)))
+        if group is None:
+            return default
+        return bool(group.get("dion_split_parameters", group.get("split_parameters", default)))
 
     def _shard_param_uid(self, shard_param):
         """Return the checkpoint/state identity for one optimizer shard."""
@@ -487,13 +517,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
                 f"bucket_id={bucket.bucket_id} param_count={len(bucket.params)}"
             )
         if is_expert_bucket:
-            expert_group = get_expected_expert_fs_group()
-            assert_same_group_ranks(
-                label=f"expert bucket {bucket.bucket_id}",
-                actual_group=fs_group,
-                expected_group=expert_group,
-                extra="Megatron-Core EP local-shard group must stay on intra_expt_dp_group.",
-            )
+            resolve_expert_fs_group(fs_group)
 
     def _init_standard_bucket(self, *, gbuf_idx: int, buffer, bucket, fs_group) -> None:
         """Configure one bucket that has no Dion layout."""
@@ -674,6 +698,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             param_map=param_map,
             param_to_name=getattr(param_and_grad_buffer, "param_to_name", None),
             fs_size=fs_size,
+            tp_group=getattr(param_and_grad_buffer, "tp_group", None),
         )
         param_map_snapshot = {}
         for param, range_info in param_map.items():
@@ -761,6 +786,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
         self._dion_fs_group = kwargs.pop("dion_fs_group", None)
         self._dion_tp_group = kwargs.pop("dion_tp_group", None)
         self._pure_data_parallel_group = kwargs.pop("pure_data_parallel_group", None)
+        self._replica_dp_group = kwargs.pop("replica_dp_group", self._pure_data_parallel_group)
         self._is_expert_dion = bool(kwargs.pop("is_expert_dion", False))
         self._dion_state_param_by_uid = {}
         self._dion_dist_meta_by_uid = {}
@@ -1068,21 +1094,23 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             param_range = param_range_info["param"]
             dion_shard_layout = param_range_info.get("matrix_shard_layout", None)
 
-            if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+            if model_param.dtype in (torch.float16, torch.bfloat16):
                 self._process_float16_param(
                     model_param, param_range, dion_shard_layout,
                     config,
                     model_fp16_params, shard_float16_params,
                     main_shard_params
                 )
-            elif model_param.type() == 'torch.cuda.FloatTensor':
+            elif model_param.dtype == torch.float32:
                 self._process_float32_param(
                     model_param, param_range, dion_shard_layout,
                     config,
                     model_fp32_params, shard_fp32_params
                 )
             else:
-                raise TypeError(f'Unsupported parameter type: {model_param.type()}')
+                raise TypeError(
+                    f"Unsupported parameter dtype: dtype={model_param.dtype} device={model_param.device}"
+                )
 
     def _check_dion_param(self, model_param, context=""):
         """Verify is_dion_param flag is set correctly.
@@ -1287,23 +1315,28 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             for dist_meta in dist_metas_sharded.values()
             if getattr(dist_meta, "param_uid", None) is not None
         }
-        self._prepare_split_child_fs_groups_for_known_metas()
+        self._init_split_groups()
 
-    def _prepare_split_child_fs_groups_for_known_metas(self) -> None:
+    def _init_split_groups(self) -> None:
         """Create split-child FS groups from known metadata before state routing."""
         if not hasattr(self, "optimizer") or not hasattr(self.optimizer, "dist_metas"):
+            finalize_row_child_groups("DION_SPLIT_CHILD_GROUP")
             return
-        split_parameters_enabled = bool(self.optimizer.defaults.get("split_parameters", False))
-        if not split_parameters_enabled:
-            return
-        dist_metas = sorted(
-            self.optimizer.dist_metas.values(),
+        dist_metas = []
+        for group in self.optimizer.param_groups:
+            if not self._split_for_group(group):
+                continue
+            for param in group.get("params", ()):
+                dist_meta = self.optimizer.dist_metas.get(param, None)
+                if dist_meta is not None:
+                    dist_metas.append(dist_meta)
+        dist_metas.sort(
             key=lambda dist_meta: repr(
                 (
                     getattr(dist_meta, "param_uid", None),
                     getattr(dist_meta, "param_name", ""),
                 )
-            ),
+            )
         )
         for dist_meta in dist_metas:
             if dist_meta is None or not bool(getattr(dist_meta, "is_dion_param", False)):
@@ -1360,6 +1393,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
                     child_kinds=child_kinds,
                     split_axis=split_axis,
                 )
+        finalize_row_child_groups("DION_SPLIT_CHILD_GROUP")
 
     def _build_all_dist_metas(self):
         """Create dist_metas with batch processing."""
@@ -1565,7 +1599,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             else None
         )
         q_init = None
-        split_parameters_enabled = bool(self.optimizer.defaults.get("split_parameters", False))
+        split_parameters_enabled = self._split_for_group(optim_group)
         split_qkvg_shapes = (
             resolve_qkvg_split_shapes(param=param, optimizer_state=state, dist_meta=dist_meta)
             if split_parameters_enabled
@@ -2038,7 +2072,8 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             ),
             error_prefix="QKVG_CHILD",
             create_group=create_group,
-            make_group=_ensure_child_group,
+            group_desc="DION_SPLIT_CHILD_GROUP",
+            namespace="DION",
         ).as_tuple()
 
     def _resolve_qkvg_child_fs_shard_layout(
@@ -2336,7 +2371,8 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             ),
             error_prefix="GDN_CHILD",
             create_group=create_group,
-            make_group=_ensure_child_group,
+            group_desc="DION_SPLIT_CHILD_GROUP",
+            namespace="DION",
         ).as_tuple()
 
     def _resolve_gdn_child_fs_shard_layout(
@@ -2641,7 +2677,8 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             ),
             error_prefix="QKV_CHILD",
             create_group=create_group,
-            make_group=_ensure_child_group,
+            group_desc="DION_SPLIT_CHILD_GROUP",
+            namespace="DION",
         ).as_tuple()
 
     def _resolve_qkv_child_fs_shard_layout(
@@ -2938,7 +2975,8 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             ),
             error_prefix="LINEAR_CHILD",
             create_group=create_group,
-            make_group=_ensure_child_group,
+            group_desc="DION_SPLIT_CHILD_GROUP",
+            namespace="DION",
         ).as_tuple()
 
     def _resolve_linear_child_fs_shard_layout(
@@ -3056,7 +3094,8 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
                 ),
                 error_prefix="LINEAR_CHILD",
                 create_group=create_group,
-                make_group=_ensure_child_group,
+                group_desc="DION_SPLIT_CHILD_GROUP",
+                namespace="DION",
             ).as_tuple()
 
         if partition_stride != 1:
@@ -3262,7 +3301,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
         dist_meta,
     ):
         """Expand one fused QKVG parent into optimizer-only child Dion step params."""
-        if not bool(self.optimizer.defaults.get("split_parameters", False)):
+        if not self._split_for_group(optim_group):
             return None
         if optim_group.get("algorithm", "dion") != "dion":
             return None
@@ -3447,7 +3486,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
         dist_meta,
     ):
         """Expand one fused QKV parent into optimizer-only child Dion step params."""
-        if not bool(self.optimizer.defaults.get("split_parameters", False)):
+        if not self._split_for_group(optim_group):
             return None
         if optim_group.get("algorithm", "dion") != "dion":
             return None
@@ -3633,7 +3672,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
     ):
         """Expand one fused GDN parent into optimizer-only child Dion step params."""
         del config
-        if not bool(self.optimizer.defaults.get("split_parameters", False)):
+        if not self._split_for_group(optim_group):
             return None
         if optim_group.get("algorithm", "dion") != "dion":
             return None
@@ -3819,7 +3858,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
     ):
         """Expand one fused linear parent into optimizer-only child Dion step params."""
         del config
-        if not bool(self.optimizer.defaults.get("split_parameters", False)):
+        if not self._split_for_group(optim_group):
             return None
         if optim_group.get("algorithm", "dion") != "dion":
             return None
@@ -4105,14 +4144,14 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             tuple(int(dim) for dim in parent_global_shape),
         )
 
-    def _iter_split_child_dist_metas(self, *, param, state, dist_meta):
+    def _iter_split_child_dist_metas(self, *, param, state, optim_group, dist_meta):
         """Yield split child metadata needed to initialize checkpoint load templates."""
         parent_layout = self._checkpoint_split_parent_layout(dist_meta)
         if parent_layout is None:
             return
         split_parent_dist_meta, parent_local_shape, parent_global_shape = parent_layout
 
-        if bool(self.optimizer.defaults.get("split_parameters", False)):
+        if self._split_for_group(optim_group):
             qkvg_shapes = resolve_qkvg_split_shapes(
                 param=param,
                 optimizer_state=state,
@@ -4248,7 +4287,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
                     )
                 return
 
-        if not bool(self.optimizer.defaults.get("split_parameters", False)):
+        if not self._split_for_group(optim_group):
             return
         split_rows = resolve_linear_split_rows(optimizer_state=state, dist_meta=dist_meta)
         if split_rows is None:
@@ -4309,14 +4348,21 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
         """Initialize lazy split-child Dion state for checkpoint load templates."""
         if optim_group.get("algorithm", "dion") != "dion":
             return
-        if not bool(self.optimizer.defaults.get("split_parameters", False)):
+        if not self._split_for_group(optim_group):
             return
 
+        has_children = False
         for split_kind, child_dist_meta in self._iter_split_child_dist_metas(
             param=param,
             state=state,
+            optim_group=optim_group,
             dist_meta=dist_meta,
         ):
+            if not has_children:
+                state.pop("Q", None)
+                state.pop("r", None)
+                state.pop("_needs_state_replica_q_sync", None)
+                has_children = True
             if split_kind == "qkvg":
                 self._ensure_qkvg_child_state_(
                     parent_param=param,
@@ -4519,7 +4565,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             is_matrix_model_param=lambda param: getattr(param, "is_dion_param", False),
         )
 
-    def requires_individual_grad_norm_in_chain(self) -> bool:
+    def needs_own_grad_norm(self) -> bool:
         """Shared-group chained grad norm must respect Dion's exact local accumulation."""
         return True
 
@@ -4532,7 +4578,14 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
         `finish_grad_sync()` here is incorrect for the multi-instance path because mixed
         standard RS-local buffers have already been flushed and cleared by the first call.
         """
-        return super().prepare_grads()
+        found_inf = super().prepare_grads()
+        if found_inf:
+            self.clear_step_state()
+        return found_inf
+
+    def clear_step_state(self) -> None:
+        clear_dense_grad_cache(self.optimizer)
+        self.optimizer._dion_full_grad_reduced_before_step = -1
 
     def _copy_model_params_to_main_params(self, state_dict=None):
         """Copy model params to main params with FS sharding awareness.
@@ -4712,8 +4765,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
                 "[Dion] invalid FS checkpoint state coordinates: "
                 f"fs_size={fs_size} fs_rank={fs_rank}"
             )
-        if is_loading:
-            self._ensure_dion_checkpoint_state()
+        self._ensure_dion_checkpoint_state()
 
         state_replica_group = getattr(self, "state_replica_group", None)
         state_replica_size = (
@@ -4722,20 +4774,6 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
         state_replica_rank = (
             0 if state_replica_group is None else self._group_rank(state_replica_group)
         )
-        state_owner_dp_rank = dp_rank
-        if state_replica_group is not None:
-            dp_ranks = self._get_group_ranks_for_checkpoint(self.data_parallel_group)
-            state_replica_ranks = self._get_group_ranks_for_checkpoint(state_replica_group)
-            if not state_replica_ranks:
-                raise RuntimeError("[Dion] empty state-replica group for checkpoint")
-            state_owner_global_rank = int(state_replica_ranks[0])
-            if state_owner_global_rank not in dp_ranks:
-                raise RuntimeError(
-                    "[Dion] checkpoint state replica owner is outside data-parallel group: "
-                    f"owner={state_owner_global_rank} dp_ranks={dp_ranks}"
-                )
-            state_owner_dp_rank = int(dp_ranks.index(state_owner_global_rank))
-
         checkpoint_metadata = build_matrix_checkpoint_metadata(
             dp_size=dp_size,
             fs_size=fs_size,
@@ -4760,62 +4798,12 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             checkpoint_metadata=checkpoint_metadata,
             sharded_object_cls=ShardedObject,
             sharded_tensor_cls=ShardedTensor,
-            state_rank_key=str(state_owner_dp_rank),
+            state_rank_key=str(dp_rank),
         )
-
-    @staticmethod
-    def _param_group_match_key(param_group):
-        keys = []
-        for key in param_group_identifier_keys:
-            if key in param_group:
-                keys.append(param_group[key])
-            elif f"pre_{key}" in param_group:
-                keys.append(param_group[f"pre_{key}"])
-            else:
-                raise ValueError(
-                    f"Key {key} (or pre_{key}) not found in param_group {param_group}."
-                )
-        return tuple(keys)
 
     def _load_dion_common_state_dict(self, state_dict) -> None:
         """Load non-tensor optimizer state without Adam-style param-state allocation."""
-        if "optimizer" not in state_dict:
-            raise RuntimeError("[Dion] distributed checkpoint missing optimizer common state")
-
-        saved_groups = {
-            self._param_group_match_key(param_group): param_group
-            for param_group in state_dict["optimizer"]["param_groups"]
-        }
-        inner_state_dict = self.optimizer.state_dict()
-        param_groups = []
-        for inner_param_group in inner_state_dict["param_groups"]:
-            group_key = self._param_group_match_key(inner_param_group)
-            if group_key not in saved_groups:
-                raise RuntimeError(
-                    "[Dion] checkpoint optimizer param-group metadata mismatch: "
-                    f"group_key={group_key}"
-                )
-            param_groups.append(
-                {**saved_groups[group_key], "params": inner_param_group["params"]}
-            )
-
-        self.optimizer.load_state_dict(
-            {
-                "state": inner_state_dict.get("state", {}),
-                "param_groups": param_groups,
-            }
-        )
-
-        if "grad_scaler" in state_dict:
-            if self.grad_scaler:
-                self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
-            else:
-                logger.info(
-                    "[Dion] checkpoint has grad scaler state but optimizer has no grad scaler; "
-                    "skipping grad scaler restore"
-                )
-        elif self.config.fp16:
-            logger.info("[Dion] checkpoint has no grad scaler state; skipping grad scaler restore")
+        self._load_matrix_common_state_dict(state_dict, label="Dion")
 
     def load_state_dict(self, state_dict):
         """Load optimizer checkpoint state with standard common-state outer protocol."""
@@ -4856,6 +4844,7 @@ class DistributedDionOptimizer(DistributedMatrixOptimizer):
             get_param_key=self._shard_param_uid,
             mixed_precision_config=getattr(self.optimizer, "_mixed_precision_config", None),
         )
+        self._ensure_dion_checkpoint_state()
         logger.info(
             '[Dion] Restored %s Dion param states from distributed checkpoint '
             '(missing_state_entry=%s, unnamed=%s)',

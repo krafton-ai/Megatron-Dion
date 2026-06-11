@@ -11,6 +11,7 @@ from ...fp8_utils import quantize_param_shard
 from ...transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 from ..clip_grads import clip_grad_by_total_norm_fp32
 from ..distrib_optimizer import DistributedOptimizer
+from ..optimizer import param_group_identifier_keys
 from .backend import MatrixBackend
 from .checkpoint_io import copy_main_params_to_model_shards, copy_model_params_to_main_shards
 from .grad_norm import compute_grad_norm, grad_norm_inputs, matrix_replica_grads
@@ -19,6 +20,7 @@ from .gradients import (
     clear_bucket_grad_buffers,
     clear_grad_transport,
     clear_matrix_local_grads,
+    get_inter_instance_grad_buffers,
     get_local_grad,
     get_standard_inter_instance_grad_buffer,
     release_rs_buffers,
@@ -93,6 +95,73 @@ class DistributedMatrixOptimizer(DistributedOptimizer):
                 f"group_ranks={group_ranks} context_parallel_ranks={cp_ranks} "
                 f"overlap={overlap} global_rank={global_rank}"
             )
+
+    @staticmethod
+    def _param_group_match_key(param_group) -> tuple:
+        keys = []
+        for key in param_group_identifier_keys:
+            if key in param_group:
+                keys.append(param_group[key])
+            elif f"pre_{key}" in param_group:
+                keys.append(param_group[f"pre_{key}"])
+            else:
+                raise ValueError(
+                    f"Key {key} (or pre_{key}) not found in param_group {param_group}."
+                )
+        return tuple(keys)
+
+    def _load_matrix_common_state_dict(self, state_dict, *, label: str = "Matrix") -> None:
+        """Load common optimizer state without allocating Adam-style shard tensors."""
+        if "optimizer" not in state_dict:
+            raise RuntimeError(f"[{label}] distributed checkpoint missing optimizer common state")
+
+        saved_groups = {}
+        for param_group in state_dict["optimizer"]["param_groups"]:
+            group_key = self._param_group_match_key(param_group)
+            if group_key in saved_groups:
+                raise RuntimeError(
+                    f"[{label}] checkpoint optimizer param-group metadata is ambiguous: "
+                    f"group_key={group_key}"
+                )
+            saved_groups[group_key] = param_group
+        inner_state_dict = self.optimizer.state_dict()
+        param_groups = []
+        current_group_keys = set()
+        for inner_param_group in inner_state_dict["param_groups"]:
+            group_key = self._param_group_match_key(inner_param_group)
+            if group_key in current_group_keys:
+                raise RuntimeError(
+                    f"[{label}] current optimizer param-group metadata is ambiguous: "
+                    f"group_key={group_key}"
+                )
+            current_group_keys.add(group_key)
+            if group_key not in saved_groups:
+                raise RuntimeError(
+                    f"[{label}] checkpoint optimizer param-group metadata mismatch: "
+                    f"group_key={group_key}"
+                )
+            param_groups.append(
+                {**saved_groups[group_key], "params": inner_param_group["params"]}
+            )
+
+        self.optimizer.load_state_dict(
+            {
+                "state": inner_state_dict.get("state", {}),
+                "param_groups": param_groups,
+            }
+        )
+
+        if "grad_scaler" in state_dict:
+            if self.grad_scaler:
+                self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
+            else:
+                logger.info(
+                    "[%s] checkpoint has grad scaler state but optimizer has no grad scaler; "
+                    "skipping grad scaler restore",
+                    label,
+                )
+        elif self.config.fp16:
+            logger.info("[%s] checkpoint has no grad scaler state; skipping grad scaler restore", label)
 
     def _resolve_state_replica_group(self):
         """Return the standard DO state-replica group, independent of backend RP."""
@@ -486,6 +555,10 @@ class DistributedMatrixOptimizer(DistributedOptimizer):
     def _clear_matrix_local_grads(self, params=None) -> None:
         clear_matrix_local_grads(self, params)
 
+    def zero_grad(self, set_to_none: bool = True):
+        super().zero_grad(set_to_none=set_to_none)
+        self._clear_matrix_local_grads()
+
     @staticmethod
     def _clear_matrix_grad_transport(bucket) -> None:
         clear_grad_transport(bucket)
@@ -520,6 +593,7 @@ class DistributedMatrixOptimizer(DistributedOptimizer):
         reduce_op,
         async_op: bool,
         reduce_scatter,
+        own_handle: bool = True,
     ):
         return start_matrix_grad_sync(
             self,
@@ -529,6 +603,7 @@ class DistributedMatrixOptimizer(DistributedOptimizer):
             reduce_op=reduce_op,
             async_op=async_op,
             reduce_scatter=reduce_scatter,
+            own_handle=own_handle,
         )
 
     def _apply_bucket_grads(self, *, bucket, local_data_view, communication_group) -> None:
@@ -545,8 +620,7 @@ class DistributedMatrixOptimizer(DistributedOptimizer):
 
     @staticmethod
     def _get_inter_instance_grad_buffers(bucket):
-        standard_grad = get_standard_inter_instance_grad_buffer(bucket)
-        return (standard_grad,) if standard_grad is not None and standard_grad.numel() > 0 else ()
+        return get_inter_instance_grad_buffers(bucket)
 
     def _matrix_grads_are_replicate_synced(self) -> bool:
         return False
@@ -718,11 +792,13 @@ class DistributedMatrixOptimizer(DistributedOptimizer):
     def get_grad_norm(self):
         return compute_grad_norm(self)
 
-    def clip_matrix_grad_norm(self, clip_grad: float, *, is_matrix_model_param) -> float:
+    def needs_own_grad_norm(self) -> bool:
+        return True
+
+    def _clip_matrix_grads(self, clip_grad: float, total_norm: float, *, is_matrix_model_param) -> None:
         params = self.get_parameters()
-        grad_norm = self.get_grad_norm() if params else 0.0
         if not params:
-            return grad_norm
+            return
 
         matrix_model_params = []
         matrix_model_param_ids = set()
@@ -742,10 +818,10 @@ class DistributedMatrixOptimizer(DistributedOptimizer):
             clip_grad_by_total_norm_fp32(
                 standard_params,
                 clip_grad,
-                grad_norm,
+                total_norm,
                 self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             )
-        clip_coeff = float(clip_grad) / (float(grad_norm) + 1.0e-6)
+        clip_coeff = float(clip_grad) / (float(total_norm) + 1.0e-6)
         if matrix_model_params and clip_coeff < 1.0:
             self._scale_matrix_local_grads(matrix_model_params, clip_coeff)
             for model_param, shard_param in matrix_shard_params:
@@ -758,4 +834,20 @@ class DistributedMatrixOptimizer(DistributedOptimizer):
                     shard_param.grad = (
                         local_grad if local_grad.dtype == torch.float32 else local_grad.float()
                     )
+
+    def clip_grad_by_total_norm(self, clip_grad: float, total_norm: float) -> None:
+        self._clip_matrix_grads(
+            clip_grad,
+            total_norm,
+            is_matrix_model_param=lambda param: getattr(param, "is_matrix_param", False),
+        )
+
+    def clip_matrix_grad_norm(self, clip_grad: float, *, is_matrix_model_param) -> float:
+        params = self.get_parameters()
+        grad_norm = self.get_grad_norm() if params else 0.0
+        self._clip_matrix_grads(
+            clip_grad,
+            grad_norm,
+            is_matrix_model_param=is_matrix_model_param,
+        )
         return grad_norm

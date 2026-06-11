@@ -169,18 +169,28 @@ def get_matrix_replica_group(
     requested_rp_world_size: int,
     is_expert_parallel: bool,
     *,
+    replica_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     optimizer_name: str = "Matrix optimizer",
 ) -> Optional[torch.distributed.ProcessGroup]:
     """Return the active matrix optimizer replica group."""
     if requested_rp_world_size <= 1:
         return None
+    if replica_dp_group is None:
+        if is_expert_parallel:
+            replica_dp_group = getattr(pg_collection, "expt_dp", None) if pg_collection is not None else None
+            if replica_dp_group is None:
+                replica_dp_group = parallel_state.get_expert_data_parallel_group(
+                    check_initialized=False
+                )
+        else:
+            replica_dp_group = pure_dp_group
 
     if pg_collection is not None and hasattr(pg_collection, "inter_dist_opt"):
         group = pg_collection.inter_dist_opt
         if group is not None and dist.get_world_size(group) == requested_rp_world_size:
             return validate_replica_group(
                 group=group,
-                pure_dp_group=pure_dp_group,
+                pure_dp_group=replica_dp_group,
                 requested_rp_world_size=requested_rp_world_size,
                 source="pg_collection_inter_dist_opt",
                 is_expert_parallel=is_expert_parallel,
@@ -191,18 +201,18 @@ def get_matrix_replica_group(
     if group is not None and dist.get_world_size(group) == requested_rp_world_size:
         return validate_replica_group(
             group=group,
-            pure_dp_group=pure_dp_group,
+            pure_dp_group=replica_dp_group,
             requested_rp_world_size=requested_rp_world_size,
             source="runtime_inter_dist_opt",
             is_expert_parallel=is_expert_parallel,
             optimizer_name=optimizer_name,
         )
 
-    if is_expert_parallel and pure_dp_group is not None:
-        if dist.get_world_size(pure_dp_group) == requested_rp_world_size:
+    if is_expert_parallel and replica_dp_group is not None:
+        if dist.get_world_size(replica_dp_group) == requested_rp_world_size:
             return validate_replica_group(
-                group=pure_dp_group,
-                pure_dp_group=pure_dp_group,
+                group=replica_dp_group,
+                pure_dp_group=replica_dp_group,
                 requested_rp_world_size=requested_rp_world_size,
                 source="expert_pure_dp",
                 is_expert_parallel=is_expert_parallel,
@@ -252,9 +262,11 @@ def resolve_fs_group(
 ) -> Optional[torch.distributed.ProcessGroup]:
     """Resolve the FS group for dense or expert matrix optimizer parameters."""
     if is_expert_parallel:
-        expert_fs_group = parallel_state.get_expert_data_parallel_group(
-            partial_expert_data_parallel=True
-        )
+        expert_fs_group = pure_data_parallel_group
+        if expert_fs_group is None:
+            expert_fs_group = parallel_state.get_expert_data_parallel_group(
+                partial_expert_data_parallel=True
+            )
         expert_fs_world_size = (
             requested_fs_world_size
             if expert_fs_group is None
@@ -263,7 +275,7 @@ def resolve_fs_group(
         return validate_expert_fs_group(
             group=expert_fs_group,
             requested_world_size=expert_fs_world_size,
-            source="expert_partial_data_parallel",
+            source="expert_pure_data_parallel",
             optimizer_name=optimizer_name,
         )
     return get_dense_fs_group(

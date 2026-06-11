@@ -19,11 +19,9 @@ from ...matrix.gradients import get_inter_instance_grad_buffers
 from ...matrix.types import MatrixBucketLayout
 from ...matrix.utils import env_flag
 from ...matrix.sharding import (
+    compute_fs_shard_range,
     create_fs_shard,
-    get_fs_split_dim,
     get_opt_shard,
-    get_tp_split_dim,
-    is_tp_enabled,
     param_shard_layout,
     attach_fs_shard_,
     register_matrix_shard,
@@ -34,7 +32,6 @@ from ...matrix.splits.linear import (
     get_linear_partition_stride,
     get_linear_split_rows,
     iter_linear_child_kinds,
-    is_linear_split_param,
     linear_child_global_shape,
     linear_child_has_local_overlap,
     linear_child_local_shape,
@@ -54,11 +51,17 @@ from ...matrix.splits.gdn import (
     gdn_child_local_shape,
     gdn_child_name,
     gdn_child_param_uid,
+    gdn_child_rank_row_range,
     gdn_child_row_range,
     iter_gdn_child_kinds,
     resolve_gdn_split_axis,
     resolve_gdn_split_shapes,
     scatter_gdn_child_,
+)
+from ...matrix.splits.row_child import (
+    child_row_layout,
+    finalize_row_child_groups,
+    resolve_child_layouts,
 )
 from ...matrix.splits.parameters import copy_parameter_split_metadata
 from ...matrix.splits.qkv import (
@@ -92,10 +95,11 @@ from ...matrix.parameter import (
     build_matrix_shard_entries,
     init_matrix_bucket,
     init_standard_bucket,
+    mark_matrix_bucket_params,
     resolve_grad_rank_to_fs_rank,
 )
 from ..backend import MuonBackend
-from ..algorithm import MegatronMuon
+from ..algorithm import MegatronMuon, init_muon_state
 from ..kernels import (
     get_and_reset_gram_profile,
     orthogonalize_muon,
@@ -109,6 +113,7 @@ from .batches import build_muon_batches
 from .checkpoint_io import (
     build_distributed_checkpoint_state,
     build_muon_checkpoint_metadata,
+    resolve_muon_state_type,
     restore_muon_param_state_,
     split_distributed_checkpoint_state,
     validate_muon_checkpoint_metadata,
@@ -130,6 +135,20 @@ def _group_rank(group) -> int:
     return dist.get_rank(group)
 
 
+def _group_ranks(group, cache: dict | None = None) -> tuple[int, ...]:
+    if group is None or not dist.is_available() or not dist.is_initialized():
+        return ()
+    if cache is None:
+        return tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+    cache_key = id(group)
+    cached = cache.get(cache_key)
+    if cached is not None and cached[0] is group:
+        return cached[1]
+    ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+    cache[cache_key] = (group, ranks)
+    return ranks
+
+
 def _split_range(size: int, world_size: int, rank: int) -> tuple[int, int]:
     base = int(size) // int(world_size)
     rem = int(size) % int(world_size)
@@ -137,74 +156,26 @@ def _split_range(size: int, world_size: int, rank: int) -> tuple[int, int]:
     return start, start + base + (1 if int(rank) < rem else 0)
 
 
-def _is_moe_expert_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool:
-    del param_name
-    if not getattr(param, "allreduce", True):
-        return True
-    num_local_experts = getattr(param, "num_local_experts", None)
-    return num_local_experts is not None and int(num_local_experts) > 1
-
-
-def mark_muon_bucket_params(param_map, param_to_name, fs_size: int):
+def mark_muon_bucket_params(param_map, param_to_name, fs_size: int, *, tp_group=None):
     """Classify bucket params and build static Muon matrix metadata."""
-    fs_size = int(fs_size)
-    if fs_size <= 0:
-        raise RuntimeError(f"[Muon] invalid FS size while marking bucket params: {fs_size}")
-
-    muon_param_count = 0
-    matrix_info_by_param = {}
-
+    muon_param_count, matrix_info_by_param = mark_matrix_bucket_params(
+        param_map=param_map,
+        param_to_name=param_to_name,
+        fs_size=fs_size,
+        include_vocab=False,
+        tp_group=tp_group,
+    )
     for param in param_map.keys():
-        param_name = None
-        if param_to_name is not None and param in param_to_name:
-            param_name = param_to_name[param]
-        if param_name:
-            param._param_name = param_name
-
-        param.is_muon_param = is_muon_matrix_param(param)
+        use_muon = (
+            getattr(param, "use_muon", None) is not False
+            and bool(getattr(param, "is_matrix_param", False))
+        )
+        param.is_muon_param = bool(use_muon)
+        param.use_muon = bool(use_muon)
         param.is_matrix_param = bool(param.is_muon_param)
-
-        is_expert = _is_moe_expert_param(param, param_name)
-        raw_tp_split_dim = get_tp_split_dim(param)
-        has_tp = is_tp_enabled(param)
-        if is_expert and has_tp:
-            tp_world_size = parallel_state.get_expert_tensor_parallel_world_size()
-        else:
-            tp_world_size = parallel_state.get_tensor_model_parallel_world_size() if has_tp else 1
-        tp_shard_dim = raw_tp_split_dim if has_tp and tp_world_size > 1 else -1
-
-        if not param.is_muon_param:
-            continue
-
-        m_local, n_local = (int(dim) for dim in param.shape)
-        fs_shard_dim = get_fs_split_dim(tp_shard_dim)
-        split_size = m_local if fs_shard_dim == 0 else n_local
-        if fs_size > 1 and split_size < fs_size:
-            param.is_muon_param = False
-            param.is_matrix_param = False
-            param.matrix_optimizer_ready = False
-            continue
-
-        muon_param_count += 1
-
-        if tp_shard_dim == 0:
-            m_global = m_local * tp_world_size
-            n_global = n_local
-        elif tp_shard_dim == 1:
-            m_global = m_local
-            n_global = n_local * tp_world_size
-        else:
-            m_global = m_local
-            n_global = n_local
-
-        matrix_info_by_param[param] = {
-            "is_muon": True,
-            "global_shape": (m_global, n_global),
-            "fs_shard_dim": fs_shard_dim,
-            "tp_shard_dim": tp_shard_dim,
-            "per_expert_global_shape": None,
-        }
-
+        if not param.is_muon_param and param in matrix_info_by_param:
+            matrix_info_by_param.pop(param, None)
+            muon_param_count = max(0, int(muon_param_count) - 1)
     return muon_param_count, matrix_info_by_param
 
 
@@ -299,6 +270,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             param_map=param_map,
             param_to_name=getattr(param_and_grad_buffer, "param_to_name", None),
             fs_size=fs_size,
+            tp_group=getattr(param_and_grad_buffer, "tp_group", None),
         )
 
         (
@@ -357,7 +329,8 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         self._muon_profile_apply_ms = 0.0
         self._muon_profile_apply_batches = 0
         self._muon_matrix_param_cache = None
-        self._muon_stack_cache = {}
+        self._muon_buffers = {}
+        self._muon_group_rank_cache = {}
 
         per_model_buffers = kwargs.get("per_model_buffers", None)
         muon_fs_size = 1 if self._muon_fs_group is None else _group_size(self._muon_fs_group)
@@ -405,18 +378,30 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             rp_size=int(self._requested_rp_size),
             tp_size=int(self.tp_size),
             is_expert=bool(self._is_expert_muon),
-            split_parameters=bool(
-                getattr(self.optimizer, "defaults", {}).get("split_parameters", False)
-            ),
+            split_parameters=self._split_enabled(),
         )
         self._setup_muon_path()
         self._attach_model_param_links()
         self.dist_metas = self._build_dist_metas()
         self.optimizer.dist_metas = self.dist_metas
+        self._init_split_groups()
 
     @property
     def muon_fs_group(self):
         return self.fs_group
+
+    def _split_enabled(self) -> bool:
+        default = self._split_for_group(None)
+        for group in getattr(self.optimizer, "param_groups", ()):
+            if self._split_for_group(group):
+                return True
+        return default
+
+    def _split_for_group(self, group) -> bool:
+        default = bool(getattr(self.config, "muon_split_parameters", True))
+        if group is None:
+            return default
+        return bool(group.get("muon_split_parameters", group.get("split_parameters", default)))
 
     @property
     def muon_tp_group(self):
@@ -554,7 +539,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 param_range_info = gbuf_range["param_map"][model_param]
                 param_range = param_range_info["param"]
                 shard_layout = param_range_info.get("matrix_shard_layout", None)
-                if model_param.type() in ["torch.cuda.HalfTensor", "torch.cuda.BFloat16Tensor"]:
+                if model_param.dtype in (torch.float16, torch.bfloat16):
                     self._process_float16_param(
                         model_param,
                         param_range,
@@ -564,7 +549,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                         shard_float16_params,
                         main_shard_params,
                     )
-                elif model_param.type() == "torch.cuda.FloatTensor":
+                elif model_param.dtype == torch.float32:
                     self._process_float32_param(
                         model_param,
                         param_range,
@@ -574,7 +559,9 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                         shard_fp32_params,
                     )
                 else:
-                    raise TypeError(f"Unsupported parameter type: {model_param.type()}")
+                    raise TypeError(
+                        f"Unsupported parameter dtype: dtype={model_param.dtype} device={model_param.device}"
+                    )
 
             if not use_precision_aware_optimizer:
                 group_range["orig_group"]["params"] = [
@@ -804,12 +791,13 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 if use_matrix:
                     global_shape = self._global_shape(model_param, tp_shard_dim)
                     is_transposed = bool(global_shape[0] > global_shape[1])
-                    param_uid = (name or f"id_{id(model_param)}", tuple(global_shape))
-                    linear_split_rows = (
-                        get_linear_split_rows(model_param)
-                        if is_linear_split_param(model_param)
-                        else None
-                    )
+                    if not name:
+                        raise RuntimeError(
+                            "[MUON_MISSING_PARAM_NAME] Matrix Muon checkpoint keys require a "
+                            "stable parameter name."
+                        )
+                    param_uid = (name, tuple(global_shape))
+                    linear_split_rows = get_linear_split_rows(model_param)
                     linear_child_kinds = (
                         get_linear_child_kinds(model_param)
                         if linear_split_rows is not None
@@ -826,8 +814,9 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     global_shape = None
                     is_transposed = False
                     param_uid = (
-                        name or f"id_{id(model_param)}",
-                        tuple(int(dim) for dim in local_shape),
+                        (name, tuple(int(dim) for dim in local_shape))
+                        if name
+                        else None
                     )
                     linear_split_rows = None
                     linear_child_kinds = ("gate", "up")
@@ -849,7 +838,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     param_uid=param_uid,
                     is_matrix_param=bool(use_matrix),
                     is_muon_param=bool(use_matrix),
-                    param_name=name or f"id_{id(model_param)}",
+                    param_name=name,
                     fs_group=self.fs_group if self.fs_size > 1 else None,
                     fs_world_size=int(self.fs_size),
                     fs_rank=int(self.fs_rank),
@@ -896,7 +885,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             extra_scale_factor=float(getattr(self.config, "muon_extra_scale_factor", 0.2)),
             fs_mode=getattr(self.config, "muon_fs_mode", self._fs_mode),
             tp_mode=getattr(self.config, "muon_tp_mode", self._tp_mode),
-            split_parameters=bool(getattr(self.config, "muon_split_parameters", True)),
+            split_parameters=self._split_for_group(optim_group),
         )
         return cfg
 
@@ -923,7 +912,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 float(getattr(self.config, "muon_extra_scale_factor", 0.2)),
                 getattr(self.config, "muon_fs_mode", self._fs_mode),
                 getattr(self.config, "muon_tp_mode", self._tp_mode),
-                bool(getattr(self.config, "muon_split_parameters", True)),
+                self._split_for_group(optim_group),
             )
             if (
                 getattr(dist_meta, "_muon_param_config_signature", None) == signature
@@ -945,7 +934,11 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
     def _ensure_optimizer_state(self, param, optim_group):
         state = self.optimizer.state[param]
         meta = self.dist_metas.get(param)
-        if meta is None or not bool(getattr(meta, "is_muon_param", False)):
+        if (
+            meta is None
+            or not bool(getattr(meta, "is_muon_param", False))
+            or optim_group.get("algorithm", "muon") != "muon"
+        ):
             return state
         shape = tuple(int(dim) for dim in meta.shape)
         momentum = state.get("momentum_buffer")
@@ -956,8 +949,12 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         return state
 
     def _should_use_distributed_muon_update(self, param, state, optim_group, dist_meta) -> bool:
-        del param, state, optim_group
-        return bool(dist_meta is not None and getattr(dist_meta, "is_muon_param", False))
+        del param, state
+        return bool(
+            optim_group.get("algorithm", "muon") == "muon"
+            and dist_meta is not None
+            and getattr(dist_meta, "is_muon_param", False)
+        )
 
     def _view_2d(self, tensor, meta):
         shape = tuple(int(dim) for dim in meta.shape)
@@ -980,38 +977,34 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         linear_rows=None,
         linear_child_kinds=None,
         split_axis=0,
+        fs_layout,
+        tp_layout,
     ):
-        split_axis = int(split_axis)
-        fs_start = int(parent_meta.fs_start_idx)
-        fs_end = int(parent_meta.fs_end_idx)
-        if int(parent_meta.fs_shard_dim) == split_axis:
-            if split_kind == "qkv":
-                row_range = qkv_child_row_range(parent_row_start=fs_start, parent_row_end=fs_end, split_shapes=qkv_shapes, child_kind=child_kind)
-            elif split_kind == "qkvg":
-                row_range = qkvg_child_row_range(parent_row_start=fs_start, parent_row_end=fs_end, split_shapes=qkvg_shapes, child_kind=child_kind)
-            elif split_kind == "gdn":
-                row_range = gdn_child_row_range(parent_row_start=fs_start, parent_row_end=fs_end, split_shapes=gdn_shapes, child_kind=child_kind)
-            elif split_kind == "linear":
-                row_range = linear_child_row_range(
-                    parent_row_start=fs_start,
-                    parent_row_end=fs_end,
-                    split_rows=linear_rows,
-                    child_kind=child_kind,
-                    child_kinds=linear_child_kinds,
-                )
-            else:
-                raise RuntimeError(f"[MUON_INVALID_SPLIT_KIND] split_kind={split_kind!r}")
-            if row_range is not None:
-                fs_start, fs_end = int(row_range[0]), int(row_range[1])
-            elif int(child_shape[0]) == 0:
-                fs_start, fs_end = 0, 0
+        row_start, row_end, row_sizes = child_row_layout(fs_layout, tp_layout)
+        child_fs_group, child_fs_world_size, child_fs_rank, child_fs_start, child_fs_end, fs_sizes = fs_layout
+        child_tp_group, child_tp_world_size, child_tp_rank, _tp_start, _tp_end, tp_sizes = tp_layout
+        tensor_row_sizes = fs_sizes if fs_sizes is not None else tp_sizes
         child_meta = replace(
             parent_meta,
             shape=tuple(child_shape),
             local_shape=tuple(child_shape),
             global_shape=tuple(child_global_shape),
-            fs_start_idx=fs_start,
-            fs_end_idx=fs_end,
+            fs_group=child_fs_group,
+            fs_world_size=int(child_fs_world_size),
+            fs_rank=int(child_fs_rank),
+            fs_start_idx=int(child_fs_start),
+            fs_end_idx=int(child_fs_end),
+            tp_group=child_tp_group,
+            tp_world_size=int(child_tp_world_size),
+            tp_rank=int(child_tp_rank),
+            tensor_row_shard_sizes=(
+                tuple(int(size) for size in tensor_row_sizes)
+                if tensor_row_sizes is not None
+                else None
+            ),
+            row_shard_start_idx=int(row_start),
+            row_shard_end_idx=int(row_end),
+            row_shard_sizes=row_sizes,
             param_uid=child_uid,
             param_name=child_name,
             parent_param_uid=parent_meta.param_uid,
@@ -1054,10 +1047,12 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         )
 
     def _config_value(self, group, param_config, group_key, config_key, default):
-        if param_config is not None and hasattr(param_config, group_key):
-            return getattr(param_config, group_key)
         if group is not None and group_key in group:
             return group[group_key]
+        if group is not None and config_key in group:
+            return group[config_key]
+        if param_config is not None and hasattr(param_config, group_key):
+            return getattr(param_config, group_key)
         defaults = getattr(getattr(self, "optimizer", None), "defaults", {})
         if group_key in defaults:
             return defaults[group_key]
@@ -1190,24 +1185,205 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             "global_shape": tuple(int(dim) for dim in global_shape),
         }
 
+    def _qkv_child_layouts(self, meta, shapes, kind, split_axis: int, *, create_group: bool):
+        parent_global_shape = tuple(int(dim) for dim in meta.global_shape)
+        child_global_shape = qkv_child_global_shape(
+            parent_global_shape,
+            shapes,
+            kind,
+            split_axis=split_axis,
+        )
+        layouts = resolve_child_layouts(
+            meta,
+            child_kind=kind,
+            child_global_shape=child_global_shape,
+            split_kind="qkv",
+            split_axis=split_axis,
+            child_range=lambda start, end: qkv_child_row_range(
+                parent_row_start=start,
+                parent_row_end=end,
+                split_shapes=shapes,
+                child_kind=kind,
+            ),
+            create_group=create_group,
+            group_desc="MUON_SPLIT_CHILD_GROUP",
+            error_prefix="MUON_SPLIT_CHILD",
+            namespace="MUON",
+        )
+        return child_global_shape, layouts
+
+    def _qkvg_child_layouts(self, meta, shapes, kind, split_axis: int, *, create_group: bool):
+        parent_global_shape = tuple(int(dim) for dim in meta.global_shape)
+        child_global_shape = qkvg_child_global_shape(
+            parent_global_shape,
+            shapes,
+            kind,
+            split_axis=split_axis,
+        )
+        layouts = resolve_child_layouts(
+            meta,
+            child_kind=kind,
+            child_global_shape=child_global_shape,
+            split_kind="qkvg",
+            split_axis=split_axis,
+            child_range=lambda start, end: qkvg_child_row_range(
+                parent_row_start=start,
+                parent_row_end=end,
+                split_shapes=shapes,
+                child_kind=kind,
+            ),
+            create_group=create_group,
+            group_desc="MUON_SPLIT_CHILD_GROUP",
+            error_prefix="MUON_SPLIT_CHILD",
+            namespace="MUON",
+        )
+        return child_global_shape, layouts
+
+    def _gdn_child_layouts(self, meta, shapes, kind, split_axis: int, *, create_group: bool):
+        parent_global_shape = tuple(int(dim) for dim in meta.global_shape)
+        child_global_shape = gdn_child_global_shape(
+            parent_global_shape,
+            shapes,
+            kind,
+            split_axis=split_axis,
+        )
+        layouts = resolve_child_layouts(
+            meta,
+            child_kind=kind,
+            child_global_shape=child_global_shape,
+            split_kind="gdn",
+            split_axis=split_axis,
+            child_range=lambda start, end: gdn_child_row_range(
+                parent_row_start=start,
+                parent_row_end=end,
+                split_shapes=shapes,
+                child_kind=kind,
+            ),
+            child_rank_range=lambda world_size, rank: gdn_child_rank_row_range(
+                split_shapes=shapes,
+                child_kind=kind,
+                world_size=world_size,
+                rank=rank,
+            ),
+            create_group=create_group,
+            group_desc="MUON_SPLIT_CHILD_GROUP",
+            error_prefix="MUON_SPLIT_CHILD",
+            namespace="MUON",
+        )
+        return child_global_shape, layouts
+
+    def _linear_child_layouts(
+        self,
+        meta,
+        rows,
+        kind,
+        child_kinds,
+        split_axis: int,
+        *,
+        create_group: bool,
+    ):
+        parent_global_shape = tuple(int(dim) for dim in meta.global_shape)
+        child_global_shape = linear_child_global_shape(
+            parent_global_shape,
+            rows,
+            kind,
+            split_axis=split_axis,
+            child_kinds=child_kinds,
+        )
+        child_rank_range = None
+        if int(getattr(meta, "linear_partition_stride", 1)) == len(tuple(rows)):
+            child_rows = int(child_global_shape[int(split_axis)])
+
+            def child_rank_range(world_size, rank):
+                start, end = compute_fs_shard_range(child_rows, int(world_size), int(rank))
+                return (start, end) if end > start else None
+
+        layouts = resolve_child_layouts(
+            meta,
+            child_kind=kind,
+            child_global_shape=child_global_shape,
+            split_kind="linear",
+            split_axis=split_axis,
+            child_range=lambda start, end: linear_child_row_range(
+                parent_row_start=start,
+                parent_row_end=end,
+                split_rows=rows,
+                child_kind=kind,
+                child_kinds=child_kinds,
+            ),
+            child_rank_range=child_rank_range,
+            create_group=create_group,
+            group_desc="MUON_SPLIT_CHILD_GROUP",
+            error_prefix="MUON_SPLIT_CHILD",
+            namespace="MUON",
+        )
+        return child_global_shape, layouts
+
+    def _init_split_groups(self) -> None:
+        if not self._split_enabled():
+            finalize_row_child_groups("MUON_SPLIT_CHILD_GROUP")
+            return
+        dist_metas = []
+        for group in self.optimizer.param_groups:
+            if not self._split_for_group(group):
+                continue
+            for param in group.get("params", ()):
+                meta = self.dist_metas.get(param, None)
+                if meta is not None:
+                    dist_metas.append(meta)
+        dist_metas.sort(
+            key=lambda meta: repr((getattr(meta, "param_uid", None), getattr(meta, "param_name", "")))
+        )
+        for meta in dist_metas:
+            if meta is None or not bool(getattr(meta, "is_muon_param", False)):
+                continue
+            config = getattr(meta, "param_config", None)
+            if config is not None and not bool(getattr(config, "split_parameters", False)):
+                continue
+            shapes = resolve_qkvg_split_shapes(param=None, optimizer_state=None, dist_meta=meta)
+            if shapes is not None:
+                axis = resolve_qkvg_split_axis(dist_meta=meta)
+                for kind in iter_qkvg_child_kinds():
+                    self._qkvg_child_layouts(meta, shapes, kind, axis, create_group=True)
+                continue
+            shapes = resolve_qkv_split_shapes(param=None, optimizer_state=None, dist_meta=meta)
+            if shapes is not None:
+                axis = resolve_qkv_split_axis(dist_meta=meta)
+                for kind in iter_qkv_child_kinds():
+                    self._qkv_child_layouts(meta, shapes, kind, axis, create_group=True)
+                continue
+            shapes = resolve_gdn_split_shapes(param=None, optimizer_state=None, dist_meta=meta)
+            if shapes is not None:
+                axis = resolve_gdn_split_axis(dist_meta=meta)
+                for kind in iter_gdn_child_kinds():
+                    self._gdn_child_layouts(meta, shapes, kind, axis, create_group=True)
+                continue
+            rows = resolve_linear_split_rows(optimizer_state=None, dist_meta=meta)
+            if rows is not None:
+                axis = resolve_linear_split_axis(dist_meta=meta)
+                child_kinds = resolve_linear_child_kinds(dist_meta=meta)
+                for kind in iter_linear_child_kinds(child_kinds):
+                    self._linear_child_layouts(
+                        meta,
+                        rows,
+                        kind,
+                        child_kinds,
+                        axis,
+                        create_group=True,
+                    )
+        finalize_row_child_groups("MUON_SPLIT_CHILD_GROUP")
+
     def _expand_split_muon_params(self, *, param, grad, optimizer_state, optim_group, config, dist_meta):
+        if optim_group.get("algorithm", "muon") != "muon":
+            return None
         if not bool(getattr(dist_meta, "is_muon_param", False)):
             return None
         if config is None:
             config = getattr(dist_meta, "param_config", None)
-        split_parameters = bool(
-            self._config_value(
-                optim_group,
-                config,
-                "split_parameters",
-                "muon_split_parameters",
-                True,
-            )
-        )
+        split_parameters = self._split_for_group(optim_group)
         param2d = self._view_2d(param, dist_meta)
         grad2d = self._view_2d(grad, dist_meta)
         parent_shape = tuple(int(dim) for dim in dist_meta.shape)
-        parent_global_shape = tuple(int(dim) for dim in (dist_meta.global_shape or parent_shape))
         if split_parameters:
             shapes = resolve_qkvg_split_shapes(param=param, optimizer_state=optimizer_state, dist_meta=dist_meta)
             if shapes is not None:
@@ -1216,7 +1392,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     optimizer_state=optimizer_state,
                     dist_meta=dist_meta,
                 )
-                return self._expand_qkvg(param2d, grad2d, optimizer_state, optim_group, dist_meta, parent_shape, parent_global_shape, shapes, axis)
+                return self._expand_qkvg(param2d, grad2d, optimizer_state, optim_group, dist_meta, parent_shape, shapes, axis)
             shapes = resolve_qkv_split_shapes(param=param, optimizer_state=optimizer_state, dist_meta=dist_meta)
             if shapes is not None:
                 axis = resolve_qkv_split_axis(
@@ -1224,7 +1400,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     optimizer_state=optimizer_state,
                     dist_meta=dist_meta,
                 )
-                return self._expand_qkv(param2d, grad2d, optimizer_state, optim_group, dist_meta, parent_shape, parent_global_shape, shapes, axis)
+                return self._expand_qkv(param2d, grad2d, optimizer_state, optim_group, dist_meta, parent_shape, shapes, axis)
             shapes = resolve_gdn_split_shapes(param=param, optimizer_state=optimizer_state, dist_meta=dist_meta)
             if shapes is not None:
                 axis = resolve_gdn_split_axis(
@@ -1232,7 +1408,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     optimizer_state=optimizer_state,
                     dist_meta=dist_meta,
                 )
-                return self._expand_gdn(param2d, grad2d, optimizer_state, optim_group, dist_meta, parent_shape, parent_global_shape, shapes, axis)
+                return self._expand_gdn(param2d, grad2d, optimizer_state, optim_group, dist_meta, parent_shape, shapes, axis)
             rows = resolve_linear_split_rows(optimizer_state=optimizer_state, dist_meta=dist_meta)
             if rows is not None:
                 axis = resolve_linear_split_axis(
@@ -1240,42 +1416,24 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     optimizer_state=optimizer_state,
                     dist_meta=dist_meta,
                 )
-                return self._expand_linear(param2d, grad2d, optimizer_state, optim_group, dist_meta, parent_shape, parent_global_shape, rows, axis)
+                return self._expand_linear(param2d, grad2d, optimizer_state, optim_group, dist_meta, parent_shape, rows, axis)
         return None
 
-    @staticmethod
-    def _include_empty_split_child(meta) -> bool:
-        cfg = getattr(meta, "param_config", None)
-        fs_mode = getattr(cfg, "fs_mode", "blockwise")
-        tp_mode = getattr(cfg, "tp_mode", "blockwise")
-        return fs_mode in ("duplicated", "distributed") or tp_mode in (
-            "duplicated",
-            "distributed",
-        )
-
-    @staticmethod
-    def _empty_split_child_shape(parent_shape, split_axis: int):
-        return (0, int(parent_shape[1])) if int(split_axis) == 0 else (int(parent_shape[0]), 0)
-
-    def _expand_qkv(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, shapes, split_axis):
+    def _expand_qkv(self, param2d, grad2d, state, group, meta, parent_shape, shapes, split_axis):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = self._include_empty_split_child(meta)
         for kind in iter_qkv_child_kinds():
-            has_overlap = qkv_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
-            if not has_overlap and not include_empty:
+            global_shape, layouts = self._qkv_child_layouts(meta, shapes, kind, split_axis, create_group=False)
+            if layouts is None:
                 continue
-            child_shape = (
-                qkv_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis)
-                if has_overlap
-                else self._empty_split_child_shape(parent_shape, split_axis)
-            )
-            global_shape = qkv_child_global_shape(parent_global_shape, shapes, kind, split_axis=split_axis)
-            child_momentum = (
-                extract_qkv_child(parent_momentum, shapes, kind, meta, split_axis=split_axis)
-                if has_overlap
-                else parent_momentum.new_empty(child_shape)
-            )
+            has_overlap = qkv_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
+            if not has_overlap:
+                raise RuntimeError(
+                    "[MUON_QKV_CHILD_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={kind}"
+                )
+            child_shape = qkv_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis)
+            child_momentum = extract_qkv_child(parent_momentum, shapes, kind, meta, split_axis=split_axis)
             child_state = self._child_state(child_momentum, child_shape, global_shape)
             child_meta = self._child_meta(
                 meta,
@@ -1288,6 +1446,8 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 optim_group=group,
                 qkv_shapes=shapes,
                 split_axis=split_axis,
+                fs_layout=layouts[0],
+                tp_layout=layouts[1],
             )
 
             def _commit_update(
@@ -1296,21 +1456,14 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 *,
                 child_kind=kind,
                 parent_momentum=parent_momentum,
-                has_local_overlap=has_overlap,
             ):
-                if not has_local_overlap:
-                    return
                 scatter_qkv_child_(param2d, updated_param, shapes, child_kind, meta, split_axis=split_axis)
                 scatter_qkv_child_(parent_momentum, updated_momentum, shapes, child_kind, meta, split_axis=split_axis)
 
             children.append(
                 self._step_param(
-                    extract_qkv_child(param2d, shapes, kind, meta, split_axis=split_axis)
-                    if has_overlap
-                    else param2d.new_empty(child_shape),
-                    extract_qkv_child(grad2d, shapes, kind, meta, split_axis=split_axis)
-                    if has_overlap
-                    else grad2d.new_empty(child_shape),
+                    extract_qkv_child(param2d, shapes, kind, meta, split_axis=split_axis),
+                    extract_qkv_child(grad2d, shapes, kind, meta, split_axis=split_axis),
                     child_state,
                     group,
                     child_meta.param_config,
@@ -1318,27 +1471,29 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     _commit_update,
                 )
             )
+        if not children:
+            raise RuntimeError(
+                "[MUON_QKV_SPLIT_NO_LOCAL_CHILDREN] "
+                f"param_uid={meta.param_uid} param_name={getattr(meta, 'param_name', '')} "
+                f"split_axis={split_axis} split_shapes={shapes}"
+            )
         return children
 
-    def _expand_qkvg(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, shapes, split_axis):
+    def _expand_qkvg(self, param2d, grad2d, state, group, meta, parent_shape, shapes, split_axis):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = self._include_empty_split_child(meta)
         for kind in iter_qkvg_child_kinds():
-            has_overlap = qkvg_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
-            if not has_overlap and not include_empty:
+            global_shape, layouts = self._qkvg_child_layouts(meta, shapes, kind, split_axis, create_group=False)
+            if layouts is None:
                 continue
-            child_shape = (
-                qkvg_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis)
-                if has_overlap
-                else self._empty_split_child_shape(parent_shape, split_axis)
-            )
-            global_shape = qkvg_child_global_shape(parent_global_shape, shapes, kind, split_axis=split_axis)
-            child_momentum = (
-                extract_qkvg_child(parent_momentum, shapes, kind, meta, split_axis=split_axis)
-                if has_overlap
-                else parent_momentum.new_empty(child_shape)
-            )
+            has_overlap = qkvg_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
+            if not has_overlap:
+                raise RuntimeError(
+                    "[MUON_QKVG_CHILD_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={kind}"
+                )
+            child_shape = qkvg_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis)
+            child_momentum = extract_qkvg_child(parent_momentum, shapes, kind, meta, split_axis=split_axis)
             child_state = self._child_state(child_momentum, child_shape, global_shape)
             child_meta = self._child_meta(
                 meta,
@@ -1351,6 +1506,8 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 optim_group=group,
                 qkvg_shapes=shapes,
                 split_axis=split_axis,
+                fs_layout=layouts[0],
+                tp_layout=layouts[1],
             )
 
             def _commit_update(
@@ -1359,21 +1516,14 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 *,
                 child_kind=kind,
                 parent_momentum=parent_momentum,
-                has_local_overlap=has_overlap,
             ):
-                if not has_local_overlap:
-                    return
                 scatter_qkvg_child_(param2d, updated_param, shapes, child_kind, meta, split_axis=split_axis)
                 scatter_qkvg_child_(parent_momentum, updated_momentum, shapes, child_kind, meta, split_axis=split_axis)
 
             children.append(
                 self._step_param(
-                    extract_qkvg_child(param2d, shapes, kind, meta, split_axis=split_axis)
-                    if has_overlap
-                    else param2d.new_empty(child_shape),
-                    extract_qkvg_child(grad2d, shapes, kind, meta, split_axis=split_axis)
-                    if has_overlap
-                    else grad2d.new_empty(child_shape),
+                    extract_qkvg_child(param2d, shapes, kind, meta, split_axis=split_axis),
+                    extract_qkvg_child(grad2d, shapes, kind, meta, split_axis=split_axis),
                     child_state,
                     group,
                     child_meta.param_config,
@@ -1381,27 +1531,29 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     _commit_update,
                 )
             )
+        if not children:
+            raise RuntimeError(
+                "[MUON_QKVG_SPLIT_NO_LOCAL_CHILDREN] "
+                f"param_uid={meta.param_uid} param_name={getattr(meta, 'param_name', '')} "
+                f"split_axis={split_axis} split_shapes={shapes}"
+            )
         return children
 
-    def _expand_gdn(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, shapes, split_axis):
+    def _expand_gdn(self, param2d, grad2d, state, group, meta, parent_shape, shapes, split_axis):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = self._include_empty_split_child(meta)
         for kind in iter_gdn_child_kinds():
-            has_overlap = gdn_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
-            if not has_overlap and not include_empty:
+            global_shape, layouts = self._gdn_child_layouts(meta, shapes, kind, split_axis, create_group=False)
+            if layouts is None:
                 continue
-            child_shape = (
-                gdn_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis)
-                if has_overlap
-                else self._empty_split_child_shape(parent_shape, split_axis)
-            )
-            global_shape = gdn_child_global_shape(parent_global_shape, shapes, kind, split_axis=split_axis)
-            child_momentum = (
-                extract_gdn_child(parent_momentum, shapes, kind, meta, split_axis=split_axis)
-                if has_overlap
-                else parent_momentum.new_empty(child_shape)
-            )
+            has_overlap = gdn_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
+            if not has_overlap:
+                raise RuntimeError(
+                    "[MUON_GDN_CHILD_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={kind}"
+                )
+            child_shape = gdn_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis)
+            child_momentum = extract_gdn_child(parent_momentum, shapes, kind, meta, split_axis=split_axis)
             child_state = self._child_state(child_momentum, child_shape, global_shape)
             child_meta = self._child_meta(
                 meta,
@@ -1414,6 +1566,8 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 optim_group=group,
                 gdn_shapes=shapes,
                 split_axis=split_axis,
+                fs_layout=layouts[0],
+                tp_layout=layouts[1],
             )
 
             def _commit_update(
@@ -1422,21 +1576,14 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 *,
                 child_kind=kind,
                 parent_momentum=parent_momentum,
-                has_local_overlap=has_overlap,
             ):
-                if not has_local_overlap:
-                    return
                 scatter_gdn_child_(param2d, updated_param, shapes, child_kind, meta, split_axis=split_axis)
                 scatter_gdn_child_(parent_momentum, updated_momentum, shapes, child_kind, meta, split_axis=split_axis)
 
             children.append(
                 self._step_param(
-                    extract_gdn_child(param2d, shapes, kind, meta, split_axis=split_axis)
-                    if has_overlap
-                    else param2d.new_empty(child_shape),
-                    extract_gdn_child(grad2d, shapes, kind, meta, split_axis=split_axis)
-                    if has_overlap
-                    else grad2d.new_empty(child_shape),
+                    extract_gdn_child(param2d, shapes, kind, meta, split_axis=split_axis),
+                    extract_gdn_child(grad2d, shapes, kind, meta, split_axis=split_axis),
                     child_state,
                     group,
                     child_meta.param_config,
@@ -1444,14 +1591,29 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     _commit_update,
                 )
             )
+        if not children:
+            raise RuntimeError(
+                "[MUON_GDN_SPLIT_NO_LOCAL_CHILDREN] "
+                f"param_uid={meta.param_uid} param_name={getattr(meta, 'param_name', '')} "
+                f"split_axis={split_axis} split_shapes={shapes}"
+            )
         return children
 
-    def _expand_linear(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, rows, split_axis):
+    def _expand_linear(self, param2d, grad2d, state, group, meta, parent_shape, rows, split_axis):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = self._include_empty_split_child(meta)
         child_kinds = resolve_linear_child_kinds(optimizer_state=state, dist_meta=meta)
         for kind in iter_linear_child_kinds(child_kinds):
+            global_shape, layouts = self._linear_child_layouts(
+                meta,
+                rows,
+                kind,
+                child_kinds,
+                split_axis,
+                create_group=False,
+            )
+            if layouts is None:
+                continue
             has_overlap = linear_child_has_local_overlap(
                 rows,
                 meta,
@@ -1459,38 +1621,26 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 split_axis=split_axis,
                 child_kinds=child_kinds,
             )
-            if not has_overlap and not include_empty:
-                continue
-            child_shape = (
-                linear_child_local_shape(
-                    parent_shape,
-                    rows,
-                    meta,
-                    kind,
-                    split_axis=split_axis,
-                    child_kinds=child_kinds,
+            if not has_overlap:
+                raise RuntimeError(
+                    "[MUON_LINEAR_CHILD_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={kind}"
                 )
-                if has_overlap
-                else self._empty_split_child_shape(parent_shape, split_axis)
-            )
-            global_shape = linear_child_global_shape(
-                parent_global_shape,
+            child_shape = linear_child_local_shape(
+                parent_shape,
                 rows,
+                meta,
                 kind,
                 split_axis=split_axis,
                 child_kinds=child_kinds,
             )
-            child_momentum = (
-                read_linear_child(
-                    parent_momentum,
-                    rows,
-                    meta,
-                    kind,
-                    split_axis=split_axis,
-                    child_kinds=child_kinds,
-                )
-                if has_overlap
-                else parent_momentum.new_empty(child_shape)
+            child_momentum = read_linear_child(
+                parent_momentum,
+                rows,
+                meta,
+                kind,
+                split_axis=split_axis,
+                child_kinds=child_kinds,
             )
             child_state = self._child_state(child_momentum, child_shape, global_shape)
             child_meta = self._child_meta(
@@ -1505,6 +1655,8 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 linear_rows=rows,
                 linear_child_kinds=child_kinds,
                 split_axis=split_axis,
+                fs_layout=layouts[0],
+                tp_layout=layouts[1],
             )
 
             def _commit_update(
@@ -1513,10 +1665,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 *,
                 child_kind=kind,
                 parent_momentum=parent_momentum,
-                has_local_overlap=has_overlap,
             ):
-                if not has_local_overlap:
-                    return
                 write_linear_child_(
                     param2d,
                     updated_param,
@@ -1545,9 +1694,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                         kind,
                         split_axis=split_axis,
                         child_kinds=child_kinds,
-                    )
-                    if has_overlap
-                    else param2d.new_empty(child_shape),
+                    ),
                     read_linear_child(
                         grad2d,
                         rows,
@@ -1555,15 +1702,19 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                         kind,
                         split_axis=split_axis,
                         child_kinds=child_kinds,
-                    )
-                    if has_overlap
-                    else grad2d.new_empty(child_shape),
+                    ),
                     child_state,
                     group,
                     child_meta.param_config,
                     child_meta,
                     _commit_update,
                 )
+            )
+        if not children:
+            raise RuntimeError(
+                "[MUON_LINEAR_SPLIT_NO_LOCAL_CHILDREN] "
+                f"param_uid={meta.param_uid} param_name={getattr(meta, 'param_name', '')} "
+                f"split_axis={split_axis} split_rows={rows}"
             )
         return children
 
@@ -1583,6 +1734,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             fs_mode=getattr(self, "_fs_mode", "blockwise"),
             tp_mode=getattr(self, "_tp_mode", "blockwise"),
             ns_backend=getattr(self, "_ns_backend", "standard"),
+            rank_cache=self._muon_group_rank_cache,
         )
 
     def _route_step_params(self):
@@ -1604,17 +1756,18 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             self._muon_matrix_param_cache = cached
         return cached
 
-    def _stack_updates(self, updates, indices, *, name: str):
+    def _update_batch(self, updates, indices, *, name: str):
         if not indices:
             raise RuntimeError("[MUON_EMPTY_STACK_INDICES]")
         first = updates[indices[0]]
         shape = (len(indices), *tuple(first.shape))
         key = (str(name), shape, first.dtype, first.device)
-        stacked = self._muon_stack_cache.get(key)
+        stacked = self._muon_buffers.get(key)
         if stacked is None:
             stacked = torch.empty(shape, dtype=first.dtype, device=first.device)
-            self._muon_stack_cache[key] = stacked
-        torch.stack([updates[index].contiguous() for index in indices], dim=0, out=stacked)
+            self._muon_buffers[key] = stacked
+        for row, index in enumerate(indices):
+            stacked[row].copy_(updates[index])
         return stacked
 
     def _weight_decay_factor(self, group) -> float:
@@ -1708,6 +1861,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
     def _orthogonalize_2d(self, update, entry, meta=None):
         meta = entry.dist_meta if meta is None else meta
         cfg = entry.config
+        row_sizes = self._row_sizes(meta)
         matrix_count = int(update.size(0)) if update.ndim > 2 else 1
         elapsed_ms = None
         if bool(getattr(self, "_muon_profile_ns", False)) and update.is_cuda:
@@ -1727,6 +1881,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             fs_partition_dim=int(getattr(meta, "fs_shard_dim", -1)),
             tp_group=getattr(meta, "tp_group", None),
             tp_partition_dim=int(getattr(meta, "tp_shard_dim", -1)),
+            row_partition_sizes=row_sizes,
             gram_restart_iterations=cfg.gram_restart_iterations,
             gram_dtype=cfg.gram_dtype,
             gram_kernel_policy=cfg.gram_kernel_policy,
@@ -1766,16 +1921,42 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             cfg.scale_mode,
             float(cfg.extra_scale_factor),
             tuple(int(dim) for dim in getattr(meta, "global_shape", entry.global_shape)),
-            id(getattr(meta, "fs_group", None)),
+            _group_ranks(getattr(meta, "fs_group", None), self._muon_group_rank_cache),
             int(getattr(meta, "fs_shard_dim", -1)),
-            id(getattr(meta, "tp_group", None)),
+            _group_ranks(getattr(meta, "tp_group", None), self._muon_group_rank_cache),
             int(getattr(meta, "tp_shard_dim", -1)),
+            self._row_sizes(meta),
         )
+
+    @staticmethod
+    def _row_sizes(meta):
+        sizes = getattr(meta, "row_shard_sizes", None) or getattr(
+            meta, "tensor_row_shard_sizes", None
+        )
+        if sizes is None:
+            return None
+        split_axis = None
+        if bool(getattr(meta, "is_qkv_child", False)):
+            split_axis = int(getattr(meta, "qkv_split_axis", 0))
+        elif bool(getattr(meta, "is_qkvg_child", False)):
+            split_axis = int(getattr(meta, "qkvg_split_axis", 0))
+        elif bool(getattr(meta, "is_gdn_child", False)):
+            split_axis = int(getattr(meta, "gdn_split_axis", 0))
+        elif bool(getattr(meta, "is_linear_child", False)):
+            split_axis = int(getattr(meta, "linear_split_axis", 0))
+        if split_axis is not None:
+            global_shape = tuple(int(dim) for dim in getattr(meta, "global_shape", ()))
+            if len(global_shape) == 2:
+                row_axis = 1 if global_shape[0] > global_shape[1] else 0
+                if int(split_axis) != int(row_axis):
+                    return None
+        return tuple(int(size) for size in sizes)
 
     def _orthogonalize_2d_stacked(self, stacked_update, entries, metas):
         entry = entries[0]
         meta = metas[0]
         cfg = entry.config
+        row_sizes = self._row_sizes(meta)
         matrix_count = int(stacked_update.size(0))
         elapsed_ms = None
         if bool(getattr(self, "_muon_profile_ns", False)) and stacked_update.is_cuda:
@@ -1795,6 +1976,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             fs_partition_dim=int(getattr(meta, "fs_shard_dim", -1)),
             tp_group=getattr(meta, "tp_group", None),
             tp_partition_dim=int(getattr(meta, "tp_shard_dim", -1)),
+            row_partition_sizes=row_sizes,
             gram_restart_iterations=cfg.gram_restart_iterations,
             gram_dtype=cfg.gram_dtype,
             gram_kernel_policy=cfg.gram_kernel_policy,
@@ -1837,7 +2019,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 )
                 continue
 
-            stacked_update = self._stack_updates(updates, indices, name="muon_2d")
+            stacked_update = self._update_batch(updates, indices, name="muon_2d")
             stacked_result = self._orthogonalize_2d_stacked(
                 stacked_update,
                 tuple(entries[index] for index in indices),
@@ -1882,7 +2064,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             str(cfg.gram_dtype),
             shard_mode,
             self._axis_logical_shape(update, meta, shard_dim, shard_mode),
-            id(shard_group),
+            _group_ranks(shard_group, self._muon_group_rank_cache),
             int(shard_dim),
         )
 
@@ -2012,7 +2194,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     )
                 continue
 
-            batch_update = self._stack_updates(updates, indices, name="muon_axis")
+            batch_update = self._update_batch(updates, indices, name="muon_axis")
             first_meta = metas[indices[0]]
             batch_result = self._orthogonalize_stacked_unscaled(
                 batch_update,
@@ -2263,6 +2445,24 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         if int(meta.fs_shard_dim) != split_axis:
             return [_split_range(split_size, world_size, r) for r in range(world_size)]
 
+        row_sizes = getattr(meta, "row_shard_sizes", None) or getattr(
+            meta, "tensor_row_shard_sizes", None
+        )
+        if row_sizes is not None:
+            ranges = []
+            start = 0
+            for size in row_sizes:
+                end = start + int(size)
+                ranges.append((start, end))
+                start = end
+            if start != int(split_size) or len(ranges) != world_size:
+                raise RuntimeError(
+                    "[MUON_SPLIT_CHILD_FS_RANGE_MISMATCH] "
+                    f"param_uid={getattr(meta, 'param_uid', None)} split_size={split_size} "
+                    f"row_sizes={tuple(int(size) for size in row_sizes)} world_size={world_size}"
+                )
+            return ranges
+
         if bool(getattr(meta, "is_qkv_child", False)):
             shapes = tuple(int(dim) for dim in getattr(meta, "qkv_split_shapes"))
             child_kind = getattr(meta, "qkv_child_kind")
@@ -2388,10 +2588,23 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         else:
             padded_shape = list(tensor.shape)
             padded_shape[dim] = max_size
-            send = tensor.new_zeros(tuple(padded_shape))
+            send = tensor.new_empty(tuple(padded_shape))
             index = [slice(None)] * tensor.ndim
             index[dim] = slice(0, local_size)
             send[tuple(index)].copy_(tensor.contiguous())
+        if all(int(size) == int(max_size) for size in sizes) and hasattr(dist, "all_gather_into_tensor"):
+            leading = send.movedim(dim, 0).contiguous()
+            gathered = torch.empty(
+                (int(world_size) * int(max_size), *tuple(leading.shape[1:])),
+                dtype=send.dtype,
+                device=send.device,
+            )
+            dist.all_gather_into_tensor(gathered, leading, group=group)
+            output_shape = list(send.shape)
+            output_shape[dim] = int(max_size) * int(world_size)
+            gathered = gathered.movedim(0, dim).reshape(tuple(output_shape)).contiguous()
+            return (gathered, tuple(sizes)) if return_sizes else gathered
+
         gathered = [torch.empty_like(send) for _ in range(int(world_size))]
         dist.all_gather(gathered, send, group=group)
         shards = []
@@ -2473,7 +2686,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 )
                 scatter_list = []
                 for target_rank in range(int(fs_world_size)):
-                    send_updates = owned_results[0].new_zeros(
+                    send_updates = owned_results[0].new_empty(
                         (len(owned_indices), int(cap))
                     )
                     for row, (entry, update) in enumerate(zip(owned_entries, owned_results)):
@@ -2515,7 +2728,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 continue
             cap, _, _ = self._fs_capacity(entry)
             key = (
-                id(meta.fs_group),
+                _group_ranks(meta.fs_group, self._muon_group_rank_cache),
                 int(meta.fs_world_size),
                 int(meta.fs_rank),
                 int(meta.fs_shard_dim),
@@ -2545,11 +2758,24 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             params = [param for param, _ in prepared]
             updates = [update for _, update in prepared]
             self._apply_weight_decay_batch(params, group_entries)
-            send = updates[0].new_zeros((len(updates), int(cap)))
+            send = updates[0].new_empty((len(updates), int(cap)))
             for index, update in enumerate(updates):
                 send[index, : update.numel()].copy_(update.contiguous().view(-1))
-            gathered = [torch.empty_like(send) for _ in range(int(fs_world_size))]
-            dist.all_gather(gathered, send, group=fs_group)
+            if hasattr(dist, "all_gather_into_tensor"):
+                gathered_tensor = torch.empty(
+                    (int(fs_world_size), *tuple(send.shape)),
+                    dtype=send.dtype,
+                    device=send.device,
+                )
+                dist.all_gather_into_tensor(
+                    gathered_tensor.view(int(fs_world_size) * int(send.size(0)), int(send.size(1))),
+                    send,
+                    group=fs_group,
+                )
+                gathered = gathered_tensor.unbind(0)
+            else:
+                gathered = [torch.empty_like(send) for _ in range(int(fs_world_size))]
+                dist.all_gather(gathered, send, group=fs_group)
 
             fs_layouts = [self._fs_capacity(entry) for entry in group_entries]
             first_cap, first_ranges, first_other = fs_layouts[0]
@@ -2638,12 +2864,13 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             raise RuntimeError(
                 f"[MUON_FS_DISTRIBUTED_INVALID_RANK] fs_rank={rank} fs_world_size={world_size}"
             )
+        group_ranks = _group_ranks(group, self._muon_group_rank_cache)
 
         for entry in entries:
             meta = entry.dist_meta
             if int(getattr(meta, "fs_world_size", 1)) != world_size:
                 raise RuntimeError("[MUON_FS_DISTRIBUTED_MIXED_WORLD_SIZES]")
-            if getattr(meta, "fs_group", group) is not group:
+            if _group_ranks(getattr(meta, "fs_group", group), self._muon_group_rank_cache) != group_ranks:
                 raise RuntimeError("[MUON_FS_DISTRIBUTED_MIXED_GROUPS]")
             if int(getattr(meta, "fs_shard_dim", fs_dim)) != fs_dim:
                 raise RuntimeError("[MUON_FS_DISTRIBUTED_MIXED_SHARD_DIMS]")
@@ -2688,7 +2915,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                     )
                 )
                 key = (
-                    id(meta.tp_group),
+                    _group_ranks(meta.tp_group, self._muon_group_rank_cache),
                     int(tp_dim),
                     partition_sizes,
                     tuple(int(dim) for dim in update.shape),
@@ -2726,7 +2953,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
                 tp_partition_sizes[first_index] = gathered_sizes
                 continue
 
-            stacked = self._stack_updates(updates, indices, name="muon_tp_gather")
+            stacked = self._update_batch(updates, indices, name="muon_tp_gather")
             full_stacked, gathered_sizes = self._gather_axis(
                 stacked,
                 group=first_meta.tp_group,
@@ -2838,7 +3065,7 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         self._apply_muon_batches(batches)
         self._maybe_log_ns_profile()
         self._copy_main_params_to_model_params()
-        if not self.ddp_config.overlap_param_gather:
+        if self.ddp_config.use_megatron_fsdp or not self.ddp_config.overlap_param_gather:
             for model_chunk in self.model_chunks:
                 model_chunk.start_param_sync()
         return True
@@ -2871,7 +3098,9 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         """Build torch_dist-compatible Muon optimizer checkpoint state."""
         from ....dist_checkpointing.mapping import ShardedObject, ShardedTensor
 
-        del model_sharded_state_dict, sharding_type
+        del model_sharded_state_dict
+        if is_loading:
+            init_muon_state(self.optimizer)
         dp_rank = self.data_parallel_group.rank()
         dp_size = self.data_parallel_group.size()
         base_key = f"optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}"
@@ -2883,20 +3112,14 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
         state_replica_rank = 0 if state_replica_group is None else self._group_rank(state_replica_group)
         rp_group = getattr(self, "rp_group", None)
         rp_size = 1 if rp_group is None else self._group_size(rp_group)
-        state_owner_dp_rank = dp_rank
-        if state_replica_group is not None:
-            dp_ranks = self._get_group_ranks_for_checkpoint(self.data_parallel_group)
-            replica_ranks = self._get_group_ranks_for_checkpoint(state_replica_group)
-            if replica_ranks:
-                state_owner_dp_rank = int(dp_ranks.index(int(replica_ranks[0])))
-
+        state_type = resolve_muon_state_type(sharding_type, metadata)
         checkpoint_metadata = build_muon_checkpoint_metadata(
             dp_size=dp_size,
             fs_size=int(getattr(self, "fs_size", 1)),
             tp_size=int(tp_size),
             rp_size=int(rp_size),
             state_replica_size=int(state_replica_size),
-            requested_type=(metadata or {}).get("distrib_optim_sharding_type", "muon_rank_local_state"),
+            requested_type=state_type,
             topology_signature=self._muon_checkpoint_topology_signature(),
             backend_state_spec=self._require_matrix_backend().state_spec(),
         )
@@ -2913,13 +3136,13 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             checkpoint_metadata=checkpoint_metadata,
             sharded_object_cls=ShardedObject,
             sharded_tensor_cls=ShardedTensor,
-            state_rank_key=str(state_owner_dp_rank),
+            state_rank_key=str(dp_rank),
         )
 
     def load_state_dict(self, state_dict):
         if "muon_checkpoint_metadata" not in state_dict:
             return super().load_state_dict(state_dict)
-        metadata, _, common = split_distributed_checkpoint_state(state_dict)
+        metadata, param_state, common = split_distributed_checkpoint_state(state_dict)
         tp_group = self._resolve_muon_tp_group()
         tp_size = 1 if tp_group is None else self._group_size(tp_group)
         state_replica_group = getattr(self, "state_replica_group", None)
@@ -2936,14 +3159,15 @@ class DistributedMuonOptimizer(DistributedMatrixOptimizer):
             topology_signature=self._muon_checkpoint_topology_signature(),
             backend_state_spec=self._require_matrix_backend().state_spec(),
         )
-        result = super().load_state_dict(common)
-        _, param_state, _ = split_distributed_checkpoint_state(state_dict)
-        restore_muon_param_state_(
+        result = self._load_matrix_common_state_dict(common, label="Muon")
+        restore = restore_muon_param_state_(
             self.optimizer.param_groups,
             self.optimizer.state,
             param_state,
             self._muon_param_key,
         )
+        if int(restore.get("missing_state_entry", 0)) != 0:
+            raise RuntimeError(f"[Muon] incomplete checkpoint restore: {restore}")
         return result
 
 

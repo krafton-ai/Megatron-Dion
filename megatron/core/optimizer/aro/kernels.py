@@ -10,8 +10,8 @@ import torch.distributed as dist
 from torch import Tensor
 
 _GROUP_KEY_CACHE: dict[int, tuple[object, tuple[int, ...] | None]] = {}
-_UNIQUE_GROUPS_CACHE: dict[tuple[int, ...], tuple] = {}
-_VALIDATE_SCQR_OUTPUTS = os.getenv("MEGATRON_ARO_VALIDATE_SCQR", "0") == "1"
+_UNIQUE_GROUPS_CACHE: dict[tuple[int, ...], tuple[tuple[object, ...], tuple]] = {}
+_VALIDATE_SCQR_OUTPUTS = os.getenv("MEGATRON_ARO_VALIDATE_SCQR", "1") != "0"
 
 
 def _validate_scqr_outputs() -> bool:
@@ -68,10 +68,15 @@ def _group_key(group):
 
 def _unique_groups(groups: Iterable) -> tuple:
     if isinstance(groups, tuple):
+        group_tuple = groups
         cache_key = tuple(id(group) for group in groups)
         cached = _UNIQUE_GROUPS_CACHE.get(cache_key)
         if cached is not None:
-            return cached
+            cached_groups, cached_unique = cached
+            if len(cached_groups) == len(group_tuple) and all(
+                old is new for old, new in zip(cached_groups, group_tuple)
+            ):
+                return cached_unique
     else:
         cache_key = None
     result = []
@@ -86,18 +91,30 @@ def _unique_groups(groups: Iterable) -> tuple:
         result.append(group)
     unique = tuple(result)
     if cache_key is not None:
-        _UNIQUE_GROUPS_CACHE[cache_key] = unique
+        _UNIQUE_GROUPS_CACHE[cache_key] = (group_tuple, unique)
     return unique
 
 
 def _all_reduce_sum_unique_(tensor: Tensor, groups: Iterable) -> Tensor:
-    for group in groups:
+    for group in _unique_groups(groups):
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
     return tensor
 
 
+def _all_reduce_min_unique_(tensor: Tensor, groups: Iterable) -> Tensor:
+    for group in _unique_groups(groups):
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=group)
+    return tensor
+
+
+def _all_reduce_max_unique_(tensor: Tensor, groups: Iterable) -> Tensor:
+    for group in _unique_groups(groups):
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=group)
+    return tensor
+
+
 def _all_reduce_sum_(tensor: Tensor, groups: Iterable) -> Tensor:
-    return _all_reduce_sum_unique_(tensor, _unique_groups(groups))
+    return _all_reduce_sum_unique_(tensor, groups)
 
 
 def _target_numel_tensor(
@@ -162,10 +179,50 @@ def _gather_rows(tensor: Tensor, group) -> tuple[Tensor, tuple[int, ...]]:
     return torch.cat(shards, dim=0), row_sizes
 
 
+def _gather_batch(tensor: Tensor, group) -> tuple[Tensor, tuple[int, ...]]:
+    world_size = _group_size(group)
+    if group is None or world_size <= 1:
+        return tensor, (int(tensor.size(1)),)
+    local_rows = torch.tensor([int(tensor.size(1))], dtype=torch.int64, device=tensor.device)
+    row_sizes_t = [torch.empty_like(local_rows) for _ in range(world_size)]
+    dist.all_gather(row_sizes_t, local_rows, group=group)
+    row_sizes = tuple(int(item.item()) for item in row_sizes_t)
+    max_rows = max(row_sizes)
+    if int(local_rows.item()) == max_rows:
+        send = tensor.contiguous()
+    else:
+        send = tensor.new_empty((int(tensor.size(0)), max_rows, int(tensor.size(2))))
+        if int(local_rows.item()) > 0:
+            send[:, : int(local_rows.item()), :].copy_(tensor.contiguous())
+    if hasattr(dist, "all_gather_into_tensor"):
+        gathered = torch.empty(
+            (world_size, *tuple(send.shape)),
+            dtype=send.dtype,
+            device=send.device,
+        )
+        dist.all_gather_into_tensor(
+            gathered.view(world_size * int(send.size(0)), int(send.size(1)), int(send.size(2))),
+            send,
+            group=group,
+        )
+        gathered = gathered.unbind(0)
+    else:
+        gathered = [torch.empty_like(send) for _ in range(world_size)]
+        dist.all_gather(gathered, send, group=group)
+    shards = [shard[:, :rows, :] for shard, rows in zip(gathered, row_sizes)]
+    return torch.cat(shards, dim=1), row_sizes
+
+
 def _slice_gathered_rows(tensor: Tensor, row_sizes: Sequence[int], rank: int) -> Tensor:
     start = sum(int(size) for size in row_sizes[: int(rank)])
     end = start + int(row_sizes[int(rank)])
     return tensor[start:end, :].contiguous()
+
+
+def _slice_batch(tensor: Tensor, row_sizes: Sequence[int], rank: int) -> Tensor:
+    start = sum(int(size) for size in row_sizes[: int(rank)])
+    end = start + int(row_sizes[int(rank)])
+    return tensor[:, start:end, :].contiguous()
 
 
 def _gather_rows_across_groups(tensor: Tensor, groups: Iterable) -> tuple[Tensor, tuple]:
@@ -178,10 +235,27 @@ def _gather_rows_across_groups(tensor: Tensor, groups: Iterable) -> tuple[Tensor
     return gathered, tuple(contexts)
 
 
+def _gather_batch_all(tensor: Tensor, groups: Iterable) -> tuple[Tensor, tuple]:
+    contexts = []
+    gathered = tensor
+    for group in _unique_groups(groups):
+        rank = dist.get_rank(group)
+        gathered, row_sizes = _gather_batch(gathered, group)
+        contexts.append((row_sizes, rank))
+    return gathered, tuple(contexts)
+
+
 def _slice_rows_across_groups(tensor: Tensor, contexts: Sequence) -> Tensor:
     local = tensor
     for row_sizes, rank in reversed(tuple(contexts)):
         local = _slice_gathered_rows(local, row_sizes, rank)
+    return local.contiguous()
+
+
+def _slice_batch_all(tensor: Tensor, contexts: Sequence) -> Tensor:
+    local = tensor
+    for row_sizes, rank in reversed(tuple(contexts)):
+        local = _slice_batch(local, row_sizes, rank)
     return local.contiguous()
 
 
@@ -201,7 +275,6 @@ def sinkhorn_project(
     in the ARO paper's Sinkhorn step is chosen so that the global output RMS is
     one after each iteration.
     """
-    y = x
     col_groups = _unique_groups(column_groups)
     if target_numel is None:
         target_numel = _target_numel(
@@ -212,19 +285,20 @@ def sinkhorn_project(
         )
     num_iters = int(iters)
     if num_iters <= 0:
-        return y
+        return x
+    y = x.clone()
     for _ in range(num_iters):
         y32 = y.float()
         sq = y32.square()
         row_sq = sq.sum(dim=1, keepdim=True)
         _all_reduce_sum_unique_(row_sq, col_groups)
         col_sq = sq.sum(dim=0, keepdim=True)
-        y = y * row_sq.clamp_min(float(eps)).rsqrt().to(dtype=y.dtype)
-        y = y * col_sq.clamp_min(float(eps)).rsqrt().to(dtype=y.dtype)
+        y.mul_(row_sq.clamp_min(float(eps)).rsqrt().to(dtype=y.dtype))
+        y.mul_(col_sq.clamp_min(float(eps)).rsqrt().to(dtype=y.dtype))
     norm_sq = y.float().square().sum()
     _all_reduce_sum_unique_(norm_sq, col_groups)
     factor = target_numel.sqrt() * norm_sq.clamp_min(float(eps) * float(eps)).rsqrt()
-    y = y * factor.to(dtype=y.dtype)
+    y.mul_(factor.to(dtype=y.dtype))
     return y
 
 
@@ -244,7 +318,6 @@ def sinkhorn_project_batched(
     """
     if x.ndim != 3:
         raise RuntimeError(f"[ARO_BATCHED_SINKHORN_REQUIRES_3D] shape={tuple(x.shape)}")
-    y = x
     col_groups = _unique_groups(column_groups)
     if column_counts is None:
         column_counts = tuple(int(x.size(2)) for _ in range(int(x.size(0))))
@@ -264,23 +337,31 @@ def sinkhorn_project_batched(
         )
     num_iters = int(iters)
     if num_iters <= 0:
-        return y
+        return x
+    y = x.clone()
     for _ in range(num_iters):
         y32 = y.float()
         sq = y32.square()
         row_sq = sq.sum(dim=2, keepdim=True)
         _all_reduce_sum_unique_(row_sq, col_groups)
         col_sq = sq.sum(dim=1, keepdim=True)
-        y = y * row_sq.clamp_min(float(eps)).rsqrt().to(dtype=y.dtype)
-        y = y * col_sq.clamp_min(float(eps)).rsqrt().to(dtype=y.dtype)
+        y.mul_(row_sq.clamp_min(float(eps)).rsqrt().to(dtype=y.dtype))
+        y.mul_(col_sq.clamp_min(float(eps)).rsqrt().to(dtype=y.dtype))
     norm_sq = y.float().square().sum(dim=(1, 2))
     _all_reduce_sum_unique_(norm_sq, col_groups)
     factors = target_numel.sqrt() * norm_sq.clamp_min(float(eps) * float(eps)).rsqrt()
-    y = y * factors.to(dtype=y.dtype).view(-1, 1, 1)
+    y.mul_(factors.to(dtype=y.dtype).view(-1, 1, 1))
     return y
 
 
 def _deterministic_qr(a: Tensor) -> Tensor:
+    q, r = torch.linalg.qr(a.float(), mode="reduced")
+    diag = torch.diagonal(r, 0, dim1=-2, dim2=-1)
+    signs = torch.where(diag < 0, -torch.ones_like(diag), torch.ones_like(diag))
+    return (q * signs.unsqueeze(-2)).to(dtype=a.dtype)
+
+
+def _batch_qr(a: Tensor) -> Tensor:
     q, r = torch.linalg.qr(a.float(), mode="reduced")
     diag = torch.diagonal(r, 0, dim1=-2, dim2=-1)
     signs = torch.where(diag < 0, -torch.ones_like(diag), torch.ones_like(diag))
@@ -292,14 +373,12 @@ def shifted_cholesky_qr(
     *,
     eps: float,
     row_groups: Iterable = (),
-    fallback_groups: Iterable = (),
     qr_backend: str = "scqr",
 ) -> Tensor:
     """Return the local rows of the SCQR/QR left factor for a row-sharded square matrix."""
     if a.ndim != 2:
         raise RuntimeError(f"[ARO_SCQR_REQUIRES_2D] shape={tuple(a.shape)}")
     row_groups = _unique_groups(row_groups)
-    fallback_groups = _unique_groups(fallback_groups)
     if qr_backend not in ("scqr", "qr"):
         raise RuntimeError(f"[ARO_INVALID_QR_BACKEND] qr_backend={qr_backend!r}")
 
@@ -327,6 +406,15 @@ def shifted_cholesky_qr(
                     failed = not bool(torch.isfinite(q_local).all().item())
         except RuntimeError:
             failed = True
+
+    if row_groups and _validate_scqr_outputs():
+        failed_flag = torch.tensor(
+            [1 if bool(failed) else 0],
+            dtype=torch.int32,
+            device=a.device,
+        )
+        _all_reduce_max_unique_(failed_flag, row_groups)
+        failed = bool(int(failed_flag.item()))
 
     if not failed and q_local is not None:
         return q_local
@@ -386,7 +474,6 @@ def _make_rotation_update(
         align,
         eps=float(config.scqr_eps),
         row_groups=row_groups,
-        fallback_groups=col_groups,
         qr_backend=str(config.qr_backend),
     )
     z_new = _rotation_times_x(new_rotation, x_rows, row_groups)
@@ -406,14 +493,34 @@ def _shifted_cholesky_qr_batched(
     *,
     eps: float,
     row_groups: Iterable = (),
-    fallback_groups: Iterable = (),
     qr_backend: str = "scqr",
+    row_counts: Optional[Sequence[int]] = None,
 ) -> Optional[Tensor]:
     """Return batched SCQR rows, or ``None`` when the caller must use fallback QR."""
     if a.ndim != 3:
         raise RuntimeError(f"[ARO_BATCHED_SCQR_REQUIRES_3D] shape={tuple(a.shape)}")
     row_groups = _unique_groups(row_groups)
-    fallback_groups = _unique_groups(fallback_groups)
+
+    def can_batch_qr() -> bool:
+        local_ok = row_counts is None or all(
+            int(count) == int(a.size(1)) for count in row_counts
+        )
+        ok = torch.tensor(
+            [1 if local_ok else 0],
+            dtype=torch.int32,
+            device=a.device,
+        )
+        _all_reduce_min_unique_(ok, row_groups)
+        return bool(int(ok.item()) == 1)
+
+    if qr_backend == "qr":
+        if not can_batch_qr():
+            return None
+        if row_groups:
+            full, row_contexts = _gather_batch_all(a, row_groups)
+            q_full = _batch_qr(full)
+            return _slice_batch_all(q_full, row_contexts).to(dtype=a.dtype)
+        return _batch_qr(a).to(dtype=a.dtype)
     if qr_backend != "scqr":
         return None
 
@@ -423,15 +530,34 @@ def _shifted_cholesky_qr_batched(
     gram.diagonal(dim1=-2, dim2=-1).add_(float(eps))
     chol, info = torch.linalg.cholesky_ex(gram, check_errors=False)
     if _validate_scqr_outputs() and bool((info != 0).any().item()):
-        return None
+        if not can_batch_qr():
+            return None
+        if row_groups:
+            full, row_contexts = _gather_batch_all(a, row_groups)
+            q_full = _batch_qr(full)
+            return _slice_batch_all(q_full, row_contexts).to(dtype=a.dtype)
+        return _batch_qr(a).to(dtype=a.dtype)
     q_local = torch.linalg.solve_triangular(
         chol.transpose(-2, -1),
         a32,
         upper=True,
         left=False,
     ).to(dtype=a.dtype)
-    if _validate_scqr_outputs() and not bool(torch.isfinite(q_local).all().item()):
-        return None
+    if _validate_scqr_outputs():
+        failed = torch.tensor(
+            [0 if bool(torch.isfinite(q_local).all().item()) else 1],
+            dtype=torch.int32,
+            device=a.device,
+        )
+        _all_reduce_max_unique_(failed, row_groups)
+        if int(failed.item()) != 0:
+            if not can_batch_qr():
+                return None
+            if row_groups:
+                full, row_contexts = _gather_batch_all(a, row_groups)
+                q_full = _batch_qr(full)
+                return _slice_batch_all(q_full, row_contexts).to(dtype=a.dtype)
+            return _batch_qr(a).to(dtype=a.dtype)
     return q_local
 
 
@@ -442,6 +568,7 @@ def _make_rotation_update_batched(
     config,
     row_groups: Iterable,
     column_groups: Iterable,
+    row_counts: Optional[Sequence[int]] = None,
     column_counts: Optional[Sequence[int]] = None,
     target_numel: Optional[Tensor] = None,
 ) -> Optional[tuple[Tensor, Tensor]]:
@@ -472,8 +599,8 @@ def _make_rotation_update_batched(
         align,
         eps=float(config.scqr_eps),
         row_groups=row_groups,
-        fallback_groups=col_groups,
         qr_backend=str(config.qr_backend),
+        row_counts=row_counts,
     )
     if new_rotation is None:
         return None
@@ -495,7 +622,7 @@ def _stack_padded(
     *,
     rows: int,
     cols: int,
-    cache: Optional[dict] = None,
+    buffers: Optional[dict] = None,
     name: str = "",
 ) -> Tensor:
     if not tensors:
@@ -505,12 +632,12 @@ def _stack_padded(
     shape = (len(tensors), rows, cols)
     first = tensors[0]
     result = None
-    if cache is not None:
+    if buffers is not None:
         key = (str(name), shape, first.dtype, first.device)
-        result = cache.get(key)
+        result = buffers.get(key)
         if result is None:
             result = first.new_empty(shape)
-            cache[key] = result
+            buffers[key] = result
     if all(int(tensor.size(0)) == rows and int(tensor.size(1)) == cols for tensor in tensors):
         if result is None:
             return torch.stack([tensor.contiguous() for tensor in tensors], dim=0)
@@ -558,10 +685,10 @@ def compute_aro_update(
     scale = float(getattr(config, "update_rms_scale", 0.2))
     if scale > 0.0:
         norm_sq = update.float().square().sum()
-        _all_reduce_sum_unique_(norm_sq, (*row_groups, *column_groups))
+        _all_reduce_sum_(norm_sq, (*row_groups, *column_groups))
         if target_numel_t is None:
             target_numel_t = update.new_tensor(float(update.numel()), dtype=torch.float32)
-            _all_reduce_sum_unique_(target_numel_t, (*row_groups, *column_groups))
+            _all_reduce_sum_(target_numel_t, (*row_groups, *column_groups))
         denom = norm_sq.sqrt().clamp_min(float(getattr(config, "scqr_eps", 1e-6)))
         update.mul_((scale * target_numel_t.sqrt() / denom).to(dtype=update.dtype))
     return update, new_rotation
@@ -576,7 +703,7 @@ def compute_aro_updates_batched(
     row_groups: Iterable = (),
     column_groups: Iterable = (),
     target_numels: Sequence[float] | Tensor | None = None,
-    stack_cache: Optional[dict] = None,
+    buffers: Optional[dict] = None,
 ) -> Optional[tuple[list[Tensor], list[Tensor]]]:
     """Compute same-invariant ARO updates with one batched Sinkhorn/SCQR path.
 
@@ -590,7 +717,8 @@ def compute_aro_updates_batched(
         raise RuntimeError(
             f"[ARO_BATCH_SIZE_MISMATCH] momentums={len(momentums)} rotations={len(rotations)}"
         )
-    if str(getattr(config, "qr_backend", "scqr")) != "scqr":
+    qr_backend = str(getattr(config, "qr_backend", "scqr"))
+    if qr_backend not in ("scqr", "qr"):
         return None
 
     row_groups = _unique_groups(row_groups)
@@ -615,12 +743,12 @@ def compute_aro_updates_batched(
     max_rows = max(int(shape[0]) for shape in x_shapes)
     max_cols = max(int(shape[1]) for shape in x_shapes)
     rot_cols = next(iter(global_rows))
-    x_batch = _stack_padded(x_rows_list, rows=max_rows, cols=max_cols, cache=stack_cache, name="x")
+    x_batch = _stack_padded(x_rows_list, rows=max_rows, cols=max_cols, buffers=buffers, name="x")
     rotation_batch = _stack_padded(
         rotations,
         rows=max_rows,
         cols=rot_cols,
-        cache=stack_cache,
+        buffers=buffers,
         name="rotation",
     )
     target_numel_t = None
@@ -636,6 +764,7 @@ def compute_aro_updates_batched(
         config=config,
         row_groups=row_groups,
         column_groups=column_groups,
+        row_counts=[shape[0] for shape in x_shapes],
         column_counts=[shape[1] for shape in x_shapes],
         target_numel=target_numel_t,
     )
@@ -645,7 +774,7 @@ def compute_aro_updates_batched(
     scale = float(getattr(config, "update_rms_scale", 0.2))
     if scale > 0.0:
         norm_sq = update_batch.float().square().sum(dim=(1, 2))
-        _all_reduce_sum_unique_(norm_sq, (*row_groups, *column_groups))
+        _all_reduce_sum_(norm_sq, (*row_groups, *column_groups))
         if target_numel_t is None:
             if len(set(x_shapes)) == 1:
                 rows, cols = x_shapes[0]
@@ -661,7 +790,7 @@ def compute_aro_updates_batched(
                     dtype=torch.float32,
                     device=update_batch.device,
                 )
-            _all_reduce_sum_unique_(target_numel_t, (*row_groups, *column_groups))
+            _all_reduce_sum_(target_numel_t, (*row_groups, *column_groups))
         denom = norm_sq.sqrt().clamp_min(float(getattr(config, "scqr_eps", 1e-6)))
         factors = (scale * target_numel_t.sqrt() / denom).to(dtype=update_batch.dtype)
         update_batch.mul_(factors.view(-1, 1, 1))

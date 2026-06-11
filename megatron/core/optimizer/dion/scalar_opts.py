@@ -63,9 +63,17 @@ def _adamw_update_foreach_chunk(
     grads_for_first_moment = [grad.to(dtype=first_moment_dtype) for grad in grads]
     torch._foreach_lerp_(first_moments, grads_for_first_moment, [1.0 - beta1] * batch_size)
 
-    grad_sq = torch._foreach_mul(grads_for_first_moment, grads_for_first_moment)
-    grad_sq = [grad.to(dtype=second_moment_dtype) for grad in grad_sq]
-    torch._foreach_lerp_(second_moments, grad_sq, [1.0 - beta2] * batch_size)
+    if first_moment_dtype == second_moment_dtype:
+        grads_for_second_moment = grads_for_first_moment
+    else:
+        grads_for_second_moment = [grad.to(dtype=second_moment_dtype) for grad in grads]
+    torch._foreach_mul_(second_moments, beta2)
+    torch._foreach_addcmul_(
+        second_moments,
+        grads_for_second_moment,
+        grads_for_second_moment,
+        value=1.0 - beta2,
+    )
 
     bias_correction1 = 1.0 - beta1**step
     bias_correction2 = 1.0 - beta2**step
@@ -133,6 +141,7 @@ def adamw_update_foreach(
         raise RuntimeError(f"[DION_INVALID_SCALAR_ADAMW_STEP] step={step}")
 
     dtype_bytes = max(first_moments[0].element_size(), second_moments[0].element_size())
+    dtype_bytes *= 4
     max_numel_per_chunk = max(1, _SCALAR_FOREACH_TEMP_BYTES_CAP // dtype_bytes)
 
     for start, end in _iter_chunk_ranges_by_numel(params, max_numel_per_chunk):

@@ -4,6 +4,8 @@ import math
 import torch
 from torch import Tensor
 
+_disable_compile = getattr(getattr(torch, "compiler", None), "disable", lambda fn: fn)
+
 def adjust_lr_rms_norm(lr, param_shape):
     """
     Adjust learning rate for constant element-wise RMS norm.
@@ -95,7 +97,7 @@ def create_param_batches(
 
     return batches
 
-@torch._dynamo.disable
+@_disable_compile
 def get_or_initialize_muon_state(optimizer_state_dict, param: Tensor) -> dict:
     """
     Get optimizer state for the given parameter tensor,

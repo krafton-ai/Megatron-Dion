@@ -77,6 +77,20 @@ def build_aro_optimizer(
         rotation_dtype=getattr(config, "aro_rotation_dtype", None),
     )
     use_distributed = bool(getattr(config, "use_distributed_optimizer", False))
+    if use_distributed and isinstance(param_groups, (list, tuple)):
+        groups = []
+        for group in param_groups:
+            if isinstance(group, dict):
+                group = dict(group)
+                if "split_parameters" in group:
+                    group.setdefault("aro_split_parameters", bool(group.pop("split_parameters")))
+                else:
+                    group.setdefault(
+                        "aro_split_parameters",
+                        bool(getattr(config, "aro_split_parameters", False)),
+                    )
+            groups.append(group)
+        param_groups = groups
     return MegatronAro(
         param_groups,
         lr=config.lr,
@@ -108,6 +122,7 @@ def build_aro_distributed_optimizer(
 
     config = kwargs.pop("config", None)
     pure_data_parallel_group = kwargs.pop("pure_data_parallel_group", None)
+    replica_dp_group = kwargs.pop("replica_dp_group", pure_data_parallel_group)
     pg_collection = kwargs.pop("pg_collection", None)
     is_expert_parallel = bool(kwargs.pop("is_expert_parallel", False))
     requested_fs_size = 1
@@ -129,6 +144,7 @@ def build_aro_distributed_optimizer(
             requested_fs_size,
             requested_rp_size,
             is_expert_parallel,
+            replica_dp_group=replica_dp_group,
             optimizer_name="ARO optimizer",
         )
         kwargs.setdefault("fully_shard_model_parallel_size", fs_size)

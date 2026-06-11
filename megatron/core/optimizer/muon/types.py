@@ -104,18 +104,6 @@ class MuonBatchEntry:
 
 
 @dataclass
-class MuonBatchGroup:
-    """One grouped Muon batch before concrete execution."""
-
-    entries: list[MuonBatchEntry] | None = None
-    sync_groups: Tuple[torch.distributed.ProcessGroup, ...] = ()
-    kernel_kind: str = "local"
-    fs_group: Optional[torch.distributed.ProcessGroup] = None
-    tp_group: Optional[torch.distributed.ProcessGroup] = None
-    batch_world_size: int = 1
-
-
-@dataclass
 class MuonDistMeta(MatrixDistMeta):
     """Muon-specific metadata layered on the matrix distributed invariant."""
 
@@ -152,11 +140,9 @@ class MuonBatch:
     batch_key: tuple = ()
     entries: Tuple[MuonBatchEntry, ...] = ()
     real_batch_size: int = 0
-    batch_cache_key: int = 0
     fs_mode: str = "blockwise"
     tp_mode: str = "blockwise"
     ns_backend: str = "standard"
-    batch_group: Optional[MuonBatchGroup] = None
     _params: Tuple[torch.Tensor | None, ...] = field(init=False, repr=False)
     _grads: Tuple[torch.Tensor | None, ...] = field(init=False, repr=False)
     _momentums: Tuple[torch.Tensor | None, ...] = field(init=False, repr=False)
@@ -221,7 +207,6 @@ class MuonBatch:
 __all__ = [
     "MuonBatch",
     "MuonBatchEntry",
-    "MuonBatchGroup",
     "MuonDistMeta",
     "MuonMixedPrecisionConfig",
     "MuonParamConfig",

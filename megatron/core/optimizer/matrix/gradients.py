@@ -29,6 +29,7 @@ class MatrixGradTransport:
 class MatrixGradRoute:
     """Bucket reduce-scatter layout for Matrix and mixed standard grads."""
 
+    layout_key: int
     group_size: int
     group_rank: int
     standard_shard_size: int
@@ -39,6 +40,7 @@ class MatrixGradRoute:
     standard_local_segments: tuple[tuple[int, int, int], ...]
     reduce_target_indices: torch.Tensor | None = None
     reduce_source_indices: torch.Tensor | None = None
+    use_bucket_grad: bool = False
 
 
 def _grad_buffer_key(shape, dtype, device):
@@ -193,8 +195,10 @@ def _get_grad_route(
             )
 
     cached = getattr(bucket, "_matrix_grad_route", None)
+    layout_key = id(matrix_layout)
     if (
         cached is not None
+        and int(cached.layout_key) == int(layout_key)
         and int(cached.group_size) == group_size
         and int(cached.group_rank) == group_rank
         and int(cached.standard_shard_size) == standard_shard_size
@@ -235,7 +239,7 @@ def _get_grad_route(
             f"bucket={getattr(bucket, 'bucket_id', -1)}"
         )
 
-    reduce_target_indices, reduce_source_indices = _build_grad_reduce_indices(
+    reduce_target_indices, reduce_source_indices, use_bucket_grad = _build_grad_reduce_indices(
         bucket=bucket,
         matrix_layout=matrix_layout,
         group_size=group_size,
@@ -246,6 +250,7 @@ def _get_grad_route(
     )
 
     route = MatrixGradRoute(
+        layout_key=int(layout_key),
         group_size=group_size,
         group_rank=group_rank,
         standard_shard_size=standard_shard_size,
@@ -256,8 +261,10 @@ def _get_grad_route(
         standard_local_segments=tuple(standard_local_segments),
         reduce_target_indices=reduce_target_indices,
         reduce_source_indices=reduce_source_indices,
+        use_bucket_grad=use_bucket_grad,
     )
     bucket._matrix_grad_route = route
+    bucket._matrix_grad_reduce_input_clear = True
     return route
 
 
@@ -286,7 +293,7 @@ def _build_grad_reduce_indices(
     matrix_numel: int,
     standard_numel: int,
     standard_rank_segments,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None, bool]:
     target_parts = []
     source_parts = []
     device = bucket.grad_data.device
@@ -351,8 +358,19 @@ def _build_grad_reduce_indices(
                         torch.arange(target_start, target_end, dtype=torch.long, device=device)
                     )
     if not source_parts:
-        return None, None
-    return torch.cat(target_parts), torch.cat(source_parts)
+        return None, None, False
+    target_indices = torch.cat(target_parts)
+    source_indices = torch.cat(source_parts)
+    expected_numel = int(group_size) * int(rank_numel)
+    if (
+        int(target_indices.numel()) == expected_numel
+        and int(source_indices.numel()) == expected_numel
+        and int(bucket.grad_data.numel()) == expected_numel
+    ):
+        expected = torch.arange(expected_numel, dtype=torch.long, device=device)
+        if torch.equal(target_indices, expected) and torch.equal(source_indices, expected):
+            return None, None, True
+    return target_indices, source_indices, False
 
 
 def _entry_grad_split_range(entry, group_rank: int) -> tuple[int, int]:
@@ -1064,10 +1082,9 @@ def wait_grad_transport(bucket) -> MatrixGradTransport | None:
         return None
     grad_reduce_handle = getattr(grad_transport, "grad_reduce_handle", None)
     if grad_reduce_handle is not None:
-        if type(grad_reduce_handle).__name__ != "_IllegalWork":
-            wait = getattr(grad_reduce_handle, "wait", None)
-            if wait is not None:
-                wait()
+        wait = getattr(grad_reduce_handle, "wait", None)
+        if wait is not None:
+            wait()
         grad_transport.grad_reduce_handle = None
     return grad_transport
 
@@ -1135,6 +1152,7 @@ def start_matrix_grad_sync(
     reduce_op,
     async_op: bool,
     reduce_scatter,
+    own_handle: bool = True,
 ):
     """Launch stock and Matrix bucket grad transport from the MCore bucket grad buffer."""
     clear_grad_transport(bucket)
@@ -1154,15 +1172,21 @@ def start_matrix_grad_sync(
     standard_grad = None
     if route.standard_numel > 0:
         standard_grad = bucket_grad[int(route.matrix_numel) : int(route.rank_numel)]
-    reduce_input = _get_bucket_grad_buffer(
-        bucket,
-        cache_attr="_matrix_grad_reduce_input_cache",
-        shape=(int(route.group_size) * int(route.rank_numel),),
-        dtype=bucket.grad_data.dtype,
-        device=bucket.grad_data.device,
-        zero_on_create=True,
-    )
-    _build_grad_reduce_input(bucket=bucket, route=route, reduce_input=reduce_input)
+    if bool(getattr(route, "use_bucket_grad", False)):
+        reduce_input = bucket.grad_data
+    else:
+        reduce_input = _get_bucket_grad_buffer(
+            bucket,
+            cache_attr="_matrix_grad_reduce_input_cache",
+            shape=(int(route.group_size) * int(route.rank_numel),),
+            dtype=bucket.grad_data.dtype,
+            device=bucket.grad_data.device,
+            zero_on_create=True,
+        )
+        if bool(getattr(bucket, "_matrix_grad_reduce_input_clear", False)):
+            reduce_input.zero_()
+            bucket._matrix_grad_reduce_input_clear = False
+        _build_grad_reduce_input(bucket=bucket, route=route, reduce_input=reduce_input)
     matrix_handle = reduce_scatter(
         bucket_grad,
         reduce_input,
@@ -1179,7 +1203,7 @@ def start_matrix_grad_sync(
             standard_grad=standard_grad,
             standard_segments=route.standard_local_segments,
             reduce_input=reduce_input,
-            grad_reduce_handle=matrix_handle,
+            grad_reduce_handle=matrix_handle if bool(own_handle) else None,
         ),
     )
     return matrix_handle

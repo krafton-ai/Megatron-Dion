@@ -5,7 +5,6 @@ from typing import Callable, Generator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import torch.distributed._functional_collectives as funcol
 from torch import Tensor
 
 from .kernels import (
@@ -366,11 +365,6 @@ def replicate_reduce_op(optimizer):
     return dist.ReduceOp.AVG if average_in_collective else dist.ReduceOp.SUM
 
 
-def low_rank_replicate_reduce_op():
-    """Return the reference Dion low-rank P/R replica reduction op."""
-    return dist.ReduceOp.AVG
-
-
 def _dist_is_initialized() -> bool:
     return not hasattr(dist, "is_initialized") or bool(dist.is_initialized())
 
@@ -482,12 +476,16 @@ def all_reduce_grads_across_replicas(
             handle.wait()
         return
 
-    reduced_grads = funcol.all_reduce_coalesced(
-        [grad if grad.is_contiguous() else grad.contiguous() for grad in grads],
-        reduceOp="avg" if op == dist.ReduceOp.AVG else "sum",
+    reduced_grads = [grad if grad.is_contiguous() else grad.contiguous() for grad in grads]
+    handle = dist.all_reduce_coalesced(
+        reduced_grads,
+        op=op,
         group=replicate_group,
+        async_op=True,
     )
     yield
+    if handle is not None:
+        handle.wait()
     for grad, reduced_grad in zip(grads, reduced_grads):
         if grad.data_ptr() != reduced_grad.data_ptr():
             grad.copy_(reduced_grad)
@@ -509,7 +507,7 @@ def all_reduce_batch_across_replicas(
     if replicate_group is None:
         return batch
 
-    del optimizer
+    op = replicate_reduce_op(optimizer)
     replicate_world_size = _process_group_world_size(replicate_group)
     if replicate_world_size is not None and replicate_world_size <= 1:
         return batch
@@ -517,7 +515,7 @@ def all_reduce_batch_across_replicas(
     if allow_in_place and batch.is_contiguous() and _dist_is_initialized():
         handle = dist.all_reduce(
             batch,
-            op=dist.ReduceOp.AVG,
+            op=op,
             group=replicate_group,
             async_op=True,
         )
@@ -526,8 +524,11 @@ def all_reduce_batch_across_replicas(
             handle.wait()
         return batch
 
-    reduced_batch = funcol.all_reduce(batch, reduceOp="avg", group=replicate_group)
+    reduced_batch = batch if allow_in_place and batch.is_contiguous() else batch.contiguous().clone()
+    handle = dist.all_reduce(reduced_batch, op=op, group=replicate_group, async_op=True)
     yield
+    if handle is not None:
+        handle.wait()
     return reduced_batch
 
 
@@ -575,6 +576,7 @@ def _q_batch_from_inputs(
     device: torch.device,
     *,
     optimizer=None,
+    name: str = "Q_batch",
 ) -> Tensor:
     if (
         direct_q_batch is not None
@@ -582,7 +584,7 @@ def _q_batch_from_inputs(
         and direct_q_batch.device == device
     ):
         return direct_q_batch
-    return _stack_tensors_as_dtype(q_inputs, dtype, optimizer=optimizer, name="Q_batch")
+    return _stack_tensors_as_dtype(q_inputs, dtype, optimizer=optimizer, name=name)
 
 
 def _common_matmul_layout(
@@ -1020,12 +1022,16 @@ def normalize_cols_async(
     q_norm_group = batch_group.q_norm_group
 
     if q_norm_group is not None:
-        col_sum_sq_real = funcol.all_reduce(
+        col_sum_sq_real = col_sum_sq_real.contiguous()
+        handle = dist.all_reduce(
             col_sum_sq_real,
-            reduceOp="sum",
+            op=dist.ReduceOp.SUM,
             group=q_norm_group,
+            async_op=True,
         )
         yield
+        if handle is not None:
+            handle.wait()
 
     q_new_real = normalize_columns(
         R_batch[:real_batch_size],
@@ -1188,6 +1194,7 @@ def run_low_rank_sync_async(
     batch_group: Optional[DionBatchGroup] = None,
     batch_collectives: Optional[DionBatchCollectives] = None,
     real_batch_size: Optional[int] = None,
+    batch_cache_key: int = 0,
     skip_p_replicate: bool = False,
     skip_r_replicate: bool = False,
 ) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
@@ -1247,24 +1254,31 @@ def run_low_rank_sync_async(
                 f"batch_size={batch_size} group_size={len(fs_collective.indices)}"
             )
 
-        P_single = funcol.reduce_scatter_tensor(
+        P_single = torch.empty_like(P_batch[:1])
+        handle = dist.reduce_scatter_tensor(
+            P_single,
             P_batch.contiguous(),
-            reduceOp="sum",
-            scatter_dim=0,
+            op=dist.ReduceOp.SUM,
             group=fs_group,
+            async_op=True,
         )
         yield
+        if handle is not None:
+            handle.wait()
 
         if (
             low_rank_replicate_group is not None
             and dist.get_world_size(low_rank_replicate_group) > 1
         ):
-            dist.all_reduce(
+            handle = dist.all_reduce(
                 P_single,
-                op=low_rank_replicate_reduce_op(),
+                op=replicate_reduce_op(optimizer),
                 group=low_rank_replicate_group,
+                async_op=True,
             )
             yield
+            if handle is not None:
+                handle.wait()
 
         fs_rank = int(fs_collective.rank)
         batch_indices = tuple(int(index) for index in fs_collective.indices)
@@ -1285,12 +1299,15 @@ def run_low_rank_sync_async(
                 )
             P_single = P_single.to(P_batch.dtype).contiguous()
 
-        P_batch = funcol.all_gather_tensor(
-            P_single.contiguous(),
-            gather_dim=0,
-            group=fs_group,
+        P_batch = torch.empty(
+            (int(fs_group_world), *tuple(P_single.shape[1:])),
+            device=P_single.device,
+            dtype=P_single.dtype,
         )
+        handle = dist.all_gather_into_tensor(P_batch, P_single.contiguous(), group=fs_group, async_op=True)
         yield
+        if handle is not None:
+            handle.wait()
         if sorted(batch_indices) != list(range(batch_size)):
             raise RuntimeError(
                 "[DION_FSONLY_GATHER_PERMUTATION_INVALID] "
@@ -1431,7 +1448,7 @@ def run_low_rank_sync_async(
                 pad = comm_world_size - (batch_size % comm_world_size)
                 padded_batch_size = batch_size + pad
                 P_padded = optimizer._cached_buffer(
-                    "replicated_p_padded",
+                    f"replicated_p_padded_{int(batch_cache_key)}",
                     (padded_batch_size, P_batch.size(1), P_batch.size(2)),
                     P_batch.dtype,
                     P_batch.device,
@@ -1444,7 +1461,7 @@ def run_low_rank_sync_async(
             comm_rank = dist.get_rank(comm_group)
             P_source_batch = P_batch
             P_ortho_batch = optimizer._cached_buffer(
-                "replicated_p_ortho_full",
+                f"replicated_p_ortho_full_{int(batch_cache_key)}",
                 P_batch.shape,
                 P_batch.dtype,
                 P_batch.device,
@@ -1453,13 +1470,17 @@ def run_low_rank_sync_async(
             for chunk_start in range(0, batch_size, comm_world_size):
                 chunk_end = chunk_start + comm_world_size
                 P_chunk = P_source_batch[chunk_start:chunk_end].contiguous()
-                P_single = funcol.reduce_scatter_tensor(
+                P_single = torch.empty_like(P_chunk[:1])
+                handle = dist.reduce_scatter_tensor(
+                    P_single,
                     P_chunk.contiguous(),
-                    reduceOp="avg",
-                    scatter_dim=0,
+                    op=replicate_reduce_op(optimizer),
                     group=comm_group,
+                    async_op=True,
                 )
                 yield
+                if handle is not None:
+                    handle.wait()
                 batch_index = chunk_start + comm_rank
                 if batch_index >= real_entry_count:
                     P_single.zero_()
@@ -1469,14 +1490,17 @@ def run_low_rank_sync_async(
                             P_single,
                             rcqr_oversample=optimizer.defaults["rcqr_oversample"],
                         )
-                P_single = P_single.to(P_chunk.dtype).contiguous()
-                P_chunk = funcol.all_gather_tensor(
+                P_single = P_single.to(P_source_batch.dtype).contiguous()
+                target = P_ortho_batch[chunk_start:chunk_end]
+                handle = dist.all_gather_into_tensor(
+                    target,
                     P_single.contiguous(),
-                    gather_dim=0,
                     group=comm_group,
+                    async_op=True,
                 )
                 yield
-                P_ortho_batch[chunk_start:chunk_end].copy_(P_chunk)
+                if handle is not None:
+                    handle.wait()
 
             P_batch = P_ortho_batch[:unpadded_batch_size]
     else:
@@ -1566,10 +1590,14 @@ def batch_dion_update_async(
     replicate_world_size = (
         dist.get_world_size(replicate_group) if replicate_group is not None else 1
     )
+    full_grad_reduced = int(
+        getattr(optimizer, "_dion_full_grad_reduced_before_step", -1)
+    ) == int(getattr(optimizer, "_step_count", 0)) - 1
     use_low_rank = (
         optimizer.use_low_rank_sync
         and replicate_world_size > 1
         and any(config.use_low_rank_sync for config in configs)
+        and not full_grad_reduced
     )
 
     active_grads = grads[:real_batch_size] if grads is not None else []
@@ -1630,7 +1658,7 @@ def batch_dion_update_async(
     cached_buffer = getattr(optimizer, "_cached_buffer", None)
     if cached_buffer is not None and M_for_matmul:
         M_batch = cached_buffer(
-            "M_batch",
+            f"M_batch_{int(batch_cache_key)}",
             (len(M_for_matmul), *tuple(M_for_matmul[0].shape)),
             dtype=M_for_matmul[0].dtype,
             device=M_for_matmul[0].device,
@@ -1644,6 +1672,7 @@ def batch_dion_update_async(
         M_batch.dtype,
         M_batch.device,
         optimizer=optimizer,
+        name=f"Q_batch_{int(batch_cache_key)}",
     )
     del q_inputs, direct_q_batch
 
@@ -1686,6 +1715,7 @@ def batch_dion_update_async(
             batch_group,
             batch_collectives,
             real_batch_size=real_batch_size,
+            batch_cache_key=batch_cache_key,
         )
     else:
         use_replicated_orthogonalize = (
@@ -1736,9 +1766,8 @@ def batch_dion_update_async(
 
                 for chunk_start in range(0, batch_size, replicate_world_size):
                     chunk_end = chunk_start + replicate_world_size
-                    P_chunk = P_source_batch[chunk_start:chunk_end].contiguous()
-                    P_single = P_chunk[replicate_rank : replicate_rank + 1].clone()
                     batch_index = chunk_start + replicate_rank
+                    P_single = P_source_batch[batch_index : batch_index + 1].clone()
                     if batch_index >= real_entry_count:
                         P_single.zero_()
                     else:
@@ -1747,14 +1776,17 @@ def batch_dion_update_async(
                                 P_single,
                                 rcqr_oversample=optimizer.defaults["rcqr_oversample"],
                             )
-                    P_single = P_single.to(P_chunk.dtype).contiguous()
-                    P_chunk = funcol.all_gather_tensor(
+                    P_single = P_single.to(P_source_batch.dtype).contiguous()
+                    target = P_ortho_batch[chunk_start:chunk_end]
+                    handle = dist.all_gather_into_tensor(
+                        target,
                         P_single.contiguous(),
-                        gather_dim=0,
                         group=replicate_group,
+                        async_op=True,
                     )
                     yield
-                    P_ortho_batch[chunk_start:chunk_end].copy_(P_chunk)
+                    if handle is not None:
+                        handle.wait()
 
                 P_batch = P_ortho_batch[:unpadded_batch_size]
         else:
@@ -1793,13 +1825,17 @@ def batch_dion_update_async(
                             f"fs_rank={fs_rank} group_size={len(fs_collective.indices)}"
                         )
 
-                    P_single = funcol.reduce_scatter_tensor(
+                    P_single = torch.empty_like(P_batch[:1])
+                    handle = dist.reduce_scatter_tensor(
+                        P_single,
                         P_batch.contiguous(),
-                        reduceOp="sum",
-                        scatter_dim=0,
+                        op=dist.ReduceOp.SUM,
                         group=fs_group,
+                        async_op=True,
                     )
                     yield
+                    if handle is not None:
+                        handle.wait()
 
                     batch_indices = tuple(int(index) for index in fs_collective.indices)
                     rank_index = batch_indices[fs_rank]
@@ -1814,12 +1850,15 @@ def batch_dion_update_async(
                             )
                     P_single = P_single.to(P_batch.dtype).contiguous()
 
-                    P_batch = funcol.all_gather_tensor(
-                        P_single.contiguous(),
-                        gather_dim=0,
-                        group=fs_group,
+                    P_batch = torch.empty(
+                        (int(fs_world_size), *tuple(P_single.shape[1:])),
+                        device=P_single.device,
+                        dtype=P_single.dtype,
                     )
+                    handle = dist.all_gather_into_tensor(P_batch, P_single.contiguous(), group=fs_group, async_op=True)
                     yield
+                    if handle is not None:
+                        handle.wait()
                     if sorted(batch_indices) != list(range(batch_size)):
                         raise RuntimeError(
                             "[DION_FSONLY_GATHER_PERMUTATION_INVALID] "

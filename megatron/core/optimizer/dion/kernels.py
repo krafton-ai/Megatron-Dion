@@ -129,7 +129,9 @@ def apply_error_feedback(
     active_configs = configs[:active_batch_size]
     active_P = P_batch[:active_batch_size]
     active_R = R_batch[:active_batch_size]
-    mu = groups[0].get("mu", default_mu)
+    mu = float(groups[0].get("mu", default_mu))
+    if mu == 1.0:
+        return
 
     is_transposed = active_configs[0].is_transposed
     if all(c.is_transposed == is_transposed for c in active_configs):
@@ -192,7 +194,8 @@ def fix_all_zero_or_nan(
         )
     R_active.nan_to_num_()
     R_active.mul_(not_all_zero)
-    R_active.add_(q_clean * is_all_zero)
+    q_clean.mul_(is_all_zero)
+    R_active.add_(q_clean)
 
     return P_batch, R_batch
 

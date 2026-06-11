@@ -52,6 +52,21 @@ from ..matrix.splits.qkvg import (
 )
 
 logger = logging.getLogger(__name__)
+_SCALAR_FOREACH_TEMP_BYTES_CAP = 128 * 1024 * 1024
+
+
+def _chunk_ranges(params: List[torch.Tensor], max_numel: int):
+    start = 0
+    chunk_numel = 0
+    for idx, param in enumerate(params):
+        numel = int(param.numel())
+        if idx > start and chunk_numel + numel > int(max_numel):
+            yield start, idx
+            start = idx
+            chunk_numel = 0
+        chunk_numel += numel
+    if start < len(params):
+        yield start, len(params)
 
 
 def _tp_group_for_param(
@@ -156,7 +171,7 @@ class MegatronMuon(torch.optim.AdamW):
         self.pg_collection = pg_collection
 
     def _init_state(self, param: torch.Tensor, state: dict, group: dict) -> None:
-        if is_muon_matrix_param(param):
+        if group.get("algorithm", "muon") == "muon" and is_muon_matrix_param(param):
             init_matrix_state(param, state)
             return
         init_scalar_state(param=param, state=state)
@@ -382,31 +397,50 @@ class MegatronMuon(torch.optim.AdamW):
 
         for indices in grouped.values():
             params = [items[index][0] for index in indices]
-            grads = [items[index][1] for index in indices]
-            states = [items[index][2] for index in indices]
-            exp_avgs = [state["exp_avg"] for state in states]
-            exp_avg_sqs = [state["exp_avg_sq"] for state in states]
-            step = int(states[0]["step"])
-            grads_for_state = [
-                grad.to(dtype=exp_avg.dtype) for grad, exp_avg in zip(grads, exp_avgs)
-            ]
-            torch._foreach_lerp_(exp_avgs, grads_for_state, [1.0 - beta1] * len(indices))
-            grad_sq = torch._foreach_mul(grads_for_state, grads_for_state)
-            grad_sq = [
-                item.to(dtype=exp_avg_sq.dtype) for item, exp_avg_sq in zip(grad_sq, exp_avg_sqs)
-            ]
-            torch._foreach_lerp_(exp_avg_sqs, grad_sq, [1.0 - beta2] * len(indices))
-            bias_correction1 = 1.0 - beta1**step
-            bias_correction2 = 1.0 - beta2**step
-            denom = torch._foreach_sqrt(exp_avg_sqs)
-            torch._foreach_div_(denom, math.sqrt(bias_correction2))
-            torch._foreach_add_(denom, [eps] * len(indices))
-            updates = torch._foreach_div(exp_avgs, denom)
-            torch._foreach_mul_(updates, lr / bias_correction1)
-            updates = [update.to(dtype=param.dtype) for update, param in zip(updates, params)]
-            if weight_decay > 0.0:
-                torch._foreach_mul_(params, 1.0 - lr * weight_decay)
-            torch._foreach_sub_(params, updates)
+            max_numel = max(
+                1,
+                _SCALAR_FOREACH_TEMP_BYTES_CAP // max(1, 4 * params[0].element_size()),
+            )
+            for start, end in _chunk_ranges(params, max_numel):
+                local = indices[start:end]
+                p = [items[index][0] for index in local]
+                grads = [items[index][1] for index in local]
+                states = [items[index][2] for index in local]
+                exp_avgs = [state["exp_avg"] for state in states]
+                exp_avg_sqs = [state["exp_avg_sq"] for state in states]
+                step = int(states[0]["step"])
+                grads_for_m = [
+                    grad.to(dtype=exp_avg.dtype) for grad, exp_avg in zip(grads, exp_avgs)
+                ]
+                torch._foreach_lerp_(exp_avgs, grads_for_m, [1.0 - beta1] * len(local))
+                if any(
+                    grad.dtype != exp_avg_sq.dtype
+                    for grad, exp_avg_sq in zip(grads_for_m, exp_avg_sqs)
+                ):
+                    grads_for_v = [
+                        grad.to(dtype=exp_avg_sq.dtype)
+                        for grad, exp_avg_sq in zip(grads, exp_avg_sqs)
+                    ]
+                else:
+                    grads_for_v = grads_for_m
+                torch._foreach_mul_(exp_avg_sqs, beta2)
+                torch._foreach_addcmul_(
+                    exp_avg_sqs,
+                    grads_for_v,
+                    grads_for_v,
+                    value=1.0 - beta2,
+                )
+                bias_correction1 = 1.0 - beta1**step
+                bias_correction2 = 1.0 - beta2**step
+                denom = torch._foreach_sqrt(exp_avg_sqs)
+                torch._foreach_div_(denom, math.sqrt(bias_correction2))
+                torch._foreach_add_(denom, [eps] * len(local))
+                updates = torch._foreach_div(exp_avgs, denom)
+                torch._foreach_mul_(updates, lr / bias_correction1)
+                updates = [update.to(dtype=param.dtype) for update, param in zip(updates, p)]
+                if weight_decay > 0.0:
+                    torch._foreach_mul_(p, 1.0 - lr * weight_decay)
+                torch._foreach_sub_(p, updates)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -417,12 +451,14 @@ class MegatronMuon(torch.optim.AdamW):
         for group in self.param_groups:
             scalar_items = []
             for param in group["params"]:
-                if param.grad is None:
-                    continue
                 grad = param.grad
+                if grad is None:
+                    grad = getattr(param, "decoupled_grad", None)
+                if grad is None:
+                    continue
                 state = self.state[param]
                 self._init_state(param, state, group)
-                if is_muon_matrix_param(param):
+                if group.get("algorithm", "muon") == "muon" and is_muon_matrix_param(param):
                     self._step_matrix_param(param, grad, state, group)
                 else:
                     scalar_items.append((param, grad, state))

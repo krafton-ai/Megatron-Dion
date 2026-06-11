@@ -378,9 +378,10 @@ def validate_enabled_rp_topology(
     if expected_rp_size <= 1:
         return
 
+    device = _collective_device()
     have_rp = torch.tensor(
         [1 if rp_group is not None else 0],
-        device=torch.cuda.current_device(),
+        device=device,
         dtype=torch.int64,
     )
     dist.all_reduce(have_rp, op=dist.ReduceOp.MIN, group=data_parallel_group)
@@ -401,7 +402,7 @@ def validate_enabled_rp_topology(
     my_dion_count = len(my_signature)
     my_cnt_tensor = torch.tensor(
         [my_dion_count],
-        device=torch.cuda.current_device(),
+        device=device,
         dtype=torch.int64,
     )
 

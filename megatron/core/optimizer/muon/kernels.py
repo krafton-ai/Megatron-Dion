@@ -363,7 +363,7 @@ def _gram_ns_core(
             q = None
 
         z = sym_baddmm(r, r, C=r, alpha=c, beta=b)
-        q = _add_identity_scaled_(z, a, alias_source=r) if q is None else sym_baddmm(q, z, C=q, beta=a)
+        q = _add_scaled_identity(z, a) if q is None else sym_baddmm(q, z, C=q, beta=a)
 
         if step < len(coeffs) - 1 and (step + 1) not in restarts:
             rz = sym_baddmm(r, z, C=r, beta=a)
@@ -702,10 +702,23 @@ def _all_gather_matrix(
     else:
         padded_shape = list(x.shape)
         padded_shape[matrix_dim] = max_size
-        send = x.new_zeros(tuple(padded_shape))
+        send = x.new_empty(tuple(padded_shape))
         index = [slice(None)] * x.ndim
         index[matrix_dim] = slice(0, local_size)
         send[tuple(index)].copy_(x.contiguous())
+    if all(int(size) == int(max_size) for size in sizes) and hasattr(dist, "all_gather_into_tensor"):
+        leading = send.movedim(matrix_dim, 0).contiguous()
+        gathered = torch.empty(
+            (int(world_size) * int(max_size), *tuple(leading.shape[1:])),
+            dtype=send.dtype,
+            device=send.device,
+        )
+        dist.all_gather_into_tensor(gathered, leading, group=tp_group)
+        output_shape = list(send.shape)
+        output_shape[matrix_dim] = int(max_size) * int(world_size)
+        gathered = gathered.movedim(0, matrix_dim).reshape(tuple(output_shape)).contiguous()
+        return (gathered, tuple(sizes)) if return_sizes else gathered
+
     gathered = [torch.empty_like(send) for _ in range(world_size)]
     dist.all_gather(gathered, send, group=tp_group)
     shards = []
@@ -792,7 +805,7 @@ def _scatter_duplicated_update(
             scatter_list = []
             offset = 0
             for size in sizes:
-                send_update = update.new_zeros(_padded_shape(update))
+                send_update = update.new_empty(_padded_shape(update))
                 shard = _slice_matrix_dim(
                     update,
                     matrix_dim=matrix_dim,
@@ -828,7 +841,7 @@ def _scatter_duplicated_update(
             scatter_list = []
             offset = 0
             for size in sizes:
-                send_update = owned_update.new_zeros(recv_shape)
+                send_update = owned_update.new_empty(recv_shape)
                 shard = _slice_matrix_dim(
                     owned_update,
                     matrix_dim=matrix_dim,
@@ -959,11 +972,10 @@ def newton_schulz_1d(
     )
 
 
-def _add_identity_scaled_(tensor: Tensor, scale: float, *, alias_source: Optional[Tensor] = None) -> Tensor:
-    if alias_source is not None and tensor.untyped_storage().data_ptr() == alias_source.untyped_storage().data_ptr():
-        tensor = tensor.clone()
-    tensor.diagonal(dim1=-2, dim2=-1).add_(scale)
-    return tensor
+def _add_scaled_identity(tensor: Tensor, scale: float, *, preserve_input: bool = True) -> Tensor:
+    result = tensor.clone() if preserve_input else tensor
+    result.diagonal(dim1=-2, dim2=-1).add_(scale)
+    return result
 
 
 def _form_gram(x: Tensor) -> Tensor:
@@ -1083,9 +1095,14 @@ def _gram_newton_schulz_impl(
                     q = None
 
                 z = ops.sym_baddmm(r, r, C=r, alpha=c, beta=b)
-                q = _add_identity_scaled_(z, a, alias_source=r) if q is None else ops.sym_baddmm(q, z, C=q, beta=a)
+                needs_z = step < len(coeffs) - 1 and (step + 1) not in restarts
+                q = (
+                    _add_scaled_identity(z, a, preserve_input=needs_z)
+                    if q is None
+                    else ops.sym_baddmm(q, z, C=q, beta=a)
+                )
 
-                if step < len(coeffs) - 1 and (step + 1) not in restarts:
+                if needs_z:
                     rz = ops.sym_baddmm(r, z, C=r, beta=a)
                     r = ops.sym_baddmm(z, rz, C=rz, beta=a)
             if q is None:
@@ -1118,9 +1135,14 @@ def _gram_newton_schulz_impl(
                     q = None
 
                 z = ops.sym_baddmm(r, r, C=r, alpha=c, beta=b)
-                q = _add_identity_scaled_(z, a, alias_source=r) if q is None else ops.sym_baddmm(q, z, C=q, beta=a)
+                needs_z = step < len(coeffs) - 1 and (step + 1) not in restarts
+                q = (
+                    _add_scaled_identity(z, a, preserve_input=needs_z)
+                    if q is None
+                    else ops.sym_baddmm(q, z, C=q, beta=a)
+                )
 
-                if step < len(coeffs) - 1 and (step + 1) not in restarts:
+                if needs_z:
                     rz = ops.sym_baddmm(r, z, C=r, beta=a)
                     r = ops.sym_baddmm(z, rz, C=rz, beta=a)
             if q is None:
@@ -1475,9 +1497,14 @@ def gram_newton_schulz_2d(
                 q = None
 
             z = ops.sym_baddmm(r, r, C=r, alpha=c, beta=b)
-            q = _add_identity_scaled_(z, a, alias_source=r) if q is None else ops.sym_baddmm(q, z, C=q, beta=a)
+            needs_z = step < len(coeffs) - 1 and (step + 1) not in restarts
+            q = (
+                _add_scaled_identity(z, a, preserve_input=needs_z)
+                if q is None
+                else ops.sym_baddmm(q, z, C=q, beta=a)
+            )
 
-            if step < len(coeffs) - 1 and (step + 1) not in restarts:
+            if needs_z:
                 rz = ops.sym_baddmm(r, z, C=r, beta=a)
                 r = ops.sym_baddmm(z, rz, C=rz, beta=a)
         if q is None:

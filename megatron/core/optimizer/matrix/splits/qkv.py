@@ -9,6 +9,7 @@ import torch
 from .axis import (
     axis_shape,
     axis_tensor,
+    clear_split_metadata,
     copy_split_axis,
     dist_meta_for_split_axis,
     get_split_axis_from_dist_meta,
@@ -138,14 +139,12 @@ def resolve_qkv_split_axis(
 
 def copy_qkv_split_metadata(destination_tensor: torch.Tensor, source_tensor: torch.Tensor) -> None:
     """Copy fused-QKV split metadata when the source tensor is tagged as QKV."""
+    clear_split_metadata(destination_tensor)
     if not is_qkv_param(source_tensor) and not hasattr(source_tensor, "qkv_split_shapes"):
         return
     destination_tensor.is_qkv = True
     destination_tensor.qkv_split_shapes = get_qkv_split_shapes(source_tensor)
     copy_split_axis(destination_tensor, source_tensor, "qkv_split_axis")
-    destination_tensor.is_qkvg = False
-    if hasattr(destination_tensor, "qkvg_split_shapes"):
-        delattr(destination_tensor, "qkvg_split_shapes")
 
 
 def qkv_child_name(parent_name: str, child_kind: str) -> str:
@@ -511,7 +510,7 @@ def extract_qkv_child(
     dist_meta=None,
     split_axis: int = 0,
 ) -> torch.Tensor:
-    """Read one Q/K/V child from a fused QKV tensor into a contiguous 2D tensor."""
+    """Read one Q/K/V child from a fused QKV tensor."""
     if tensor.ndim != 2:
         raise RuntimeError(
             "[MATRIX_QKV_READ_REQUIRES_2D] "
@@ -541,7 +540,7 @@ def extract_qkv_child(
     if len(segments) == 1:
         source_start, source_end, _, _ = segments[0]
         return original_tensor(
-            tensor_axis.narrow(0, source_start, source_end - source_start).contiguous(),
+            tensor_axis.narrow(0, source_start, source_end - source_start),
             split_axis,
         )
 
@@ -575,7 +574,7 @@ def scatter_qkv_child_(
     split_axis = normalize_split_axis(split_axis)
     axis_meta = dist_meta_for_split_axis(dist_meta, split_axis)
     dest_axis = axis_tensor(dest, split_axis)
-    child_axis = axis_tensor(child, split_axis).contiguous()
+    child_axis = axis_tensor(child, split_axis)
     rows, cols = int(dest_axis.size(0)), int(dest_axis.size(1))
     parent_row_start, parent_row_end = _parent_row_range(
         local_rows=rows,

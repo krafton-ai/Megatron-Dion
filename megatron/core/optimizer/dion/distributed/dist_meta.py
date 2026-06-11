@@ -182,8 +182,10 @@ def assert_context_parallel_excluded(*, label: str, group, extra: str = "") -> N
         )
 
 
-def get_expected_expert_fs_group():
+def resolve_expert_fs_group(group=None):
     """Return the authoritative Megatron-Core expert-local shard group."""
+    if group is not None:
+        return group
     group = parallel_state.get_expert_data_parallel_group(
         check_initialized=False,
         partial_expert_data_parallel=True,
@@ -196,30 +198,10 @@ def get_expected_expert_fs_group():
     return group
 
 
-def assert_same_group_ranks(*, label: str, actual_group, expected_group, extra: str = "") -> None:
-    """Fail fast when two runtime groups do not contain the same global-rank membership."""
-    actual_ranks = get_group_ranks(actual_group)
-    expected_ranks = get_group_ranks(expected_group)
-    if actual_ranks != expected_ranks:
-        raise RuntimeError(
-            f"[Dion][EP] {label} group mismatch: "
-            f"actual={actual_ranks} expected={expected_ranks}. {extra}".strip()
-        )
-
-
 def select_fs_group(*, model_param, fs_group):
     """Return the authoritative local-shard group for one model param."""
     if not getattr(model_param, "allreduce", True):
-        expert_group = get_expected_expert_fs_group()
-        assert_same_group_ranks(
-            label="expert param fs_group",
-            actual_group=fs_group,
-            expected_group=expert_group,
-            extra=(
-                f"param={getattr(model_param, '_param_name', '') or id(model_param)} "
-                "Dion EP must keep expert params on the standard expert-local DO shard group."
-            ),
-        )
+        expert_group = resolve_expert_fs_group(fs_group)
         assert_context_parallel_excluded(
             label="expert param fs_group",
             group=expert_group,

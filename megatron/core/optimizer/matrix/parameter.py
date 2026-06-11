@@ -11,7 +11,6 @@ from typing import Callable, Iterable, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from ...distributed.param_and_grad_buffer import _HandleGroup
 from ...fp8_utils import is_float8tensor
 from ...transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
 from .sharding import (
@@ -31,6 +30,9 @@ from .types import (
 from .utils import env_flag
 
 
+_CHECK_PARAM_VIEWS = env_flag("MATRIX_CHECK_PARAM_VIEWS", False)
+
+
 def prepare_matrix_params(module: torch.nn.Module) -> None:
     """Prepare local parameters for matrix optimizer routing."""
     for param in module.parameters():
@@ -40,10 +42,8 @@ def prepare_matrix_params(module: torch.nn.Module) -> None:
 def is_matrix_param(
     param: torch.Tensor,
     param_name: Optional[str] = None,
-    *,
-    include_embedding_and_lm_head: bool = False,
 ) -> bool:
-    """Return True iff this parameter should use Matrix FS sharding."""
+    """Return True iff this parameter can use Matrix FS sharding."""
     resolved_name = param_name or getattr(param, "_param_name", None)
     if getattr(param, "use_matrix", None) is False:
         return False
@@ -55,11 +55,6 @@ def is_matrix_param(
         return False
     if getattr(param, "average_gradients_across_tp_domain", False):
         return False
-    if not include_embedding_and_lm_head:
-        if getattr(param, "is_embedding_or_output_parameter", False):
-            return False
-        if getattr(param, "is_lm_head_parameter", False):
-            return False
     if is_float8tensor(param):
         return False
     if is_combined_grouped_mlp_param(param, resolved_name):
@@ -67,6 +62,14 @@ def is_matrix_param(
     if is_unindexed_multi_local_expert_param(param, resolved_name):
         return False
     return True
+
+
+def is_vocab_param(param: torch.Tensor) -> bool:
+    """Return whether this tensor is an embedding or LM-head weight."""
+    return bool(
+        getattr(param, "is_embedding_or_output_parameter", False)
+        or getattr(param, "is_lm_head_parameter", False)
+    )
 
 
 def is_moe_expert_param(param: torch.Tensor, param_name: Optional[str] = None) -> bool:
@@ -132,6 +135,7 @@ class ParamGatherBuffer:
 class MatrixParamGatherRoute:
     """Cached flat-index route for Matrix parameter gather/restore."""
 
+    layout_key: int
     group_size: int
     shard_size: int
     input_target_indices: torch.Tensor | None = None
@@ -756,6 +760,18 @@ class BucketGatherHandle:
         self._matrix_handle = None
 
 
+class HandleGroup:
+    """Waitable group for independent async handles."""
+
+    def __init__(self, handles):
+        self._handles = list(handles)
+
+    def wait(self):
+        for handle in self._handles:
+            handle.wait()
+        self._handles = []
+
+
 def assert_shard_aliased(
     *,
     optimizer,
@@ -879,7 +895,8 @@ def mark_matrix_bucket_params(
     param_to_name,
     fs_size,
     *,
-    include_embedding_and_lm_head: bool = False,
+    include_vocab: bool = False,
+    tp_group=None,
 ):
     """Classify bucket params and build static Matrix metadata once."""
     from ... import parallel_state
@@ -902,11 +919,9 @@ def mark_matrix_bucket_params(
             is_combined_grouped_mlp_param(param, param_name)
             or is_unindexed_multi_local_expert_param(param, param_name)
         )
-        param.is_matrix_param = is_matrix_param(
-            param,
-            param_name,
-            include_embedding_and_lm_head=include_embedding_and_lm_head,
-        )
+        param.is_matrix_param = is_matrix_param(param, param_name)
+        if param.is_matrix_param and not include_vocab and is_vocab_param(param):
+            param.is_matrix_param = False
         param.is_matrix_param = bool(param.is_matrix_param)
         if not param.is_matrix_param and fallback_to_scalar:
             param.matrix_optimizer_ready = False
@@ -914,10 +929,14 @@ def mark_matrix_bucket_params(
         is_expert = is_moe_expert_param(param, param_name)
         raw_tp_split_dim = get_tp_split_dim(param)
         has_tp = is_tp_enabled(param)
-        if is_expert and has_tp:
+        if not has_tp:
+            tp_world_size = 1
+        elif tp_group is not None and dist.is_initialized():
+            tp_world_size = dist.get_world_size(tp_group)
+        elif is_expert:
             tp_world_size = parallel_state.get_expert_tensor_parallel_world_size()
         else:
-            tp_world_size = parallel_state.get_tensor_model_parallel_world_size() if has_tp else 1
+            tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
         tp_shard_dim = raw_tp_split_dim if has_tp and tp_world_size > 1 else -1
 
         if not param.is_matrix_param:
@@ -1057,6 +1076,8 @@ def check_bucket_param_views(
     params: Optional[list[torch.nn.Parameter]] = None,
 ) -> None:
     """Verify bucket param views still alias the canonical bucket buffer."""
+    if not _CHECK_PARAM_VIEWS:
+        return
     if bucket is None or not getattr(bucket, "_tracks_matrix_param_views", False):
         return
     if getattr(bucket, "param_data", None) is None:
@@ -1111,6 +1132,13 @@ def attach_matrix_bucket_layout_(
                 "is not present in the current runtime bucket"
             )
     bucket.matrix_layout = matrix_layout
+    for attr in (
+        "_matrix_param_gather_route",
+        "_standard_param_gather_route",
+        "_matrix_grad_route",
+    ):
+        if hasattr(bucket, attr):
+            delattr(bucket, attr)
     for entry in matrix_layout.entries:
         optimizer._matrix_buckets_by_param[entry.param] = bucket
         optimizer._matrix_entries_by_param[entry.param] = entry
@@ -1230,8 +1258,10 @@ def _get_matrix_param_gather_route(
 ) -> MatrixParamGatherRoute:
     device = bucket.param_data.device
     cached = getattr(bucket, "_matrix_param_gather_route", None)
+    layout_key = id(matrix_layout)
     if (
         cached is not None
+        and int(cached.layout_key) == int(layout_key)
         and int(cached.group_size) == int(shard_group_size)
         and int(cached.shard_size) == int(matrix_layout.shard_size)
         and _index_route_device(cached.input_target_indices, cached.restore_target_indices)
@@ -1309,6 +1339,7 @@ def _get_matrix_param_gather_route(
             restore_target_parts.append(target_indices)
 
     route = MatrixParamGatherRoute(
+        layout_key=int(layout_key),
         group_size=int(shard_group_size),
         shard_size=shard_size,
         input_target_indices=_cat_index_parts(input_target_parts),
@@ -1317,6 +1348,7 @@ def _get_matrix_param_gather_route(
         restore_source_indices=_cat_index_parts(restore_source_parts),
     )
     bucket._matrix_param_gather_route = route
+    bucket._matrix_param_input_clear = True
     return route
 
 
@@ -1395,6 +1427,12 @@ def prepare_matrix_param_gather(
             shard_group = optimizer.fs_group
         shard_group_size = optimizer._group_size(shard_group) if shard_group is not None else 1
 
+    route = _get_matrix_param_gather_route(
+        bucket=bucket,
+        matrix_layout=matrix_layout,
+        shard_group_size=int(shard_group_size),
+    )
+    clear_input = bool(getattr(bucket, "_matrix_param_input_clear", False))
     prepared_buffer = _acquire_param_gather_tensor(
         bucket,
         name="matrix_input",
@@ -1406,13 +1444,11 @@ def prepare_matrix_param_gather(
             int(matrix_layout.shard_size),
             int(matrix_layout.max_shard_capacity),
         ),
+        zero=clear_input,
         zero_on_create=True,
     )
-    route = _get_matrix_param_gather_route(
-        bucket=bucket,
-        matrix_layout=matrix_layout,
-        shard_group_size=int(shard_group_size),
-    )
+    if clear_input:
+        bucket._matrix_param_input_clear = False
     target_indices = route.input_target_indices
     source_indices = route.input_source_indices
     if target_indices is not None and source_indices is not None:
@@ -1587,8 +1623,10 @@ def _get_standard_param_gather_route(
     standard_shard_size: int,
 ) -> MatrixStandardGatherRoute:
     cached = getattr(bucket, "_standard_param_gather_route", None)
+    layout_key = id(getattr(bucket, "matrix_layout", None))
     if (
         cached is not None
+        and int(cached.layout_key) == int(layout_key)
         and int(cached.group_size) == int(group_size)
         and int(cached.group_rank) == int(group_rank)
         and int(cached.standard_shard_size) == int(standard_shard_size)
@@ -1614,6 +1652,7 @@ def _get_standard_param_gather_route(
         rank_segments=rank_segments,
     )
     route = MatrixStandardGatherRoute(
+        layout_key=int(layout_key),
         group_size=int(group_size),
         group_rank=int(group_rank),
         standard_shard_size=int(standard_shard_size),
@@ -1625,6 +1664,7 @@ def _get_standard_param_gather_route(
         restore_source_indices=restore_source_indices,
     )
     bucket._standard_param_gather_route = route
+    bucket._matrix_standard_input_clear = True
     return route
 
 
@@ -1703,8 +1743,10 @@ def prepare_standard_param_gather(optimizer, bucket):
             int(route.standard_shard_size),
             int(route.standard_numel),
         ),
+        zero=bool(getattr(bucket, "_matrix_standard_input_clear", False)),
         zero_on_create=True,
     )
+    bucket._matrix_standard_input_clear = False
     fill_standard_param_gather(bucket, input_shard, route)
     return input_shard, route, dp_group
 
@@ -1809,6 +1851,8 @@ def all_gather_matrix_params_(
     if shard_group is None:
         shard_group = optimizer.fs_group
     shard_group_size = optimizer._group_size(shard_group) if shard_group is not None else 1
+    if shard_group_size == 1 and prepared_gather is None:
+        return None
     if prepared_gather is None:
         prepared_buffer, prepared_entries = prepare_matrix_param_gather(
             optimizer,
@@ -1906,6 +1950,14 @@ def prepare_mixed_param_gather(
     matrix_size = int(matrix_layout.shard_size)
     standard_numel = int(standard_route.standard_numel)
     gather_numel = matrix_size + standard_numel
+    route = _get_matrix_param_gather_route(
+        bucket=bucket,
+        matrix_layout=matrix_layout,
+        shard_group_size=int(group_size),
+    )
+    clear_input = bool(getattr(bucket, "_matrix_param_input_clear", False)) or bool(
+        getattr(bucket, "_matrix_standard_input_clear", False)
+    )
     gather_input = _acquire_param_gather_tensor(
         bucket,
         name="mixed_input",
@@ -1913,18 +1965,17 @@ def prepare_mixed_param_gather(
         dtype=bucket.param_data.dtype,
         device=bucket.param_data.device,
         route_key=(int(group_size), int(matrix_size), int(standard_numel)),
+        zero=clear_input,
         zero_on_create=True,
     )
+    if clear_input:
+        bucket._matrix_param_input_clear = False
+        bucket._matrix_standard_input_clear = False
     prepared_entries = []
     try:
         for entry in matrix_layout.entries:
             full_view_2d = bucket_matrix_param_view(optimizer, bucket, entry)
             prepared_entries.append((entry, full_view_2d))
-        route = _get_matrix_param_gather_route(
-            bucket=bucket,
-            matrix_layout=matrix_layout,
-            shard_group_size=int(group_size),
-        )
         target_indices = route.input_target_indices
         source_indices = route.input_source_indices
         if target_indices is not None and source_indices is not None:
@@ -2064,11 +2115,12 @@ def all_gather_bucket_params_(optimizer, bucket, async_op=False):
                 standard_numel=standard_numel,
             )
 
-        prepared_matrix_entries = prepare_matrix_param_gather(
-            optimizer,
-            bucket,
-            shard_group_size=int(shard_group_size),
-        )
+        if int(shard_group_size) != 1:
+            prepared_matrix_entries = prepare_matrix_param_gather(
+                optimizer,
+                bucket,
+                shard_group_size=int(shard_group_size),
+            )
         prepared_standard_gather = prepare_standard_param_gather(optimizer, bucket)
         standard_handle = all_gather_standard_params_(
             optimizer,
@@ -2098,5 +2150,5 @@ def all_gather_bucket_params_(optimizer, bucket, async_op=False):
     if standard_handle is not None:
         handles.append(standard_handle)
     if async_op and handles:
-        return _HandleGroup(handles)
+        return HandleGroup(handles)
     return None

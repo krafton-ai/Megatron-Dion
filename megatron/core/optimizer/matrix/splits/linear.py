@@ -9,6 +9,7 @@ import torch
 from .axis import (
     axis_shape,
     axis_tensor,
+    clear_split_metadata,
     copy_split_axis,
     dist_meta_for_split_axis,
     get_split_axis_from_dist_meta,
@@ -230,6 +231,7 @@ def resolve_linear_child_kinds(
 
 def copy_linear_split_metadata(destination_tensor: torch.Tensor, source_tensor: torch.Tensor) -> None:
     """Copy fused linear split metadata."""
+    clear_split_metadata(destination_tensor)
     if not is_linear_split_param(source_tensor) and not hasattr(source_tensor, "linear_split_rows"):
         return
     destination_tensor.is_linear_split = True
@@ -584,7 +586,7 @@ def read_linear_child(
     split_axis: int = 0,
     child_kinds=None,
 ) -> torch.Tensor:
-    """Read one split-linear child from a fused parent tensor into a contiguous 2D tensor."""
+    """Read one split-linear child from a fused parent tensor."""
     if tensor.ndim != 2:
         raise RuntimeError(
             "[MATRIX_LINEAR_READ_REQUIRES_2D] "
@@ -610,7 +612,7 @@ def read_linear_child(
     if len(segments) == 1:
         source_start, source_end, _, _ = segments[0]
         return original_tensor(
-            tensor_axis.narrow(0, source_start, source_end - source_start).contiguous(),
+            tensor_axis.narrow(0, source_start, source_end - source_start),
             split_axis,
         )
 
@@ -675,7 +677,7 @@ def write_linear_child_(
     split_axis = normalize_split_axis(split_axis)
     axis_meta = dist_meta_for_split_axis(dist_meta, split_axis)
     dest_axis = axis_tensor(dest, split_axis)
-    child_axis = axis_tensor(child, split_axis).contiguous()
+    child_axis = axis_tensor(child, split_axis)
     expected_shape = linear_child_local_shape(
         parent_local_shape=(int(dest.size(0)), int(dest.size(1))),
         split_rows=split_rows,

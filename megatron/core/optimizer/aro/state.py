@@ -91,11 +91,7 @@ def is_aro_matrix_param(
         return False
     if dist_meta is not None and getattr(dist_meta, "is_aro_param", False):
         return True
-    return is_matrix_param(
-        param,
-        param_name,
-        include_embedding_and_lm_head=True,
-    )
+    return is_matrix_param(param, param_name)
 
 
 def prepare_aro_params(module: torch.nn.Module) -> None:
@@ -105,17 +101,26 @@ def prepare_aro_params(module: torch.nn.Module) -> None:
         param.use_aro = is_aro_matrix_param(param)
 
 
-def mark_aro_bucket_params(param_map, param_to_name, fs_size: int):
+def mark_aro_bucket_params(param_map, param_to_name, fs_size: int, *, tp_group=None):
     """Classify bucket params and build static ARO metadata once."""
     aro_param_count, aro_info_by_param = mark_matrix_bucket_params(
         param_map=param_map,
         param_to_name=param_to_name,
         fs_size=fs_size,
-        include_embedding_and_lm_head=True,
+        include_vocab=True,
+        tp_group=tp_group,
     )
     for param in param_map.keys():
-        param.is_aro_param = bool(getattr(param, "is_matrix_param", False))
-        param.use_aro = bool(getattr(param, "is_matrix_param", False))
+        use_aro = (
+            getattr(param, "use_aro", None) is not False
+            and bool(getattr(param, "is_matrix_param", False))
+        )
+        param.is_aro_param = bool(use_aro)
+        param.use_aro = bool(use_aro)
+        param.is_matrix_param = bool(param.is_aro_param)
+        if not param.is_aro_param and param in aro_info_by_param:
+            aro_info_by_param.pop(param, None)
+            aro_param_count = max(0, int(aro_param_count) - 1)
     return aro_param_count, aro_info_by_param
 
 
@@ -181,8 +186,7 @@ def _identity_rows(
     row_ids = torch.arange(local_rows, device=device)
     col_ids = row_ids + int(row_start)
     valid = col_ids < global_rows
-    if bool(valid.any().item()):
-        result[row_ids[valid], col_ids[valid]] = 1.0
+    result[row_ids[valid], col_ids[valid]] = 1.0
     return result
 
 
@@ -192,13 +196,13 @@ def _rotation_row_start(dist_meta: Optional[AroDistMeta], orientation: str) -> i
     fs_shard_dim = int(getattr(dist_meta, "fs_shard_dim", -1))
     fs_dim = _rotation_shard_dim(orientation, fs_shard_dim)
     if fs_dim == 0 and int(getattr(dist_meta, "fs_world_size", 1)) > 1:
-        if fs_shard_dim == 0 and int(getattr(dist_meta, "row_shard_start_idx", -1)) >= 0:
+        if int(getattr(dist_meta, "row_shard_start_idx", -1)) >= 0:
             return int(getattr(dist_meta, "row_shard_start_idx"))
         return int(getattr(dist_meta, "fs_start_idx", 0))
     tp_shard_dim = int(getattr(dist_meta, "tp_shard_dim", -1))
     tp_dim = _rotation_shard_dim(orientation, tp_shard_dim)
     if tp_dim == 0 and int(getattr(dist_meta, "tp_world_size", 1)) > 1:
-        if tp_shard_dim == 0 and int(getattr(dist_meta, "row_shard_start_idx", -1)) >= 0:
+        if int(getattr(dist_meta, "row_shard_start_idx", -1)) >= 0:
             return int(getattr(dist_meta, "row_shard_start_idx"))
         global_rows = int(oriented_shape(getattr(dist_meta, "global_shape"), orientation)[0])
         world = int(getattr(dist_meta, "tp_world_size", 1))
@@ -259,6 +263,7 @@ def init_matrix_state(
             state["per_expert_global_shape"] = tuple(int(dim) for dim in per_expert_shape)
 
     if not init_rotation:
+        state.pop("rotation", None)
         return
     rotation_dtype = str_to_dtype(mixed_precision_config.rotation_dtype)
     if rotation_dtype is None:
@@ -359,9 +364,23 @@ def state_backend_keys() -> tuple[str, ...]:
     )
 
 
+def _scalar_optimizer_for_group(opt, group, config=None) -> str:
+    defaults = getattr(opt, "defaults", {}) or {}
+    scalar_optimizer = group.get(
+        "scalar_optimizer",
+        group.get(
+            "aro_scalar_optimizer",
+            defaults.get(
+                "scalar_optimizer",
+                getattr(config, "aro_scalar_optimizer", "adam") if config is not None else "adam",
+            ),
+        ),
+    )
+    return str(scalar_optimizer).lower()
+
+
 def init_aro_state(opt, config=None):
     """Initialize ARO state for checkpointing wrappers."""
-    del config
     mixed_precision_config = getattr(opt, "_mixed_precision_config", AroMixedPrecisionConfig())
     for group in opt.param_groups:
         for param in group["params"]:
@@ -377,8 +396,11 @@ def init_aro_state(opt, config=None):
                 continue
             if "exp_avg" not in state:
                 state["exp_avg"] = torch.zeros_like(param)
-            if "exp_avg_sq" not in state:
+            scalar_optimizer = _scalar_optimizer_for_group(opt, group, config)
+            if scalar_optimizer in ("adam", "adamw") and "exp_avg_sq" not in state:
                 state["exp_avg_sq"] = torch.zeros_like(param)
+            elif scalar_optimizer != "lion":
+                raise RuntimeError(f"[ARO_INVALID_SCALAR_OPTIMIZER] {scalar_optimizer!r}")
 
 
 __all__ = [

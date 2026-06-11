@@ -15,6 +15,7 @@ import torch
 from .axis import (
     axis_shape,
     axis_tensor,
+    clear_split_metadata,
     copy_split_axis,
     dist_meta_for_split_axis,
     get_split_axis_from_dist_meta,
@@ -172,6 +173,7 @@ def resolve_gdn_split_axis(
 
 def copy_gdn_split_metadata(destination_tensor: torch.Tensor, source_tensor: torch.Tensor) -> None:
     """Copy fused-GDN split metadata when the source tensor is tagged as GDN."""
+    clear_split_metadata(destination_tensor)
     if not is_gdn_param(source_tensor) and not hasattr(source_tensor, "gdn_split_shapes"):
         return
     destination_tensor.is_gdn = True
@@ -600,7 +602,7 @@ def extract_gdn_child(
         )
     source_start, source_end, _, _ = segments[0]
     return original_tensor(
-        tensor_axis.narrow(0, source_start, source_end - source_start).contiguous(),
+        tensor_axis.narrow(0, source_start, source_end - source_start),
         split_axis,
     )
 
@@ -623,7 +625,7 @@ def scatter_gdn_child_(
     split_axis = normalize_split_axis(split_axis)
     axis_meta = dist_meta_for_split_axis(dist_meta, split_axis)
     dest_axis = axis_tensor(dest, split_axis)
-    child_axis = axis_tensor(child, split_axis).contiguous()
+    child_axis = axis_tensor(child, split_axis)
     rows, cols = int(dest_axis.size(0)), int(dest_axis.size(1))
     parent_row_start, parent_row_end, active_shapes = _parent_row_range(
         local_rows=rows,

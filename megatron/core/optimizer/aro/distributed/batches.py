@@ -1,4 +1,4 @@
-"""ARO distributed batch-planning helpers."""
+"""ARO distributed batch helpers."""
 
 from __future__ import annotations
 

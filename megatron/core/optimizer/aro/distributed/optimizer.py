@@ -14,6 +14,7 @@ from ....fp8_utils import is_float8tensor
 from ...matrix.checkpoint_io import (
     build_distributed_checkpoint_state,
     build_matrix_checkpoint_metadata,
+    resolve_matrix_checkpoint_sharding_type,
     restore_distributed_checkpoint_state,
     split_distributed_checkpoint_state,
     validate_matrix_checkpoint_metadata,
@@ -42,7 +43,6 @@ from ...matrix.splits.linear import (
     get_linear_partition_stride,
     get_linear_split_rows,
     iter_linear_child_kinds,
-    is_linear_split_param,
     linear_child_global_shape,
     linear_child_has_local_overlap,
     linear_child_local_shape,
@@ -72,6 +72,11 @@ from ...matrix.splits.gdn import (
     scatter_gdn_child_,
 )
 from ...matrix.splits.parameters import copy_parameter_split_metadata
+from ...matrix.splits.row_child import (
+    child_row_layout,
+    finalize_row_child_groups,
+    resolve_child_layouts,
+)
 from ...matrix.splits.qkv import (
     extract_qkv_child,
     iter_qkv_child_kinds,
@@ -233,6 +238,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
             param_map=param_map,
             param_to_name=getattr(param_and_grad_buffer, "param_to_name", None),
             fs_size=fs_size,
+            tp_group=getattr(param_and_grad_buffer, "tp_group", None),
         )
 
         (
@@ -264,7 +270,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
         self._matrix_buckets_by_param = {}
         self._matrix_entries_by_param = {}
         self._aro_group_rank_cache = {}
-        self._aro_stack_cache = {}
+        self._aro_buffers = {}
         self._aro_fs_group = kwargs.pop("aro_fs_group", None)
         self._aro_tp_group = kwargs.pop("aro_tp_group", None)
         self._replica_group = kwargs.pop("replica_group", kwargs.pop("replica_group_override", None))
@@ -320,7 +326,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
             rp_size=int(self._requested_rp_size),
             tp_size=int(self.tp_size),
             is_expert=bool(self._is_expert_aro),
-            split_parameters=bool(getattr(self.config, "aro_split_parameters", False)),
+            split_parameters=self._split_enabled(),
         )
         self._mixed_precision_config = AroMixedPrecisionConfig(
             momentum_dtype=getattr(self.config, "aro_momentum_dtype", None),
@@ -330,10 +336,24 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
         self._attach_model_param_links()
         self.dist_metas = self._build_dist_metas()
         self.optimizer.dist_metas = self.dist_metas
+        self._init_split_groups()
 
     @property
     def aro_fs_group(self):
         return self.fs_group
+
+    def _split_enabled(self) -> bool:
+        default = self._split_for_group(None)
+        for group in getattr(self.optimizer, "param_groups", ()):
+            if self._split_for_group(group):
+                return True
+        return default
+
+    def _split_for_group(self, group) -> bool:
+        default = bool(getattr(self.config, "aro_split_parameters", False))
+        if group is None:
+            return default
+        return bool(group.get("aro_split_parameters", group.get("split_parameters", default)))
 
     def _init_bucket_comm(self, bucket, fs_group) -> None:
         """Attach the ARO shard group to a bucket."""
@@ -463,7 +483,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 param_range_info = gbuf_range["param_map"][model_param]
                 param_range = param_range_info["param"]
                 shard_layout = param_range_info.get("matrix_shard_layout", None)
-                if model_param.type() in ["torch.cuda.HalfTensor", "torch.cuda.BFloat16Tensor"]:
+                if model_param.dtype in (torch.float16, torch.bfloat16):
                     self._process_float16_param(
                         model_param,
                         param_range,
@@ -473,7 +493,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                         shard_float16_params,
                         main_shard_params,
                     )
-                elif model_param.type() == "torch.cuda.FloatTensor":
+                elif model_param.dtype == torch.float32:
                     self._process_float32_param(
                         model_param,
                         param_range,
@@ -483,7 +503,9 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                         shard_fp32_params,
                     )
                 else:
-                    raise TypeError(f"Unsupported parameter type: {model_param.type()}")
+                    raise TypeError(
+                        f"Unsupported parameter dtype: dtype={model_param.dtype} device={model_param.device}"
+                    )
             if not use_precision_aware_optimizer:
                 group_range["orig_group"]["params"] = [*shard_fp32_params, *main_shard_params]
             else:
@@ -753,11 +775,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                             "stable parameter name."
                         )
                     param_uid = (name, tuple(logical_shape))
-                    linear_split_rows = (
-                        get_linear_split_rows(model_param)
-                        if is_linear_split_param(model_param)
-                        else None
-                    )
+                    linear_split_rows = get_linear_split_rows(model_param)
                     linear_child_kinds = (
                         get_linear_child_kinds(model_param)
                         if linear_split_rows is not None
@@ -774,8 +792,9 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                     global_shape = None
                     orientation = "normal"
                     param_uid = (
-                        name or f"id_{id(model_param)}",
-                        tuple(int(dim) for dim in local_shape),
+                        (name, tuple(int(dim) for dim in local_shape))
+                        if name
+                        else None
                     )
                     linear_split_rows = None
                     linear_child_kinds = ("gate", "up")
@@ -802,7 +821,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                     param_uid=param_uid,
                     is_matrix_param=bool(use_matrix),
                     is_aro_param=bool(use_matrix),
-                    param_name=name or f"id_{id(model_param)}",
+                    param_name=name,
                     fs_group=fs_group,
                     fs_world_size=int(fs_world_size),
                     fs_rank=int(fs_rank),
@@ -830,7 +849,6 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
         return dist_metas
 
     def _build_param_config(self, param, dist_meta, optim_group) -> AroParamConfig:
-        del optim_group
         return build_param_config(
             param_ndim=2 if bool(getattr(dist_meta, "is_aro_param", False)) else param.ndim,
             local_shape=getattr(dist_meta, "shape", None),
@@ -846,7 +864,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
             beta1=float(getattr(self.config, "aro_beta1", 0.9)),
             beta2=float(getattr(self.config, "aro_beta2", 0.95)),
             scalar_eps=float(getattr(self.config, "aro_scalar_eps", 1e-8)),
-            split_parameters=bool(getattr(self.config, "aro_split_parameters", False)),
+            split_parameters=self._split_for_group(optim_group),
         )
 
     def _refresh_aro_step_metadata(self, *, param, optimizer_state, optim_group, dist_meta):
@@ -870,7 +888,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 float(getattr(self.config, "aro_beta1", 0.9)),
                 float(getattr(self.config, "aro_beta2", 0.95)),
                 float(getattr(self.config, "aro_scalar_eps", 1e-8)),
-                bool(getattr(self.config, "aro_split_parameters", False)),
+                self._split_for_group(optim_group),
             )
             if (
                 getattr(dist_meta, "_aro_param_config_signature", None) == signature
@@ -984,6 +1002,9 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
         )
         momentum = state.get("momentum")
         rotation = state.get("rotation")
+        if not init_rotation:
+            state.pop("rotation", None)
+            rotation = None
         if (
             getattr(param, "_aro_matrix_state_signature", None) == signature
             and momentum is not None
@@ -1011,6 +1032,220 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
     def _view_2d(self, tensor, meta):
         shape = tuple(int(dim) for dim in meta.shape)
         return tensor if tensor.ndim == 2 and tuple(tensor.shape) == shape else tensor.view(shape)
+
+    def _qkv_child_layouts(self, meta, shapes, kind, split_axis: int, *, create_group: bool):
+        child_global_shape = qkv_child_global_shape(
+            tuple(int(dim) for dim in meta.global_shape),
+            shapes,
+            kind,
+            split_axis=split_axis,
+        )
+        return child_global_shape, resolve_child_layouts(
+            meta,
+            child_kind=kind,
+            child_global_shape=child_global_shape,
+            split_kind="qkv",
+            split_axis=split_axis,
+            child_range=lambda start, end: qkv_child_row_range(
+                parent_row_start=start,
+                parent_row_end=end,
+                split_shapes=shapes,
+                child_kind=kind,
+            ),
+            create_group=create_group,
+            group_desc="ARO_SPLIT_CHILD_GROUP",
+            error_prefix="ARO_SPLIT_CHILD",
+            namespace="ARO",
+        )
+
+    def _qkvg_child_layouts(self, meta, shapes, kind, split_axis: int, *, create_group: bool):
+        child_global_shape = qkvg_child_global_shape(
+            tuple(int(dim) for dim in meta.global_shape),
+            shapes,
+            kind,
+            split_axis=split_axis,
+        )
+        return child_global_shape, resolve_child_layouts(
+            meta,
+            child_kind=kind,
+            child_global_shape=child_global_shape,
+            split_kind="qkvg",
+            split_axis=split_axis,
+            child_range=lambda start, end: qkvg_child_row_range(
+                parent_row_start=start,
+                parent_row_end=end,
+                split_shapes=shapes,
+                child_kind=kind,
+            ),
+            create_group=create_group,
+            group_desc="ARO_SPLIT_CHILD_GROUP",
+            error_prefix="ARO_SPLIT_CHILD",
+            namespace="ARO",
+        )
+
+    def _gdn_child_layouts(self, meta, shapes, kind, split_axis: int, *, create_group: bool):
+        child_global_shape = gdn_child_global_shape(
+            tuple(int(dim) for dim in meta.global_shape),
+            shapes,
+            kind,
+            split_axis=split_axis,
+        )
+        return child_global_shape, resolve_child_layouts(
+            meta,
+            child_kind=kind,
+            child_global_shape=child_global_shape,
+            split_kind="gdn",
+            split_axis=split_axis,
+            child_range=lambda start, end: gdn_child_row_range(
+                parent_row_start=start,
+                parent_row_end=end,
+                split_shapes=shapes,
+                child_kind=kind,
+            ),
+            child_rank_range=lambda world_size, rank: gdn_child_rank_row_range(
+                split_shapes=shapes,
+                child_kind=kind,
+                world_size=world_size,
+                rank=rank,
+            ),
+            create_group=create_group,
+            group_desc="ARO_SPLIT_CHILD_GROUP",
+            error_prefix="ARO_SPLIT_CHILD",
+            namespace="ARO",
+        )
+
+    def _linear_child_layouts(
+        self,
+        meta,
+        rows,
+        kind,
+        child_kinds,
+        split_axis: int,
+        *,
+        create_group: bool,
+    ):
+        child_global_shape = linear_child_global_shape(
+            tuple(int(dim) for dim in meta.global_shape),
+            rows,
+            kind,
+            split_axis=split_axis,
+            child_kinds=child_kinds,
+        )
+        child_rank_range = None
+        if int(getattr(meta, "linear_partition_stride", 1)) == len(tuple(rows)):
+            child_rows = int(child_global_shape[int(split_axis)])
+
+            def child_rank_range(world_size, rank):
+                start, end = compute_fs_shard_range(child_rows, int(world_size), int(rank))
+                return (start, end) if end > start else None
+
+        return child_global_shape, resolve_child_layouts(
+            meta,
+            child_kind=kind,
+            child_global_shape=child_global_shape,
+            split_kind="linear",
+            split_axis=split_axis,
+            child_range=lambda start, end: linear_child_row_range(
+                parent_row_start=start,
+                parent_row_end=end,
+                split_rows=rows,
+                child_kind=kind,
+                child_kinds=child_kinds,
+            ),
+            child_rank_range=child_rank_range,
+            create_group=create_group,
+            group_desc="ARO_SPLIT_CHILD_GROUP",
+            error_prefix="ARO_SPLIT_CHILD",
+            namespace="ARO",
+        )
+
+    def _init_split_groups(self) -> None:
+        if not self._split_enabled():
+            finalize_row_child_groups("ARO_SPLIT_CHILD_GROUP")
+            return
+        dist_metas = []
+        for group in self.optimizer.param_groups:
+            if not self._split_for_group(group):
+                continue
+            for param in group.get("params", ()):
+                meta = self.dist_metas.get(param, None)
+                if meta is not None:
+                    dist_metas.append(meta)
+        dist_metas.sort(
+            key=lambda meta: repr((getattr(meta, "param_uid", None), getattr(meta, "param_name", "")))
+        )
+        for meta in dist_metas:
+            if meta is None or not bool(getattr(meta, "is_aro_param", False)):
+                continue
+            config = getattr(meta, "param_config", None)
+            if config is not None and not bool(getattr(config, "split_parameters", False)):
+                continue
+            shapes = resolve_qkvg_split_shapes(param=None, optimizer_state=None, dist_meta=meta)
+            if shapes is not None:
+                axis = resolve_qkvg_split_axis(dist_meta=meta)
+                for kind in iter_qkvg_child_kinds():
+                    self._qkvg_child_layouts(meta, shapes, kind, axis, create_group=True)
+                continue
+            shapes = resolve_qkv_split_shapes(param=None, optimizer_state=None, dist_meta=meta)
+            if shapes is not None:
+                axis = resolve_qkv_split_axis(dist_meta=meta)
+                for kind in iter_qkv_child_kinds():
+                    self._qkv_child_layouts(meta, shapes, kind, axis, create_group=True)
+                continue
+            shapes = resolve_gdn_split_shapes(param=None, optimizer_state=None, dist_meta=meta)
+            if shapes is not None:
+                axis = resolve_gdn_split_axis(dist_meta=meta)
+                for kind in iter_gdn_child_kinds():
+                    self._gdn_child_layouts(meta, shapes, kind, axis, create_group=True)
+                continue
+            rows = resolve_linear_split_rows(optimizer_state=None, dist_meta=meta)
+            if rows is not None:
+                axis = resolve_linear_split_axis(dist_meta=meta)
+                child_kinds = resolve_linear_child_kinds(dist_meta=meta)
+                for kind in iter_linear_child_kinds(child_kinds):
+                    self._linear_child_layouts(
+                        meta,
+                        rows,
+                        kind,
+                        child_kinds,
+                        axis,
+                        create_group=True,
+                    )
+        finalize_row_child_groups("ARO_SPLIT_CHILD_GROUP")
+
+    def _ensure_aro_checkpoint_state(self) -> None:
+        for group in self.optimizer.param_groups:
+            for param in group.get("params", ()):
+                meta = self.dist_metas.get(param, None)
+                state = self.optimizer.state[param]
+                if meta is None or not bool(getattr(meta, "is_aro_param", False)):
+                    if "exp_avg" not in state:
+                        state["exp_avg"] = torch.zeros_like(param)
+                    scalar_optimizer = str(
+                        group.get(
+                            "scalar_optimizer",
+                            group.get(
+                                "aro_scalar_optimizer",
+                                getattr(self.config, "aro_scalar_optimizer", "adam"),
+                            ),
+                        )
+                    ).lower()
+                    if scalar_optimizer in ("adam", "adamw") and "exp_avg_sq" not in state:
+                        state["exp_avg_sq"] = torch.zeros_like(param)
+                    elif scalar_optimizer != "lion":
+                        raise RuntimeError(f"[ARO_INVALID_SCALAR_OPTIMIZER] {scalar_optimizer!r}")
+                    continue
+                self._ensure_optimizer_state(param, group)
+                if not self._split_for_group(group):
+                    continue
+                self._expand_split_aro_params(
+                    param=param,
+                    grad=param,
+                    optimizer_state=state,
+                    optim_group=group,
+                    config=getattr(meta, "param_config", None),
+                    dist_meta=meta,
+                )
 
     def _child_param_config(self, child_meta, child_shape, optim_group) -> AroParamConfig:
         del optim_group
@@ -1049,102 +1284,13 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
         linear_rows=None,
         linear_child_kinds=None,
         split_axis=0,
+        fs_layout,
+        tp_layout,
     ):
-        split_axis = int(split_axis)
-        fs_start = int(parent_meta.fs_start_idx)
-        fs_end = int(parent_meta.fs_end_idx)
-        row_start = int(getattr(parent_meta, "row_shard_start_idx", -1))
-        row_end = int(getattr(parent_meta, "row_shard_end_idx", -1))
-
-        def _child_row_range(parent_start: int, parent_end: int):
-            if split_kind == "qkv":
-                return qkv_child_row_range(
-                    parent_row_start=parent_start,
-                    parent_row_end=parent_end,
-                    split_shapes=qkv_shapes,
-                    child_kind=child_kind,
-                )
-            if split_kind == "qkvg":
-                return qkvg_child_row_range(
-                    parent_row_start=parent_start,
-                    parent_row_end=parent_end,
-                    split_shapes=qkvg_shapes,
-                    child_kind=child_kind,
-                )
-            if split_kind == "gdn":
-                return gdn_child_row_range(
-                    parent_row_start=parent_start,
-                    parent_row_end=parent_end,
-                    split_shapes=gdn_shapes,
-                    child_kind=child_kind,
-                )
-            if split_kind == "linear":
-                return linear_child_row_range(
-                    parent_row_start=parent_start,
-                    parent_row_end=parent_end,
-                    split_rows=linear_rows,
-                    child_kind=child_kind,
-                    child_kinds=linear_child_kinds,
-                )
-            raise RuntimeError(f"[ARO_INVALID_SPLIT_KIND] split_kind={split_kind!r}")
-
-        if int(parent_meta.fs_shard_dim) == split_axis:
-            row_range = _child_row_range(fs_start, fs_end)
-            if row_range is not None:
-                fs_start, fs_end = int(row_range[0]), int(row_range[1])
-                if split_axis == 0:
-                    row_start, row_end = fs_start, fs_end
-            elif int(child_shape[0]) == 0:
-                fs_start, fs_end = 0, 0
-                if split_axis == 0:
-                    row_start, row_end = 0, 0
-
-        if int(parent_meta.tp_shard_dim) == split_axis and int(getattr(parent_meta, "tp_world_size", 1)) > 1:
-            parent_shape_for_axis = (
-                getattr(parent_meta, "per_expert_global_shape", None)
-                or parent_meta.global_shape
-            )
-            parent_rows = int(parent_shape_for_axis[split_axis])
-            tp_parent_start, tp_parent_end = compute_fs_shard_range(
-                parent_rows,
-                int(parent_meta.tp_world_size),
-                int(parent_meta.tp_rank),
-            )
-            if split_kind == "gdn":
-                row_range = gdn_child_rank_row_range(
-                    split_shapes=gdn_shapes,
-                    child_kind=child_kind,
-                    world_size=int(parent_meta.tp_world_size),
-                    rank=int(parent_meta.tp_rank),
-                )
-            elif (
-                split_kind == "linear"
-                and int(getattr(parent_meta, "linear_partition_stride", 1))
-                == len(tuple(int(dim) for dim in linear_rows))
-            ):
-                linear_child_kinds = tuple(linear_child_kinds or ("gate", "up"))
-                try:
-                    child_index = linear_child_kinds.index(child_kind)
-                except ValueError as exc:
-                    raise RuntimeError(
-                        "[ARO_LINEAR_INVALID_CHILD_KIND] "
-                        f"child_kind={child_kind!r} child_kinds={linear_child_kinds}"
-                    ) from exc
-                child_rows = int(linear_rows[child_index])
-                row_range = compute_fs_shard_range(
-                    child_rows,
-                    int(parent_meta.tp_world_size),
-                    int(parent_meta.tp_rank),
-                )
-            else:
-                row_range = _child_row_range(tp_parent_start, tp_parent_end)
-            if row_range is not None:
-                if split_axis == 0:
-                    row_start, row_end = int(row_range[0]), int(row_range[1])
-            elif int(child_shape[0]) == 0:
-                if split_axis == 0:
-                    row_start, row_end = 0, 0
-
+        row_start, row_end, row_sizes = child_row_layout(fs_layout, tp_layout)
+        child_fs_group, child_fs_world_size, child_fs_rank, child_fs_start, child_fs_end, fs_sizes = fs_layout
+        child_tp_group, child_tp_world_size, child_tp_rank, _tp_start, _tp_end, tp_sizes = tp_layout
+        tensor_row_sizes = fs_sizes if fs_sizes is not None else tp_sizes
         orientation = choose_orientation(child_global_shape)
         child_meta = replace(
             parent_meta,
@@ -1152,10 +1298,22 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
             local_shape=tuple(child_shape),
             global_shape=tuple(child_global_shape),
             per_expert_global_shape=None,
-            fs_start_idx=fs_start,
-            fs_end_idx=fs_end,
+            fs_group=child_fs_group,
+            fs_world_size=int(child_fs_world_size),
+            fs_rank=int(child_fs_rank),
+            fs_start_idx=int(child_fs_start),
+            fs_end_idx=int(child_fs_end),
+            tp_group=child_tp_group,
+            tp_world_size=int(child_tp_world_size),
+            tp_rank=int(child_tp_rank),
+            tensor_row_shard_sizes=(
+                tuple(int(size) for size in tensor_row_sizes)
+                if tensor_row_sizes is not None
+                else None
+            ),
             row_shard_start_idx=row_start,
             row_shard_end_idx=row_end,
+            row_shard_sizes=row_sizes,
             param_uid=child_uid,
             param_name=child_name,
             parent_param_uid=parent_meta.param_uid,
@@ -1291,7 +1449,6 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
         param2d = self._view_2d(param, dist_meta)
         grad2d = self._view_2d(grad, dist_meta)
         parent_shape = tuple(int(dim) for dim in dist_meta.shape)
-        parent_global_shape = tuple(int(dim) for dim in (dist_meta.global_shape or parent_shape))
         shapes = resolve_qkvg_split_shapes(
             param=param,
             optimizer_state=optimizer_state,
@@ -1310,7 +1467,6 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 optim_group,
                 dist_meta,
                 parent_shape,
-                parent_global_shape,
                 shapes,
                 axis,
             )
@@ -1332,7 +1488,6 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 optim_group,
                 dist_meta,
                 parent_shape,
-                parent_global_shape,
                 shapes,
                 axis,
             )
@@ -1354,7 +1509,6 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 optim_group,
                 dist_meta,
                 parent_shape,
-                parent_global_shape,
                 shapes,
                 axis,
             )
@@ -1372,36 +1526,28 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 optim_group,
                 dist_meta,
                 parent_shape,
-                parent_global_shape,
                 rows,
                 axis,
             )
         return None
 
-    @staticmethod
-    def _include_empty_split_child(meta) -> bool:
-        return bool(
-            int(getattr(meta, "fs_world_size", 1)) > 1
-            or int(getattr(meta, "tp_world_size", 1)) > 1
-        )
-
-    @staticmethod
-    def _empty_split_child_shape(parent_shape, split_axis: int):
-        return (0, int(parent_shape[1])) if int(split_axis) == 0 else (int(parent_shape[0]), 0)
-
-    def _expand_qkv(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, shapes, split_axis):
+    def _expand_qkv(self, param2d, grad2d, state, group, meta, parent_shape, shapes, split_axis):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = self._include_empty_split_child(meta)
         for kind in iter_qkv_child_kinds():
-            has_overlap = qkv_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
-            if not has_overlap and not include_empty:
+            global_shape, layouts = self._qkv_child_layouts(meta, shapes, kind, split_axis, create_group=False)
+            if layouts is None:
                 continue
-            child_shape = qkv_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis) if has_overlap else self._empty_split_child_shape(parent_shape, split_axis)
-            global_shape = qkv_child_global_shape(parent_global_shape, shapes, kind, split_axis=split_axis)
-            child_param = extract_qkv_child(param2d, shapes, kind, meta, split_axis=split_axis) if has_overlap else param2d.new_empty(child_shape)
-            child_grad = extract_qkv_child(grad2d, shapes, kind, meta, split_axis=split_axis) if has_overlap else grad2d.new_empty(child_shape)
-            child_momentum = extract_qkv_child(parent_momentum, shapes, kind, meta, split_axis=split_axis) if has_overlap else parent_momentum.new_empty(child_shape)
+            has_overlap = qkv_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
+            if not has_overlap:
+                raise RuntimeError(
+                    "[ARO_QKV_CHILD_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={kind}"
+                )
+            child_shape = qkv_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis)
+            child_param = extract_qkv_child(param2d, shapes, kind, meta, split_axis=split_axis)
+            child_grad = extract_qkv_child(grad2d, shapes, kind, meta, split_axis=split_axis)
+            child_momentum = extract_qkv_child(parent_momentum, shapes, kind, meta, split_axis=split_axis)
             child_meta = self._child_meta(
                 meta,
                 child_kind=kind,
@@ -1413,6 +1559,8 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 optim_group=group,
                 qkv_shapes=shapes,
                 split_axis=split_axis,
+                fs_layout=layouts[0],
+                tp_layout=layouts[1],
             )
             child_state = self._child_state(
                 state,
@@ -1423,9 +1571,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 child_kind=kind,
             )
 
-            def _commit_update(updated_param, updated_momentum, *, child_kind=kind, has_local_overlap=has_overlap):
-                if not has_local_overlap:
-                    return
+            def _commit_update(updated_param, updated_momentum, *, child_kind=kind):
                 scatter_qkv_child_(param2d, updated_param, shapes, child_kind, meta, split_axis=split_axis)
                 scatter_qkv_child_(parent_momentum, updated_momentum, shapes, child_kind, meta, split_axis=split_axis)
 
@@ -1440,21 +1586,31 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                     _commit_update,
                 )
             )
+        if not children:
+            raise RuntimeError(
+                "[ARO_QKV_SPLIT_NO_LOCAL_CHILDREN] "
+                f"param_uid={meta.param_uid} param_name={getattr(meta, 'param_name', '')} "
+                f"split_axis={split_axis} split_shapes={shapes}"
+            )
         return children
 
-    def _expand_qkvg(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, shapes, split_axis):
+    def _expand_qkvg(self, param2d, grad2d, state, group, meta, parent_shape, shapes, split_axis):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = self._include_empty_split_child(meta)
         for kind in iter_qkvg_child_kinds():
-            has_overlap = qkvg_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
-            if not has_overlap and not include_empty:
+            global_shape, layouts = self._qkvg_child_layouts(meta, shapes, kind, split_axis, create_group=False)
+            if layouts is None:
                 continue
-            child_shape = qkvg_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis) if has_overlap else self._empty_split_child_shape(parent_shape, split_axis)
-            global_shape = qkvg_child_global_shape(parent_global_shape, shapes, kind, split_axis=split_axis)
-            child_param = extract_qkvg_child(param2d, shapes, kind, meta, split_axis=split_axis) if has_overlap else param2d.new_empty(child_shape)
-            child_grad = extract_qkvg_child(grad2d, shapes, kind, meta, split_axis=split_axis) if has_overlap else grad2d.new_empty(child_shape)
-            child_momentum = extract_qkvg_child(parent_momentum, shapes, kind, meta, split_axis=split_axis) if has_overlap else parent_momentum.new_empty(child_shape)
+            has_overlap = qkvg_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
+            if not has_overlap:
+                raise RuntimeError(
+                    "[ARO_QKVG_CHILD_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={kind}"
+                )
+            child_shape = qkvg_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis)
+            child_param = extract_qkvg_child(param2d, shapes, kind, meta, split_axis=split_axis)
+            child_grad = extract_qkvg_child(grad2d, shapes, kind, meta, split_axis=split_axis)
+            child_momentum = extract_qkvg_child(parent_momentum, shapes, kind, meta, split_axis=split_axis)
             child_meta = self._child_meta(
                 meta,
                 child_kind=kind,
@@ -1466,6 +1622,8 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 optim_group=group,
                 qkvg_shapes=shapes,
                 split_axis=split_axis,
+                fs_layout=layouts[0],
+                tp_layout=layouts[1],
             )
             child_state = self._child_state(
                 state,
@@ -1476,9 +1634,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 child_kind=kind,
             )
 
-            def _commit_update(updated_param, updated_momentum, *, child_kind=kind, has_local_overlap=has_overlap):
-                if not has_local_overlap:
-                    return
+            def _commit_update(updated_param, updated_momentum, *, child_kind=kind):
                 scatter_qkvg_child_(param2d, updated_param, shapes, child_kind, meta, split_axis=split_axis)
                 scatter_qkvg_child_(parent_momentum, updated_momentum, shapes, child_kind, meta, split_axis=split_axis)
 
@@ -1493,37 +1649,31 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                     _commit_update,
                 )
             )
+        if not children:
+            raise RuntimeError(
+                "[ARO_QKVG_SPLIT_NO_LOCAL_CHILDREN] "
+                f"param_uid={meta.param_uid} param_name={getattr(meta, 'param_name', '')} "
+                f"split_axis={split_axis} split_shapes={shapes}"
+            )
         return children
 
-    def _expand_gdn(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, shapes, split_axis):
+    def _expand_gdn(self, param2d, grad2d, state, group, meta, parent_shape, shapes, split_axis):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = self._include_empty_split_child(meta)
         for kind in iter_gdn_child_kinds():
-            has_overlap = gdn_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
-            if not has_overlap and not include_empty:
+            global_shape, layouts = self._gdn_child_layouts(meta, shapes, kind, split_axis, create_group=False)
+            if layouts is None:
                 continue
-            child_shape = (
-                gdn_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis)
-                if has_overlap
-                else self._empty_split_child_shape(parent_shape, split_axis)
-            )
-            global_shape = gdn_child_global_shape(parent_global_shape, shapes, kind, split_axis=split_axis)
-            child_param = (
-                extract_gdn_child(param2d, shapes, kind, meta, split_axis=split_axis)
-                if has_overlap
-                else param2d.new_empty(child_shape)
-            )
-            child_grad = (
-                extract_gdn_child(grad2d, shapes, kind, meta, split_axis=split_axis)
-                if has_overlap
-                else grad2d.new_empty(child_shape)
-            )
-            child_momentum = (
-                extract_gdn_child(parent_momentum, shapes, kind, meta, split_axis=split_axis)
-                if has_overlap
-                else parent_momentum.new_empty(child_shape)
-            )
+            has_overlap = gdn_child_has_local_overlap(shapes, meta, kind, split_axis=split_axis)
+            if not has_overlap:
+                raise RuntimeError(
+                    "[ARO_GDN_CHILD_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={kind}"
+                )
+            child_shape = gdn_child_local_shape(parent_shape, shapes, kind, meta, split_axis=split_axis)
+            child_param = extract_gdn_child(param2d, shapes, kind, meta, split_axis=split_axis)
+            child_grad = extract_gdn_child(grad2d, shapes, kind, meta, split_axis=split_axis)
+            child_momentum = extract_gdn_child(parent_momentum, shapes, kind, meta, split_axis=split_axis)
             child_meta = self._child_meta(
                 meta,
                 child_kind=kind,
@@ -1535,6 +1685,8 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 optim_group=group,
                 gdn_shapes=shapes,
                 split_axis=split_axis,
+                fs_layout=layouts[0],
+                tp_layout=layouts[1],
             )
             child_state = self._child_state(
                 state,
@@ -1550,10 +1702,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 updated_momentum,
                 *,
                 child_kind=kind,
-                has_local_overlap=has_overlap,
             ):
-                if not has_local_overlap:
-                    return
                 scatter_gdn_child_(param2d, updated_param, shapes, child_kind, meta, split_axis=split_axis)
                 scatter_gdn_child_(parent_momentum, updated_momentum, shapes, child_kind, meta, split_axis=split_axis)
 
@@ -1568,14 +1717,29 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                     _commit_update,
                 )
             )
+        if not children:
+            raise RuntimeError(
+                "[ARO_GDN_SPLIT_NO_LOCAL_CHILDREN] "
+                f"param_uid={meta.param_uid} param_name={getattr(meta, 'param_name', '')} "
+                f"split_axis={split_axis} split_shapes={shapes}"
+            )
         return children
 
-    def _expand_linear(self, param2d, grad2d, state, group, meta, parent_shape, parent_global_shape, rows, split_axis):
+    def _expand_linear(self, param2d, grad2d, state, group, meta, parent_shape, rows, split_axis):
         children = []
         parent_momentum = self._parent_momentum(state, param2d)
-        include_empty = self._include_empty_split_child(meta)
         child_kinds = resolve_linear_child_kinds(optimizer_state=state, dist_meta=meta)
         for kind in iter_linear_child_kinds(child_kinds):
+            global_shape, layouts = self._linear_child_layouts(
+                meta,
+                rows,
+                kind,
+                child_kinds,
+                split_axis,
+                create_group=False,
+            )
+            if layouts is None:
+                continue
             has_overlap = linear_child_has_local_overlap(
                 rows,
                 meta,
@@ -1583,62 +1747,42 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 split_axis=split_axis,
                 child_kinds=child_kinds,
             )
-            if not has_overlap and not include_empty:
-                continue
-            child_shape = (
-                linear_child_local_shape(
-                    parent_shape,
-                    rows,
-                    meta,
-                    kind,
-                    split_axis=split_axis,
-                    child_kinds=child_kinds,
+            if not has_overlap:
+                raise RuntimeError(
+                    "[ARO_LINEAR_CHILD_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={kind}"
                 )
-                if has_overlap
-                else self._empty_split_child_shape(parent_shape, split_axis)
-            )
-            global_shape = linear_child_global_shape(
-                parent_global_shape,
+            child_shape = linear_child_local_shape(
+                parent_shape,
                 rows,
+                meta,
                 kind,
                 split_axis=split_axis,
                 child_kinds=child_kinds,
             )
-            child_param = (
-                read_linear_child(
-                    param2d,
-                    rows,
-                    meta,
-                    kind,
-                    split_axis=split_axis,
-                    child_kinds=child_kinds,
-                )
-                if has_overlap
-                else param2d.new_empty(child_shape)
+            child_param = read_linear_child(
+                param2d,
+                rows,
+                meta,
+                kind,
+                split_axis=split_axis,
+                child_kinds=child_kinds,
             )
-            child_grad = (
-                read_linear_child(
-                    grad2d,
-                    rows,
-                    meta,
-                    kind,
-                    split_axis=split_axis,
-                    child_kinds=child_kinds,
-                )
-                if has_overlap
-                else grad2d.new_empty(child_shape)
+            child_grad = read_linear_child(
+                grad2d,
+                rows,
+                meta,
+                kind,
+                split_axis=split_axis,
+                child_kinds=child_kinds,
             )
-            child_momentum = (
-                read_linear_child(
-                    parent_momentum,
-                    rows,
-                    meta,
-                    kind,
-                    split_axis=split_axis,
-                    child_kinds=child_kinds,
-                )
-                if has_overlap
-                else parent_momentum.new_empty(child_shape)
+            child_momentum = read_linear_child(
+                parent_momentum,
+                rows,
+                meta,
+                kind,
+                split_axis=split_axis,
+                child_kinds=child_kinds,
             )
             child_meta = self._child_meta(
                 meta,
@@ -1652,6 +1796,8 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 linear_rows=rows,
                 linear_child_kinds=child_kinds,
                 split_axis=split_axis,
+                fs_layout=layouts[0],
+                tp_layout=layouts[1],
             )
             child_state = self._child_state(
                 state,
@@ -1662,9 +1808,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                 child_kind=kind,
             )
 
-            def _commit_update(updated_param, updated_momentum, *, child_kind=kind, has_local_overlap=has_overlap):
-                if not has_local_overlap:
-                    return
+            def _commit_update(updated_param, updated_momentum, *, child_kind=kind):
                 write_linear_child_(
                     param2d,
                     updated_param,
@@ -1694,6 +1838,12 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                     child_meta,
                     _commit_update,
                 )
+            )
+        if not children:
+            raise RuntimeError(
+                "[ARO_LINEAR_SPLIT_NO_LOCAL_CHILDREN] "
+                f"param_uid={meta.param_uid} param_name={getattr(meta, 'param_name', '')} "
+                f"split_axis={split_axis} split_rows={rows}"
             )
         return children
 
@@ -1796,14 +1946,8 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
 
     def _batch_entry_key(self, entry, momentum, rotation, row_groups, col_groups):
         cfg = entry.config
-        global_shape = tuple(int(dim) for dim in entry.global_shape)
         orientation = str(entry.orientation)
-        if orientation == "transpose":
-            oriented_global_shape = (global_shape[1], global_shape[0])
-        else:
-            oriented_global_shape = global_shape
         return (
-            oriented_global_shape,
             orientation,
             str(momentum.dtype),
             str(rotation.dtype),
@@ -1870,7 +2014,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
             target_numels=[
                 self._sinkhorn_target_numel(item[0], item[2]) for item in items
             ],
-            stack_cache=self._aro_stack_cache,
+            buffers=self._aro_buffers,
         )
         if result is None:
             for entry, param, momentum, rotation, row_groups, col_groups in items:
@@ -1905,6 +2049,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
 
     def _apply_scalar_params(self, scalar_params) -> None:
         root_config = getattr(self, "config", None)
+        defaults = getattr(self.optimizer, "defaults", {}) or {}
         grouped = OrderedDict()
         order = []
         for step_param in scalar_params:
@@ -1916,10 +2061,42 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
             state = step_param.optimizer_state or self.optimizer.state[param]
             lr = float(group.get("lr", getattr(root_config, "lr", 0.0)))
             weight_decay = float(group.get("weight_decay", getattr(root_config, "weight_decay", 0.0)))
-            scalar_optimizer = getattr(root_config, "aro_scalar_optimizer", "adam")
-            beta1 = float(getattr(root_config, "aro_beta1", 0.9))
-            beta2 = float(getattr(root_config, "aro_beta2", 0.95))
-            lr_scale = float(getattr(root_config, "aro_scalar_lr_scale", 1.0))
+            scalar_optimizer = str(
+                group.get(
+                    "scalar_optimizer",
+                    group.get(
+                        "aro_scalar_optimizer",
+                        defaults.get(
+                            "scalar_optimizer",
+                            getattr(root_config, "aro_scalar_optimizer", "adam"),
+                        ),
+                    ),
+                )
+            ).lower()
+            beta1, beta2 = group.get(
+                "betas",
+                defaults.get(
+                    "betas",
+                    (
+                        float(getattr(root_config, "aro_beta1", 0.9)),
+                        float(getattr(root_config, "aro_beta2", 0.95)),
+                    ),
+                ),
+            )
+            beta1 = float(group.get("beta1", group.get("aro_beta1", beta1)))
+            beta2 = float(group.get("beta2", group.get("aro_beta2", beta2)))
+            lr_scale = float(
+                group.get(
+                    "scalar_lr_scale",
+                    group.get(
+                        "aro_scalar_lr_scale",
+                        defaults.get(
+                            "scalar_lr_scale",
+                            getattr(root_config, "aro_scalar_lr_scale", 1.0),
+                        ),
+                    ),
+                )
+            )
             if scalar_optimizer in ("adam", "adamw"):
                 key = (
                     "adamw",
@@ -1927,7 +2104,18 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                     weight_decay,
                     beta1,
                     beta2,
-                    float(getattr(root_config, "aro_scalar_eps", 1e-8)),
+                    float(
+                        group.get(
+                            "scalar_eps",
+                            group.get(
+                                "aro_scalar_eps",
+                                defaults.get(
+                                    "scalar_eps",
+                                    getattr(root_config, "aro_scalar_eps", 1e-8),
+                                ),
+                            ),
+                        )
+                    ),
                     lr_scale,
                 )
             elif scalar_optimizer == "lion":
@@ -1981,7 +2169,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
         self._apply_scalar_params(scalar_params)
         self._apply_aro_batches(batches)
         self._copy_main_params_to_model_params()
-        if not self.ddp_config.overlap_param_gather:
+        if self.ddp_config.use_megatron_fsdp or not self.ddp_config.overlap_param_gather:
             for model_chunk in self.model_chunks:
                 model_chunk.start_param_sync()
         return True
@@ -2015,70 +2203,89 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
 
     def _expected_child_layout(self, *, meta, state, split_kind: str, child_kind: str):
         parent_shape = tuple(int(dim) for dim in meta.shape)
-        parent_global_shape = tuple(
-            int(dim)
-            for dim in (getattr(meta, "per_expert_global_shape", None) or meta.global_shape)
-        )
         if split_kind == "qkv":
             shapes = tuple(int(dim) for dim in state["qkv_split_shapes"])
             split_axis = int(state.get("qkv_split_axis", getattr(meta, "qkv_split_axis", 0)))
-            if qkv_child_has_local_overlap(shapes, meta, child_kind, split_axis=split_axis):
-                child_shape = qkv_child_local_shape(
-                    parent_shape, shapes, child_kind, meta, split_axis=split_axis
-                )
-            else:
-                child_shape = self._empty_split_child_shape(parent_shape, split_axis)
-            child_global_shape = qkv_child_global_shape(
-                parent_global_shape, shapes, child_kind, split_axis=split_axis
+            child_global_shape, layouts = self._qkv_child_layouts(
+                meta,
+                shapes,
+                child_kind,
+                split_axis,
+                create_group=False,
             )
+            if layouts is None:
+                return None
+            if not qkv_child_has_local_overlap(shapes, meta, child_kind, split_axis=split_axis):
+                raise RuntimeError(
+                    "[ARO_QKV_CHECKPOINT_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={child_kind}"
+                )
+            child_shape = qkv_child_local_shape(parent_shape, shapes, child_kind, meta, split_axis=split_axis)
         elif split_kind == "qkvg":
             shapes = tuple(int(dim) for dim in state["qkvg_split_shapes"])
             split_axis = int(state.get("qkvg_split_axis", getattr(meta, "qkvg_split_axis", 0)))
-            if qkvg_child_has_local_overlap(shapes, meta, child_kind, split_axis=split_axis):
-                child_shape = qkvg_child_local_shape(
-                    parent_shape, shapes, child_kind, meta, split_axis=split_axis
-                )
-            else:
-                child_shape = self._empty_split_child_shape(parent_shape, split_axis)
-            child_global_shape = qkvg_child_global_shape(
-                parent_global_shape, shapes, child_kind, split_axis=split_axis
+            child_global_shape, layouts = self._qkvg_child_layouts(
+                meta,
+                shapes,
+                child_kind,
+                split_axis,
+                create_group=False,
             )
+            if layouts is None:
+                return None
+            if not qkvg_child_has_local_overlap(shapes, meta, child_kind, split_axis=split_axis):
+                raise RuntimeError(
+                    "[ARO_QKVG_CHECKPOINT_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={child_kind}"
+                )
+            child_shape = qkvg_child_local_shape(parent_shape, shapes, child_kind, meta, split_axis=split_axis)
         elif split_kind == "gdn":
             shapes = tuple(int(dim) for dim in state["gdn_split_shapes"])
             split_axis = int(state.get("gdn_split_axis", getattr(meta, "gdn_split_axis", 0)))
-            if gdn_child_has_local_overlap(shapes, meta, child_kind, split_axis=split_axis):
-                child_shape = gdn_child_local_shape(
-                    parent_shape, shapes, child_kind, meta, split_axis=split_axis
-                )
-            else:
-                child_shape = self._empty_split_child_shape(parent_shape, split_axis)
-            child_global_shape = gdn_child_global_shape(
-                parent_global_shape, shapes, child_kind, split_axis=split_axis
+            child_global_shape, layouts = self._gdn_child_layouts(
+                meta,
+                shapes,
+                child_kind,
+                split_axis,
+                create_group=False,
             )
+            if layouts is None:
+                return None
+            if not gdn_child_has_local_overlap(shapes, meta, child_kind, split_axis=split_axis):
+                raise RuntimeError(
+                    "[ARO_GDN_CHECKPOINT_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={child_kind}"
+                )
+            child_shape = gdn_child_local_shape(parent_shape, shapes, child_kind, meta, split_axis=split_axis)
         elif split_kind == "linear":
             rows = tuple(int(dim) for dim in state["linear_split_rows"])
             split_axis = int(state.get("linear_split_axis", getattr(meta, "linear_split_axis", 0)))
             child_kinds = resolve_linear_child_kinds(optimizer_state=state, dist_meta=meta)
-            if linear_child_has_local_overlap(
+            child_global_shape, layouts = self._linear_child_layouts(
+                meta,
+                rows,
+                child_kind,
+                child_kinds=child_kinds,
+                split_axis=split_axis,
+                create_group=False,
+            )
+            if layouts is None:
+                return None
+            if not linear_child_has_local_overlap(
                 rows,
                 meta,
                 child_kind,
                 split_axis=split_axis,
                 child_kinds=child_kinds,
             ):
-                child_shape = linear_child_local_shape(
-                    parent_shape,
-                    rows,
-                    meta,
-                    child_kind,
-                    split_axis=split_axis,
-                    child_kinds=child_kinds,
+                raise RuntimeError(
+                    "[ARO_LINEAR_CHECKPOINT_OWNER_WITHOUT_LOCAL_ROWS] "
+                    f"param_uid={meta.param_uid} child_kind={child_kind}"
                 )
-            else:
-                child_shape = self._empty_split_child_shape(parent_shape, split_axis)
-            child_global_shape = linear_child_global_shape(
-                parent_global_shape,
+            child_shape = linear_child_local_shape(
+                parent_shape,
                 rows,
+                meta,
                 child_kind,
                 split_axis=split_axis,
                 child_kinds=child_kinds,
@@ -2123,12 +2330,15 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
         for child_kind in child_kinds:
             rotation_key = self._split_rotation_key(split_kind, child_kind)
             orientation_key = f"{split_kind}_{child_kind}_orientation"
-            _, _, expected_orientation, expected_rotation_shape = self._expected_child_layout(
+            expected = self._expected_child_layout(
                 meta=meta,
                 state=state,
                 split_kind=split_kind,
                 child_kind=child_kind,
             )
+            if expected is None:
+                continue
+            _, _, expected_orientation, expected_rotation_shape = expected
             actual_orientation = state.get(orientation_key)
             if actual_orientation != expected_orientation:
                 raise RuntimeError(
@@ -2230,11 +2440,13 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
         """Build torch_dist-compatible ARO optimizer checkpoint state."""
         from ....dist_checkpointing.mapping import ShardedObject, ShardedTensor
 
-        del model_sharded_state_dict, is_loading, sharding_type
+        del model_sharded_state_dict
+        self._ensure_aro_checkpoint_state()
         dp_rank = self.data_parallel_group.rank()
         dp_size = self.data_parallel_group.size()
         base_key = f"optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}"
         common_replica_id = (self.distributed_optimizer_instance_id, 0, dp_rank)
+        state_type = resolve_matrix_checkpoint_sharding_type(sharding_type, metadata)
         tp_group = self._resolve_aro_tp_group()
         tp_size = 1 if tp_group is None else self._group_size(tp_group)
         state_replica_group = getattr(self, "state_replica_group", None)
@@ -2242,19 +2454,13 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
         state_replica_rank = 0 if state_replica_group is None else self._group_rank(state_replica_group)
         rp_group = getattr(self, "rp_group", None)
         rp_size = 1 if rp_group is None else self._group_size(rp_group)
-        state_owner_dp_rank = dp_rank
-        if state_replica_group is not None:
-            dp_ranks = self._get_group_ranks_for_checkpoint(self.data_parallel_group)
-            replica_ranks = self._get_group_ranks_for_checkpoint(state_replica_group)
-            if replica_ranks:
-                state_owner_dp_rank = int(dp_ranks.index(int(replica_ranks[0])))
         checkpoint_metadata = build_matrix_checkpoint_metadata(
             dp_size=dp_size,
             fs_size=int(getattr(self, "fs_size", 1)),
             tp_size=int(tp_size),
             rp_size=int(rp_size),
             state_replica_size=int(state_replica_size),
-            requested_type=(metadata or {}).get("distrib_optim_sharding_type", "matrix_fs_rank_state"),
+            requested_type=state_type,
             topology_signature=self._aro_checkpoint_topology_signature(),
             backend_state_spec=self._require_matrix_backend().state_spec(),
         )
@@ -2271,7 +2477,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
             checkpoint_metadata=checkpoint_metadata,
             sharded_object_cls=ShardedObject,
             sharded_tensor_cls=ShardedTensor,
-            state_rank_key=str(state_owner_dp_rank),
+            state_rank_key=str(dp_rank),
         )
 
     def load_state_dict(self, state_dict):
@@ -2294,7 +2500,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
             topology_signature=self._aro_checkpoint_topology_signature(),
             backend_state_spec=self._require_matrix_backend().state_spec(),
         )
-        result = super().load_state_dict(common)
+        result = self._load_matrix_common_state_dict(common, label="ARO")
         restore_distributed_checkpoint_state(
             param_state_data=param_state,
             param_groups=self.optimizer.param_groups,
@@ -2303,6 +2509,7 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
             mixed_precision_config=self._mixed_precision_config,
         )
         self._cast_restored_aro_state_dtypes()
+        self._ensure_aro_checkpoint_state()
         self._validate_restored_aro_state()
         return result
 
