@@ -33,6 +33,8 @@ class Dion2ParamConfig:
     fraction: float = 0.25
     ef_decay: float = 0.95
     adjust_lr: Optional[str] = "spectral_norm"
+    scale_mode: str = "spectral"
+    extra_scale_factor: float = 0.2
     select_dim: str | int = "auto"
     selection_policy: str = "local_shard"
     ns_backend: str = "standard"
@@ -54,6 +56,12 @@ class Dion2ParamConfig:
             raise ValueError(f"Dion2 ef_decay must be non-negative, got {self.ef_decay}")
         if self.adjust_lr not in ("spectral_norm", "rms_norm", None):
             raise ValueError(f"Invalid Dion2 adjust_lr: {self.adjust_lr!r}")
+        if self.scale_mode not in ("spectral", "unit_rms_norm", "shape_scaling"):
+            raise ValueError(f"Invalid Dion2 scale_mode: {self.scale_mode!r}")
+        if float(self.extra_scale_factor) <= 0.0:
+            raise ValueError(
+                f"Dion2 extra_scale_factor must be positive, got {self.extra_scale_factor}"
+            )
         if self.select_dim not in ("auto", "row", "rows", "col", "cols", "column", "columns", 0, 1, -2, -1):
             raise ValueError(f"Invalid Dion2 select_dim: {self.select_dim!r}")
         if self.selection_policy not in ("local_shard",):

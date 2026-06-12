@@ -1,7 +1,11 @@
 import torch
 
 from megatron.core.optimizer.dion2.algorithm import TensorParallelDion2
-from megatron.core.optimizer.dion2.kernels import dion2_compute_update, resolve_select_dim
+from megatron.core.optimizer.dion2.kernels import (
+    adjusted_lr_scale,
+    dion2_compute_update,
+    resolve_select_dim,
+)
 from megatron.core.optimizer.dion2.types import Dion2ParamConfig
 
 
@@ -86,6 +90,38 @@ def test_dion2_auto_selects_only_sharded_axis_when_unique():
         )
         == 1
     )
+
+
+def test_dion2_sparse_spectral_scale_matches_full_muon_energy_for_short_axis():
+    scale = adjusted_lr_scale(
+        base_lr=1.0,
+        global_shape=(16, 64),
+        selected_shape=(4, 64),
+        adjust_lr="spectral_norm",
+        scale_mode="spectral",
+        extra_scale_factor=0.2,
+    )
+
+    # full Muon scale is 0.2 * sqrt(64); selecting alpha=0.25 of the short
+    # dimension requires 1/sqrt(alpha) correction to preserve full update RMS.
+    expected = 0.2 * (64.0 ** 0.5) / (0.25 ** 0.5)
+    assert abs(scale - expected) < 1e-12
+
+
+def test_dion2_sparse_spectral_scale_does_not_overcorrect_when_long_axis_is_selected():
+    scale = adjusted_lr_scale(
+        base_lr=1.0,
+        global_shape=(64, 16),
+        selected_shape=(16, 16),
+        adjust_lr="spectral_norm",
+        scale_mode="spectral",
+        extra_scale_factor=0.2,
+    )
+
+    # Selecting the long dimension does not reduce the polar rank here, so the
+    # sparse update needs the same scale as full Muon, not a blind 1/sqrt(alpha).
+    expected = 0.2 * (64.0 ** 0.5)
+    assert abs(scale - expected) < 1e-12
 
 
 def test_dion2_optimizer_step_updates_matrix_state():

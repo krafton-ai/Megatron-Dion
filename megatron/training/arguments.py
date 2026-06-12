@@ -2678,6 +2678,11 @@ def _add_training_args(parser):
     group.add_argument('--dion2-adjust-lr', type=str, default='spectral_norm',
                        choices=['spectral_norm', 'rms_norm', 'none'],
                        help='Dion2 matrix LR adjustment. Use none to disable.')
+    group.add_argument('--dion2-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       help='Dion2 matrix scale mode matched to the Muon/Dion scale law.')
+    group.add_argument('--dion2-extra-scale-factor', type=float, default=0.2,
+                       help='Additional multiplicative constant for Dion2 matrix updates.')
     group.add_argument('--dion2-select-dim', type=str, default='auto',
                        choices=['auto', 'row', 'rows', 'col', 'cols', 'column', 'columns'],
                        help='Dion2 selected matrix axis.')

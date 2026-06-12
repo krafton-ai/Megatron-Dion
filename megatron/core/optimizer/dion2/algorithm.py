@@ -73,6 +73,8 @@ class MegatronDion2(MegatronMuon):
         betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
         adjust_lr: Optional[str] = "spectral_norm",
+        scale_mode: str = "spectral",
+        extra_scale_factor: float = 0.2,
         select_dim: str | int = "auto",
         selection_policy: str = "local_shard",
         split_parameters: bool = True,
@@ -104,8 +106,8 @@ class MegatronDion2(MegatronMuon):
             gram_restart_steps=gram_restart_steps,
             gram_dtype=gram_dtype,
             gram_kernel_policy=gram_kernel_policy,
-            scale_mode="spectral",
-            extra_scale_factor=1.0,
+            scale_mode=scale_mode,
+            extra_scale_factor=extra_scale_factor,
             fs_mode=fs_mode,
             tp_mode=tp_mode,
             pg_collection=pg_collection,
@@ -115,6 +117,8 @@ class MegatronDion2(MegatronMuon):
             fraction=float(fraction),
             ef_decay=float(ef_decay),
             adjust_lr=adjust_lr,
+            scale_mode=scale_mode,
+            extra_scale_factor=float(extra_scale_factor),
             select_dim=select_dim,
             selection_policy=selection_policy,
         )
@@ -123,6 +127,8 @@ class MegatronDion2(MegatronMuon):
             group.setdefault("fraction", float(fraction))
             group.setdefault("ef_decay", float(ef_decay))
             group.setdefault("adjust_lr", adjust_lr)
+            group.setdefault("scale_mode", scale_mode)
+            group.setdefault("extra_scale_factor", float(extra_scale_factor))
             group.setdefault("select_dim", select_dim)
             group.setdefault("selection_policy", selection_policy)
         self.mixed_precision_config = mixed_precision_config or Dion2MixedPrecisionConfig()
@@ -147,6 +153,10 @@ class MegatronDion2(MegatronMuon):
             fraction=float(group.get("fraction", self.defaults["fraction"])),
             ef_decay=float(group.get("ef_decay", self.defaults["ef_decay"])),
             adjust_lr=group.get("adjust_lr", self.defaults["adjust_lr"]),
+            scale_mode=group.get("scale_mode", self.defaults["scale_mode"]),
+            extra_scale_factor=float(
+                group.get("extra_scale_factor", self.defaults["extra_scale_factor"])
+            ),
             select_dim=group.get("select_dim", self.defaults["select_dim"]),
             selection_policy=group.get("selection_policy", self.defaults["selection_policy"]),
             ns_backend=group.get("ns_backend", self.defaults["ns_backend"]),
@@ -328,6 +338,8 @@ def build_dion2_optimizer(
         betas=(config.dion2_beta1, config.dion2_beta2),
         eps=config.dion2_scalar_eps,
         adjust_lr=config.dion2_adjust_lr,
+        scale_mode=config.dion2_scale_mode,
+        extra_scale_factor=config.dion2_extra_scale_factor,
         select_dim=config.dion2_select_dim,
         selection_policy=config.dion2_selection_policy,
         split_parameters=(

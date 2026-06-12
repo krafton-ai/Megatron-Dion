@@ -585,7 +585,13 @@ class Dion2OptimizerConfig(OptimizerConfig):
     """Error-feedback decay applied only to selected momentum slices."""
 
     dion2_adjust_lr: Optional[str] = "spectral_norm"
-    """Dion2 matrix LR adjustment: spectral_norm, rms_norm, or None."""
+    """Dion2 matrix LR adjustment gate: spectral_norm/rms_norm or None."""
+
+    dion2_scale_mode: str = "spectral"
+    """Dion2 matrix scale mode, matched to the Muon/Dion scale law."""
+
+    dion2_extra_scale_factor: float = 0.2
+    """Dion2 multiplicative scale factor for matrix updates."""
 
     dion2_select_dim: str = "auto"
     """Dion2 selected axis: auto, row/rows, or col/columns."""

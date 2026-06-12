@@ -60,7 +60,10 @@ def adjusted_lr_scale(
     *,
     base_lr: float,
     global_shape: tuple[int, int],
+    selected_shape: tuple[int, int],
     adjust_lr: Optional[str],
+    scale_mode: str = "spectral",
+    extra_scale_factor: float = 0.2,
 ) -> float:
     """Return adjusted_lr / base_lr for the Dion2 matrix update."""
     if float(base_lr) == 0.0 or adjust_lr is None:
@@ -68,11 +71,20 @@ def adjusted_lr_scale(
     fan_out, fan_in = int(global_shape[0]), int(global_shape[1])
     if fan_out <= 0 or fan_in <= 0:
         raise RuntimeError(f"[DION2_INVALID_GLOBAL_SHAPE] global_shape={global_shape}")
-    if adjust_lr == "spectral_norm":
-        return math.sqrt(float(fan_out) / float(fan_in))
+    selected_out, selected_in = int(selected_shape[0]), int(selected_shape[1])
+    if selected_out <= 0 or selected_in <= 0:
+        raise RuntimeError(f"[DION2_INVALID_SELECTED_SHAPE] selected_shape={selected_shape}")
+
     if adjust_lr == "rms_norm":
-        return 0.2 * math.sqrt(float(max(fan_out, fan_in)))
-    raise RuntimeError(f"[DION2_INVALID_ADJUST_LR] adjust_lr={adjust_lr!r}")
+        scale_mode = "unit_rms_norm"
+    elif adjust_lr != "spectral_norm":
+        raise RuntimeError(f"[DION2_INVALID_ADJUST_LR] adjust_lr={adjust_lr!r}")
+
+    full_polar_rank = float(min(fan_out, fan_in))
+    selected_polar_rank = float(min(selected_out, selected_in))
+    full_scale = muon_kernels.muon_scale_factor(fan_out, fan_in, mode=scale_mode)
+    sparse_energy_correction = math.sqrt(full_polar_rank / selected_polar_rank)
+    return float(extra_scale_factor) * float(full_scale) * sparse_energy_correction
 
 
 def resolve_select_dim(
@@ -414,7 +426,10 @@ def dion2_prepare_selected(
     lr_scale = adjusted_lr_scale(
         base_lr=1.0,
         global_shape=global_shape,
+        selected_shape=layout.logical_shape,
         adjust_lr=config.adjust_lr,
+        scale_mode=config.scale_mode,
+        extra_scale_factor=config.extra_scale_factor,
     )
     return canonical, indices, select_dim, layout, lr_scale
 
