@@ -77,7 +77,7 @@ class MegatronDion2(MegatronMuon):
         selection_policy: str = "local_shard",
         split_parameters: bool = True,
         fp32_matmul_prec: str = "medium",
-        coefficient_type: str = "polar_express",
+        coefficient_type: str = "dion2_polar_express",
         num_ns_steps: int = 5,
         ns_backend: str = "standard",
         gram_restart_steps: tuple[int, ...] = (2,),

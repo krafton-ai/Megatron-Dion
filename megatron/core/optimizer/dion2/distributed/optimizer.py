@@ -82,7 +82,11 @@ class DistributedDion2Optimizer(DistributedMuonOptimizer):
             select_dim=getattr(self.config, "dion2_select_dim", "auto"),
             selection_policy=getattr(self.config, "dion2_selection_policy", "local_shard"),
             ns_backend=getattr(self.config, "dion2_ns_backend", self._ns_backend),
-            coefficient_type=getattr(self.config, "dion2_coefficient_type", "polar_express"),
+            coefficient_type=getattr(
+                self.config,
+                "dion2_coefficient_type",
+                "dion2_polar_express",
+            ),
             num_ns_steps=int(getattr(self.config, "dion2_num_ns_steps", 5)),
             ns_epsilon=float(getattr(self.config, "dion2_ns_epsilon", 1e-7)),
             gram_restart_iterations=tuple(
@@ -116,7 +120,11 @@ class DistributedDion2Optimizer(DistributedMuonOptimizer):
             select_dim=getattr(self.config, "dion2_select_dim", "auto"),
             selection_policy=getattr(self.config, "dion2_selection_policy", "local_shard"),
             ns_backend=getattr(self.config, "dion2_ns_backend", self._ns_backend),
-            coefficient_type=getattr(self.config, "dion2_coefficient_type", "polar_express"),
+            coefficient_type=getattr(
+                self.config,
+                "dion2_coefficient_type",
+                "dion2_polar_express",
+            ),
             num_ns_steps=int(getattr(self.config, "dion2_num_ns_steps", 5)),
             ns_epsilon=float(getattr(self.config, "dion2_ns_epsilon", 1e-7)),
             gram_restart_iterations=tuple(
@@ -147,7 +155,7 @@ class DistributedDion2Optimizer(DistributedMuonOptimizer):
             getattr(self.config, "dion2_select_dim", "auto"),
             getattr(self.config, "dion2_selection_policy", "local_shard"),
             getattr(self.config, "dion2_ns_backend", self._ns_backend),
-            getattr(self.config, "dion2_coefficient_type", "polar_express"),
+            getattr(self.config, "dion2_coefficient_type", "dion2_polar_express"),
             int(getattr(self.config, "dion2_num_ns_steps", 5)),
             float(getattr(self.config, "dion2_ns_epsilon", 1e-7)),
             tuple(getattr(self.config, "dion2_gram_ns_restart_iters", (2,))),

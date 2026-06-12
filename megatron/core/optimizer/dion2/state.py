@@ -180,7 +180,7 @@ def build_param_config(
     select_dim: str | int = "auto",
     selection_policy: str = "local_shard",
     ns_backend: str = "standard",
-    coefficient_type: str = "polar_express",
+    coefficient_type: str = "dion2_polar_express",
     num_ns_steps: int = 5,
     ns_epsilon: float = 1e-7,
     gram_restart_iterations: Tuple[int, ...] = (2,),

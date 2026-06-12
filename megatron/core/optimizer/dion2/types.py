@@ -36,7 +36,7 @@ class Dion2ParamConfig:
     select_dim: str | int = "auto"
     selection_policy: str = "local_shard"
     ns_backend: str = "standard"
-    coefficient_type: str = "polar_express"
+    coefficient_type: str = "dion2_polar_express"
     num_ns_steps: int = 5
     ns_epsilon: float = 1e-7
     gram_restart_iterations: Tuple[int, ...] = (2,)
@@ -60,7 +60,14 @@ class Dion2ParamConfig:
             raise ValueError(f"Invalid Dion2 selection_policy: {self.selection_policy!r}")
         if self.ns_backend not in ("standard", "gram"):
             raise ValueError(f"Invalid Dion2 ns_backend: {self.ns_backend!r}")
-        if self.coefficient_type not in ("simple", "quintic", "polar_express", "aol", "custom"):
+        if self.coefficient_type not in (
+            "simple",
+            "quintic",
+            "polar_express",
+            "dion2_polar_express",
+            "aol",
+            "custom",
+        ):
             raise ValueError(f"Invalid Dion2 coefficient_type: {self.coefficient_type!r}")
         if int(self.num_ns_steps) < 1:
             raise ValueError(f"Dion2 num_ns_steps must be at least 1, got {self.num_ns_steps}")
