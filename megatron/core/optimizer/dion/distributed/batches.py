@@ -914,7 +914,7 @@ def group_and_order_param_batches(
                     f"existing={existing} new={count}"
                 )
             batch_multiplicity_by_key[batch_key] = count
-    all_batch_keys = unique_preserve_order(all_batch_keys)
+    all_batch_keys = sorted(unique_preserve_order(all_batch_keys), key=repr)
 
     ordered_batches = []
     for batch_key in all_batch_keys:

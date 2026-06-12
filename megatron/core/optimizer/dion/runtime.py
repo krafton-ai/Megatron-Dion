@@ -120,10 +120,19 @@ def _rank_range_for_dim(size: int, world_size: int, rank: int) -> tuple[int, int
 class AsyncTask:
     """Async generator task used for concurrent Dion execution."""
 
-    def __init__(self, generator: Generator[None, None, None]):
+    def __init__(
+        self,
+        generator: Generator[None, None, None],
+        *,
+        sync_group_keys=(),
+        exclusive_sync: bool = False,
+        auto_start: bool = True,
+    ):
         self.generator = generator
         self.completed = False
-        self._running = self.run()
+        self.sync_group_keys = tuple(sync_group_keys or ())
+        self.exclusive_sync = bool(exclusive_sync)
+        self._running = self.run() if auto_start else False
 
     def run(self) -> bool:
         """Execute one step of the async task. Returns True while still running."""
@@ -151,25 +160,126 @@ class AsyncRuntime:
         """Execute all tasks with controlled concurrency."""
         have_new_tasks = True
         previous_tasks: List[AsyncTask] = []
+        pending_tasks: List[AsyncTask] = []
         task_iter = iter(self.tasks)
 
-        while have_new_tasks or previous_tasks:
+        while have_new_tasks or previous_tasks or pending_tasks:
             running_tasks: List[AsyncTask] = []
-
-            if have_new_tasks and len(previous_tasks) < self.max_concurrent:
-                try:
-                    new_task = next(task_iter)
-                except StopIteration:
-                    have_new_tasks = False
-                else:
-                    if new_task._running:
-                        running_tasks.append(new_task)
 
             for task in previous_tasks:
                 if task.run():
                     running_tasks.append(task)
 
             previous_tasks = running_tasks
+
+            while len(previous_tasks) < self.max_concurrent:
+                if not pending_tasks and have_new_tasks:
+                    try:
+                        pending_tasks.append(next(task_iter))
+                    except StopIteration:
+                        have_new_tasks = False
+                if not pending_tasks:
+                    break
+
+                next_task = pending_tasks[0]
+                if self._task_conflicts(next_task, previous_tasks):
+                    break
+                pending_tasks.pop(0)
+                if next_task.run():
+                    previous_tasks.append(next_task)
+
+    @staticmethod
+    def _task_conflicts(candidate: AsyncTask, running_tasks: List[AsyncTask]) -> bool:
+        if not running_tasks:
+            return False
+        candidate_keys = tuple(getattr(candidate, "sync_group_keys", ()) or ())
+        if not candidate_keys:
+            return False
+        candidate_exclusive = bool(getattr(candidate, "exclusive_sync", False))
+        if not candidate_exclusive and not any(
+            bool(getattr(task, "exclusive_sync", False)) for task in running_tasks
+        ):
+            return False
+
+        candidate_sets = tuple(frozenset(key) for key in candidate_keys if key)
+        if not candidate_sets:
+            return False
+        for task in running_tasks:
+            task_keys = tuple(getattr(task, "sync_group_keys", ()) or ())
+            if not task_keys:
+                continue
+            for candidate_set in candidate_sets:
+                for task_key in task_keys:
+                    task_set = frozenset(task_key)
+                    if task_set and not candidate_set.isdisjoint(task_set):
+                        return True
+        return False
+
+
+def _group_ranks_key(process_group) -> tuple[int, ...]:
+    if process_group is None:
+        return ()
+    return tuple(int(rank) for rank in dist.get_process_group_ranks(process_group))
+
+
+def _is_split_child_meta(dist_meta) -> bool:
+    return (
+        dist_meta is not None
+        and (
+            getattr(dist_meta, "parent_param_uid", None) is not None
+            or bool(getattr(dist_meta, "is_qkv_child", False))
+            or bool(getattr(dist_meta, "is_qkvg_child", False))
+            or bool(getattr(dist_meta, "is_gdn_child", False))
+            or bool(getattr(dist_meta, "is_linear_child", False))
+        )
+    )
+
+
+def _batch_sync_group_keys(dion_batch: DionBatch) -> tuple[tuple[int, ...], ...]:
+    groups = []
+    batch_group = getattr(dion_batch, "batch_group", None)
+    if batch_group is not None:
+        groups.extend(getattr(batch_group, "sync_groups", ()) or ())
+        groups.extend(
+            (
+                getattr(batch_group, "replicate_group", None),
+                getattr(batch_group, "ortho_group", None),
+                getattr(batch_group, "q_norm_group", None),
+                getattr(batch_group, "low_rank_replicate_group", None),
+            )
+        )
+    batch_collectives = getattr(dion_batch, "batch_collectives", None)
+    if batch_collectives is not None:
+        for collective_group in (
+            getattr(batch_collectives, "tp_q_gathers", ()) or (),
+            getattr(batch_collectives, "fs_p_collectives", ()) or (),
+            getattr(batch_collectives, "tp_r_collectives", ()) or (),
+            getattr(batch_collectives, "tp_q_reshards", ()) or (),
+        ):
+            groups.extend(
+                getattr(collective, "process_group", None)
+                for collective in collective_group
+            )
+        fs_collective = getattr(batch_collectives, "fs_collective", None)
+        if fs_collective is not None:
+            groups.append(getattr(fs_collective, "process_group", None))
+
+    keys = []
+    seen = set()
+    for group in groups:
+        key = _group_ranks_key(group)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return tuple(keys)
+
+
+def _batch_has_split_children(dion_batch: DionBatch) -> bool:
+    return any(
+        _is_split_child_meta(dist_meta)
+        for dist_meta in getattr(dion_batch, "dist_metas", ())
+    )
 
 
 def resolve_async_task_limit(
@@ -310,10 +420,15 @@ def iter_dist_tasks(optimizer) -> Generator[AsyncTask, None, None]:
     optimizer._scalar_update_count += len(scalar_params)
 
     for dion_batch in dion_batches:
-        yield AsyncTask(run_dion_batch_async(optimizer, dion_batch))
+        yield AsyncTask(
+            run_dion_batch_async(optimizer, dion_batch),
+            sync_group_keys=_batch_sync_group_keys(dion_batch),
+            exclusive_sync=_batch_has_split_children(dion_batch),
+            auto_start=False,
+        )
 
     if scalar_params:
-        yield AsyncTask(optimizer._apply_scalar_batches(scalar_params))
+        yield AsyncTask(optimizer._apply_scalar_batches(scalar_params), auto_start=False)
 
 
 def run_dion_batch_async(
