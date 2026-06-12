@@ -51,7 +51,10 @@ def scaled_lr_for_shape(
     raise RuntimeError(f"[DION_INVALID_SCALE_MODE] scale_mode={scale_mode!r}")
 
 
-@_dion_compile(fullgraph=True)
+# These helpers are called across many parameter shapes and active batch sizes in
+# one optimizer step. Fullgraph compilation specializes each case and can hit the
+# Dynamo recompile limit before the first iteration completes.
+@torch.compiler.disable
 def _apply_batched_matmul_regular(
     X: List[Tensor],
     A: Tensor,
@@ -67,7 +70,7 @@ def _apply_batched_matmul_regular(
     torch._foreach_add_(X, update)
 
 
-@_dion_compile(fullgraph=True)
+@torch.compiler.disable
 def _apply_batched_matmul_transposed(
     X: List[Tensor],
     A: Tensor,
@@ -206,7 +209,7 @@ def local_column_sum_sq(X: Tensor) -> Tensor:
     return X.to(dtype=torch.float32).square().sum(dim=-2, keepdim=True)
 
 
-@_dion_compile(fullgraph=True)
+@torch.compiler.disable
 def _compute_update_batch_regular(
     q_new_f32: Tensor,
     p_for_delta: Tensor,
@@ -214,7 +217,7 @@ def _compute_update_batch_regular(
     return torch.bmm(p_for_delta, q_new_f32.transpose(1, 2))
 
 
-@_dion_compile(fullgraph=True)
+@torch.compiler.disable
 def _compute_update_batch_transposed(
     q_new_f32: Tensor,
     p_for_delta: Tensor,
