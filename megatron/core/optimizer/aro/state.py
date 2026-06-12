@@ -7,7 +7,12 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch import Tensor
 
-from ..matrix.parameter import is_matrix_param, mark_matrix_bucket_params, prepare_matrix_params
+from ..matrix.parameter import (
+    is_matrix_param,
+    is_vocab_param,
+    mark_matrix_bucket_params,
+    prepare_matrix_params,
+)
 from ..matrix.splits.gdn import (
     get_gdn_split_axis_from_dist_meta,
     get_gdn_split_shapes_from_dist_meta,
@@ -91,7 +96,7 @@ def is_aro_matrix_param(
         return False
     if dist_meta is not None and getattr(dist_meta, "is_aro_param", False):
         return True
-    return is_matrix_param(param, param_name)
+    return is_matrix_param(param, param_name) and not is_vocab_param(param)
 
 
 def prepare_aro_params(module: torch.nn.Module) -> None:
@@ -107,7 +112,7 @@ def mark_aro_bucket_params(param_map, param_to_name, fs_size: int, *, tp_group=N
         param_map=param_map,
         param_to_name=param_to_name,
         fs_size=fs_size,
-        include_vocab=True,
+        include_vocab=False,
         tp_group=tp_group,
     )
     for param in param_map.keys():

@@ -20,9 +20,9 @@ def get_aro_param_override(
 ) -> Optional[ParamGroupOverride]:
     """Return ARO-specific param group overrides.
 
-    Full-model ARO applies matrix updates to eligible 2D parameters, including
-    embedding and LM-head tensors, and does not need an optimizer-specific LR
-    override.
+    Hybrid ARO mirrors Muon/Dion matrix selection: eligible non-vocab 2D
+    parameters use ARO, while embeddings and LM-head tensors use scalar Adam
+    fallback. No optimizer-specific LR override is needed.
     """
     del config, param, param_override, param_name
     return None
