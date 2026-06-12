@@ -2693,7 +2693,7 @@ def _add_training_args(parser):
     group.add_argument('--dion2-ns-backend', type=str, default='standard',
                        choices=['standard', 'gram'],
                        help='Newton-Schulz backend for Dion2.')
-    group.add_argument('--dion2-coefficient-type', type=str, default='polar_express',
+    group.add_argument('--dion2-coefficient-type', type=str, default='dion2_polar_express',
                        help='Newton-Schulz coefficient type for Dion2.')
     group.add_argument('--dion2-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Dion2.')

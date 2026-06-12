@@ -10,8 +10,31 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from ..muon import kernels as muon_kernels
 from ..muon.kernels import orthogonalize_muon, orthogonalize_muon_2d
 from .types import Dion2ParamConfig
+
+
+DION2_POLAR_EXPRESS_COEFFICIENT_TYPE = "dion2_polar_express"
+DION2_POLAR_EXPRESS_COEFFS = (
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+)
+
+
+def ensure_dion2_coefficients_registered() -> None:
+    """Register Dion2-local Polar Express coefficients with Muon NS dispatch."""
+    existing = muon_kernels._COEFFICIENT_SETS.get(DION2_POLAR_EXPRESS_COEFFICIENT_TYPE)
+    if existing is None:
+        muon_kernels._COEFFICIENT_SETS[DION2_POLAR_EXPRESS_COEFFICIENT_TYPE] = (
+            DION2_POLAR_EXPRESS_COEFFS
+        )
+        return
+    if tuple(existing) != DION2_POLAR_EXPRESS_COEFFS:
+        raise RuntimeError("[DION2_POLAR_EXPRESS_COEFF_MISMATCH]")
 
 
 def _dist_world_size(group) -> int:
@@ -244,6 +267,7 @@ def orthogonalize_selected(
     config: Dion2ParamConfig,
 ) -> Tensor:
     """Orthogonalize a canonical selected Dion2 matrix without Muon scaling."""
+    ensure_dion2_coefficients_registered()
     row_world = _dist_world_size(layout.row_group)
     col_world = _dist_world_size(layout.col_group)
     row_active = row_world > 1 and layout.row_partition_dim in (0, 1)

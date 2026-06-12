@@ -602,7 +602,7 @@ class Dion2OptimizerConfig(OptimizerConfig):
     dion2_ns_backend: str = "standard"
     """Newton-Schulz backend for Dion2. Valid values are standard and gram."""
 
-    dion2_coefficient_type: str = "polar_express"
+    dion2_coefficient_type: str = "dion2_polar_express"
     """Newton-Schulz coefficient type for Dion2."""
 
     dion2_num_ns_steps: int = 5
