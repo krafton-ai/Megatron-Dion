@@ -939,6 +939,14 @@ def validate_args(args, defaults={}):
         args.dion_q_dtype = map_dtype(args.dion_q_dtype)
     if hasattr(args, "dion_variance_dtype") and args.dion_variance_dtype is not None:
         args.dion_variance_dtype = map_dtype(args.dion_variance_dtype)
+    if hasattr(args, "dion2_momentum_dtype") and args.dion2_momentum_dtype is not None:
+        args.dion2_momentum_dtype = map_dtype(args.dion2_momentum_dtype)
+    if hasattr(args, "dion2_scalar_momentum_dtype") and args.dion2_scalar_momentum_dtype is not None:
+        args.dion2_scalar_momentum_dtype = map_dtype(args.dion2_scalar_momentum_dtype)
+    if hasattr(args, "dion2_scalar_variance_dtype") and args.dion2_scalar_variance_dtype is not None:
+        args.dion2_scalar_variance_dtype = map_dtype(args.dion2_scalar_variance_dtype)
+    if getattr(args, "dion2_adjust_lr", None) == "none":
+        args.dion2_adjust_lr = None
     if hasattr(args, "aro_momentum_dtype") and args.aro_momentum_dtype is not None:
         args.aro_momentum_dtype = map_dtype(args.aro_momentum_dtype)
     if hasattr(args, "aro_rotation_dtype") and args.aro_rotation_dtype is not None:
@@ -953,6 +961,16 @@ def validate_args(args, defaults={}):
                 )
             else:
                 args.muon_gram_ns_restart_iters = tuple()
+    if hasattr(args, "dion2_gram_ns_restart_iters"):
+        restart_iters = args.dion2_gram_ns_restart_iters
+        if isinstance(restart_iters, str):
+            restart_iters = restart_iters.strip()
+            if restart_iters:
+                args.dion2_gram_ns_restart_iters = tuple(
+                    int(item) for item in restart_iters.split(",") if item.strip()
+                )
+            else:
+                args.dion2_gram_ns_restart_iters = tuple()
     if args.grad_reduce_in_bf16:
         args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
@@ -1516,10 +1534,12 @@ def validate_args(args, defaults={}):
             args.muon_split_parameters = split_parameters
         elif args.optimizer == 'dion':
             args.dion_split_parameters = split_parameters
+        elif args.optimizer == 'dion2':
+            args.dion2_split_parameters = split_parameters
         elif args.optimizer == 'aro':
             args.aro_split_parameters = split_parameters
         elif split_parameters:
-            assert False, "--split-parameters is only supported by Muon, Dion, and ARO."
+            assert False, "--split-parameters is only supported by Muon, Dion, Dion2, and ARO."
 
     # Muon optimizer check.
     if args.optimizer in ('muon', 'dist_muon'):
@@ -1561,6 +1581,21 @@ def validate_args(args, defaults={}):
                 "--ckpt-format torch_dist. Use --no-save-optim/--no-load-optim for "
                 "model-only checkpoints."
             )
+
+    if args.optimizer == "dion2" and args.use_distributed_optimizer:
+        if not args.no_save_optim or not args.no_load_optim:
+            assert args.ckpt_format == "torch_dist", (
+                "Dion2 distributed optimizer supports optimizer checkpointing only with "
+                "--ckpt-format torch_dist. Use --no-save-optim/--no-load-optim for "
+                "model-only checkpoints."
+            )
+    if args.optimizer == "dion2" and not args.use_distributed_optimizer:
+        assert not args.overlap_grad_reduce, (
+            "Local Dion2 optimizer does not support overlap grad reduce."
+        )
+        assert not args.overlap_param_gather, (
+            "Local Dion2 optimizer does not support overlap param gather."
+        )
 
     if args.optimizer == "aro" and args.use_distributed_optimizer:
         if not args.no_save_optim or not args.no_load_optim:
@@ -2590,7 +2625,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'dion', 'muon', 'dist_muon', 'aro', 'lion'],
+                       choices=['adam', 'sgd', 'dion', 'dion2', 'muon', 'dist_muon', 'aro', 'lion'],
                        help='Optimizer function')
     group.add_argument('--dion-momentum', type=float, default=0.95,
                        help='Dion error-feedback momentum.')
@@ -2636,6 +2671,69 @@ def _add_training_args(parser):
     group.add_argument('--dion-variance-dtype', type=str, default=None,
                        choices=['fp32', 'float32', 'bf16', 'bfloat16'],
                        help='Dtype for Dion scalar second-moment state.')
+    group.add_argument('--dion2-fraction', type=float, default=0.25,
+                       help='Dion2 fraction of rows/columns to orthogonalize per step.')
+    group.add_argument('--dion2-ef-decay', type=float, default=0.95,
+                       help='Dion2 error-feedback decay applied to selected momentum slices.')
+    group.add_argument('--dion2-adjust-lr', type=str, default='spectral_norm',
+                       choices=['spectral_norm', 'rms_norm', 'none'],
+                       help='Dion2 matrix LR adjustment. Use none to disable.')
+    group.add_argument('--dion2-select-dim', type=str, default='auto',
+                       choices=['auto', 'row', 'rows', 'col', 'cols', 'column', 'columns'],
+                       help='Dion2 selected matrix axis.')
+    group.add_argument('--dion2-selection-policy', type=str, default='local_shard',
+                       choices=['local_shard'],
+                       help='Dion2 top-k selection policy.')
+    group.add_argument('--dion2-fs-mode', type=str, default='distributed',
+                       choices=['blockwise', 'duplicated', 'distributed'],
+                       help='How distributed optimizer FS shards participate in Dion2 NS.')
+    group.add_argument('--dion2-tp-mode', type=str, default='distributed',
+                       choices=['blockwise', 'duplicated', 'distributed'],
+                       help='How tensor model parallel shards participate in Dion2 NS.')
+    group.add_argument('--dion2-ns-backend', type=str, default='standard',
+                       choices=['standard', 'gram'],
+                       help='Newton-Schulz backend for Dion2.')
+    group.add_argument('--dion2-coefficient-type', type=str, default='polar_express',
+                       help='Newton-Schulz coefficient type for Dion2.')
+    group.add_argument('--dion2-num-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schulz steps for Dion2.')
+    group.add_argument('--dion2-ns-epsilon', type=float, default=1e-7,
+                       help='Dion2 Newton-Schulz normalization epsilon.')
+    group.add_argument('--dion2-gram-ns-restart-iters', type=str, default='2',
+                       help='Comma-separated restart iterations for Dion2 Gram Newton-Schulz.')
+    group.add_argument('--dion2-gram-ns-kernel-policy', type=str, default='torch',
+                       choices=['torch', 'auto', 'dao', 'quack', 'compile', 'disabled'],
+                       help='Kernel policy for Dion2 Gram Newton-Schulz.')
+    group.add_argument('--dion2-gram-ns-dtype', type=str, default=None,
+                       choices=['float32', 'float', 'fp32', 'float16', 'fp16', 'half',
+                                'bfloat16', 'bf16'],
+                       help='Optional compute dtype override for Dion2 Gram Newton-Schulz.')
+    group.add_argument('--dion2-fp32-matmul-prec', type=str, default='medium',
+                       choices=['low', 'medium', 'high'],
+                       help='FP32 matmul precision for Dion2 Newton-Schulz.')
+    group.add_argument('--dion2-scalar-optimizer', type=str, default='adam',
+                       choices=['adam'],
+                       help='Scalar optimizer used for non-matrix Dion2 parameters.')
+    group.add_argument('--dion2-scalar-lr-scale', type=float, default=1.0,
+                       help='Additional multiplicative constant for Dion2 scalar updates.')
+    group.add_argument('--dion2-beta1', type=float, default=0.9,
+                       help='Beta1 for Dion2 scalar Adam fallback.')
+    group.add_argument('--dion2-beta2', type=float, default=0.95,
+                       help='Beta2 for Dion2 scalar Adam fallback.')
+    group.add_argument('--dion2-scalar-eps', type=float, default=1e-8,
+                       help='Epsilon for Dion2 scalar Adam fallback.')
+    group.add_argument('--dion2-split-parameters', action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='Split fused parameters into optimizer-only children for Dion2.')
+    group.add_argument('--dion2-momentum-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for Dion2 matrix momentum state.')
+    group.add_argument('--dion2-scalar-momentum-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for Dion2 scalar first-moment state.')
+    group.add_argument('--dion2-scalar-variance-dtype', type=str, default=None,
+                       choices=['fp32', 'float32', 'bf16', 'bfloat16'],
+                       help='Dtype for Dion2 scalar second-moment state.')
     group.add_argument('--aro-momentum', type=float, default=0.95,
                        help='ARO momentum coefficient.')
     group.add_argument('--aro-base-optimizer', type=str, default='sinkhorn',

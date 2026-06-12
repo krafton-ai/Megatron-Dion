@@ -365,7 +365,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     if device_count > 0:
-        if args.optimizer in ("dion", "muon", "aro") and args.use_distributed_optimizer:
+        if args.optimizer in ("dion", "dion2", "muon", "aro") and args.use_distributed_optimizer:
             resolved_fs, resolved_rp = _resolve_matrix_fs_rp_topology(args)
             args.fully_shard_model_parallel_size = resolved_fs
             args.replicate_model_parallel_size = resolved_rp

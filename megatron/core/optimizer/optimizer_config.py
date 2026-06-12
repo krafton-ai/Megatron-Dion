@@ -572,6 +572,86 @@ class DionOptimizerConfig(OptimizerConfig):
 
 
 @dataclass
+class Dion2OptimizerConfig(OptimizerConfig):
+    """Dion2 optimizer configuration object."""
+
+    optimizer: str = 'dion2'
+    """Optimizer name."""
+
+    dion2_fraction: float = 0.25
+    """Fraction of rows/columns selected for Dion2 orthogonalization."""
+
+    dion2_ef_decay: float = 0.95
+    """Error-feedback decay applied only to selected momentum slices."""
+
+    dion2_adjust_lr: Optional[str] = "spectral_norm"
+    """Dion2 matrix LR adjustment: spectral_norm, rms_norm, or None."""
+
+    dion2_select_dim: str = "auto"
+    """Dion2 selected axis: auto, row/rows, or col/columns."""
+
+    dion2_selection_policy: str = "local_shard"
+    """Dion2 selection policy. local_shard selects within each selected-axis shard."""
+
+    dion2_fs_mode: str = "distributed"
+    """How distributed-optimizer FS shards participate in Dion2 NS."""
+
+    dion2_tp_mode: str = "distributed"
+    """How tensor-parallel shards participate in Dion2 NS."""
+
+    dion2_ns_backend: str = "standard"
+    """Newton-Schulz backend for Dion2. Valid values are standard and gram."""
+
+    dion2_coefficient_type: str = "polar_express"
+    """Newton-Schulz coefficient type for Dion2."""
+
+    dion2_num_ns_steps: int = 5
+    """Number of Newton-Schulz iterations for Dion2."""
+
+    dion2_ns_epsilon: float = 1e-7
+    """Numerical epsilon for Dion2 Newton-Schulz normalization."""
+
+    dion2_gram_ns_restart_iters: Tuple[int, ...] = (2,)
+    """Restart iterations for Dion2 Gram Newton-Schulz."""
+
+    dion2_gram_ns_kernel_policy: str = "torch"
+    """Kernel policy for Dion2 Gram Newton-Schulz."""
+
+    dion2_gram_ns_dtype: Optional[str] = None
+    """Optional compute dtype override for Dion2 Gram Newton-Schulz."""
+
+    dion2_fp32_matmul_prec: str = "medium"
+    """FP32 matmul precision for Dion2 Newton-Schulz."""
+
+    dion2_scalar_optimizer: str = "adam"
+    """Scalar optimizer used for non-matrix Dion2 parameters."""
+
+    dion2_scalar_lr_scale: float = 1.0
+    """Additional multiplicative constant for Dion2 scalar updates."""
+
+    dion2_beta1: float = 0.9
+    """Beta1 for Dion2 scalar Adam fallback."""
+
+    dion2_beta2: float = 0.95
+    """Beta2 for Dion2 scalar Adam fallback."""
+
+    dion2_scalar_eps: float = 1e-8
+    """Epsilon for Dion2 scalar Adam fallback."""
+
+    dion2_split_parameters: bool = True
+    """Whether Dion2 should split fused parameters into optimizer-only children."""
+
+    dion2_momentum_dtype: Optional[torch.dtype] = None
+    """Dtype for Dion2 matrix momentum state."""
+
+    dion2_scalar_momentum_dtype: Optional[torch.dtype] = None
+    """Dtype for Dion2 scalar first-moment state."""
+
+    dion2_scalar_variance_dtype: Optional[torch.dtype] = None
+    """Dtype for Dion2 scalar second-moment state."""
+
+
+@dataclass
 class AroOptimizerConfig(OptimizerConfig):
     """ARO optimizer configuration object."""
 

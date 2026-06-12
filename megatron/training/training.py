@@ -174,6 +174,7 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     AdamOptimizerConfig,
     AroOptimizerConfig,
+    Dion2OptimizerConfig,
     DionOptimizerConfig,
     MuonOptimizerConfig,
     OptimizerConfig,
@@ -1589,6 +1590,8 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
         config_class = MuonOptimizerConfig
     elif args.optimizer == 'dion':
         config_class = DionOptimizerConfig
+    elif args.optimizer == 'dion2':
+        config_class = Dion2OptimizerConfig
     elif args.optimizer == 'aro':
         config_class = AroOptimizerConfig
     else:
