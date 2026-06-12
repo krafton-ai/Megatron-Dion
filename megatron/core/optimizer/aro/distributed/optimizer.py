@@ -1230,8 +1230,9 @@ class DistributedAroOptimizer(DistributedMatrixOptimizer):
                             ),
                         )
                     ).lower()
-                    if scalar_optimizer in ("adam", "adamw") and "exp_avg_sq" not in state:
-                        state["exp_avg_sq"] = torch.zeros_like(param)
+                    if scalar_optimizer in ("adam", "adamw"):
+                        if "exp_avg_sq" not in state:
+                            state["exp_avg_sq"] = torch.zeros_like(param)
                     elif scalar_optimizer != "lion":
                         raise RuntimeError(f"[ARO_INVALID_SCALAR_OPTIMIZER] {scalar_optimizer!r}")
                     continue
