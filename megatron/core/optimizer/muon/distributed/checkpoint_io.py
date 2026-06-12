@@ -11,7 +11,7 @@ from ..backend import MuonBackend
 
 _MUON_PARAM_STATE_FORMAT = "muon_rank_local_state_v1"
 _MUON_TENSOR_STATE_FORMAT = "muon_rank_local_tensor_shards_v1"
-_MUON_STATE_TYPES = {"muon_rank_local_state"}
+_MUON_STATE_TYPES = {"dp_reshardable", "muon_rank_local_state"}
 
 
 def resolve_muon_state_type(sharding_type, metadata) -> str:
