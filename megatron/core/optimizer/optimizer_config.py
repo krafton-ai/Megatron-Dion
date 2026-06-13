@@ -636,10 +636,10 @@ class Dion2OptimizerConfig(OptimizerConfig):
     """Additional multiplicative constant for Dion2 scalar updates."""
 
     dion2_beta1: float = 0.9
-    """Beta1 for Dion2 scalar Adam fallback."""
+    """Beta1 for Dion2 scalar fallback."""
 
     dion2_beta2: float = 0.95
-    """Beta2 for Dion2 scalar Adam fallback."""
+    """Beta2 for Dion2 scalar fallback."""
 
     dion2_scalar_eps: float = 1e-8
     """Epsilon for Dion2 scalar Adam fallback."""

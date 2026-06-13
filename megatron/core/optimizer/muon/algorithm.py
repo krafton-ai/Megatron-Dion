@@ -130,6 +130,8 @@ class MegatronMuon(torch.optim.AdamW):
         gram_kernel_policy: str = "torch",
         scale_mode: str = "spectral",
         extra_scale_factor: float = 0.2,
+        scalar_optimizer: str = "adam",
+        scalar_lr_scale: float = 1.0,
         fs_mode: str = "blockwise",
         tp_mode: str = "blockwise",
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -146,6 +148,13 @@ class MegatronMuon(torch.optim.AdamW):
             raise ValueError(f"invalid Muon tp_mode: {tp_mode}")
         if ns_backend not in ("standard", "gram"):
             raise ValueError(f"invalid Muon ns_backend: {ns_backend}")
+        scalar_optimizer = str(scalar_optimizer).lower()
+        if scalar_optimizer == "adam":
+            scalar_optimizer = "adamw"
+        if scalar_optimizer not in ("adamw", "lion"):
+            raise ValueError(f"invalid Muon scalar optimizer: {scalar_optimizer}")
+        if float(scalar_lr_scale) < 0.0:
+            raise ValueError(f"invalid Muon scalar_lr_scale: {scalar_lr_scale}")
 
         defaults = dict(
             lr=lr,
@@ -164,6 +173,8 @@ class MegatronMuon(torch.optim.AdamW):
             gram_kernel_policy=gram_kernel_policy,
             scale_mode=scale_mode,
             extra_scale_factor=extra_scale_factor,
+            scalar_optimizer=scalar_optimizer,
+            scalar_lr_scale=float(scalar_lr_scale),
             fs_mode=fs_mode,
             tp_mode=tp_mode,
         )
@@ -174,7 +185,11 @@ class MegatronMuon(torch.optim.AdamW):
         if group.get("algorithm", "muon") == "muon" and is_muon_matrix_param(param):
             init_matrix_state(param, state)
             return
-        init_scalar_state(param=param, state=state)
+        init_scalar_state(
+            param=param,
+            state=state,
+            scalar_optimizer=group.get("scalar_optimizer", self.defaults["scalar_optimizer"]),
+        )
 
     def _matrix_child_updates(
         self,
@@ -373,10 +388,19 @@ class MegatronMuon(torch.optim.AdamW):
     def _step_scalar_batch(self, items, group: dict):
         if not items:
             return
+        scalar_optimizer = str(
+            group.get("scalar_optimizer", self.defaults.get("scalar_optimizer", "adamw"))
+        ).lower()
+        if scalar_optimizer == "adam":
+            scalar_optimizer = "adamw"
+        if scalar_optimizer not in ("adamw", "lion"):
+            raise RuntimeError(f"[MUON_INVALID_SCALAR_OPTIMIZER] {scalar_optimizer!r}")
         beta1, beta2 = group.get("betas", self.defaults["betas"])
         beta1 = float(beta1)
         beta2 = float(beta2)
-        lr = float(group.get("lr", self.defaults["lr"]))
+        lr = float(group.get("lr", self.defaults["lr"])) * float(
+            group.get("scalar_lr_scale", self.defaults.get("scalar_lr_scale", 1.0))
+        )
         eps = float(group.get("eps", self.defaults["eps"]))
         weight_decay = float(group.get("weight_decay", self.defaults["weight_decay"]))
 
@@ -384,13 +408,17 @@ class MegatronMuon(torch.optim.AdamW):
         for index, (param, grad, state) in enumerate(items):
             state["step"] = int(state.get("step", 0)) + 1
             exp_avg = state["exp_avg"]
-            exp_avg_sq = state["exp_avg_sq"]
+            exp_avg_sq = state.get("exp_avg_sq")
+            if scalar_optimizer == "adamw" and exp_avg_sq is None:
+                exp_avg_sq = torch.zeros_like(param, dtype=exp_avg.dtype)
+                state["exp_avg_sq"] = exp_avg_sq
             key = (
+                scalar_optimizer,
                 param.device,
                 param.dtype,
                 grad.dtype,
                 exp_avg.dtype,
-                exp_avg_sq.dtype,
+                exp_avg_sq.dtype if exp_avg_sq is not None else None,
                 int(state["step"]),
             )
             grouped.setdefault(key, []).append(index)
@@ -407,11 +435,21 @@ class MegatronMuon(torch.optim.AdamW):
                 grads = [items[index][1] for index in local]
                 states = [items[index][2] for index in local]
                 exp_avgs = [state["exp_avg"] for state in states]
-                exp_avg_sqs = [state["exp_avg_sq"] for state in states]
                 step = int(states[0]["step"])
                 grads_for_m = [
                     grad.to(dtype=exp_avg.dtype) for grad, exp_avg in zip(grads, exp_avgs)
                 ]
+                if scalar_optimizer == "lion":
+                    updates = torch._foreach_lerp(exp_avgs, grads_for_m, [1.0 - beta1] * len(local))
+                    torch._foreach_sign_(updates)
+                    torch._foreach_lerp_(exp_avgs, grads_for_m, [1.0 - beta2] * len(local))
+                    torch._foreach_mul_(updates, lr)
+                    updates = [update.to(dtype=param.dtype) for update, param in zip(updates, p)]
+                    if weight_decay > 0.0:
+                        torch._foreach_mul_(p, 1.0 - lr * weight_decay)
+                    torch._foreach_sub_(p, updates)
+                    continue
+                exp_avg_sqs = [state["exp_avg_sq"] for state in states]
                 torch._foreach_lerp_(exp_avgs, grads_for_m, [1.0 - beta1] * len(local))
                 if any(
                     grad.dtype != exp_avg_sq.dtype
@@ -478,13 +516,19 @@ def build_muon_optimizer(
 ):
     """Build the base Muon optimizer used by MCore wrappers."""
     del kwargs
+    scalar_optimizer = getattr(config, "muon_scalar_optimizer", "adam")
+    scalar_betas = (
+        (config.lion_beta1, config.lion_beta2)
+        if str(scalar_optimizer).lower() == "lion"
+        else (config.adam_beta1, config.adam_beta2)
+    )
     return MegatronMuon(
         param_groups,
         lr=config.lr,
         momentum_beta=config.muon_momentum,
         use_nesterov=config.muon_use_nesterov,
         weight_decay=config.weight_decay,
-        betas=(config.adam_beta1, config.adam_beta2),
+        betas=scalar_betas,
         eps=config.adam_eps,
         split_parameters=config.muon_split_parameters,
         fp32_matmul_prec=config.muon_fp32_matmul_prec,
@@ -502,6 +546,8 @@ def build_muon_optimizer(
         gram_kernel_policy=getattr(config, "muon_gram_ns_kernel_policy", "torch"),
         scale_mode=config.muon_scale_mode,
         extra_scale_factor=config.muon_extra_scale_factor,
+        scalar_optimizer=scalar_optimizer,
+        scalar_lr_scale=getattr(config, "muon_scalar_lr_scale", 1.0),
         fs_mode=getattr(config, "muon_fs_mode", "blockwise"),
         tp_mode=config.muon_tp_mode,
         pg_collection=pg_collection,

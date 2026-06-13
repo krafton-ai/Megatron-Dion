@@ -150,19 +150,23 @@ def init_scalar_state(
     param: Tensor,
     state: Dict[str, Any],
     mixed_precision_config: Optional[Dion2MixedPrecisionConfig] = None,
+    scalar_optimizer: str = "adamw",
 ) -> None:
-    """Initialize AdamW-style scalar fallback state."""
+    """Initialize scalar fallback state."""
     if mixed_precision_config is None:
         mixed_precision_config = Dion2MixedPrecisionConfig()
+    scalar_optimizer = str(scalar_optimizer).lower()
+    if scalar_optimizer == "adam":
+        scalar_optimizer = "adamw"
     momentum_dtype = str_to_dtype(mixed_precision_config.scalar_momentum_dtype)
     if momentum_dtype is None:
         momentum_dtype = param.dtype
-    variance_dtype = str_to_dtype(mixed_precision_config.scalar_variance_dtype)
-    if variance_dtype is None:
-        variance_dtype = param.dtype
     if "exp_avg" not in state:
         state["exp_avg"] = torch.zeros_like(param, dtype=momentum_dtype)
-    if "exp_avg_sq" not in state:
+    if scalar_optimizer == "adamw" and "exp_avg_sq" not in state:
+        variance_dtype = str_to_dtype(mixed_precision_config.scalar_variance_dtype)
+        if variance_dtype is None:
+            variance_dtype = param.dtype
         state["exp_avg_sq"] = torch.zeros_like(param, dtype=variance_dtype)
     state.setdefault("step", 0)
 
@@ -308,6 +312,7 @@ def init_param_state(
         param=param,
         state=state,
         mixed_precision_config=mixed_precision_config,
+        scalar_optimizer=optim_group.get("scalar_optimizer", "adamw"),
     )
 
 

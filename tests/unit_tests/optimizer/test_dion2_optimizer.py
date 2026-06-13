@@ -149,3 +149,22 @@ def test_dion2_optimizer_step_updates_matrix_state():
     assert torch.isfinite(param).all()
     assert torch.isfinite(state["momentum"]).all()
     assert not torch.equal(param, before)
+
+
+def test_dion2_scalar_lion_updates_only_first_moment():
+    param = torch.nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.float32))
+    param.grad = torch.tensor([0.25, -0.5], dtype=torch.float32)
+
+    optimizer = TensorParallelDion2(
+        [param],
+        lr=0.1,
+        weight_decay=0.0,
+        scalar_optimizer="lion",
+        betas=(0.95, 0.98),
+    )
+    optimizer.step()
+
+    state = optimizer.state[param]
+    assert "exp_avg" in state
+    assert "exp_avg_sq" not in state
+    assert torch.allclose(param.detach(), torch.tensor([0.9, -1.9]))

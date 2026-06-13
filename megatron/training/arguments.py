@@ -2717,7 +2717,7 @@ def _add_training_args(parser):
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Dion2 Newton-Schulz.')
     group.add_argument('--dion2-scalar-optimizer', type=str, default='adam',
-                       choices=['adam'],
+                       choices=['adam', 'adamw', 'lion'],
                        help='Scalar optimizer used for non-matrix Dion2 parameters.')
     group.add_argument('--dion2-scalar-lr-scale', type=float, default=1.0,
                        help='Additional multiplicative constant for Dion2 scalar updates.')

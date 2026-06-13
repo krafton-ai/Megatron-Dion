@@ -87,6 +87,8 @@ class MegatronDion2(MegatronMuon):
         gram_kernel_policy: str = "torch",
         fs_mode: str = "distributed",
         tp_mode: str = "distributed",
+        scalar_optimizer: str = "adam",
+        scalar_lr_scale: float = 1.0,
         mixed_precision_config: Optional[Dion2MixedPrecisionConfig] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:
@@ -108,6 +110,8 @@ class MegatronDion2(MegatronMuon):
             gram_kernel_policy=gram_kernel_policy,
             scale_mode=scale_mode,
             extra_scale_factor=extra_scale_factor,
+            scalar_optimizer=scalar_optimizer,
+            scalar_lr_scale=scalar_lr_scale,
             fs_mode=fs_mode,
             tp_mode=tp_mode,
             pg_collection=pg_collection,
@@ -137,7 +141,12 @@ class MegatronDion2(MegatronMuon):
         if group.get("algorithm", "dion2") == "dion2" and is_dion2_matrix_param(param):
             init_matrix_state(param, state, self.mixed_precision_config)
             return
-        init_scalar_state(param=param, state=state, mixed_precision_config=self.mixed_precision_config)
+        init_scalar_state(
+            param=param,
+            state=state,
+            mixed_precision_config=self.mixed_precision_config,
+            scalar_optimizer=group.get("scalar_optimizer", self.defaults["scalar_optimizer"]),
+        )
 
     def _param_config(self, parent_param: torch.Tensor, update: torch.Tensor, group: dict) -> Dion2ParamConfig:
         partition_dim = getattr(parent_param, "partition_dim", None)
@@ -356,6 +365,8 @@ def build_dion2_optimizer(
         gram_kernel_policy=config.dion2_gram_ns_kernel_policy,
         fs_mode=config.dion2_fs_mode,
         tp_mode=config.dion2_tp_mode,
+        scalar_optimizer=config.dion2_scalar_optimizer,
+        scalar_lr_scale=config.dion2_scalar_lr_scale,
         mixed_precision_config=mixed_precision_config,
         pg_collection=pg_collection,
     )
